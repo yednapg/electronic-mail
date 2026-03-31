@@ -1,0 +1,28 @@
+{
+  "name": "decision-pipeline-system",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev -w @decision-pipeline/web\" \"npm run dev -w @decision-pipeline/api\" \"python3 -m uvicorn main:app --reload --app-dir services/decision --port 8001\"",
+    "dev:web": "npm run dev -w @decision-pipeline/web",
+    "dev:api": "npm run dev -w @decision-pipeline/api",
+    "dev:decision": "cd services/decision && source venv/bin/activate &&python3 -m uvicorn main:app --reload --app-dir services/decision --port 8001",
+    "db:generate": "npm run db:generate -w @decision-pipeline/api",
+    "db:push": "npm run db:push -w @decision-pipeline/api",
+    "lint": "eslint . --ext .ts,.tsx",
+    "format": "prettier --write .",
+    "typecheck": "npm run typecheck -w @decision-pipeline/types && npm run typecheck -w @decision-pipeline/web && npm run typecheck -w @decision-pipeline/api"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^8.28.0",
+    "@typescript-eslint/parser": "^8.28.0",
+    "concurrently": "^9.1.2",
+    "eslint": "^8.57.0",
+    "eslint-config-prettier": "^10.1.1",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.3"
+  }
+}
