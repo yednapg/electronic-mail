@@ -167,7 +167,7 @@ test('completed entities are suppressed', () => {
 
   assert.equal(result.attention_item, null);
   assert.equal(result.suppressed, true);
-  assert.equal(result.suppression_reason, 'no_action_needed');
+  assert.equal(result.suppression_reason, 'resolved');
 });
 
 test('due_at presence makes the entity a decision', () => {
@@ -347,5 +347,322 @@ test.describe('decision invariants', () => {
     for (const value of Object.values(result.attention_item ?? {})) {
       assert.notEqual(value, undefined);
     }
+  });
+});
+
+test.describe('stress + edge cases', () => {
+  test('conflicting signals: resolved lifecycle beats awaiting_reply and suppresses', () => {
+    const entity: Entity = {
+      id: 'stress-1',
+      user_id: 'user-1',
+      thread_id: 'thread-1',
+      current_state: 'awaiting_reply',
+      due_at: null,
+      importance: true,
+      lifecycle_state: 'resolved',
+      created_at: '2026-03-31T16:00:00.000Z',
+      updated_at: '2026-03-31T16:00:00.000Z',
+    };
+
+    const result = classifyEntity(entity);
+
+    assert.equal(result.attention_item, null);
+    assert.equal(result.suppressed, true);
+    assert.equal(result.suppression_reason, 'resolved');
+  });
+
+  test('deadline wins over informational state', () => {
+    const entity: Entity = {
+      id: 'stress-2',
+      user_id: 'user-2',
+      thread_id: 'thread-2',
+      current_state: 'informational',
+      due_at: '2026-04-01T12:00:00.000Z',
+      importance: true,
+      lifecycle_state: 'active',
+      created_at: '2026-03-31T16:10:00.000Z',
+      updated_at: '2026-03-31T16:10:00.000Z',
+    };
+
+    const result = classifyEntity(entity);
+
+    assert.notEqual(result.attention_item, null);
+    assert.equal(result.suppressed, false);
+    assert.equal(result.attention_item?.need_type, 'decision');
+    assert.equal(result.attention_item?.primary_action, 'open');
+  });
+
+  test('multiple importance signals fall back to external open', () => {
+    const entity: Entity = {
+      id: 'stress-3',
+      user_id: 'user-3',
+      thread_id: 'thread-3',
+      current_state: 'needs_review',
+      due_at: null,
+      importance: true,
+      lifecycle_state: 'active',
+      created_at: '2026-03-31T16:20:00.000Z',
+      updated_at: '2026-03-31T16:20:00.000Z',
+    };
+
+    const result = classifyEntity(entity);
+
+    assert.notEqual(result.attention_item, null);
+    assert.equal(result.attention_item?.action_type, 'external');
+    assert.equal(result.attention_item?.primary_action, 'open');
+    assert.equal(result.attention_item?.action_confidence, 'medium');
+  });
+
+  test('extreme input with very long state string does not crash', () => {
+    const longState = `needs_review_${'x'.repeat(5000)}`;
+    const entity: Entity = {
+      id: 'stress-4',
+      user_id: 'user-4',
+      thread_id: 'thread-4',
+      current_state: longState,
+      due_at: null,
+      importance: true,
+      lifecycle_state: 'active',
+      created_at: '2026-03-31T16:30:00.000Z',
+      updated_at: '2026-03-31T16:30:00.000Z',
+    };
+
+    const result = classifyEntity(entity);
+
+    assert.equal(typeof result.suppressed, 'boolean');
+    assert.equal(result.attention_item?.action_type, 'external');
+    assert.equal(result.attention_item?.primary_action, 'open');
+  });
+
+  test('missing optional due_at as null still yields valid output', () => {
+    const entity: Entity = {
+      id: 'stress-5',
+      user_id: 'user-5',
+      thread_id: 'thread-5',
+      current_state: 'awaiting_rsvp',
+      due_at: null,
+      importance: true,
+      lifecycle_state: 'active',
+      created_at: '2026-03-31T16:40:00.000Z',
+      updated_at: '2026-03-31T16:40:00.000Z',
+    };
+
+    const result = classifyEntity(entity);
+
+    assert.equal(result.suppressed, false);
+    assert.notEqual(result.attention_item, null);
+    assert.equal(result.attention_item?.need_type, 'decision');
+    assert.equal(result.attention_item?.primary_action, 'confirm');
+  });
+
+  test('unknown state with importance true uses external open fallback', () => {
+    const entity: Entity = {
+      id: 'stress-6',
+      user_id: 'user-6',
+      thread_id: 'thread-6',
+      current_state: 'random_unknown_state',
+      due_at: null,
+      importance: true,
+      lifecycle_state: 'active',
+      created_at: '2026-03-31T16:50:00.000Z',
+      updated_at: '2026-03-31T16:50:00.000Z',
+    };
+
+    const result = classifyEntity(entity);
+
+    assert.notEqual(result.attention_item, null);
+    assert.equal(result.attention_item?.action_type, 'external');
+    assert.equal(result.attention_item?.primary_action, 'open');
+  });
+
+  test('unknown state with low importance is suppressed', () => {
+    const entity: Entity = {
+      id: 'stress-7',
+      user_id: 'user-7',
+      thread_id: 'thread-7',
+      current_state: 'random_unknown_state',
+      due_at: null,
+      importance: false,
+      lifecycle_state: 'active',
+      created_at: '2026-03-31T17:00:00.000Z',
+      updated_at: '2026-03-31T17:00:00.000Z',
+    };
+
+    const result = classifyEntity(entity);
+
+    assert.equal(result.attention_item, null);
+    assert.equal(result.suppressed, true);
+    assert.equal(result.suppression_reason, 'no_action_needed');
+  });
+
+  test('lifecycle conflict resolved plus awaiting_reply is suppressed', () => {
+    const entity: Entity = {
+      id: 'stress-8',
+      user_id: 'user-8',
+      thread_id: 'thread-8',
+      current_state: 'awaiting_reply',
+      due_at: null,
+      importance: true,
+      lifecycle_state: 'resolved',
+      created_at: '2026-03-31T17:10:00.000Z',
+      updated_at: '2026-03-31T17:10:00.000Z',
+    };
+
+    const result = classifyEntity(entity);
+
+    assert.equal(result.attention_item, null);
+    assert.equal(result.suppressed, true);
+  });
+
+  test('determinism stress returns identical output across five runs', () => {
+    const entity: Entity = {
+      id: 'stress-9',
+      user_id: 'user-9',
+      thread_id: 'thread-9',
+      current_state: 'needs_review',
+      due_at: null,
+      importance: true,
+      lifecycle_state: 'active',
+      created_at: '2026-03-31T17:20:00.000Z',
+      updated_at: '2026-03-31T17:20:00.000Z',
+    };
+
+    const results = Array.from({ length: 5 }, () => classifyEntity(entity));
+
+    for (const result of results) {
+      assert.deepEqual(result, results[0]);
+    }
+  });
+
+  test('multiple entities batch simulation stays correct and independent', () => {
+    const entities: Entity[] = [
+      {
+        id: 'batch-1',
+        user_id: 'user-a',
+        thread_id: 'thread-a',
+        current_state: 'awaiting_reply',
+        due_at: null,
+        importance: true,
+        lifecycle_state: 'active',
+        created_at: '2026-03-31T18:00:00.000Z',
+        updated_at: '2026-03-31T18:00:00.000Z',
+      },
+      {
+        id: 'batch-2',
+        user_id: 'user-b',
+        thread_id: 'thread-b',
+        current_state: 'informational',
+        due_at: null,
+        importance: false,
+        lifecycle_state: 'active',
+        created_at: '2026-03-31T18:01:00.000Z',
+        updated_at: '2026-03-31T18:01:00.000Z',
+      },
+      {
+        id: 'batch-3',
+        user_id: 'user-c',
+        thread_id: 'thread-c',
+        current_state: 'completed',
+        due_at: null,
+        importance: true,
+        lifecycle_state: 'resolved',
+        created_at: '2026-03-31T18:02:00.000Z',
+        updated_at: '2026-03-31T18:02:00.000Z',
+      },
+      {
+        id: 'batch-4',
+        user_id: 'user-d',
+        thread_id: 'thread-d',
+        current_state: 'needs_review',
+        due_at: null,
+        importance: true,
+        lifecycle_state: 'active',
+        created_at: '2026-03-31T18:03:00.000Z',
+        updated_at: '2026-03-31T18:03:00.000Z',
+      },
+      {
+        id: 'batch-5',
+        user_id: 'user-e',
+        thread_id: 'thread-e',
+        current_state: 'needs_review',
+        due_at: null,
+        importance: false,
+        lifecycle_state: 'active',
+        created_at: '2026-03-31T18:04:00.000Z',
+        updated_at: '2026-03-31T18:04:00.000Z',
+      },
+      {
+        id: 'batch-6',
+        user_id: 'user-f',
+        thread_id: 'thread-f',
+        current_state: 'awaiting_rsvp',
+        due_at: null,
+        importance: true,
+        lifecycle_state: 'active',
+        created_at: '2026-03-31T18:05:00.000Z',
+        updated_at: '2026-03-31T18:05:00.000Z',
+      },
+      {
+        id: 'batch-7',
+        user_id: 'user-g',
+        thread_id: 'thread-g',
+        current_state: 'informational',
+        due_at: '2026-04-01T18:00:00.000Z',
+        importance: true,
+        lifecycle_state: 'active',
+        created_at: '2026-03-31T18:06:00.000Z',
+        updated_at: '2026-03-31T18:06:00.000Z',
+      },
+      {
+        id: 'batch-8',
+        user_id: 'user-h',
+        thread_id: 'thread-h',
+        current_state: 'random_unknown_state',
+        due_at: null,
+        importance: true,
+        lifecycle_state: 'active',
+        created_at: '2026-03-31T18:07:00.000Z',
+        updated_at: '2026-03-31T18:07:00.000Z',
+      },
+      {
+        id: 'batch-9',
+        user_id: 'user-i',
+        thread_id: 'thread-i',
+        current_state: 'random_unknown_state',
+        due_at: null,
+        importance: false,
+        lifecycle_state: 'active',
+        created_at: '2026-03-31T18:08:00.000Z',
+        updated_at: '2026-03-31T18:08:00.000Z',
+      },
+      {
+        id: 'batch-10',
+        user_id: 'user-j',
+        thread_id: 'thread-j',
+        current_state: 'awaiting_reply',
+        due_at: null,
+        importance: true,
+        lifecycle_state: 'resolved',
+        created_at: '2026-03-31T18:09:00.000Z',
+        updated_at: '2026-03-31T18:09:00.000Z',
+      },
+    ];
+
+    const outputs = entities.map((entity) => classifyEntity(entity));
+
+    assert.equal(outputs.length, 10);
+    assert.equal(outputs[0].attention_item?.primary_action, 'reply');
+    assert.equal(outputs[1].suppressed, true);
+    assert.equal(outputs[2].suppressed, true);
+    assert.equal(outputs[3].attention_item?.primary_action, 'open');
+    assert.equal(outputs[4].suppressed, true);
+    assert.equal(outputs[5].attention_item?.primary_action, 'confirm');
+    assert.equal(outputs[6].attention_item?.need_type, 'decision');
+    assert.equal(outputs[7].attention_item?.primary_action, 'open');
+    assert.equal(outputs[8].suppressed, true);
+    assert.equal(outputs[9].suppressed, true);
+
+    assert.equal(outputs[0].entity.id, 'batch-1');
+    assert.equal(outputs[9].entity.id, 'batch-10');
   });
 });

@@ -9,6 +9,15 @@ import type {
 } from '@decision-pipeline/types';
 
 export function classifyEntity(entity: Entity): PipelineOutput {
+  if (entity.lifecycle_state === 'resolved') {
+    return {
+      entity,
+      attention_item: null,
+      suppressed: true,
+      suppression_reason: 'resolved',
+    };
+  }
+
   const derivedNeedType = deriveNeedType(entity);
   const highImportanceOverride =
     derivedNeedType !== 'decision' &&
