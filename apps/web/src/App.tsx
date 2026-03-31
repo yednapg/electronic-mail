@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
 
-import type { HealthResponse } from '@electronic-mail/types';
-
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3001';
+
+type HealthResponse = {
+  status: 'ok';
+};
 
 function App() {
   const [health, setHealth] = useState<string>('loading');

@@ -55,7 +55,7 @@ export type Entity = (EntityThreadIdentity | EntityGroupIdentity) & {
   readonly user_id: string;
 
   readonly current_state: string;
-  readonly due_at?: string | null;
+  readonly due_at: string | null;
 
   readonly importance: boolean;
 
