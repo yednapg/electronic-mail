@@ -5,6 +5,115 @@ import type { SourceRecord } from '@electronic-mail/types';
 
 import { groupSourceRecordsToEntities } from './groupSourceRecordsToEntities';
 
+test('example 1: same thread_id collapses into one informational entity', () => {
+  const input: SourceRecord[] = [
+    {
+      id: 'g1',
+      user_id: 'u1',
+      source: 'gmail',
+      thread_id: 'thread-example-1',
+      raw_payload: {
+        from: 'no-reply@updates.example.com',
+        subject: 'Product update',
+        body: 'Weekly roundup only.',
+      },
+      received_at: '2026-03-31T08:00:00.000Z',
+    },
+    {
+      id: 'g2',
+      user_id: 'u1',
+      source: 'gmail',
+      thread_id: 'thread-example-1',
+      raw_payload: {
+        body: 'More product updates.',
+      },
+      received_at: '2026-03-31T09:00:00.000Z',
+    },
+  ];
+
+  const expected = [
+    {
+      id: 'thread-example-1',
+      user_id: 'u1',
+      thread_id: 'thread-example-1',
+      current_state: 'informational',
+      due_at: null,
+      importance: false,
+      lifecycle_state: 'active',
+      created_at: '2026-03-31T08:00:00.000Z',
+      updated_at: '2026-03-31T09:00:00.000Z',
+    },
+  ] as const;
+
+  assert.deepEqual(groupSourceRecordsToEntities(input), expected);
+});
+
+test('example 2: RSVP thread derives awaiting_rsvp with due_at', () => {
+  const input: SourceRecord[] = [
+    {
+      id: 'g3',
+      user_id: 'u2',
+      source: 'gmail',
+      thread_id: 'thread-example-2',
+      raw_payload: {
+        from: 'Taylor Example <taylor@example.com>',
+        subject: 'Dinner invitation',
+        body: 'Please RSVP by 2026-04-05.',
+      },
+      received_at: '2026-03-31T10:00:00.000Z',
+    },
+  ];
+
+  const expected = [
+    {
+      id: 'thread-example-2',
+      user_id: 'u2',
+      thread_id: 'thread-example-2',
+      current_state: 'awaiting_rsvp',
+      due_at: '2026-04-05',
+      importance: true,
+      lifecycle_state: 'active',
+      created_at: '2026-03-31T10:00:00.000Z',
+      updated_at: '2026-03-31T10:00:00.000Z',
+    },
+  ] as const;
+
+  assert.deepEqual(groupSourceRecordsToEntities(input), expected);
+});
+
+test('example 3: completed payment thread derives resolved entity', () => {
+  const input: SourceRecord[] = [
+    {
+      id: 'g4',
+      user_id: 'u3',
+      source: 'gmail',
+      thread_id: 'thread-example-3',
+      raw_payload: {
+        from: 'billing@vendor.com',
+        subject: 'Payment completed',
+        body: 'Your invoice is paid. Receipt attached.',
+      },
+      received_at: '2026-03-31T11:00:00.000Z',
+    },
+  ];
+
+  const expected = [
+    {
+      id: 'thread-example-3',
+      user_id: 'u3',
+      thread_id: 'thread-example-3',
+      current_state: 'completed',
+      due_at: null,
+      importance: true,
+      lifecycle_state: 'resolved',
+      created_at: '2026-03-31T11:00:00.000Z',
+      updated_at: '2026-03-31T11:00:00.000Z',
+    },
+  ] as const;
+
+  assert.deepEqual(groupSourceRecordsToEntities(input), expected);
+});
+
 test('creates exactly one entity per thread_id', () => {
   const input: SourceRecord[] = [
     {
