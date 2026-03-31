@@ -1,0 +1,11 @@
+{
+  "name": "@electronic-mail/types",
+  "private": true,
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
