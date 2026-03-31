@@ -1,12 +1,14 @@
 import cors from 'cors';
 import express from 'express';
 
-import type { HealthResponse } from '@decision-pipeline/types';
-
 import { testDatabaseConnection } from './db';
 import { env } from './env';
 
 const app = express();
+
+type HealthResponse = {
+  status: 'ok';
+};
 
 app.use(cors({ origin: env.corsOrigin }));
 app.use(express.json());
