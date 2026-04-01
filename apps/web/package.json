@@ -2,18 +2,21 @@
   "name": "@electronic-mail/web",
   "private": true,
   "scripts": {
-    "dev": "vite",
+    "dev": "next dev --port 5173",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@electronic-mail/types": "*",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "lucide-react": "latest",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest"
   },
   "devDependencies": {
+    "@types/node": "^22.14.0",
     "@types/react": "^19.1.1",
     "@types/react-dom": "^19.1.2",
-    "@vitejs/plugin-react": "^4.3.4",
-    "vite": "^6.2.6"
+    "autoprefixer": "latest",
+    "postcss": "latest",
+    "tailwindcss": "latest"
   }
 }

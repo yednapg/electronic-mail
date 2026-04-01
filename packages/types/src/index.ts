@@ -104,6 +104,12 @@ export interface PipelineOutput {
   readonly suppression_reason: string | null;
 }
 
+export interface FeedResponse {
+  readonly now: AttentionItem[];
+  readonly today: AttentionItem[];
+  readonly worth_knowing: AttentionItem[];
+}
+
 /**
  * Debug trace for each pipeline stage
  */

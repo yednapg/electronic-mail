@@ -1,9 +1,9 @@
-import test from 'node:test';
+import test, { describe } from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { SourceRecord } from '@electronic-mail/types';
 
-import { groupSourceRecordsToEntities } from './groupSourceRecordsToEntities';
+import { computeNormalizedGroupId, groupSourceRecordsToEntities } from './groupSourceRecordsToEntities';
 
 test('example 1: same thread_id collapses into one informational entity', () => {
   const input: SourceRecord[] = [
@@ -254,4 +254,158 @@ test('keeps clearly informational system mail as informational and not important
   assert.equal(entities[0].current_state, 'informational');
   assert.equal(entities[0].importance, false);
   assert.equal(entities[0].lifecycle_state, 'active');
+});
+
+describe('cross-thread grouping', () => {
+  test('same bank reminders collapse into one entity', () => {
+    const records: SourceRecord[] = [
+      {
+        id: 'northstar-1',
+        user_id: 'user-northstar',
+        source: 'gmail',
+        thread_id: 'thread-northstar-1',
+        raw_payload: {
+          from: 'alerts@northstar.com',
+          subject: 'Bill due reminder',
+          body: 'Payment due on 2026-04-05. Card ending 1234.',
+        },
+        received_at: '2026-03-30T08:00:00.000Z',
+      },
+      {
+        id: 'northstar-2',
+        user_id: 'user-northstar',
+        source: 'gmail',
+        thread_id: 'thread-northstar-2',
+        raw_payload: {
+          from: 'reminders@northstar.com',
+          subject: 'Payment due reminder',
+          body: 'Statement due on 2026-04-05. Card ending 1234.',
+        },
+        received_at: '2026-04-01T08:00:00.000Z',
+      },
+      {
+        id: 'northstar-3',
+        user_id: 'user-northstar',
+        source: 'gmail',
+        thread_id: 'thread-northstar-3',
+        raw_payload: {
+          from: 'billing@northstar.com',
+          subject: 'Last bill due reminder',
+          body: 'Bill due on 2026-04-05. Card ending 1234.',
+        },
+        received_at: '2026-04-03T08:00:00.000Z',
+      },
+    ];
+
+    const entities = groupSourceRecordsToEntities(records);
+
+    assert.equal(entities.length, 1);
+    assert.ok('group_id' in entities[0], 'Expected cross-thread merge to use group_id');
+    assert.equal(entities[0].due_at, '2026-04-05');
+    assert.equal(entities[0].importance, true);
+    assert.equal(computeNormalizedGroupId(records[0]), 'group:northstar.com:bill:due');
+    assert.equal(computeNormalizedGroupId(records[1]), 'group:northstar.com:due:payment');
+  });
+
+  test('different banks remain separate', () => {
+    const records: SourceRecord[] = [
+      {
+        id: 'bank-1',
+        user_id: 'user-banks',
+        source: 'gmail',
+        thread_id: 'thread-northstar-bank',
+        raw_payload: {
+          from: 'alerts@northstar.com',
+          subject: 'Bill due reminder',
+          body: 'Payment due on 2026-04-05.',
+        },
+        received_at: '2026-03-31T08:00:00.000Z',
+      },
+      {
+        id: 'bank-2',
+        user_id: 'user-banks',
+        source: 'gmail',
+        thread_id: 'thread-hsbc-bank',
+        raw_payload: {
+          from: 'alerts@bank.example',
+          subject: 'Bill due reminder',
+          body: 'Payment due on 2026-04-05.',
+        },
+        received_at: '2026-04-01T08:00:00.000Z',
+      },
+    ];
+
+    const entities = groupSourceRecordsToEntities(records);
+
+    assert.equal(entities.length, 2);
+    assert.equal(new Set(entities.map((entity) => entity.id)).size, 2);
+  });
+
+  test('same subject but different domains do not merge', () => {
+    const records: SourceRecord[] = [
+      {
+        id: 'domain-1',
+        user_id: 'user-domains',
+        source: 'gmail',
+        thread_id: 'thread-domain-1',
+        raw_payload: {
+          from: 'alerts@northstar.com',
+          subject: 'Payment due reminder',
+          body: 'Statement due on 2026-04-05.',
+        },
+        received_at: '2026-03-31T08:00:00.000Z',
+      },
+      {
+        id: 'domain-2',
+        user_id: 'user-domains',
+        source: 'gmail',
+        thread_id: 'thread-domain-2',
+        raw_payload: {
+          from: 'alerts@vendor.com',
+          subject: 'Payment due reminder',
+          body: 'Statement due on 2026-04-05.',
+        },
+        received_at: '2026-04-01T08:00:00.000Z',
+      },
+    ];
+
+    const entities = groupSourceRecordsToEntities(records);
+
+    assert.equal(entities.length, 2);
+  });
+
+  test('same domain but very different subjects do not merge', () => {
+    const records: SourceRecord[] = [
+      {
+        id: 'subject-1',
+        user_id: 'user-subjects',
+        source: 'gmail',
+        thread_id: 'thread-subject-1',
+        raw_payload: {
+          from: 'alerts@northstar.com',
+          subject: 'Bill due reminder',
+          body: 'Payment due on 2026-04-05.',
+        },
+        received_at: '2026-03-31T08:00:00.000Z',
+      },
+      {
+        id: 'subject-2',
+        user_id: 'user-subjects',
+        source: 'gmail',
+        thread_id: 'thread-subject-2',
+        raw_payload: {
+          from: 'alerts@northstar.com',
+          subject: 'Travel rewards update',
+          body: 'New offers for your account.',
+        },
+        received_at: '2026-04-01T08:00:00.000Z',
+      },
+    ];
+
+    const entities = groupSourceRecordsToEntities(records);
+
+    assert.equal(entities.length, 2);
+    assert.equal(computeNormalizedGroupId(records[0]), 'group:northstar.com:bill:due');
+    assert.equal(computeNormalizedGroupId(records[1]), 'thread:thread-subject-2');
+  });
 });
