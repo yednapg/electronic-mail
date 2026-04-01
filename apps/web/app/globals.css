@@ -1,0 +1,265 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --page-bg: #ffffff;
+  --page-text: #1f1f1f;
+  --page-text-muted: #565656;
+  --rule: #ececec;
+  --agenda-bg: #f7f7f7;
+  --agenda-time-rose: #d78b8b;
+  --agenda-time-coral: #e39b94;
+  --agenda-time-green: #3fcb4c;
+  --agenda-time-amber: #d2a96a;
+  --agenda-time-lime: #5bcf64;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  background: var(--page-bg);
+  color: var(--page-text);
+  font-family: var(--font-sf-pro-rounded), 'SF Pro Rounded', sans-serif;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.digest-page {
+  min-height: 100vh;
+}
+
+.digest-shell {
+  width: min(100%, 46.5rem);
+  margin: 0 auto;
+  padding: 40px 26px 72px;
+}
+
+.digest-topbar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.digest-greeting {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 400;
+  line-height: 1.18;
+  letter-spacing: -0.03em;
+}
+
+.digest-greeting-name {
+  font-weight: 500;
+}
+
+.digest-clock {
+  flex-shrink: 0;
+  font-size: 20px;
+  font-weight: 500;
+  letter-spacing: -0.03em;
+}
+
+.digest-summary {
+  max-width: 42rem;
+  margin: 34px 0 40px;
+  color: var(--page-text);
+  font-size: 22px;
+  line-height: 1.17;
+  letter-spacing: -0.03em;
+  font-weight: 300;
+}
+
+.digest-summary-light {
+  font-weight: 300;
+}
+
+.digest-summary-medium {
+  font-weight: 500;
+}
+
+.digest-agenda {
+  margin-bottom: 52px;
+  padding: 14px 18px 12px;
+  border-radius: 2px;
+  background: var(--agenda-bg);
+}
+
+.digest-agenda-row {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.digest-agenda-row + .digest-agenda-row {
+  margin-top: 2px;
+}
+
+.digest-agenda-time {
+  font-weight: 500;
+}
+
+.digest-agenda-time-0 {
+  color: var(--agenda-time-rose);
+}
+
+.digest-agenda-time-1 {
+  color: var(--agenda-time-coral);
+}
+
+.digest-agenda-time-2 {
+  color: var(--agenda-time-green);
+}
+
+.digest-agenda-time-3 {
+  color: var(--agenda-time-amber);
+}
+
+.digest-agenda-time-4 {
+  color: var(--agenda-time-lime);
+}
+
+.digest-agenda-title {
+  color: var(--page-text-muted);
+  font-weight: 400;
+}
+
+.digest-agenda-empty {
+  color: var(--page-text-muted);
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.digest-section + .digest-section {
+  margin-top: 58px;
+}
+
+.digest-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.digest-section-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.04em;
+  text-transform: uppercase;
+}
+
+.digest-section-menu {
+  color: var(--page-text-muted);
+  font-size: 20px;
+  line-height: 1;
+  letter-spacing: 0.08em;
+}
+
+.digest-list {
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.digest-list-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  color: var(--page-text);
+  font-size: 22px;
+  line-height: 1.22;
+  letter-spacing: -0.03em;
+  font-weight: 400;
+}
+
+.digest-checkbox {
+  flex-shrink: 0;
+  color: var(--page-text-muted);
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.digest-empty-state {
+  margin: 14px 0 0;
+  color: var(--page-text-muted);
+  font-size: 18px;
+  line-height: 1.24;
+}
+
+@media (max-width: 640px) {
+  .digest-shell {
+    padding: 28px 18px 56px;
+  }
+
+  .digest-topbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .digest-summary {
+    margin: 28px 0 36px;
+    font-size: 17px;
+    line-height: 1.35;
+  }
+
+  .digest-agenda {
+    margin-bottom: 40px;
+    padding: 14px 14px 12px;
+  }
+
+  .digest-agenda-row {
+    grid-template-columns: 58px minmax(0, 1fr);
+    font-size: 14px;
+    line-height: 1.35;
+  }
+
+  .digest-section + .digest-section {
+    margin-top: 44px;
+  }
+
+  .digest-section-title {
+    font-size: 18px;
+  }
+
+  .digest-section-menu {
+    font-size: 24px;
+  }
+
+  .digest-list-item {
+    font-size: 15px;
+    line-height: 1.35;
+    gap: 6px;
+  }
+
+  .digest-checkbox {
+    font-size: 13px;
+    line-height: 1.65;
+  }
+
+  .digest-empty-state,
+  .digest-agenda-empty {
+    font-size: 15px;
+    line-height: 1.45;
+  }
+}
