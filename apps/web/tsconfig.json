@@ -8,6 +8,9 @@
     "lib": ["DOM", "DOM.Iterable", "ES2022"],
     "moduleResolution": "Bundler",
     "noEmit": true,
+    "paths": {
+      "@/*": ["./*"]
+    },
     "plugins": [{ "name": "next" }]
   },
   "include": [
@@ -15,6 +18,7 @@
     "app/**/*.tsx",
     "components/**/*.ts",
     "components/**/*.tsx",
+    "dev-data/**/*.json",
     "lib/**/*.ts",
     "tailwind.config.ts",
     ".next/types/**/*.ts"

@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 
 import type { SourceRecord } from '@electronic-mail/types';
 
-import { computeNormalizedGroupId, groupSourceRecordsToEntities } from './groupSourceRecordsToEntities';
+import {
+  computeNormalizedGroupId,
+  groupSourceRecordsToEntities,
+  groupSourceRecordsToEntityBundles,
+} from './groupSourceRecordsToEntities';
 
 test('example 1: same thread_id collapses into one informational entity', () => {
   const input: SourceRecord[] = [
@@ -408,4 +412,64 @@ describe('cross-thread grouping', () => {
     assert.equal(computeNormalizedGroupId(records[0]), 'group:northstar.com:bill:due');
     assert.equal(computeNormalizedGroupId(records[1]), 'thread:thread-subject-2');
   });
+});
+
+test('entity bundles preserve grouped source records for downstream decision input', () => {
+  const records: SourceRecord[] = [
+    {
+      id: 'bundle-1',
+      user_id: 'user-1',
+      source: 'gmail',
+      thread_id: 'thread-bundle',
+      raw_payload: {
+        subject: 'Please review this proposal',
+        body: 'Can you review the attached proposal today?',
+        from: 'rahul@example.com',
+      },
+      received_at: '2026-04-03T06:00:00.000Z',
+    },
+    {
+      id: 'bundle-2',
+      user_id: 'user-1',
+      source: 'gmail',
+      thread_id: 'thread-bundle',
+      raw_payload: {
+        subject: 'Re: Please review this proposal',
+        body: 'Following up on the proposal review request.',
+        from: 'rahul@example.com',
+      },
+      received_at: '2026-04-03T07:00:00.000Z',
+    },
+  ];
+
+  const bundles = groupSourceRecordsToEntityBundles(records);
+
+  assert.equal(bundles.length, 1);
+  assert.equal(bundles[0].entity.id, 'thread-bundle');
+  assert.equal(bundles[0].records.length, 2);
+  assert.equal(bundles[0].records[0].id, 'bundle-1');
+  assert.equal(bundles[0].records[1].id, 'bundle-2');
+});
+
+test('email received_at metadata does not create a false due_at without an explicit due signal', () => {
+  const records: SourceRecord[] = [
+    {
+      id: 'received-at-only',
+      user_id: 'user-1',
+      source: 'gmail',
+      thread_id: 'thread-received-at-only',
+      raw_payload: {
+        subject: 'Your GitHub Pro discount ends April 6',
+        body: 'This is a product update with no deadline request.',
+        from: 'support@github.com',
+        received_at: '2026-04-03T06:00:00.000Z',
+      },
+      received_at: '2026-04-03T06:00:00.000Z',
+    },
+  ];
+
+  const entities = groupSourceRecordsToEntities(records);
+
+  assert.equal(entities.length, 1);
+  assert.equal(entities[0].due_at, null);
 });

@@ -6,3 +6,47 @@ datasource db {
   provider = "sqlite"
   url      = env("DATABASE_URL")
 }
+
+model SourceRecord {
+  id            String         @id
+  source        String
+  threadId      String?
+  subject       String?
+  sender        String?
+  timestamp     DateTime
+  rawPayload    Json
+  createdAt     DateTime       @default(now())
+
+  entityMembers EntityMember[]
+}
+
+model Entity {
+  id           String         @id @default(uuid())
+  canonicalKey String         @unique
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  members      EntityMember[]
+  state        EntityState?
+}
+
+model EntityMember {
+  id             String       @id @default(uuid())
+  entityId       String
+  sourceRecordId String
+
+  entity         Entity       @relation(fields: [entityId], references: [id])
+  sourceRecord   SourceRecord @relation(fields: [sourceRecordId], references: [id])
+
+  @@unique([entityId, sourceRecordId])
+}
+
+model EntityState {
+  id           String   @id @default(uuid())
+  entityId     String   @unique
+  currentState String
+  dueAt        DateTime?
+  updatedAt    DateTime @updatedAt
+
+  entity       Entity   @relation(fields: [entityId], references: [id])
+}

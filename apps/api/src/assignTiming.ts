@@ -19,6 +19,7 @@ export function assignTiming(
     attention_item: {
       ...output.attention_item,
       timing_band: timingBand,
+      importance_level: deriveImportanceLevel(entity, timingBand),
     },
   };
 }
@@ -61,4 +62,19 @@ function deriveTimingBand(
   }
 
   return 'later';
+}
+
+function deriveImportanceLevel(
+  entity: Entity,
+  timingBand: TimingBand,
+): NonNullable<NonNullable<PipelineOutput['attention_item']>['importance_level']> {
+  if (timingBand === 'now') {
+    return 'high';
+  }
+
+  if (entity.importance || timingBand === 'today') {
+    return 'medium';
+  }
+
+  return 'low';
 }
