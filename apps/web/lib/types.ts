@@ -3,7 +3,20 @@ export type NeedType = 'decision' | 'awareness';
 export type ActionType = 'inline' | 'external' | 'none';
 export type EffortLevel = 'quick' | 'deep';
 export type ActionConfidence = 'high' | 'medium' | 'low';
-export type PrimaryActionType = 'reply' | 'open' | 'confirm' | 'pay' | 'track' | 'none';
+export type PrimaryActionType =
+  | 'reply'
+  | 'open'
+  | 'confirm'
+  | 'pay'
+  | 'track'
+  | 'review'
+  | 'join'
+  | 'send'
+  | 'approve'
+  | 'register'
+  | 'none';
+export type ImportanceLevel = 'high' | 'medium' | 'low';
+export type SourceType = 'gmail' | 'calendar';
 
 export interface FeedItem {
   id: string;
@@ -18,6 +31,11 @@ export interface FeedItem {
   fallback_action: 'open' | 'none';
   title: string;
   why_this_is_here: string;
+  due_at?: string | null;
+  importance_level?: ImportanceLevel;
+  lifecycle_state?: string;
+  current_state?: string;
+  source?: SourceType;
   trace_id: string;
   created_at: string;
 }

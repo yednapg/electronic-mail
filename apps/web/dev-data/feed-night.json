@@ -1,0 +1,70 @@
+{
+  "now": [
+    {
+      "id": "pay-card-bill",
+      "entity_id": "entity-pay-card-bill",
+      "user_id": "user-gaurav",
+      "need_type": "decision",
+      "action_type": "external",
+      "effort_level": "quick",
+      "timing_band": "now",
+      "action_confidence": "high",
+      "primary_action": "pay",
+      "fallback_action": "open",
+      "title": "Pay the Northstar credit card bill",
+      "why_this_is_here": "The bill is due by 11:00 PM, so this is now a last-chance payment.",
+      "due_at": "2026-02-01T23:00:00.000+05:30",
+      "importance_level": "high",
+      "lifecycle_state": "active",
+      "current_state": "payment_due",
+      "source": "gmail",
+      "trace_id": "trace-pay-card-bill",
+      "created_at": "2026-02-01T06:55:00.000+05:30"
+    },
+    {
+      "id": "review-security-questionnaire",
+      "entity_id": "entity-review-security-questionnaire",
+      "user_id": "user-gaurav",
+      "need_type": "decision",
+      "action_type": "external",
+      "effort_level": "deep",
+      "timing_band": "now",
+      "action_confidence": "medium",
+      "primary_action": "open",
+      "fallback_action": "open",
+      "title": "Review the vendor security questionnaire",
+      "why_this_is_here": "Legal needs the review tonight and it is now inside the next two hours.",
+      "due_at": "2026-02-01T22:30:00.000+05:30",
+      "importance_level": "medium",
+      "lifecycle_state": "active",
+      "current_state": "awaiting_review",
+      "source": "gmail",
+      "trace_id": "trace-review-security-questionnaire",
+      "created_at": "2026-02-01T08:05:00.000+05:30"
+    }
+  ],
+  "today": [],
+  "worth_knowing": [
+    {
+      "id": "confirm-startup-school",
+      "entity_id": "entity-confirm-startup-school",
+      "user_id": "user-gaurav",
+      "need_type": "decision",
+      "action_type": "external",
+      "effort_level": "quick",
+      "timing_band": "later",
+      "action_confidence": "high",
+      "primary_action": "confirm",
+      "fallback_action": "open",
+      "title": "Confirm your spot for YC Startup School India",
+      "why_this_is_here": "This is more time-sensitive now, but the confirmation is still not due until tomorrow.",
+      "due_at": "2026-02-02T12:00:00.000+05:30",
+      "importance_level": "medium",
+      "lifecycle_state": "active",
+      "current_state": "awaiting_confirmation",
+      "source": "gmail",
+      "trace_id": "trace-confirm-startup-school",
+      "created_at": "2026-02-01T08:25:00.000+05:30"
+    }
+  ]
+}

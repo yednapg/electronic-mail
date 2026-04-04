@@ -53,6 +53,7 @@ export interface SourceRecord {
 export type Entity = (EntityThreadIdentity | EntityGroupIdentity) & {
   readonly id: string; // entity_id
   readonly user_id: string;
+  readonly source?: SourceType;
 
   readonly current_state: string;
   readonly due_at: string | null;
@@ -85,6 +86,11 @@ export interface AttentionItem {
 
   readonly title: string;
   readonly why_this_is_here: string;
+  readonly due_at?: string | null;
+  readonly importance_level?: 'high' | 'medium' | 'low';
+  readonly lifecycle_state?: string;
+  readonly current_state?: string;
+  readonly source?: SourceType;
 
   readonly trace_id: string;
 

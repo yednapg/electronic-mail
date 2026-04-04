@@ -6,10 +6,12 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "concurrently \"npm run dev -w @electronic-mail/web\" \"npm run dev -w @electronic-mail/api\" \"./services/decision/.venv/bin/python -m uvicorn main:app --reload --app-dir services/decision --port 8001\"",
+    "setup": "bash scripts/bootstrap.sh",
+    "start": "npm run setup && npm run dev",
+    "dev": "concurrently \"npm run dev -w @electronic-mail/web\" \"npm run dev -w @electronic-mail/api\" \".venv/bin/python -m uvicorn main:app --reload --app-dir apps/ai --port 8001\"",
     "dev:web": "npm run dev -w @electronic-mail/web",
     "dev:api": "npm run dev -w @electronic-mail/api",
-    "dev:decision": "./services/decision/.venv/bin/python -m uvicorn main:app --reload --app-dir services/decision --port 8001",
+    "dev:ai": ".venv/bin/python -m uvicorn main:app --reload --app-dir apps/ai --port 8001",
     "db:generate": "npm run db:generate -w @electronic-mail/api",
     "db:push": "npm run db:push -w @electronic-mail/api",
     "lint": "eslint . --ext .ts,.tsx",
