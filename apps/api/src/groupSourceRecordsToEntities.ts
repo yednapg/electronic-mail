@@ -1,5 +1,10 @@
 import type { Entity, SourceRecord } from '@decision-pipeline/types';
 
+export type EntityBundle = {
+  readonly entity: Entity;
+  readonly records: SourceRecord[];
+};
+
 const GROUPING_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 const GROUPING_SUBJECT_KEYWORDS = ['bill', 'payment', 'due', 'statement'];
@@ -64,6 +69,10 @@ const SYSTEM_SENDER_PATTERNS = [
 ];
 
 export function groupSourceRecordsToEntities(records: SourceRecord[]): Entity[] {
+  return groupSourceRecordsToEntityBundles(records).map((bundle) => bundle.entity);
+}
+
+export function groupSourceRecordsToEntityBundles(records: SourceRecord[]): EntityBundle[] {
   const groupedRecords: Array<{
     records: SourceRecord[];
   }> = [];
@@ -104,36 +113,53 @@ export function groupSourceRecordsToEntities(records: SourceRecord[]): Entity[] 
       dueAt !== null ||
       hasPattern(normalizedText, FINANCIAL_PATTERNS) ||
       isCalendarRelated(recordsInGroup, normalizedText);
+    const entitySource = deriveEntitySource(recordsInGroup);
     const threadIds = new Set(recordsInGroup.map((record) => record.thread_id));
 
     if (threadIds.size === 1) {
       return {
-        id: firstRecord.thread_id,
-        user_id: firstRecord.user_id,
-        thread_id: firstRecord.thread_id,
-        current_state: currentState,
+        records: recordsInGroup,
+        entity: {
+          id: firstRecord.thread_id,
+          user_id: firstRecord.user_id,
+          ...(entitySource === 'calendar' ? { source: entitySource } : {}),
+          thread_id: firstRecord.thread_id,
+          current_state: currentState,
         due_at: dueAt,
         importance,
         lifecycle_state: currentState === 'completed' ? 'resolved' : 'active',
         created_at: firstRecord.received_at,
-        updated_at: lastRecord.received_at,
+          updated_at: lastRecord.received_at,
+        },
       };
     }
 
     const groupId = buildCrossThreadEntityId(group.records);
 
     return {
-      id: groupId,
-      user_id: firstRecord.user_id,
-      group_id: groupId,
-      current_state: currentState,
-      due_at: dueAt,
-      importance,
-      lifecycle_state: currentState === 'completed' ? 'resolved' : 'active',
-      created_at: firstRecord.received_at,
-      updated_at: lastRecord.received_at,
+      records: recordsInGroup,
+      entity: {
+        id: groupId,
+        user_id: firstRecord.user_id,
+        ...(entitySource === 'calendar' ? { source: entitySource } : {}),
+        group_id: groupId,
+        current_state: currentState,
+        due_at: dueAt,
+        importance,
+        lifecycle_state: currentState === 'completed' ? 'resolved' : 'active',
+        created_at: firstRecord.received_at,
+        updated_at: lastRecord.received_at,
+      },
     };
   });
+}
+
+function deriveEntitySource(records: SourceRecord[]): SourceRecord['source'] {
+  if (records.some((record) => record.source === 'calendar')) {
+    return 'calendar';
+  }
+
+  return records[0]?.source ?? 'gmail';
 }
 
 export function computeNormalizedGroupId(record: SourceRecord): string {
@@ -165,7 +191,7 @@ function deriveCurrentState(records: SourceRecord[], combinedText: string): stri
 
 function extractDueAt(records: SourceRecord[], combinedText: string): string | null {
   const keyMatches = records.flatMap((record) =>
-    findValuesForKeys(record.raw_payload, /due|deadline|date|start|end|time|when/i),
+    findValuesForKeys(record.raw_payload, /due|deadline|start|end|time|when/i),
   );
 
   for (const candidate of keyMatches) {
@@ -176,7 +202,19 @@ function extractDueAt(records: SourceRecord[], combinedText: string): string | n
     }
   }
 
+  if (!hasExplicitDueSignal(records, combinedText)) {
+    return null;
+  }
+
   return extractDateString(combinedText);
+}
+
+function hasExplicitDueSignal(records: SourceRecord[], combinedText: string): boolean {
+  if (records.some((record) => record.source === 'calendar')) {
+    return true;
+  }
+
+  return /\b(due|deadline|by\s+\w+|before\s+\w+|tomorrow|today|tonight)\b/i.test(combinedText);
 }
 
 function hasHumanSender(records: SourceRecord[]): boolean {

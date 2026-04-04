@@ -1,4 +1,4 @@
-import type { AttentionItem, FeedResponse, PipelineOutput } from '@decision-pipeline/types';
+import type { AttentionItem, FeedResponse, LifecycleState, PipelineOutput } from '@decision-pipeline/types';
 
 type FeedSection = keyof FeedResponse;
 
@@ -13,6 +13,39 @@ const SECTION_PRIORITY: Record<FeedSection, number> = {
   today: 1,
   worth_knowing: 2,
 };
+
+const TIMING_SCORE: Record<AttentionItem['timing_band'], number> = {
+  now: 400,
+  today: 250,
+  later: 100,
+  hidden: -1000,
+};
+
+const IMPORTANCE_SCORE: Record<NonNullable<AttentionItem['importance_level']>, number> = {
+  high: 90,
+  medium: 50,
+  low: 10,
+};
+
+const CONFIDENCE_SCORE: Record<AttentionItem['action_confidence'], number> = {
+  high: 30,
+  medium: 18,
+  low: 0,
+};
+
+const EFFORT_SCORE: Record<AttentionItem['effort_level'], number> = {
+  quick: 8,
+  deep: 2,
+};
+
+const LIFECYCLE_SCORE: Record<NonNullable<AttentionItem['lifecycle_state']>, number> = {
+  active: 12,
+  scheduled: 8,
+  resolved: -1000,
+  suppressed: -1000,
+};
+
+const BLOCKING_STATES = new Set(['awaiting_reply', 'awaiting_rsvp', 'awaiting_payment']);
 
 const ENABLE_INVARIANT_ASSERTIONS = process.env.NODE_ENV !== 'production';
 
@@ -57,23 +90,20 @@ export function buildFeed(outputs: PipelineOutput[]): FeedResponse {
   };
 
   for (const candidate of selectedByEntityId.values()) {
-    assertPlacement(candidate.attentionItem, candidate.section);
-    feed[candidate.section].push(candidate.attentionItem);
+    const feedItem = enrichAttentionItem(candidate);
+
+    assertPlacement(feedItem, candidate.section);
+    feed[candidate.section].push(feedItem);
   }
 
   feed.now.sort((left, right) =>
-    compareBySection(
-      selectedByEntityId.get(left.entity_id)!,
-      selectedByEntityId.get(right.entity_id)!,
-      'now',
-    ),
+    compareBySection(selectedByEntityId.get(left.entity_id)!, selectedByEntityId.get(right.entity_id)!),
   );
   feed.today.sort((left, right) =>
-    compareBySection(
-      selectedByEntityId.get(left.entity_id)!,
-      selectedByEntityId.get(right.entity_id)!,
-      'today',
-    ),
+    compareBySection(selectedByEntityId.get(left.entity_id)!, selectedByEntityId.get(right.entity_id)!),
+  );
+  feed.worth_knowing.sort((left, right) =>
+    compareBySection(selectedByEntityId.get(left.entity_id)!, selectedByEntityId.get(right.entity_id)!),
   );
 
   return feed;
@@ -116,34 +146,72 @@ function shouldReplaceCandidate(existing: FeedCandidate, incoming: FeedCandidate
     return priorityDelta < 0;
   }
 
-  return compareBySection(incoming, existing, incoming.section) < 0;
+  return compareBySection(incoming, existing) < 0;
 }
 
-function compareBySection(
-  left: FeedCandidate,
-  right: FeedCandidate,
-  section: FeedSection,
-): number {
-  if (section === 'now') {
-    return compareByDueAt(left, right);
+function compareBySection(left: FeedCandidate, right: FeedCandidate): number {
+  const scoreDelta = getCandidateScore(right) - getCandidateScore(left);
+
+  if (scoreDelta !== 0) {
+    return scoreDelta;
   }
 
-  if (section === 'today') {
-    const dueComparison = compareByDueAt(left, right);
+  const dueComparison = compareByDueAt(left, right);
 
-    if (dueComparison !== 0) {
-      return dueComparison;
-    }
-
-    const importanceComparison =
-      Number(right.output.entity.importance) - Number(left.output.entity.importance);
-
-    if (importanceComparison !== 0) {
-      return importanceComparison;
-    }
+  if (dueComparison !== 0) {
+    return dueComparison;
   }
 
   return left.attentionItem.entity_id.localeCompare(right.attentionItem.entity_id);
+}
+
+function getCandidateScore(candidate: FeedCandidate): number {
+  const importanceLevel =
+    candidate.attentionItem.importance_level ?? (candidate.output.entity.importance ? 'medium' : 'low');
+  const lifecycleState = normalizeLifecycleState(
+    candidate.attentionItem.lifecycle_state ?? candidate.output.entity.lifecycle_state,
+  );
+  const currentState = candidate.attentionItem.current_state ?? candidate.output.entity.current_state;
+  const blockingBoost = BLOCKING_STATES.has(currentState) ? 20 : 0;
+
+  return (
+    TIMING_SCORE[candidate.attentionItem.timing_band] +
+    IMPORTANCE_SCORE[importanceLevel] +
+    CONFIDENCE_SCORE[candidate.attentionItem.action_confidence] +
+    EFFORT_SCORE[candidate.attentionItem.effort_level] +
+    LIFECYCLE_SCORE[lifecycleState] +
+    blockingBoost
+  );
+}
+
+function enrichAttentionItem(candidate: FeedCandidate): AttentionItem {
+  return {
+    ...candidate.attentionItem,
+    ...(candidate.output.entity.due_at !== null ? { due_at: candidate.output.entity.due_at } : {}),
+    ...(candidate.output.entity.source !== undefined ? { source: candidate.output.entity.source } : {}),
+    ...(candidate.attentionItem.lifecycle_state !== undefined
+      ? {}
+      : { lifecycle_state: candidate.output.entity.lifecycle_state }),
+    ...(candidate.attentionItem.current_state !== undefined
+      ? {}
+      : { current_state: candidate.output.entity.current_state }),
+  };
+}
+
+function normalizeLifecycleState(value: string): LifecycleState {
+  if (value === 'scheduled') {
+    return 'scheduled';
+  }
+
+  if (value === 'resolved') {
+    return 'resolved';
+  }
+
+  if (value === 'suppressed') {
+    return 'suppressed';
+  }
+
+  return 'active';
 }
 
 function compareByDueAt(left: FeedCandidate, right: FeedCandidate): number {

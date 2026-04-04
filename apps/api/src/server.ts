@@ -2,65 +2,18 @@ import cors from 'cors';
 import express from 'express';
 import type { FeedResponse, SourceRecord } from '@decision-pipeline/types';
 
-import { assignTiming } from './assignTiming';
-import { buildFeed } from './buildFeed';
-import { classifyEntity } from './classifyEntity';
 import { testDatabaseConnection } from './db';
 import { env } from './env';
-import { groupSourceRecordsToEntities } from './groupSourceRecordsToEntities';
+import {
+  fetchGoogleSourceRecords,
+  getGoogleAuthUrl,
+  handleGoogleCallback,
+  hasStoredGoogleTokens,
+  isGoogleConfigured,
+} from './integrations/google';
+import { buildFeedFromEntities, hydratePersistentMemory } from './memoryPipeline';
 
 const app = express();
-const FEED_CURRENT_TIME = '2026-03-31T00:00:00.000Z';
-const MOCK_SOURCE_RECORDS: SourceRecord[] = [
-  {
-    id: 'feed-now-1',
-    user_id: 'demo-user',
-    source: 'gmail',
-    thread_id: 'thread-feed-now',
-    raw_payload: {
-      from: 'billing@vendor.com',
-      subject: 'Overdue invoice',
-      body: 'Amount due 2026-03-30T00:00:00.000Z.',
-    },
-    received_at: '2026-03-31T08:00:00.000Z',
-  },
-  {
-    id: 'feed-today-1',
-    user_id: 'demo-user',
-    source: 'gmail',
-    thread_id: 'thread-feed-today',
-    raw_payload: {
-      from: 'alex@example.com',
-      subject: 'Need your response',
-      body: 'Please reply when you can.',
-    },
-    received_at: '2026-03-31T09:00:00.000Z',
-  },
-  {
-    id: 'feed-later-1',
-    user_id: 'demo-user',
-    source: 'gmail',
-    thread_id: 'thread-feed-later',
-    raw_payload: {
-      from: 'billing@vendor.com',
-      subject: 'Invoice reminder',
-      body: 'Amount due 2026-04-05T00:00:00.000Z.',
-    },
-    received_at: '2026-03-31T10:00:00.000Z',
-  },
-  {
-    id: 'feed-hidden-1',
-    user_id: 'demo-user',
-    source: 'gmail',
-    thread_id: 'thread-feed-hidden',
-    raw_payload: {
-      from: 'no-reply@updates.example.com',
-      subject: 'Weekly newsletter',
-      body: 'This is your weekly roundup.',
-    },
-    received_at: '2026-03-31T11:00:00.000Z',
-  },
-];
 
 type HealthResponse = {
   status: 'ok';
@@ -75,20 +28,57 @@ app.get('/health', (_request, response) => {
   response.json(payload);
 });
 
-app.get('/feed', (_request, response) => {
-  const payload = buildMockFeed();
+app.get('/auth/google', (_request, response) => {
+  if (!isGoogleConfigured()) {
+    response.status(500).send('Google OAuth is not configured in apps/api/.env');
+    return;
+  }
+
+  response.redirect(getGoogleAuthUrl());
+});
+
+app.get('/auth/google/callback', async (request, response) => {
+  const code = typeof request.query.code === 'string' ? request.query.code : null;
+
+  if (code === null) {
+    response.status(400).send('Missing OAuth code');
+    return;
+  }
+
+  try {
+    await handleGoogleCallback(code);
+    response.redirect(`${env.corsOrigin}/dashboard`);
+  } catch (error) {
+    console.error('Failed to complete Google OAuth callback', error);
+    response.status(500).send('Google OAuth callback failed');
+  }
+});
+
+app.get('/feed', async (_request, response) => {
+  const payload = await buildPipelineFeed();
 
   response.json(payload);
 });
 
-function buildMockFeed(): FeedResponse {
-  const outputs = groupSourceRecordsToEntities(MOCK_SOURCE_RECORDS).map((entity) => {
-    const classified = classifyEntity(entity);
+async function buildPipelineFeed(): Promise<FeedResponse> {
+  let sourceRecords: SourceRecord[] = [];
 
-    return assignTiming(entity, classified, FEED_CURRENT_TIME);
-  });
+  if (isGoogleConfigured() && hasStoredGoogleTokens()) {
+    sourceRecords = await fetchGoogleSourceRecords();
+  }
 
-  return buildFeed(outputs);
+  const currentTime = new Date().toISOString();
+  await hydratePersistentMemory(sourceRecords);
+
+  return buildFeedFromEntities(currentTime);
+}
+
+function isSameLocalDay(left: Date, right: Date): boolean {
+  return (
+    left.getFullYear() === right.getFullYear() &&
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate()
+  );
 }
 
 async function startServer(): Promise<void> {

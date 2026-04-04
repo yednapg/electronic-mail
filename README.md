@@ -8,15 +8,14 @@ Minimal monorepo scaffold for the V1 decision pipeline system.
 .
 ├── apps
 │   ├── api
+│   ├── ai
 │   └── web
 ├── packages
 │   └── types
-├── services
-│   └── decision
-├── .eslintrc.cjs
-├── .prettierrc.json
+├── scripts
+│   └── bootstrap.sh
 ├── package.json
-└── tsconfig.base.json
+└── package-lock.json
 ```
 
 ## Prerequisites
@@ -25,59 +24,54 @@ Minimal monorepo scaffold for the V1 decision pipeline system.
 - npm 10+
 - Python 3.11+
 
-## Setup
+## Run the complete app (recommended)
 
-1. Install Node dependencies:
-
-```bash
-npm install
-```
-
-2. Install Python dependencies:
+From repo root:
 
 ```bash
-python3 -m pip install -r services/decision/requirements.txt
+npm run start
 ```
 
-3. Create env files:
+This runs:
+
+1. `npm run setup` (idempotent)
+2. starts:
+   - UI: `http://localhost:5173`
+   - API: `http://localhost:3001`
+   - AI service: `http://localhost:8001`
+
+## Setup (manual / one-time)
+
+If you prefer to run setup separately:
 
 ```bash
-cp apps/api/.env.example apps/api/.env
-cp apps/web/.env.example apps/web/.env
+npm run setup
 ```
 
-4. Generate the Prisma client:
+What `setup` does:
 
-```bash
-npm run db:generate
-```
+- Installs Node dependencies (`npm install`) if `node_modules` is missing.
+- Creates `.env` files in:
+  - `apps/api/.env`
+  - `apps/web/.env`
+  - `apps/ai/.env`
+- Creates root `.venv` (if missing).
+- Installs Python dependencies for the AI service into root `.venv`.
+- Runs `prisma generate` and `prisma db push` for the API DB.
 
-5. Create the local SQLite database:
-
-```bash
-npm run db:push
-```
-
-The API uses a local SQLite database file at `apps/api/dev.db`.
-
-## Run
-
-Run all services:
-
-```bash
-npm run dev
-```
-
-Individual services:
+## Individual services
 
 ```bash
 npm run dev:web
 npm run dev:api
-npm run dev:decision
+npm run dev:ai
 ```
 
-## Endpoints
+## Useful endpoints
 
 - Web: `http://localhost:5173`
 - API health: `http://localhost:3001/health`
-- Decision service health: `http://localhost:8001/health`
+- AI service health: `http://localhost:8001/health`
+- AI service docs: `http://localhost:8001/docs`
+
+If you run only `npm run dev`, ensure `.venv` exists and was used to install `apps/ai/requirements.txt`.

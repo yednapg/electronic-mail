@@ -4,9 +4,11 @@
 Build an invite-only, web-first alpha for Gmail + Google Calendar users that shows only decision-worthy items on the main dashboard and keeps awareness off-main by default.
 
 Main dashboard only:
-- `Day Brief`
-- `Needs Action Now`
-- `Due Today`
+- `Summary`
+- `Small Calendar Snippet`
+- `Now`
+- `Today`
+- `Later`
 
 Off-main:
 - collapsed `Worth Knowing`
