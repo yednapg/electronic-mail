@@ -1,17 +1,15 @@
 # Decision Pipeline System
 
-Minimal monorepo scaffold for the V1 decision pipeline system.
+Repo with a TypeScript frontend and one Python backend.
 
 ## Structure
 
 ```text
 .
-├── apps
-│   ├── api
-│   ├── ai
-│   └── web
+├── backend       # Unified FastAPI backend: API routes, AI services, integrations, SQLite
+├── web           # Next.js frontend
 ├── packages
-│   └── types
+│   └── types    # shared frontend TypeScript contracts
 ├── scripts
 │   └── bootstrap.sh
 ├── package.json
@@ -24,21 +22,16 @@ Minimal monorepo scaffold for the V1 decision pipeline system.
 - npm 10+
 - Python 3.11+
 
-## Run the complete app (recommended)
+## Frontend
 
 From repo root:
 
 ```bash
-npm run start
+npm run setup
+npm run dev
 ```
 
-This runs:
-
-1. `npm run setup` (idempotent)
-2. starts:
-   - UI: `http://localhost:5173`
-   - API: `http://localhost:3001`
-   - AI service: `http://localhost:8001`
+This starts the Next.js UI on `http://localhost:5173`.
 
 ## Setup (manual / one-time)
 
@@ -52,26 +45,60 @@ What `setup` does:
 
 - Installs Node dependencies (`npm install`) if `node_modules` is missing.
 - Creates `.env` files in:
-  - `apps/api/.env`
-  - `apps/web/.env`
-  - `apps/ai/.env`
+  - `backend/.env`
+  - `web/.env`
 - Creates root `.venv` (if missing).
-- Installs Python dependencies for the AI service into root `.venv`.
-- Runs `prisma generate` and `prisma db push` for the API DB.
+- Installs Python dependencies for `backend` into root `.venv`.
+- Initializes the backend SQLite database with Python.
 
-## Individual services
+## Frontend-only npm commands
 
 ```bash
-npm run dev:web
-npm run dev:api
-npm run dev:ai
+npm run dev
+npm run test
+npm run typecheck
+```
+
+## Backend Python commands
+
+```bash
+cd backend
+../.venv/bin/python -m uvicorn app.main:app --reload --port 3001
+```
+
+Test backend:
+
+```bash
+cd backend
+../.venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'
+```
+
+Typecheck backend imports:
+
+```bash
+cd backend
+../.venv/bin/python -m compileall -q app tests db_init.py reset_data.py
+```
+
+Initialize backend DB:
+
+```bash
+cd backend
+../.venv/bin/python db_init.py
+```
+
+Reset backend data:
+
+```bash
+cd backend
+../.venv/bin/python reset_data.py
 ```
 
 ## Useful endpoints
 
 - Web: `http://localhost:5173`
-- API health: `http://localhost:3001/health`
-- AI service health: `http://localhost:8001/health`
-- AI service docs: `http://localhost:8001/docs`
+- Backend health: `http://localhost:3001/health`
+- Backend trace replay: `http://localhost:3001/trace/<entity_id>`
+- Backend docs: `http://localhost:3001/docs`
 
-If you run only `npm run dev`, ensure `.venv` exists and was used to install `apps/ai/requirements.txt`.
+Use the shared root `.venv` created by `npm run setup`.

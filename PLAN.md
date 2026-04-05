@@ -11,7 +11,7 @@ Main dashboard only:
 - `Later`
 
 Off-main:
-- collapsed `Worth Knowing`
+- collapsed `Worth Knowing` / bounded overflow
 - secondary inbox/history view
 - operator trace console
 
@@ -152,8 +152,8 @@ Keep only three parts:
 3. `app layer`
 
 ### Responsibilities
-- TypeScript: sync, orchestration, lifecycle, APIs, UI contracts, actions, traces
-- Python: structured decision step only
+- Python backend: sync, orchestration, lifecycle, APIs, traces, persistence, and decision pipeline
+- TypeScript frontend: UI, presentation logic, and shared UI-facing contracts
 
 Do not split timing, learning, feed, or ranking into separate runtime services in v1.
 
@@ -166,7 +166,7 @@ Capture signals only:
 No runtime self-tuning in v1.
 
 ## Traceability
-Every source record must be traceable through:
+Every source record must be traceable through the system-owned stages that exist in v1:
 - ingestion
 - normalization
 - grouping
@@ -177,19 +177,20 @@ Every source record must be traceable through:
 - ranking
 - surfacing or suppression
 - lifecycle transition
-- user outcome
+
+`user outcome` begins when action execution and feedback capture ship.
 
 Each visible item should expose:
 - `why this is here`
 - `trace_id`
 
-The operator console should support replay from raw source record to final outcome.
+The operator console should support replay from raw source record to final surfaced or suppressed outcome.
 
 ## Implementation Phases
 Implement in narrow, reviewable slices. Do not jump ahead.
 
 ### Phase 1: Foundation
-- initialize monorepo/app structure for web app, TS backend, and Python decision component
+- initialize monorepo/app structure for web app and Python backend
 - define core contracts: `SourceRecord`, `Entity`, `AttentionItem`, `PipelineOutput`, `TraceRecord`, `FeedbackEvent`
 - define lifecycle, timing, and drop-rule enums/constants
 - set up Postgres schema and migration baseline
@@ -227,7 +228,7 @@ Review checkpoint:
 - implement `need_type`, `action_type`, `effort_level`
 - enforce downgrade/drop rules
 - implement typed Python decision output
-- TS validates and persists output
+- Python backend validates and persists output
 
 Review checkpoint:
 - inspect real examples: newsletter, RSVP, bill, PR, ticket

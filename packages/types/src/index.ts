@@ -1,3 +1,4 @@
+/** Shared TypeScript contracts used by the frontend and fixtures. */
 export type NeedType = 'decision' | 'awareness';
 
 export type ActionType = 'inline' | 'external' | 'none';
@@ -23,7 +24,8 @@ export type TraceStage =
   | 'action_selection'
   | 'timing'
   | 'ranking'
-  | 'output';
+  | 'output'
+  | 'lifecycle_transition';
 
 type EntityThreadIdentity = {
   readonly thread_id: string;
@@ -121,7 +123,9 @@ export interface FeedResponse {
  */
 export interface TraceRecord {
   readonly id: string;
-  readonly entity_id: string;
+  readonly trace_id: string;
+  readonly entity_id: string | null;
+  readonly source_record_id?: string | null;
   readonly user_id: string;
 
   readonly stage: TraceStage;
@@ -130,6 +134,12 @@ export interface TraceRecord {
   readonly output: Record<string, unknown>;
 
   readonly created_at: string;
+}
+
+export interface TraceReplayResponse {
+  readonly entity_id: string;
+  readonly source_record_ids: string[];
+  readonly items: TraceRecord[];
 }
 
 /**
