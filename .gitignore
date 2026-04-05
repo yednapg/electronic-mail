@@ -5,17 +5,19 @@ build
 .next
 .turbo
 .env
-apps/*/.env
-apps/*/.env.local
-apps/api/.google-oauth.json
+backend/.env
+backend/.env.local
+web/.env
+web/.env.local
+backend/.google-oauth.json
 *.pyc
 __pycache__
 .pytest_cache
 .venv
 .DS_Store
 *.tsbuildinfo
-apps/api/dev.db
-apps/api/dev.db-journal
+backend/dev.db
+backend/dev.db-journal
 
 *.log
 .coverage
