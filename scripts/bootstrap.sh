@@ -15,9 +15,9 @@ else
   echo "==> Node dependencies already installed"
 fi
 
-for name in api web ai; do
-  source_file="$ROOT_DIR/apps/$name/.env.example"
-  target_file="$ROOT_DIR/apps/$name/.env"
+for name in backend web; do
+  source_file="$ROOT_DIR/$name/.env.example"
+  target_file="$ROOT_DIR/$name/.env"
   if [ -f "$source_file" ] && [ ! -f "$target_file" ]; then
     cp "$source_file" "$target_file"
     echo "==> Created $target_file from example"
@@ -33,16 +33,13 @@ else
   echo "==> Root python virtualenv already exists"
 fi
 
-echo "==> Installing ai service python dependencies"
+echo "==> Installing Python dependencies for the backend"
 "$VENV_DIR/bin/pip" install --upgrade pip
-"$VENV_DIR/bin/pip" install -r "$ROOT_DIR/apps/ai/requirements.txt"
-
-cd "$ROOT_DIR"
-echo "==> Generating Prisma client"
-npm run db:generate
+"$VENV_DIR/bin/pip" install -r "$ROOT_DIR/backend/requirements.txt"
 
 echo "==> Creating local SQLite db schema"
-npm run db:push
+"$VENV_DIR/bin/python" "$ROOT_DIR/backend/db_init.py"
 
 echo "==> Bootstrap complete"
-echo "Next: run npm run dev to start web, API, and AI service."
+echo "Frontend: npm run dev"
+echo "Backend: cd backend && ../.venv/bin/python -m uvicorn app.main:app --reload --port 3001"
