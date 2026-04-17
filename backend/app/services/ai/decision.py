@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from openai import OpenAI
 
+from app.db.models import StoredSourceRecord
 from app.schemas.ai import (
     CalendarContextInput,
     CalendarContextOutput,
@@ -91,6 +92,10 @@ FEED_JUDGMENT_PROMPT = """You judge which persisted entities should appear in a 
 Rules:
 - Return one judgment max per entity.
 - The entity timeline is the memory/context for what has happened so far.
+- current_state uses this memory vocabulary:
+  - open: still active or needing attention
+  - waiting: waiting on someone else, a scheduled item, or an acknowledged request
+  - done: completed, closed, or finished
 - Repeated reminders and lifecycle updates should collapse into one meaningful item.
 - Read the whole timeline together, not just the latest subject line.
 - Title must be concise, human-readable, and useful in a personal feed.
@@ -125,6 +130,20 @@ Return strict JSON only:
 }
 """
 
+ENTITY_STATE_PROMPT = """You classify one entity timeline into a memory state.
+
+Rules:
+- Use open when the thread is still active or still needs attention.
+- Use waiting when the thread is waiting on someone else, a scheduled item, or an acknowledged request.
+- Use done when the thread is completed, closed, delivered, or otherwise finished.
+- Prefer done only when the timeline clearly shows completion or closure.
+- Prefer waiting only when the timeline clearly shows the user is waiting on someone else or the item is scheduled.
+- Return strict JSON only:
+{
+  "current_state": "open|waiting|done"
+}
+"""
+
 DASHBOARD_BRIEFING_PROMPT = """You write the top briefing for a personal dashboard.
 
 Rules:
@@ -154,8 +173,15 @@ Return strict JSON only:
 ENTITY_GROUPING_PROMPT = """You decide whether a new email belongs to an existing entity.
 
 Rules:
-- Prefer exact semantic grouping over loose similarity.
-- Repeated reminders and lifecycle updates should attach to the same entity.
+- Group by the same real-world task, case, request, or dispute, not by sender similarity.
+- Repeated reminders, acknowledgements, escalations, compensation updates, and closures for the same underlying issue should attach to one entity even when the thread, sender, or institution changes.
+- Same company, same people, or same domain is not enough to merge.
+- Different workstreams must stay separate even when they come from the same company.
+- Ignore HTML boilerplate, signatures, quoted reply history, and forwarded headers. Focus on the current message content and the underlying real-world case.
+- Use the explicit reference_ids and named_markers as strong clues. Matching complaint/reference ids strongly support a merge.
+- If a message mentions multiple institutions, prefer the institution that is the main subject of the complaint, compensation, or closure. Treat supporting evidence, comparative references, quoted rebuttals, and attached reports as secondary context, not as the grouping anchor.
+- Do not merge unrelated requests such as IPO/applications, billing, KYC/profile changes, email-id updates, account opening, shipping, and support tickets unless the underlying request is clearly the same.
+- Be especially conservative with merge decisions. A missed merge is better than a wrong merge.
 - If uncertain, return entity_id = null.
 - confidence must be between 0 and 1.
 
@@ -206,9 +232,6 @@ def decide_entities(entities: list[EntityInput]) -> list[DecisionOutput]:
 
     if _has_llm_config():
         return _decide_with_llm(entities)
-
-    if _llm_required():
-        _raise_missing_llm()
 
     return _decide_with_heuristics(entities)
 
@@ -285,9 +308,6 @@ def describe_calendar_context(
     if _has_llm_config():
         return _describe_calendar_context_with_llm(items)
 
-    if _llm_required():
-        _raise_missing_llm()
-
     return [_describe_calendar_context_heuristically(item) for item in items]
 
 
@@ -301,10 +321,49 @@ def judge_feed_entities(
     if _has_llm_config():
         return _judge_feed_entities_with_llm(entities)
 
-    if _llm_required():
-        _raise_missing_llm()
-
     return [_judge_feed_entity_heuristically(entity) for entity in entities]
+
+
+def classify_entity_state(records: list[StoredSourceRecord]) -> str:
+    """Classify one entity timeline into open, waiting, or done."""
+    if not records:
+        return "open"
+
+    if _has_llm_config():
+        try:
+            return _classify_entity_state_with_llm(records)
+        except Exception:
+            return _classify_entity_state_heuristically(records)
+
+    return _classify_entity_state_heuristically(records)
+
+
+def normalize_entity_state(current_state: str | None) -> str:
+    """Collapse legacy lifecycle labels into the new memory-state vocabulary."""
+    if current_state is None:
+        return "open"
+
+    normalized = current_state.strip().lower()
+
+    if normalized in {"done", "resolved", "completed", "finished", "closed", "delivered", "shipped"}:
+        return "done"
+    if normalized in {
+        "waiting",
+        "awaiting_reply",
+        "awaiting_rsvp",
+        "awaiting_payment",
+        "pending",
+        "pending_deadline",
+        "scheduled",
+        "received",
+        "processing",
+        "registered",
+        "acknowledged",
+        "under_review",
+    }:
+        return "waiting"
+
+    return "open"
 
 
 def resolve_entity_group(request: EntityGroupingRequest) -> EntityGroupingResponse:
@@ -314,9 +373,6 @@ def resolve_entity_group(request: EntityGroupingRequest) -> EntityGroupingRespon
 
     if _has_llm_config():
         return _resolve_entity_group_with_llm(request)
-
-    if _llm_required():
-        _raise_missing_llm()
 
     return _resolve_entity_group_heuristically(request)
 
@@ -330,9 +386,6 @@ def generate_dashboard_briefing(
 
     if _has_llm_config():
         return _generate_dashboard_briefing_with_llm(briefing_input)
-
-    if _llm_required():
-        _raise_missing_llm()
 
     return _generate_dashboard_briefing_heuristically(briefing_input)
 
@@ -547,13 +600,14 @@ def _judge_feed_entity_heuristically(
     entity: FeedEntityContextInput,
 ) -> FeedEntityJudgmentOutput:
     """Fallback feed judgment using only derived state and memory metadata."""
+    current_state = normalize_entity_state(entity.current_state)
     focus = _derive_feed_focus(entity)
     suggested_timing = _infer_feed_timing(entity)
     suggested_priority = _infer_feed_priority(entity)
     suggested_visibility = suggested_timing != "hidden"
-    action = _infer_feed_action(entity)
-    title = _build_feed_title(focus, action)
-    explanation = _build_feed_explanation(focus, entity.current_state)
+    action = _infer_feed_action(current_state)
+    title = _build_feed_title(focus, action, current_state)
+    explanation = _build_feed_explanation(focus, current_state)
 
     return FeedEntityJudgmentOutput(
         id=entity.id,
@@ -564,6 +618,117 @@ def _judge_feed_entity_heuristically(
         suggested_priority=suggested_priority,
         suggested_visibility=suggested_visibility,
     )
+
+
+def _classify_entity_state_with_llm(records: list[StoredSourceRecord]) -> str:
+    """Batch one entity timeline through the configured model."""
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model = os.getenv("OPENAI_MODEL", "gpt-5.4")
+    user_payload = {"timeline": _compact_state_timeline(records)}
+    completion = client.chat.completions.create(
+        model=model,
+        temperature=0.0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": ENTITY_STATE_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Classify this entity timeline into one current_state value.\n\n"
+                    f"{json.dumps(user_payload, ensure_ascii=True)}"
+                ),
+            },
+        ],
+    )
+
+    content = completion.choices[0].message.content or '{"current_state":"open"}'
+    _log_openai_exchange(label="classify_entity_state", model=model, payload=user_payload, content=content)
+
+    try:
+        parsed = json.loads(content)
+        state = parsed.get("current_state")
+        normalized = normalize_entity_state(state if isinstance(state, str) else None)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return _classify_entity_state_heuristically(records)
+
+    return normalized
+
+
+def _classify_entity_state_heuristically(records: list[StoredSourceRecord]) -> str:
+    """Fallback classification based on coarse lifecycle cues in the timeline."""
+    text = " ".join(
+        part
+        for record in records
+        for part in [build_record_text(record), str(record.source or "")]
+        if part
+    ).lower()
+
+    if _has_any(
+        text,
+        [
+            "completed",
+            "complete",
+            "resolved",
+            "closed",
+            "finished",
+            "final response has been shared",
+            "processed successfully",
+            "successfully reversed",
+            "delivered",
+            "shipped",
+            "cancelled",
+            "canceled",
+            "paid",
+            "refund processed",
+            "no further action",
+        ],
+    ):
+        return "done"
+
+    if records and all(record.source == "calendar" for record in records):
+        return "waiting"
+
+    if _has_any(
+        text,
+        [
+            "received",
+            "acknowledged",
+            "registered",
+            "under review",
+            "taken up for review",
+            "subject to internal checks",
+            "we will respond",
+            "we'll respond",
+            "reply within",
+            "scheduled",
+            "confirmed",
+            "waitlist",
+            "wait list",
+            "on the way",
+            "in progress",
+            "being prepared",
+            "processing",
+            "will get back",
+        ],
+    ):
+        return "waiting"
+
+    return "open"
+
+
+def build_record_text(record: StoredSourceRecord) -> str:
+    """Build one searchable text blob from a stored source record."""
+    parts = [
+        record.subject or "",
+        _payload_string(record.raw_payload, "subject") or "",
+        _payload_string(record.raw_payload, "body") or "",
+    ]
+    return " ".join(parts).strip()
+
+
+def _payload_string(payload: dict[str, object], key: str) -> str | None:
+    value = payload.get(key)
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _generate_dashboard_briefing_with_llm(
@@ -619,6 +784,8 @@ def _resolve_entity_group_with_llm(request: EntityGroupingRequest) -> EntityGrou
     user_payload = {
         "subject": _compact(request.subject),
         "snippet": _truncate_text(request.snippet, 220),
+        "reference_ids": request.reference_ids[:8],
+        "named_markers": request.named_markers[:8],
         "candidates": [
             {
                 "entity_id": candidate.entity_id,
@@ -627,6 +794,8 @@ def _resolve_entity_group_with_llm(request: EntityGroupingRequest) -> EntityGrou
                 "latest_sender": _truncate_text(candidate.latest_sender or "", MAX_SENDER_CHARS) or None,
                 "current_state": candidate.current_state,
                 "summary": _truncate_text(candidate.summary, 220),
+                "reference_ids": candidate.reference_ids[:8],
+                "named_markers": candidate.named_markers[:8],
             }
             for candidate in request.candidates[:5]
         ],
@@ -887,23 +1056,23 @@ def _with_meeting_article(subject: str) -> str:
     return subject
 
 
-def _infer_feed_action(entity: FeedEntityContextInput) -> str:
-    if entity.current_state == "awaiting_reply":
-        return "reply"
-    if entity.current_state == "pending_deadline":
-        return "review"
-    if entity.current_state == "scheduled":
+def _infer_feed_action(current_state: str) -> str:
+    if current_state == "done":
+        return "none"
+    if current_state == "waiting":
         return "none"
 
     return "open"
 
 
 def _infer_feed_timing(entity: FeedEntityContextInput) -> str:
-    if entity.current_state == "resolved":
+    current_state = normalize_entity_state(entity.current_state)
+
+    if current_state == "done":
         return "hidden"
 
     if entity.due_at is None:
-        return "today" if entity.source == "calendar" else "later"
+        return "today" if entity.source == "calendar" or current_state == "waiting" else "later"
 
     due_at = _parse_iso(entity.due_at)
     reference = _parse_iso(entity.latest_timestamp)
@@ -921,42 +1090,30 @@ def _infer_feed_timing(entity: FeedEntityContextInput) -> str:
 
 
 def _infer_feed_priority(entity: FeedEntityContextInput) -> int:
-    if entity.current_state == "pending_deadline":
-        return 90
-    if entity.current_state == "awaiting_reply":
-        return 75
-    if entity.current_state == "scheduled":
+    current_state = normalize_entity_state(entity.current_state)
+
+    if current_state == "open":
+        return 70
+    if current_state == "waiting":
         return 55
+    return 0
 
-    return 40
 
-
-def _build_feed_title(subject: str, action: str) -> str:
-    if action == "reply":
-        return f"Reply about {subject}"
-    if action == "review":
-        return f"Review {subject}"
-    if action == "register":
-        return f"Register for {subject}"
-    if action == "confirm":
-        return f"Confirm {subject}"
-    if action == "none":
+def _build_feed_title(subject: str, action: str, current_state: str) -> str:
+    if current_state == "waiting" or action == "none":
         return subject
-
     return f"Open {subject}"
 
 
 def _build_feed_explanation(subject: str, current_state: str) -> str:
-    if current_state == "pending_deadline":
-        return f"This still has an upcoming deadline for {subject}."
-    if current_state == "awaiting_reply":
-        return f"This thread is waiting on your reply about {subject}."
-    if current_state == "scheduled":
-        return f"This is still relevant on your schedule for {subject}."
-    if current_state == "resolved":
-        return f"This was updated recently for {subject}."
+    normalized_state = normalize_entity_state(current_state)
 
-    return f"This still matters for {subject}."
+    if normalized_state == "waiting":
+        return f"This is still waiting on the other side for {subject}."
+    if normalized_state == "done":
+        return f"This was already completed for {subject}."
+
+    return f"This still needs attention for {subject}."
 
 
 def _derive_feed_focus(entity: FeedEntityContextInput) -> str:

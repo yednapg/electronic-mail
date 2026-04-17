@@ -11,10 +11,12 @@ from app.schemas.domain import FeedResponse, SourceRecord
 from app.services.feed.memory_pipeline import (
     build_feed_from_entities,
     hydrate_persistent_memory,
+    rebuild_persistent_memory,
     refresh_ai_suggestions_for_entities,
 )
 from app.services.integrations.google import (
     fetch_google_source_records,
+    fetch_raw_gmail_api_messages,
     fetch_raw_gmail_source_records,
     has_stored_google_tokens,
 )
@@ -44,3 +46,20 @@ def raw_feed() -> list[SourceRecord]:
         return []
 
     return fetch_raw_gmail_source_records(settings)
+
+
+@router.get("/raw-gmail-api")
+def raw_gmail_api() -> list[dict[str, object]]:
+    """Return the raw Gmail API message payloads before normalization."""
+    if not settings.google_configured or not has_stored_google_tokens():
+        return []
+
+    return fetch_raw_gmail_api_messages(settings)
+
+
+@router.post("/rebuild-memory", response_model=FeedResponse)
+def rebuild_memory() -> FeedResponse:
+    """Rebuild entity memory from persisted source records without re-syncing Gmail."""
+    changed_entity_ids = rebuild_persistent_memory(str(settings.database_path))
+    refresh_ai_suggestions_for_entities(str(settings.database_path), changed_entity_ids)
+    return build_feed_from_entities(str(settings.database_path), datetime.now(timezone.utc).isoformat())

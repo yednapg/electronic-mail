@@ -21,6 +21,11 @@ export type DashboardSectionItem = {
   cta?: {
     label: string;
     tone: DashboardActionTone;
+    action?: {
+      kind: 'gmail-thread';
+      threadId: string;
+      operation: 'archive' | 'unarchive';
+    };
   };
 };
 

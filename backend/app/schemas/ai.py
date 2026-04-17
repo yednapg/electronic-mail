@@ -166,11 +166,15 @@ class EntityGroupingCandidateInput(BaseModel):
     latest_sender: str | None = None
     current_state: str | None = None
     summary: str
+    reference_ids: list[str] = Field(default_factory=list)
+    named_markers: list[str] = Field(default_factory=list)
 
 
 class EntityGroupingRequest(BaseModel):
     subject: str
     snippet: str
+    reference_ids: list[str] = Field(default_factory=list)
+    named_markers: list[str] = Field(default_factory=list)
     candidates: list[EntityGroupingCandidateInput] = Field(default_factory=list)
 
 

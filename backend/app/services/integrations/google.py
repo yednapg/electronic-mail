@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-"""Google OAuth and read-only Gmail/Calendar ingestion helpers."""
+"""Google OAuth, Gmail thread actions, and Calendar ingestion helpers."""
 
 from base64 import urlsafe_b64decode
+from email.utils import getaddresses
 import json
 import os
 
@@ -29,17 +30,19 @@ from app.schemas.domain import DashboardProfile, GoogleAuthState, SourceRecord
 
 
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GMAIL_WRITE_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
-GOOGLE_SCOPES = [GMAIL_SCOPE, CALENDAR_SCOPE]
+GOOGLE_SCOPES = [GMAIL_SCOPE, GMAIL_WRITE_SCOPE, CALENDAR_SCOPE]
 TOKEN_FILE_PATH = BACKEND_DIR / ".google-oauth.json"
 OAUTH_SESSION_FILE_PATH = BACKEND_DIR / ".google-oauth-session.json"
 ACCOUNT_PROFILE_FILE_PATH = BACKEND_DIR / ".google-account.json"
 DEV_USER_ID = "google-dev-user"
 GMAIL_PAGE_SIZE = 100
 GMAIL_LOOKBACK_DAYS = 90
-GMAIL_INCLUDED_LABELS = {"INBOX", "SENT"}
 CALENDAR_MAX_RESULTS = 20
 CALENDAR_WINDOW_DAYS = 7
+GMAIL_SYNC_SCOPES = {"full", "recent"}
+GMAIL_INBOX_LABEL = "INBOX"
 
 
 def _gmail_debug_enabled() -> bool:
@@ -158,9 +161,52 @@ def fetch_raw_gmail_source_records(settings: Settings) -> list[SourceRecord]:
         return []
 
     gmail_service = build("gmail", "v1", credentials=credentials)
-    message_ids = fetch_all_gmail_message_ids(gmail_service)
+    message_ids = fetch_all_gmail_message_ids(
+        gmail_service,
+        scope=resolve_gmail_sync_scope(settings.gmail_sync_scope),
+        recent_days=settings.gmail_recent_days,
+    )
     messages, _threads_fetched, _history_id = fetch_thread_messages_for_message_ids(gmail_service, message_ids)
-    return normalize_gmail_messages(messages)
+    return normalize_gmail_messages(
+        messages,
+        scope=resolve_gmail_sync_scope(settings.gmail_sync_scope),
+        recent_days=settings.gmail_recent_days,
+    )
+
+
+def fetch_raw_gmail_api_messages(settings: Settings) -> list[dict[str, object]]:
+    """Fetch full raw Gmail API message payloads for debugging and copy/paste inspection."""
+    credentials = create_authorized_credentials(settings)
+
+    if credentials is None:
+        return []
+
+    gmail_service = build("gmail", "v1", credentials=credentials)
+    message_ids = fetch_all_gmail_message_ids(
+        gmail_service,
+        scope=resolve_gmail_sync_scope(settings.gmail_sync_scope),
+        recent_days=settings.gmail_recent_days,
+    )
+    messages, _threads_fetched, _history_id = fetch_thread_messages_for_message_ids(gmail_service, message_ids)
+    return messages
+
+
+def archive_gmail_thread(settings: Settings, thread_id: str) -> dict[str, object]:
+    """Archive one Gmail thread by removing its INBOX label."""
+    return modify_gmail_thread_labels(
+        settings,
+        thread_id,
+        remove_label_ids=[GMAIL_INBOX_LABEL],
+    )
+
+
+def unarchive_gmail_thread(settings: Settings, thread_id: str) -> dict[str, object]:
+    """Unarchive one Gmail thread by restoring its INBOX label."""
+    return modify_gmail_thread_labels(
+        settings,
+        thread_id,
+        add_label_ids=[GMAIL_INBOX_LABEL],
+    )
 
 
 def persist_source_records(settings: Settings, records: list[SourceRecord]) -> None:
@@ -391,9 +437,14 @@ def sync_gmail_source_records(settings: Settings, gmail_service) -> list[SourceR
     database_path = str(settings.database_path)
     sync_state = get_gmail_sync_state(database_path, DEV_USER_ID)
     used_full_sync = sync_state is None or not sync_state.last_history_id
+    sync_scope = resolve_gmail_sync_scope(settings.gmail_sync_scope)
 
     if used_full_sync:
-        message_ids = fetch_all_gmail_message_ids(gmail_service)
+        message_ids = fetch_all_gmail_message_ids(
+            gmail_service,
+            scope=sync_scope,
+            recent_days=settings.gmail_recent_days,
+        )
         mailbox_history_id = None
     else:
         message_ids, mailbox_history_id, needs_full_sync = fetch_incremental_gmail_message_ids(
@@ -402,11 +453,19 @@ def sync_gmail_source_records(settings: Settings, gmail_service) -> list[SourceR
         )
         if needs_full_sync:
             used_full_sync = True
-            message_ids = fetch_all_gmail_message_ids(gmail_service)
+            message_ids = fetch_all_gmail_message_ids(
+                gmail_service,
+                scope=sync_scope,
+                recent_days=settings.gmail_recent_days,
+            )
             mailbox_history_id = None
 
     messages, threads_fetched, latest_history_id = fetch_thread_messages_for_message_ids(gmail_service, message_ids)
-    records = normalize_gmail_messages(messages)
+    records = normalize_gmail_messages(
+        messages,
+        scope=sync_scope,
+        recent_days=settings.gmail_recent_days,
+    )
     existing_ids = list_existing_source_record_ids(database_path, (record.id for record in records))
     new_count = len([record for record in records if record.id not in existing_ids])
 
@@ -443,11 +502,11 @@ def sync_gmail_source_records(settings: Settings, gmail_service) -> list[SourceR
     return records
 
 
-def fetch_all_gmail_message_ids(gmail_service) -> list[str]:
-    """List recent Gmail message ids limited to inbox or sent mail."""
+def fetch_all_gmail_message_ids(gmail_service, *, scope: str, recent_days: int) -> list[str]:
+    """List Gmail message ids for either full-mailbox or recent-window sync."""
     ids: list[str] = []
     page_token: str | None = None
-    query = f"newer_than:{GMAIL_LOOKBACK_DAYS}d (in:inbox OR in:sent)"
+    query = None if scope == "full" else f"newer_than:{recent_days}d"
 
     while True:
         request_payload = {
@@ -651,40 +710,38 @@ def fetch_thread_messages_for_message_ids(
     return list(thread_messages.values()), len(fetched_threads), latest_history_id
 
 
-def normalize_gmail_messages(messages: list[dict[str, object]]) -> list[SourceRecord]:
-    """Normalize Gmail API payloads into recent source records without silently dropping valid messages."""
+def normalize_gmail_messages(
+    messages: list[dict[str, object]],
+    *,
+    scope: str = "full",
+    recent_days: int = GMAIL_LOOKBACK_DAYS,
+) -> list[SourceRecord]:
+    """Normalize Gmail API payloads into source records for the configured sync scope."""
     records_by_id: dict[str, SourceRecord] = {}
-    cutoff_iso = get_gmail_cutoff_iso()
+    cutoff_iso = get_gmail_cutoff_iso(recent_days) if scope == "recent" else None
 
     for message in messages:
         record = to_gmail_source_record(message)
         if record is None:
             continue
-        if record.received_at < cutoff_iso:
-            continue
-        if not is_included_gmail_record(record):
+        if cutoff_iso is not None and record.received_at < cutoff_iso:
             continue
         records_by_id[record.id] = record
 
     return sorted(records_by_id.values(), key=lambda record: record.received_at, reverse=True)
 
 
-def get_gmail_cutoff_iso() -> str:
-    """Return the earliest Gmail timestamp that should be kept in the local sync window."""
+def get_gmail_cutoff_iso(recent_days: int) -> str:
+    """Return the earliest Gmail timestamp that should be kept in a recent sync window."""
     from datetime import datetime, timedelta, timezone
 
-    return (datetime.now(timezone.utc) - timedelta(days=GMAIL_LOOKBACK_DAYS)).isoformat()
+    return (datetime.now(timezone.utc) - timedelta(days=recent_days)).isoformat()
 
 
-def is_included_gmail_record(record: SourceRecord) -> bool:
-    """Keep only inbox or sent Gmail records inside the local sync window."""
-    raw_labels = record.raw_payload.get("label_ids")
-
-    if not isinstance(raw_labels, list):
-        return False
-
-    labels = {str(label).upper() for label in raw_labels}
-    return bool(labels & GMAIL_INCLUDED_LABELS)
+def resolve_gmail_sync_scope(value: str) -> str:
+    """Clamp configured Gmail sync scope to the supported values."""
+    normalized = value.strip().lower()
+    return normalized if normalized in GMAIL_SYNC_SCOPES else "full"
 
 
 def max_history_id(left: str | None, right: str | None) -> str | None:
@@ -733,15 +790,16 @@ def to_gmail_source_record(message: dict[str, object]) -> SourceRecord | None:
     subject = get_header(headers, "subject") or "(no subject)"
     sender = get_header(headers, "from") or ""
     recipients = get_header(headers, "to") or ""
+    cc_recipients = get_header(headers, "cc") or ""
+    bcc_recipients = get_header(headers, "bcc") or ""
     date_header = get_header(headers, "date")
     internal_date = message.get("internalDate")
-    received_at = to_valid_iso(date_header) or (
-        to_valid_iso(str(int(internal_date) / 1000)) if internal_date else None
-    )
+    received_at = to_valid_iso(date_header) or to_gmail_internal_date_iso(internal_date)
     received_at = received_at or utc_now_iso()
     body = extract_gmail_body(payload).strip() or str(message.get("snippet") or "").strip()
     message_id = message.get("id")
     thread_id = message.get("threadId")
+    participants = extract_participants(sender, recipients, cc_recipients, bcc_recipients)
 
     if not message_id or not thread_id:
         _log_gmail_debug(
@@ -767,10 +825,14 @@ def to_gmail_source_record(message: dict[str, object]) -> SourceRecord | None:
         source="gmail",
         thread_id=str(thread_id),
         raw_payload={
+            "message_id": str(message_id),
             "subject": subject,
             "body": body,
             "from": sender,
             "to": recipients,
+            "cc": cc_recipients,
+            "bcc": bcc_recipients,
+            "participants": participants,
             "received_at": received_at,
             "snippet": str(message.get("snippet") or ""),
             "label_ids": message.get("labelIds") if isinstance(message.get("labelIds"), list) else [],
@@ -845,6 +907,66 @@ def get_header(headers: list[object], name: str) -> str | None:
     return None
 
 
+def modify_gmail_thread_labels(
+    settings: Settings,
+    thread_id: str,
+    *,
+    add_label_ids: list[str] | None = None,
+    remove_label_ids: list[str] | None = None,
+) -> dict[str, object]:
+    """Apply explicit Gmail label mutations to a single thread."""
+    if not thread_id.strip():
+        raise RuntimeError("Missing Gmail thread id")
+
+    credentials = create_authorized_credentials(settings)
+    if credentials is None:
+        raise RuntimeError("Google account is not connected")
+
+    gmail_service = build("gmail", "v1", credentials=credentials)
+    request_body: dict[str, list[str]] = {}
+    if add_label_ids:
+        request_body["addLabelIds"] = add_label_ids
+    if remove_label_ids:
+        request_body["removeLabelIds"] = remove_label_ids
+
+    _log_gmail_debug(
+        "gmail_thread_modify_request",
+        {
+            "threadId": thread_id,
+            "addLabelIds": add_label_ids or [],
+            "removeLabelIds": remove_label_ids or [],
+        },
+    )
+
+    try:
+        response = (
+            gmail_service.users()
+            .threads()
+            .modify(userId="me", id=thread_id, body=request_body)
+            .execute()
+        )
+    except HttpError as error:
+        _log_gmail_error(
+            "gmail_thread_modify_failed",
+            {
+                "threadId": thread_id,
+                "addLabelIds": add_label_ids or [],
+                "removeLabelIds": remove_label_ids or [],
+                "error": str(error),
+            },
+        )
+        raise
+
+    _log_gmail_debug(
+        "gmail_thread_modify_response",
+        {
+            "threadId": thread_id,
+            "response": response,
+        },
+    )
+    return response
+
+
 def extract_gmail_body(payload: dict[str, object]) -> str:
     """Walk the Gmail MIME payload tree until a readable text body is found."""
     if payload.get("mimeType") == "text/plain":
@@ -873,6 +995,38 @@ def decode_base64_url(value: str) -> str:
     """Decode Gmail's URL-safe base64 body encoding."""
     padded = value + "=" * (-len(value) % 4)
     return urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8", errors="ignore")
+
+
+def extract_participants(*address_fields: str) -> list[str]:
+    """Normalize sender/recipient header fields into a compact participant list."""
+    participants: list[str] = []
+    seen: set[str] = set()
+
+    for _display_name, address in getaddresses(address_fields):
+        normalized = address.strip().lower()
+
+        if not normalized or normalized in seen:
+            continue
+
+        seen.add(normalized)
+        participants.append(normalized)
+
+    return participants
+
+
+def to_gmail_internal_date_iso(value: object) -> str | None:
+    """Convert Gmail's millisecond internalDate value into a UTC ISO timestamp."""
+    from datetime import datetime, timezone
+
+    if value is None:
+        return None
+
+    try:
+        milliseconds = int(str(value))
+    except ValueError:
+        return None
+
+    return datetime.fromtimestamp(milliseconds / 1000, tz=timezone.utc).isoformat()
 
 
 def to_valid_iso(value) -> str | None:

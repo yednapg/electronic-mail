@@ -31,6 +31,17 @@ class StoredEntity:
 
 
 @dataclass
+class StoredEntityThreadMembership:
+    """Explicit entity-to-thread membership row for source-scoped thread identity."""
+
+    id: str
+    entity_id: str
+    source: str
+    thread_id: str
+    created_at: str
+
+
+@dataclass
 class StoredEntityState:
     """Current derived lifecycle state for an entity."""
 
@@ -65,6 +76,7 @@ class LoadedEntity:
     entity: StoredEntity
     state: StoredEntityState | None
     ai_suggestion: StoredEntityAiSuggestion | None
+    thread_memberships: list[StoredEntityThreadMembership] = field(default_factory=list)
     members: list[StoredSourceRecord] = field(default_factory=list)
 
 
