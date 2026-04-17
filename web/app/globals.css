@@ -311,6 +311,23 @@ textarea {
   text-underline-offset: 3px;
 }
 
+.attention-cta-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.attention-cta-button:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.attention-cta-button:focus-visible {
+  outline: 2px solid #1f1f1f;
+  outline-offset: 2px;
+}
+
 .attention-cta-blue {
   color: var(--cta-blue);
 }

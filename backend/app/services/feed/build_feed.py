@@ -2,18 +2,17 @@ from __future__ import annotations
 
 """Final feed projection, filtering, deduplication, and ranking logic."""
 
+from datetime import datetime
+
 from app.db.repository import append_trace_record
 from app.schemas.domain import AttentionItem, FeedResponse, PipelineOutput
+from app.services.ai.decision import normalize_entity_state
 
 
-# Higher priority means a section or item should be surfaced earlier.
-SECTION_PRIORITY = {"now": 0, "today": 1, "worth_knowing": 2}
-TIMING_SCORE = {"now": 400, "today": 250, "later": 100, "hidden": -1000}
-IMPORTANCE_SCORE = {"high": 90, "medium": 50, "low": 10}
-CONFIDENCE_SCORE = {"high": 30, "medium": 18, "low": 0}
-EFFORT_SCORE = {"quick": 8, "deep": 2}
-LIFECYCLE_SCORE = {"active": 12, "scheduled": 8, "resolved": -1000, "suppressed": -1000}
-BLOCKING_STATES = {"awaiting_reply", "awaiting_rsvp", "awaiting_payment"}
+TIMING_ORDER = {"now": 0, "today": 1, "later": 2}
+STATE_ORDER = {"open": 0, "waiting": 1, "done": 2}
+IMPORTANCE_ORDER = {"high": 0, "medium": 1, "low": 2}
+DEFAULT_ORDER = 3
 
 
 def build_feed(outputs: list[PipelineOutput], database_path: str | None = None) -> FeedResponse:
@@ -26,7 +25,7 @@ def build_feed(outputs: list[PipelineOutput], database_path: str | None = None) 
         if candidate is None:
             continue
 
-        _, attention_item, section = candidate
+        _, attention_item, _ = candidate
         existing = selected_by_entity_id.get(attention_item.entity_id)
 
         if existing is None or should_replace_candidate(existing, candidate):
@@ -49,20 +48,22 @@ def build_feed(outputs: list[PipelineOutput], database_path: str | None = None) 
 
 
 def to_feed_candidate(output: PipelineOutput) -> tuple[PipelineOutput, AttentionItem, str] | None:
-    """Drop suppressed, hidden, and resolved items before ranking."""
+    """Keep every surfaced entity and map it into a feed section."""
     attention_item = output.attention_item
 
     if attention_item is None or output.suppressed:
         return None
 
-    lifecycle_state = attention_item.lifecycle_state or output.entity.lifecycle_state
+    timing_band = attention_item.timing_band
 
-    if lifecycle_state == "resolved" or attention_item.timing_band == "hidden":
-        return None
-    if attention_item.current_state == "resolved":
-        return None
+    if timing_band == "hidden":
+        timing_band = "later"
+        data = attention_item.model_dump()
+        data["timing_band"] = "later"
+        data["importance_level"] = "low"
+        attention_item = AttentionItem.model_validate(data)
 
-    return output, attention_item, map_timing_band_to_section(attention_item.timing_band)
+    return output, attention_item, map_timing_band_to_section(timing_band)
 
 
 def map_timing_band_to_section(timing_band: str) -> str:
@@ -79,40 +80,34 @@ def should_replace_candidate(
     incoming: tuple[PipelineOutput, AttentionItem, str],
 ) -> bool:
     """Pick the stronger candidate when multiple items claim the same entity."""
-    _, _, existing_section = existing
-    _, _, incoming_section = incoming
-    priority_delta = SECTION_PRIORITY[incoming_section] - SECTION_PRIORITY[existing_section]
-
-    if priority_delta != 0:
-        return priority_delta < 0
-
     return sort_key(incoming) < sort_key(existing)
 
 
-def sort_key(candidate: tuple[PipelineOutput, AttentionItem, str]) -> tuple[int, int, str]:
-    """Sort by descending score, then nearest due date, then stable entity id."""
+def sort_key(candidate: tuple[PipelineOutput, AttentionItem, str]) -> tuple[int, int, int, int, str]:
+    """Sort by timing, then state, then importance, then recency."""
     output, attention_item, _ = candidate
-    score = get_candidate_score(output, attention_item)
-    due_timestamp = due_at_timestamp(output.entity.due_at)
-    due_sort = due_timestamp if due_timestamp is not None else 2**63 - 1
-    return (-score, due_sort, attention_item.entity_id)
-
-
-def get_candidate_score(output: PipelineOutput, attention_item: AttentionItem) -> int:
-    """Blend urgency, importance, confidence, and lifecycle into one ranking score."""
+    timing_rank = _rank_timing_band(attention_item.timing_band)
+    current_state = normalize_entity_state(attention_item.current_state or output.entity.current_state)
+    state_rank = STATE_ORDER.get(current_state, DEFAULT_ORDER)
     importance_level = attention_item.importance_level or ("medium" if output.entity.importance else "low")
-    lifecycle_state = attention_item.lifecycle_state or output.entity.lifecycle_state
-    current_state = attention_item.current_state or output.entity.current_state
-    blocking_boost = 20 if current_state in BLOCKING_STATES else 0
+    importance_rank = IMPORTANCE_ORDER.get(importance_level, DEFAULT_ORDER)
+    recency_rank = _timestamp_rank(attention_item.created_at)
 
-    return (
-        TIMING_SCORE[attention_item.timing_band]
-        + IMPORTANCE_SCORE[importance_level]
-        + CONFIDENCE_SCORE[attention_item.action_confidence]
-        + EFFORT_SCORE[attention_item.effort_level]
-        + LIFECYCLE_SCORE[lifecycle_state]
-        + blocking_boost
-    )
+    return (timing_rank, state_rank, importance_rank, recency_rank, attention_item.entity_id)
+
+
+def _rank_timing_band(timing_band: str) -> int:
+    return TIMING_ORDER.get(timing_band, DEFAULT_ORDER)
+
+
+def _timestamp_rank(value: str | None) -> int:
+    if value is None:
+        return 2**63 - 1
+
+    try:
+        return -int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return 2**63 - 1
 
 
 def enrich_attention_item(output: PipelineOutput, attention_item: AttentionItem) -> AttentionItem:
@@ -126,20 +121,9 @@ def enrich_attention_item(output: PipelineOutput, attention_item: AttentionItem)
     if attention_item.lifecycle_state is None:
         data["lifecycle_state"] = output.entity.lifecycle_state
     if attention_item.current_state is None:
-        data["current_state"] = output.entity.current_state
+        data["current_state"] = normalize_entity_state(output.entity.current_state)
 
     return AttentionItem.model_validate(data)
-
-
-def due_at_timestamp(due_at: str | None) -> int | None:
-    """Convert a due timestamp into epoch seconds when it is parseable."""
-    if due_at is None:
-        return None
-
-    try:
-        return int(__import__("datetime").datetime.fromisoformat(due_at.replace("Z", "+00:00")).timestamp())
-    except ValueError:
-        return None
 
 
 def log_feed_ranking(
@@ -156,7 +140,7 @@ def log_feed_ranking(
         for index, item in enumerate(items):
             output, _, _ = selected_by_entity_id[item.entity_id]
             source_record_id = item.id if item.id != item.entity_id else None
-            score = get_candidate_score(output, item)
+            rank_key = sort_key(selected_by_entity_id[item.entity_id])
             append_trace_record(
                 database_path,
                 stage="ranking",
@@ -166,14 +150,14 @@ def log_feed_ranking(
                 trace_id=item.trace_id,
                 input={
                     "timing_band": item.timing_band,
+                    "current_state": item.current_state,
                     "importance_level": item.importance_level,
-                    "action_confidence": item.action_confidence,
-                    "effort_level": item.effort_level,
+                    "created_at": item.created_at,
                 },
                 output={
                     "section": section_name,
                     "rank": index,
-                    "score": score,
+                    "rank_key": rank_key,
                 },
             )
             append_trace_record(

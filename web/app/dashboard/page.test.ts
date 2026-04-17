@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { FeedItem, FeedResponse } from '../../lib/types';
-import { buildAgenda, buildSections, buildSummary, toActionSentence } from './page';
+import { buildAgenda, buildSections, buildSummary, toActionSentence, toSectionCta } from './page';
 
 function createFeedItem(overrides: Partial<FeedItem> = {}): FeedItem {
   return {
@@ -155,5 +155,25 @@ test('dashboard summary renders backend-generated briefing copy without rewritin
   assert.deepEqual(summary, {
     headline: 'Good morning, Gaurav.',
     brief: 'You have 0 meetings and a mostly open afternoon.',
+  });
+});
+
+test('gmail items expose an explicit archive CTA when one thread can be mutated', () => {
+  const cta = toSectionCta(
+    createFeedItem({
+      source: 'gmail',
+      gmail_thread_id: 'thread-123',
+      gmail_thread_action: 'archive',
+    }),
+  );
+
+  assert.deepEqual(cta, {
+    label: 'Archive',
+    tone: 'green',
+    action: {
+      kind: 'gmail-thread',
+      threadId: 'thread-123',
+      operation: 'archive',
+    },
   });
 });
