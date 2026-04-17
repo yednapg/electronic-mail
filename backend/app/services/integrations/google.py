@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from base64 import urlsafe_b64decode
 from email.utils import getaddresses
+import html
 import json
 import os
+import re
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -43,6 +45,7 @@ CALENDAR_MAX_RESULTS = 20
 CALENDAR_WINDOW_DAYS = 7
 GMAIL_SYNC_SCOPES = {"full", "recent"}
 GMAIL_INBOX_LABEL = "INBOX"
+HTML_TAG_PATTERN = re.compile(r"(?is)<[^>]+>")
 
 
 def _gmail_debug_enabled() -> bool:
@@ -189,6 +192,11 @@ def fetch_raw_gmail_api_messages(settings: Settings) -> list[dict[str, object]]:
     )
     messages, _threads_fetched, _history_id = fetch_thread_messages_for_message_ids(gmail_service, message_ids)
     return messages
+
+
+def fetch_clean_gmail_api_messages(settings: Settings) -> list[dict[str, object]]:
+    """Fetch Gmail API messages in a readable debugging shape without MIME/base64 noise."""
+    return [clean_gmail_api_message(message) for message in fetch_raw_gmail_api_messages(settings)]
 
 
 def archive_gmail_thread(settings: Settings, thread_id: str) -> dict[str, object]:
@@ -995,6 +1003,124 @@ def decode_base64_url(value: str) -> str:
     """Decode Gmail's URL-safe base64 body encoding."""
     padded = value + "=" * (-len(value) % 4)
     return urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8", errors="ignore")
+
+
+def clean_gmail_api_message(message: dict[str, object]) -> dict[str, object]:
+    """Project a raw Gmail API message into a compact debugging shape."""
+    payload = message.get("payload") or {}
+    headers = payload.get("headers") or []
+    plain_body, html_body = extract_gmail_body_variants(payload)
+    chosen_body = plain_body or html_to_text(html_body) or str(message.get("snippet") or "").strip()
+
+    return {
+        "id": str(message.get("id") or ""),
+        "thread_id": str(message.get("threadId") or ""),
+        "history_id": str(message.get("historyId") or ""),
+        "label_ids": message.get("labelIds") if isinstance(message.get("labelIds"), list) else [],
+        "internal_date": to_gmail_internal_date_iso(message.get("internalDate")),
+        "snippet": str(message.get("snippet") or "").strip(),
+        "subject": get_header(headers, "subject") or "",
+        "from": get_header(headers, "from") or "",
+        "to": get_header(headers, "to") or "",
+        "cc": get_header(headers, "cc") or "",
+        "bcc": get_header(headers, "bcc") or "",
+        "date": get_header(headers, "date") or "",
+        "mime_type": str(payload.get("mimeType") or ""),
+        "body": {
+            "text_plain": truncate_debug_text(plain_body),
+            "text_html_as_text": truncate_debug_text(html_to_text(html_body)),
+            "chosen": truncate_debug_text(chosen_body),
+        },
+        "parts": summarize_gmail_parts(payload),
+    }
+
+
+def extract_gmail_body_variants(payload: dict[str, object]) -> tuple[str, str]:
+    """Walk the MIME tree and return best plain-text and html bodies."""
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+
+    def walk(part: dict[str, object]) -> None:
+        mime_type = str(part.get("mimeType") or "")
+        body = part.get("body") or {}
+        data = ""
+
+        if isinstance(body, dict) and body.get("data"):
+            data = decode_base64_url(str(body["data"]))
+
+        if mime_type == "text/plain" and data.strip():
+            plain_parts.append(data.strip())
+        elif mime_type == "text/html" and data.strip():
+            html_parts.append(data.strip())
+
+        for child in part.get("parts") or []:
+            if isinstance(child, dict):
+                walk(child)
+
+    walk(payload)
+
+    return ("\n\n".join(plain_parts).strip(), "\n\n".join(html_parts).strip())
+
+
+def summarize_gmail_parts(payload: dict[str, object]) -> list[dict[str, object]]:
+    """Return readable metadata about Gmail MIME parts without raw data blobs."""
+    summaries: list[dict[str, object]] = []
+
+    def walk(part: dict[str, object]) -> None:
+        body = part.get("body") or {}
+        data = ""
+
+        if isinstance(body, dict) and body.get("data"):
+            data = decode_base64_url(str(body["data"]))
+
+        headers = part.get("headers") or []
+        summaries.append(
+            {
+                "part_id": str(part.get("partId") or ""),
+                "mime_type": str(part.get("mimeType") or ""),
+                "filename": str(part.get("filename") or ""),
+                "size": body.get("size") if isinstance(body, dict) else None,
+                "headers": {
+                    name.lower(): value
+                    for header in headers
+                    if isinstance(header, dict)
+                    and isinstance((name := header.get("name")), str)
+                    and isinstance((value := header.get("value")), str)
+                    and name.lower() in {"content-type", "content-transfer-encoding", "content-disposition"}
+                },
+                "text_preview": truncate_debug_text(html_to_text(data) if str(part.get("mimeType") or "") == "text/html" else data),
+            }
+        )
+
+        for child in part.get("parts") or []:
+            if isinstance(child, dict):
+                walk(child)
+
+    for part in payload.get("parts") or []:
+        if isinstance(part, dict):
+            walk(part)
+
+    return summaries
+
+
+def html_to_text(value: str) -> str:
+    """Flatten simple HTML into readable text for debugging."""
+    if not value:
+        return ""
+
+    text = value.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+    text = re.sub(r"(?i)</p>|</div>|</li>|</tr>|</td>|</h[1-6]>", "\n", text)
+    text = HTML_TAG_PATTERN.sub(" ", text)
+    text = html.unescape(text)
+    return " ".join(text.split())
+
+
+def truncate_debug_text(value: str, limit: int = 1200) -> str:
+    """Keep debug text readable in browser/JSON viewers."""
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}...<truncated>"
 
 
 def extract_participants(*address_fields: str) -> list[str]:

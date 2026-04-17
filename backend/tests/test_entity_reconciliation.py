@@ -182,6 +182,77 @@ class EntityReconciliationTests(unittest.TestCase):
         self.assertEqual(changed, [])
         mock_grouping.assert_not_called()
 
+    def test_reconcile_entities_does_not_merge_stale_provider_history_without_explicit_reference(self) -> None:
+        groww_closure = build_record(
+            record_id="groww-closure",
+            thread_id="thread-groww-closure",
+            subject="Demat Account successfully closed",
+            sender="Groww <noreply@groww.in>",
+            body="Your request for closure of your Demat Account has been successfully processed.",
+            received_at="2025-02-07T04:34:00+00:00",
+        )
+        groww_issue = build_record(
+            record_id="groww-issue",
+            thread_id="thread-groww-issue",
+            subject="Re: screenshot 90000005",
+            sender="Groww <support@groww.in>",
+            body="We have taken up your concern on high priority with the CDSL and will provide you with an update at the earliest.",
+            received_at="2026-04-17T07:22:10+00:00",
+        )
+
+        self.seed_entity(groww_closure)
+        self.seed_entity(groww_issue)
+
+        with patch(
+            "app.services.entities.entity_reconciler.resolve_entity_group",
+            return_value=EntityGroupingResponse(entity_id="should-not-merge", confidence=0.99),
+        ) as mock_grouping:
+            changed = reconcile_entities(self.database_path)
+
+        loaded_entities = list_all_loaded_entities(self.database_path)
+        self.assertEqual(len(loaded_entities), 2)
+        self.assertEqual(changed, [])
+        mock_grouping.assert_not_called()
+
+    def test_reconcile_entities_merges_recent_same_provider_support_threads_with_same_subject_root(self) -> None:
+        screenshot_seed = build_record(
+            record_id="groww-screenshot-seed",
+            thread_id="thread-groww-screenshot-seed",
+            subject="screenshot",
+            sender="Groww <support@groww.in>",
+            body="With reference to your concern, we would like a screen shot of the issue to check it better.",
+            received_at="2026-04-09T05:14:42+00:00",
+        )
+        screenshot_followup = build_record(
+            record_id="groww-screenshot-followup",
+            thread_id="thread-groww-screenshot-followup",
+            subject="Re: screenshot 90000005",
+            sender="Groww <support@groww.in>",
+            body=(
+                "We have taken up your concern on high priority with the CDSL and will provide you with an update at the earliest.\n"
+                "On Thu, Apr 9, Groww wrote:\n"
+                "With reference to your concern, we would like a screen shot of the issue to check it better."
+            ),
+            received_at="2026-04-12T07:39:56+00:00",
+        )
+
+        seed_entity = self.seed_entity(screenshot_seed)
+        self.seed_entity(screenshot_followup)
+
+        with patch(
+            "app.services.entities.entity_reconciler.resolve_entity_group",
+            return_value=EntityGroupingResponse(entity_id=seed_entity.id, confidence=0.84),
+        ):
+            changed = reconcile_entities(self.database_path)
+
+        loaded_entities = list_all_loaded_entities(self.database_path)
+        self.assertEqual(len(loaded_entities), 1)
+        self.assertEqual(changed, [seed_entity.id])
+        self.assertEqual(
+            {member.id for member in loaded_entities[0].members},
+            {"groww-screenshot-seed", "groww-screenshot-followup"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
