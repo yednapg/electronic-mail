@@ -91,7 +91,8 @@ def refresh_ai_suggestions_for_entities(database_path: str, entity_ids: list[str
         return
 
     entities = [entity for entity in list_all_loaded_entities(database_path) if entity.entity.id in unique_entity_ids]
-    contexts = [context for entity in entities if (context := to_feed_entity_context(entity)) is not None]
+    entities_needing_refresh = [entity for entity in entities if get_usable_suggestion(entity) is None]
+    contexts = [context for entity in entities_needing_refresh if (context := to_feed_entity_context(entity)) is not None]
 
     if not contexts:
         return
@@ -100,7 +101,7 @@ def refresh_ai_suggestions_for_entities(database_path: str, entity_ids: list[str
     judgments = judge_feed_entities(contexts)
     judgment_by_id = {judgment.id: judgment for judgment in judgments}
 
-    for entity in entities:
+    for entity in entities_needing_refresh:
         judgment = judgment_by_id.get(entity.entity.id)
 
         if judgment is None:
@@ -508,6 +509,32 @@ def derive_lifecycle_hints(records) -> list[str]:
         for hint in ["registered", "waitlist", "accepted", "rsvp", "confirmed", "received", "processing", "shipped", "delivered"]
         if hint in text
     ]
+    if any(token in text for token in ["acknowledge receipt", "request has been registered", "system generated response"]):
+        hints.append("acknowledged")
+    if any(
+        token in text
+        for token in [
+            "under review",
+            "taken up for",
+            "appropriate review",
+            "interim response",
+            "we shall respond by",
+            "respond within 2 working days",
+            "request has been raised",
+            "activation will be completed",
+        ]
+    ):
+        hints.append("under_review")
+    if any(
+        token in text
+        for token in [
+            "successfully reversed",
+            "final response has been shared",
+            "completed from our end",
+            "processed successfully",
+        ]
+    ):
+        hints.append("provider_done")
     return sorted(set(hints))
 
 

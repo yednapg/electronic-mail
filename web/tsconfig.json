@@ -18,7 +18,6 @@
     "app/**/*.tsx",
     "components/**/*.ts",
     "components/**/*.tsx",
-    "dev-data/**/*.json",
     "lib/**/*.ts",
     ".next/types/**/*.ts"
   ]

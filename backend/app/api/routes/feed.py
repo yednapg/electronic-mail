@@ -7,13 +7,17 @@ from datetime import datetime, timezone
 from fastapi import APIRouter
 
 from app.core.config import load_settings
-from app.schemas.domain import FeedResponse
+from app.schemas.domain import FeedResponse, SourceRecord
 from app.services.feed.memory_pipeline import (
     build_feed_from_entities,
     hydrate_persistent_memory,
     refresh_ai_suggestions_for_entities,
 )
-from app.services.integrations.google import fetch_google_source_records, has_stored_google_tokens
+from app.services.integrations.google import (
+    fetch_google_source_records,
+    fetch_raw_gmail_source_records,
+    has_stored_google_tokens,
+)
 
 
 router = APIRouter()
@@ -31,3 +35,12 @@ def feed() -> FeedResponse:
     changed_entity_ids = hydrate_persistent_memory(str(settings.database_path), source_records)
     refresh_ai_suggestions_for_entities(str(settings.database_path), changed_entity_ids)
     return build_feed_from_entities(str(settings.database_path), datetime.now(timezone.utc).isoformat())
+
+
+@router.get("/raw-feed", response_model=list[SourceRecord])
+def raw_feed() -> list[SourceRecord]:
+    """Return the current raw Gmail source records exactly as they enter the pipeline."""
+    if not settings.google_configured or not has_stored_google_tokens():
+        return []
+
+    return fetch_raw_gmail_source_records(settings)
