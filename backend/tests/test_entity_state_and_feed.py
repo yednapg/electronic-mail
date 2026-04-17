@@ -8,11 +8,12 @@ from unittest.mock import patch
 from app.db.models import LoadedEntity, StoredEntity, StoredEntityAiSuggestion, StoredEntityState
 from app.db.models import StoredSourceRecord
 from app.db.repository import initialize_database
+from app.schemas.ai import FeedEntityJudgmentOutput
 from app.schemas.domain import AttentionItem, PipelineEntity, PipelineOutput
 from app.services.ai.decision import classify_entity_state
 from app.services.entities.derive_entity_state import derive_state
 from app.services.feed.build_feed import build_feed
-from app.services.feed.memory_pipeline import to_pipeline_output
+from app.services.feed.memory_pipeline import normalize_judgment, to_pipeline_output
 
 
 def make_record(
@@ -285,6 +286,97 @@ class EntityStateAndFeedTests(unittest.TestCase):
         self.assertEqual(feed.now, [])
         self.assertEqual(feed.today, [])
         self.assertEqual([item.entity_id for item in feed.worth_knowing], ["entity-done-visible"])
+
+    def test_normalize_judgment_enriches_title_with_missing_artifact_context(self) -> None:
+        entity = LoadedEntity(
+            entity=StoredEntity(
+                id="entity-groww",
+                canonical_key="gmail-thread:thread-groww",
+                created_at="2026-04-17T09:00:00+00:00",
+                updated_at="2026-04-17T10:00:00+00:00",
+            ),
+            state=StoredEntityState(
+                id="state-groww",
+                entity_id="entity-groww",
+                current_state="done",
+                due_at=None,
+                updated_at="2026-04-17T10:00:00+00:00",
+            ),
+            ai_suggestion=None,
+            members=[
+                make_record(
+                    record_id="record-groww",
+                    source="gmail",
+                    subject="Demat Account successfully closed",
+                    body="We have attached your client master report.",
+                    timestamp="2026-04-17T10:00:00+00:00",
+                )
+            ],
+        )
+
+        normalized = normalize_judgment(
+            entity,
+            FeedEntityJudgmentOutput(
+                id="entity-groww",
+                title="Groww confirmed your demat account has been closed.",
+                explanation="Groww has already completed the account closure and sent the client master report, so this is just a finished record of the closure.",
+                action="none",
+                suggested_timing="later",
+                suggested_priority=10,
+                suggested_visibility=True,
+            ),
+        )
+
+        self.assertIsNotNone(normalized)
+        assert normalized is not None
+        self.assertEqual(
+            normalized["title"],
+            "Groww confirmed your demat account has been closed and sent the client master report.",
+        )
+
+    def test_normalize_judgment_keeps_title_when_explanation_adds_no_high_value_clause(self) -> None:
+        entity = LoadedEntity(
+            entity=StoredEntity(
+                id="entity-waiting",
+                canonical_key="gmail-thread:thread-waiting",
+                created_at="2026-04-17T09:00:00+00:00",
+                updated_at="2026-04-17T10:00:00+00:00",
+            ),
+            state=StoredEntityState(
+                id="state-waiting",
+                entity_id="entity-waiting",
+                current_state="waiting",
+                due_at=None,
+                updated_at="2026-04-17T10:00:00+00:00",
+            ),
+            ai_suggestion=None,
+            members=[
+                make_record(
+                    record_id="record-waiting",
+                    source="gmail",
+                    subject="Request acknowledged",
+                    body="We will get back to you soon.",
+                    timestamp="2026-04-17T10:00:00+00:00",
+                )
+            ],
+        )
+
+        normalized = normalize_judgment(
+            entity,
+            FeedEntityJudgmentOutput(
+                id="entity-waiting",
+                title="The bank acknowledged your request.",
+                explanation="The bank has acknowledged the request, so you are waiting for their response.",
+                action="none",
+                suggested_timing="today",
+                suggested_priority=55,
+                suggested_visibility=True,
+            ),
+        )
+
+        self.assertIsNotNone(normalized)
+        assert normalized is not None
+        self.assertEqual(normalized["title"], "The bank acknowledged your request.")
 
 
 if __name__ == "__main__":

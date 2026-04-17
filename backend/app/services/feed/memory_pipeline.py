@@ -3,6 +3,7 @@ from __future__ import annotations
 """Persisted-memory pipeline that hydrates entities and produces the feed."""
 
 from datetime import datetime, timezone
+import re
 
 from app.db.models import LoadedEntity
 from app.db.repository import (
@@ -38,6 +39,30 @@ ALLOWED_ACTIONS = {
     "track",
     "none",
 }
+
+TITLE_CONTEXT_KEYWORDS = {
+    "approval",
+    "approved",
+    "callback",
+    "compensation",
+    "copy",
+    "document",
+    "documents",
+    "fund",
+    "funding",
+    "letter",
+    "paid",
+    "payment",
+    "receipt",
+    "refund",
+    "report",
+    "sent",
+    "statement",
+}
+TITLE_CONTEXT_PATTERNS = [
+    re.compile(r"\b(?:and|after|but)\b[^.;]{12,120}", re.IGNORECASE),
+]
+MAX_SUGGESTED_TITLE_CHARS = 120
 
 
 def hydrate_persistent_memory(
@@ -432,7 +457,10 @@ def build_entity_summary(entity: LoadedEntity) -> str:
 
 def normalize_judgment(entity: LoadedEntity, judgment: FeedEntityJudgmentOutput) -> dict[str, object] | None:
     """Validate and normalize AI judgment fields before writing them to SQLite."""
-    title = normalize_text_field(judgment.title)
+    title = enrich_title_with_explanation(
+        normalize_text_field(judgment.title),
+        normalize_text_field(judgment.explanation),
+    )
     explanation = normalize_text_field(judgment.explanation)
 
     if not title or not explanation:
@@ -662,6 +690,32 @@ def normalize_action(action: str, current_state: str) -> str:
 
 def normalize_text_field(value: str) -> str:
     return " ".join(value.split()).strip()
+
+
+def enrich_title_with_explanation(title: str, explanation: str) -> str:
+    """Carry over one missing high-value clause from the explanation when the title is too narrow."""
+    if not title or not explanation:
+        return title
+
+    lower_title = title.lower()
+
+    for pattern in TITLE_CONTEXT_PATTERNS:
+        for match in pattern.finditer(explanation):
+            clause = normalize_text_field(match.group(0)).rstrip(".,;: ")
+            clause = re.split(r",|;|\bso\b", clause, maxsplit=1, flags=re.IGNORECASE)[0].rstrip(".,;: ")
+            lower_clause = clause.lower()
+
+            if lower_clause in lower_title:
+                continue
+            if not any(keyword in lower_clause for keyword in TITLE_CONTEXT_KEYWORDS):
+                continue
+
+            candidate = normalize_text_field(f"{title.rstrip('.')} {clause}").rstrip(".")
+
+            if len(candidate) <= MAX_SUGGESTED_TITLE_CHARS:
+                return f"{candidate}."
+
+    return title
 
 
 def to_fallback_action(current_state: str) -> str:
