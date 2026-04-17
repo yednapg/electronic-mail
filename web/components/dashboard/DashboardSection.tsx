@@ -52,6 +52,30 @@ export function DashboardSection({
 function DashboardSectionItemRow({ item }: { item: DashboardSectionItem }) {
   // Checkboxes are intentionally local-only; they are a UI affordance, not persisted state.
   const [checked, setChecked] = useState(item.checked ?? false);
+  const [ctaState, setCtaState] = useState<'idle' | 'loading' | 'done'>('idle');
+
+  async function runCtaAction() {
+    if (item.cta?.action === undefined || ctaState !== 'idle') {
+      return;
+    }
+
+    setCtaState('loading');
+
+    try {
+      const { threadId, operation } = item.cta.action;
+      const response = await fetch(`http://localhost:3001/gmail/threads/${threadId}/${operation}`, {
+        method: 'POST',
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to ${operation} Gmail thread`);
+      }
+
+      setCtaState('done');
+    } catch (_error) {
+      setCtaState('idle');
+    }
+  }
 
   return (
     <li className="attention-item">
@@ -74,7 +98,18 @@ function DashboardSectionItemRow({ item }: { item: DashboardSectionItem }) {
               {' '}
               →{' '}
             </span>
-            <span className={`attention-cta attention-cta-${item.cta.tone}`}>{item.cta.label}</span>
+            {item.cta.action ? (
+              <button
+                type="button"
+                className={`attention-cta attention-cta-${item.cta.tone} attention-cta-button`}
+                onClick={runCtaAction}
+                disabled={ctaState !== 'idle'}
+              >
+                {ctaState === 'done' ? 'Done' : ctaState === 'loading' ? 'Working...' : item.cta.label}
+              </button>
+            ) : (
+              <span className={`attention-cta attention-cta-${item.cta.tone}`}>{item.cta.label}</span>
+            )}
           </>
         ) : null}
       </p>

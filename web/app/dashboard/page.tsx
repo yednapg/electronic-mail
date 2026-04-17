@@ -134,12 +134,14 @@ export function toSectionItem(item: FeedItem): DashboardSectionItem {
         item.source === 'calendar' && item.why_this_is_here.trim().length > 0
           ? item.why_this_is_here
           : item.title,
+      cta: toSectionCta(item),
     };
   }
 
   return {
     id: item.id,
     title: toActionSentence(item),
+    cta: toSectionCta(item),
   };
 }
 
@@ -291,6 +293,38 @@ export function startsWithActionVerb(title: string): boolean {
 export function stripDuePrefix(title: string): string {
   /** Soften titles like "Due Friday" when converting them into a sentence. */
   return title.startsWith('Due ') ? `item due ${title.slice(4)}` : title;
+}
+
+export function toSectionCta(item: FeedItem): DashboardSectionItem['cta'] | undefined {
+  if (item.source !== 'gmail' || item.gmail_thread_id === undefined || item.gmail_thread_id === null) {
+    return undefined;
+  }
+
+  if (item.gmail_thread_action === 'archive') {
+    return {
+      label: 'Archive',
+      tone: 'green',
+      action: {
+        kind: 'gmail-thread',
+        threadId: item.gmail_thread_id,
+        operation: 'archive',
+      },
+    };
+  }
+
+  if (item.gmail_thread_action === 'unarchive') {
+    return {
+      label: 'Unarchive',
+      tone: 'blue',
+      action: {
+        kind: 'gmail-thread',
+        threadId: item.gmail_thread_id,
+        operation: 'unarchive',
+      },
+    };
+  }
+
+  return undefined;
 }
 
 function sortSectionFeedItems(items: FeedItem[]): FeedItem[] {

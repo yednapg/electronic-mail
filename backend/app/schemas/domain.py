@@ -14,6 +14,8 @@ EffortLevel = Literal["quick", "deep"]
 TimingBand = Literal["now", "today", "later", "hidden"]
 ActionConfidence = Literal["high", "medium", "low"]
 LifecycleState = Literal["active", "scheduled", "resolved", "suppressed"]
+EntityCurrentState = Literal["open", "waiting", "done"]
+GmailThreadAction = Literal["archive", "unarchive"]
 TraceStage = Literal[
     "ingestion",
     "normalization",
@@ -57,8 +59,10 @@ class AttentionItem(BaseModel):
     due_at: str | None = None
     importance_level: Literal["high", "medium", "low"] | None = None
     lifecycle_state: str | None = None
-    current_state: str | None = None
+    current_state: EntityCurrentState | None = None
     source: SourceType | None = None
+    gmail_thread_id: str | None = None
+    gmail_thread_action: GmailThreadAction | None = None
     trace_id: str
     created_at: str
 
@@ -69,7 +73,7 @@ class PipelineEntity(BaseModel):
     id: str
     user_id: str
     source: SourceType | None = None
-    current_state: str
+    current_state: EntityCurrentState
     due_at: str | None
     importance: bool
     lifecycle_state: LifecycleState

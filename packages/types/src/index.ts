@@ -10,8 +10,10 @@ export type TimingBand = 'now' | 'today' | 'later' | 'hidden';
 export type ActionConfidence = 'high' | 'medium' | 'low';
 
 export type LifecycleState = 'active' | 'scheduled' | 'resolved' | 'suppressed';
+export type EntityCurrentState = 'open' | 'waiting' | 'done';
 
 export type SourceType = 'gmail' | 'calendar';
+export type GmailThreadAction = 'archive' | 'unarchive';
 
 export type FeedbackType = 'acted' | 'ignored' | 'snoozed' | 'dismissed';
 
@@ -57,7 +59,7 @@ export type Entity = (EntityThreadIdentity | EntityGroupIdentity) & {
   readonly user_id: string;
   readonly source?: SourceType;
 
-  readonly current_state: string;
+  readonly current_state: EntityCurrentState;
   readonly due_at: string | null;
 
   readonly importance: boolean;
@@ -91,8 +93,10 @@ export interface AttentionItem {
   readonly due_at?: string | null;
   readonly importance_level?: 'high' | 'medium' | 'low';
   readonly lifecycle_state?: string;
-  readonly current_state?: string;
+  readonly current_state?: EntityCurrentState;
   readonly source?: SourceType;
+  readonly gmail_thread_id?: string | null;
+  readonly gmail_thread_action?: GmailThreadAction | null;
 
   readonly trace_id: string;
 

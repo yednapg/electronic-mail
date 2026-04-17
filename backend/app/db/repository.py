@@ -16,6 +16,7 @@ from app.db.models import (
     StoredEntityState,
     StoredGmailSyncState,
     StoredSourceRecord,
+    StoredEntityThreadMembership,
     StoredTraceRecord,
 )
 
@@ -57,6 +58,17 @@ def initialize_database(database_path: str) -> None:
               FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE,
               FOREIGN KEY(source_record_id) REFERENCES source_records(id) ON DELETE CASCADE,
               UNIQUE(entity_id, source_record_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS entity_thread_memberships (
+              id TEXT PRIMARY KEY,
+              entity_id TEXT NOT NULL,
+              source TEXT NOT NULL,
+              thread_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+              UNIQUE(source, thread_id),
+              UNIQUE(entity_id, source, thread_id)
             );
 
             CREATE TABLE IF NOT EXISTS entity_states (
@@ -125,10 +137,22 @@ def clear_all_data(database_path: str) -> None:
         connection.execute("DELETE FROM trace_records")
         connection.execute("DELETE FROM entity_ai_suggestions")
         connection.execute("DELETE FROM entity_members")
+        connection.execute("DELETE FROM entity_thread_memberships")
         connection.execute("DELETE FROM entity_states")
         connection.execute("DELETE FROM entities")
         connection.execute("DELETE FROM source_records")
         connection.execute("DELETE FROM gmail_sync_state")
+
+
+def clear_derived_memory(database_path: str) -> None:
+    """Remove derived entity memory while preserving synced source records."""
+    with connect(database_path) as connection:
+        connection.execute("DELETE FROM trace_records")
+        connection.execute("DELETE FROM entity_ai_suggestions")
+        connection.execute("DELETE FROM entity_members")
+        connection.execute("DELETE FROM entity_thread_memberships")
+        connection.execute("DELETE FROM entity_states")
+        connection.execute("DELETE FROM entities")
 
 
 def upsert_source_records(database_path: str, records: Iterable[StoredSourceRecord]) -> None:
@@ -212,20 +236,48 @@ def upsert_gmail_sync_state(
 
 def create_entity(database_path: str, canonical_key: str) -> StoredEntity:
     """Create a new canonical entity row."""
-    entity = StoredEntity(
-        id=str(uuid4()),
-        canonical_key=canonical_key,
-        created_at=utc_now_iso(),
-        updated_at=utc_now_iso(),
-    )
-
     with connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM entities WHERE canonical_key = ? LIMIT 1",
+            (canonical_key,),
+        ).fetchone()
+
+        if row is not None:
+            return _to_entity(row)
+
+        entity = StoredEntity(
+            id=str(uuid4()),
+            canonical_key=canonical_key,
+            created_at=utc_now_iso(),
+            updated_at=utc_now_iso(),
+        )
+
         connection.execute(
             "INSERT INTO entities (id, canonical_key, created_at, updated_at) VALUES (?, ?, ?, ?)",
             (entity.id, entity.canonical_key, entity.created_at, entity.updated_at),
         )
 
     return entity
+
+
+def attach_thread_to_entity(database_path: str, entity_id: str, source: str, thread_id: str) -> None:
+    """Ensure a source-scoped thread belongs to one entity and bump entity freshness."""
+    created_at = utc_now_iso()
+
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO entity_thread_memberships (id, entity_id, source, thread_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(source, thread_id) DO UPDATE SET
+              entity_id = excluded.entity_id
+            """,
+            (str(uuid4()), entity_id, source, thread_id, created_at),
+        )
+        connection.execute(
+            "UPDATE entities SET updated_at = ? WHERE id = ?",
+            (created_at, entity_id),
+        )
 
 
 def attach_record_to_entity(database_path: str, entity_id: str, source_record_id: str) -> None:
@@ -246,6 +298,35 @@ def attach_record_to_entity(database_path: str, entity_id: str, source_record_id
         connection.execute(
             "UPDATE entities SET updated_at = ? WHERE id = ?",
             (utc_now_iso(), entity_id),
+        )
+
+
+def merge_entities(database_path: str, target_entity_id: str, source_entity_id: str) -> None:
+    """Move all memberships from one entity into another and delete the source entity."""
+    if target_entity_id == source_entity_id:
+        return
+
+    updated_at = utc_now_iso()
+
+    with connect(database_path) as connection:
+        connection.execute(
+            "UPDATE entity_members SET entity_id = ? WHERE entity_id = ?",
+            (target_entity_id, source_entity_id),
+        )
+        connection.execute(
+            "UPDATE entity_thread_memberships SET entity_id = ? WHERE entity_id = ?",
+            (target_entity_id, source_entity_id),
+        )
+        connection.execute(
+            "UPDATE trace_records SET entity_id = ? WHERE entity_id = ?",
+            (target_entity_id, source_entity_id),
+        )
+        connection.execute("DELETE FROM entity_states WHERE entity_id = ?", (source_entity_id,))
+        connection.execute("DELETE FROM entity_ai_suggestions WHERE entity_id = ?", (source_entity_id,))
+        connection.execute("DELETE FROM entities WHERE id = ?", (source_entity_id,))
+        connection.execute(
+            "UPDATE entities SET updated_at = ? WHERE id = ?",
+            (updated_at, target_entity_id),
         )
 
 
@@ -424,20 +505,34 @@ def find_entity_by_member_record_id(database_path: str, source_record_id: str) -
     return _to_entity(row) if row is not None else None
 
 
-def find_entity_by_thread_id(database_path: str, thread_id: str) -> StoredEntity | None:
+def find_entity_by_thread_id(database_path: str, source: str, thread_id: str) -> StoredEntity | None:
     """Find an existing entity by thread id for exact thread-level grouping."""
     with connect(database_path) as connection:
         row = connection.execute(
             """
             SELECT entities.*
             FROM entities
-            JOIN entity_members ON entity_members.entity_id = entities.id
-            JOIN source_records ON source_records.id = entity_members.source_record_id
-            WHERE source_records.thread_id = ?
+            JOIN entity_thread_memberships ON entity_thread_memberships.entity_id = entities.id
+            WHERE entity_thread_memberships.source = ?
+              AND entity_thread_memberships.thread_id = ?
             LIMIT 1
             """,
-            (thread_id,),
+            (source, thread_id),
         ).fetchone()
+
+        if row is None:
+            row = connection.execute(
+                """
+                SELECT entities.*
+                FROM entities
+                JOIN entity_members ON entity_members.entity_id = entities.id
+                JOIN source_records ON source_records.id = entity_members.source_record_id
+                WHERE source_records.source = ?
+                  AND source_records.thread_id = ?
+                LIMIT 1
+                """,
+                (source, thread_id),
+            ).fetchone()
     return _to_entity(row) if row is not None else None
 
 
@@ -457,7 +552,7 @@ def list_candidate_records(database_path: str, sender_domain: str | None) -> lis
         query += " AND source_records.sender LIKE ?"
         params.append(f"%{sender_domain}%")
 
-    query += " ORDER BY source_records.timestamp DESC LIMIT 50"
+    query += " ORDER BY source_records.timestamp DESC LIMIT 200"
 
     with connect(database_path) as connection:
         rows = connection.execute(query, params).fetchall()
@@ -541,6 +636,15 @@ def list_loaded_entities(database_path: str, entity_ids: list[str]) -> list[Load
             f"SELECT * FROM entity_ai_suggestions WHERE entity_id IN ({placeholders})",
             entity_ids,
         ).fetchall()
+        thread_rows = connection.execute(
+            f"""
+            SELECT *
+            FROM entity_thread_memberships
+            WHERE entity_id IN ({placeholders})
+            ORDER BY source ASC, thread_id ASC
+            """,
+            entity_ids,
+        ).fetchall()
         member_rows = connection.execute(
             f"""
             SELECT entity_members.entity_id, source_records.*
@@ -556,6 +660,19 @@ def list_loaded_entities(database_path: str, entity_ids: list[str]) -> list[Load
     suggestion_by_entity = {
         str(row["entity_id"]): _to_ai_suggestion(row) for row in suggestion_rows
     }
+    thread_members_by_entity: dict[str, list[StoredEntityThreadMembership]] = {
+        entity_id: [] for entity_id in entity_ids
+    }
+    for row in thread_rows:
+        thread_members_by_entity.setdefault(str(row["entity_id"]), []).append(
+            StoredEntityThreadMembership(
+                id=str(row["id"]),
+                entity_id=str(row["entity_id"]),
+                source=str(row["source"]),
+                thread_id=str(row["thread_id"]),
+                created_at=str(row["created_at"]),
+            )
+        )
     members_by_entity: dict[str, list[StoredSourceRecord]] = {entity_id: [] for entity_id in entity_ids}
 
     for row in member_rows:
@@ -572,6 +689,24 @@ def list_loaded_entities(database_path: str, entity_ids: list[str]) -> list[Load
             )
         )
 
+    for entity_id, members in members_by_entity.items():
+        if thread_members_by_entity.get(entity_id):
+            continue
+
+        deduped_threads: list[str] = []
+        for member in members:
+            if member.thread_id and member.thread_id not in deduped_threads:
+                deduped_threads.append(member.thread_id)
+                thread_members_by_entity.setdefault(entity_id, []).append(
+                    StoredEntityThreadMembership(
+                        id=f"inferred:{entity_id}:{member.source}:{member.thread_id}",
+                        entity_id=entity_id,
+                        source=member.source,
+                        thread_id=member.thread_id,
+                        created_at=member.created_at,
+                    )
+                )
+
     loaded = []
 
     for row in entity_rows:
@@ -581,6 +716,7 @@ def list_loaded_entities(database_path: str, entity_ids: list[str]) -> list[Load
                 entity=entity,
                 state=state_by_entity.get(entity.id),
                 ai_suggestion=suggestion_by_entity.get(entity.id),
+                thread_memberships=thread_members_by_entity.get(entity.id, []),
                 members=members_by_entity.get(entity.id, []),
             )
         )
