@@ -118,6 +118,29 @@ export interface FeedResponse {
   readonly worth_knowing: AttentionItem[];
 }
 
+export interface GoogleAuthState {
+  readonly available: boolean;
+  readonly connected: boolean;
+  readonly connect_url?: string | null;
+}
+
+export interface DashboardProfile {
+  readonly email?: string | null;
+  readonly display_name?: string | null;
+}
+
+export interface DashboardBriefing {
+  readonly headline: string;
+  readonly brief: string;
+}
+
+export interface DashboardResponse {
+  readonly auth: GoogleAuthState;
+  readonly profile?: DashboardProfile | null;
+  readonly briefing?: DashboardBriefing | null;
+  readonly feed: FeedResponse;
+}
+
 /**
  * Debug trace for each pipeline stage
  */

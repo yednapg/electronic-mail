@@ -23,10 +23,21 @@ def auth_google() -> RedirectResponse:
 
 
 @router.get("/auth/google/callback")
-def auth_google_callback(code: str | None = None) -> RedirectResponse:
+def auth_google_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> RedirectResponse:
     """Exchange the Google OAuth code and send the user back to the dashboard."""
+    if error is not None:
+        raise HTTPException(status_code=400, detail=f"Google OAuth failed: {error}")
+
     if code is None:
         raise HTTPException(status_code=400, detail="Missing OAuth code")
 
-    handle_google_callback(settings, code)
+    try:
+        handle_google_callback(settings, code, state)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     return RedirectResponse(f"{settings.cors_origin}/dashboard")

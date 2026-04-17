@@ -1,7 +1,7 @@
 /**
  * Server-rendered dashboard page that turns the feed response into UI view models.
  */
-import { getFeed } from '../../lib/api';
+import { getDashboard } from '../../lib/api';
 import {
   formatClockTime,
   formatDate,
@@ -10,7 +10,7 @@ import {
   isTimedIsoTimestamp,
   toAgendaSortValue,
 } from '../../lib/formatting';
-import type { FeedItem, FeedResponse, PrimaryActionType, TimingBand } from '../../lib/types';
+import type { FeedItem, FeedResponse, GoogleAuthState, TimingBand } from '../../lib/types';
 import { DashboardAgenda } from '../../components/dashboard/DashboardAgenda';
 import { DashboardMeta } from '../../components/dashboard/DashboardMeta';
 import { DashboardSection } from '../../components/dashboard/DashboardSection';
@@ -24,11 +24,16 @@ import type {
 
 export default async function DashboardPage() {
   // Build all derived view models once on the server so leaf components stay simple.
-  const feed = await getFeed();
+  const dashboard = await getDashboard();
   const now = new Date();
-  const agenda = buildAgenda(feed);
-  const summary = buildSummary(feed, agenda);
-  const sections = buildSections(feed);
+
+  if (!dashboard.auth.connected) {
+    return <SignedOutDashboard now={now} auth={dashboard.auth} />;
+  }
+
+  const agenda = buildAgenda(dashboard.feed);
+  const summary = buildSummary(dashboard);
+  const sections = buildSections(dashboard.feed);
 
   return (
     <main className="digest-page">
@@ -53,34 +58,43 @@ export default async function DashboardPage() {
   );
 }
 
-export function buildSummary(
-  feed: FeedResponse,
-  agenda: DashboardAgendaItem[],
-): DashboardSummaryData {
-  /** Summarize visible work and schedule density for the sentence at the top of the page. */
-  const visibleItems = [...feed.now, ...feed.today, ...feed.worth_knowing];
-  const replyCount = countByAction(visibleItems, 'reply');
-  const paymentCount = countByAction(visibleItems, 'pay');
-  const taskCount = visibleItems.filter(
-    (item) =>
-      item.primary_action === 'open' ||
-      item.primary_action === 'track' ||
-      item.primary_action === 'confirm' ||
-      item.primary_action === 'review' ||
-      item.primary_action === 'join' ||
-      item.primary_action === 'send' ||
-      item.primary_action === 'approve' ||
-      item.primary_action === 'register',
-  ).length;
+function SignedOutDashboard({ now, auth }: { now: Date; auth: GoogleAuthState }) {
+  return (
+    <main className="digest-page">
+      <div className="digest-shell">
+        <DashboardMeta dateLabel={formatDate(now)} timeLabel={formatClockTime(now)} />
+        <section className="digest-auth-state" aria-label="Connect Google">
+          <p className="digest-summary">
+            <span className="digest-summary-medium">Connect your Google account.</span>{' '}
+            <span className="digest-summary-light">
+              {auth.available
+                ? 'The dashboard needs live Gmail and Calendar access before it can build your brief.'
+                : 'Google OAuth is not configured in the backend yet.'}
+            </span>
+          </p>
+          {auth.connect_url ? (
+            <a className="digest-connect-link" href={auth.connect_url}>
+              Continue with Google
+            </a>
+          ) : null}
+        </section>
+      </div>
+    </main>
+  );
+}
+
+export function buildSummary(dashboard: { briefing?: { headline: string; brief: string } | null }): DashboardSummaryData {
+  /** Keep the frontend as a thin renderer over backend-generated summary copy. */
+  if (dashboard.briefing !== undefined && dashboard.briefing !== null) {
+    return {
+      headline: dashboard.briefing.headline,
+      brief: dashboard.briefing.brief,
+    };
+  }
 
   return {
-    greeting: getGreetingForTime(new Date()),
-    name: 'Gaurav',
-    meetingCount: agenda.length,
-    taskCount,
-    replyCount,
-    paymentCount,
-    freeAfterLabel: agenda.at(-1)?.time ?? 'the rest of the day',
+    headline: 'Your dashboard is ready.',
+    brief: 'Connect Google to generate a personalized briefing.',
   };
 }
 
@@ -113,10 +127,13 @@ export function buildSections(feed: FeedResponse): DashboardSectionData[] {
 
 export function toSectionItem(item: FeedItem): DashboardSectionItem {
   // Awareness-only calendar items already come with natural sentence copy from the backend.
-  if (item.source === 'calendar' && item.need_type === 'awareness') {
+  if (item.need_type === 'awareness') {
     return {
       id: item.id,
-      title: item.why_this_is_here,
+      title:
+        item.source === 'calendar' && item.why_this_is_here.trim().length > 0
+          ? item.why_this_is_here
+          : item.title,
     };
   }
 
@@ -124,26 +141,6 @@ export function toSectionItem(item: FeedItem): DashboardSectionItem {
     id: item.id,
     title: toActionSentence(item),
   };
-}
-
-export function countByAction(items: FeedItem[], action: PrimaryActionType): number {
-  /** Count a specific primary action across the visible feed. */
-  return items.filter((item) => item.primary_action === action).length;
-}
-
-export function getGreetingForTime(date: Date): string {
-  /** Pick the greeting label from the local hour. */
-  const hour = date.getHours();
-
-  if (hour >= 12 && hour < 18) {
-    return 'Good afternoon';
-  }
-
-  if (hour >= 18) {
-    return 'Good evening';
-  }
-
-  return 'Good morning';
 }
 
 export function buildAgenda(feed: FeedResponse): DashboardAgendaItem[] {
@@ -208,7 +205,7 @@ export function toActionSentence(item: FeedItem): string {
   /** Normalize backend titles into short action-first UI copy. */
   const cleanTitle = item.title.trim();
 
-  if (startsWithActionVerb(cleanTitle)) {
+  if (startsWithActionVerb(cleanTitle) || shouldKeepNaturalTitle(item, cleanTitle)) {
     return cleanTitle;
   }
 
@@ -249,6 +246,21 @@ export function toActionSentence(item: FeedItem): string {
     default:
       return cleanTitle;
   }
+}
+
+export function shouldKeepNaturalTitle(item: FeedItem, title: string): boolean {
+  /** Preserve already-natural status sentences instead of forcing an imperative verb. */
+  if (item.need_type === 'awareness') {
+    return true;
+  }
+
+  if (/[.!?]$/.test(title)) {
+    return true;
+  }
+
+  return /^(you\b|your\b|you're\b|we\b|this\b|[A-Z][A-Za-z0-9&.'/-]+(?: [A-Z][A-Za-z0-9&.'/-]+){0,4} (?:updated|declined|approved|confirmed|registered|delivered|shipped|sent|accepted|resolved|says|changed|scheduled)\b)/i.test(
+    title,
+  );
 }
 
 export function startsWithVerb(title: string, verbs: string[]): boolean {

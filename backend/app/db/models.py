@@ -81,3 +81,12 @@ class StoredTraceRecord:
     input: dict[str, Any]
     output: dict[str, Any]
     created_at: str
+
+
+@dataclass
+class StoredGmailSyncState:
+    """Persisted Gmail mailbox sync cursor for resumable ingestion."""
+
+    user_id: str
+    last_history_id: str | None
+    last_full_sync_at: str | None

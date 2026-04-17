@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { FeedItem, FeedResponse } from '../../lib/types';
-import { buildAgenda, buildSections, toActionSentence } from './page';
+import { buildAgenda, buildSections, buildSummary, toActionSentence } from './page';
 
 function createFeedItem(overrides: Partial<FeedItem> = {}): FeedItem {
   return {
@@ -105,6 +105,25 @@ test('register action becomes an action-first sentence when title is not already
   assert.equal(toActionSentence(item), 'Register for YC Startup School India talk');
 });
 
+test('natural status titles are preserved without adding vague action prefixes', () => {
+  const item = createFeedItem({
+    title: 'HDFC Bank declined a recurring card payment as non-compliant.',
+    primary_action: 'review',
+  });
+
+  assert.equal(toActionSentence(item), 'HDFC Bank declined a recurring card payment as non-compliant.');
+});
+
+test('awareness items keep their natural title', () => {
+  const item = createFeedItem({
+    need_type: 'awareness',
+    primary_action: 'none',
+    title: 'Your Samsung order #12304086779 was delivered.',
+  });
+
+  assert.equal(toActionSentence(item), 'Your Samsung order #12304086779 was delivered.');
+});
+
 test('dashboard renders a Worth Knowing section for low-priority overflow items', () => {
   const sections = buildSections(
     createFeed({
@@ -123,4 +142,18 @@ test('dashboard renders a Worth Knowing section for low-priority overflow items'
   assert.equal(sections[2].title, 'Worth Knowing');
   assert.equal(sections[2].id, 'worth-knowing');
   assert.equal(sections[2].items.length, 1);
+});
+
+test('dashboard summary renders backend-generated briefing copy without rewriting it', () => {
+  const summary = buildSummary({
+    briefing: {
+      headline: 'Good morning, Gaurav.',
+      brief: 'You have 0 meetings and a mostly open afternoon.',
+    },
+  });
+
+  assert.deepEqual(summary, {
+    headline: 'Good morning, Gaurav.',
+    brief: 'You have 0 meetings and a mostly open afternoon.',
+  });
 });

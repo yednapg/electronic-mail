@@ -14,6 +14,7 @@ from app.db.models import (
     StoredEntity,
     StoredEntityAiSuggestion,
     StoredEntityState,
+    StoredGmailSyncState,
     StoredSourceRecord,
     StoredTraceRecord,
 )
@@ -95,6 +96,12 @@ def initialize_database(database_path: str) -> None:
               FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE,
               FOREIGN KEY(source_record_id) REFERENCES source_records(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS gmail_sync_state (
+              user_id TEXT PRIMARY KEY,
+              last_history_id TEXT,
+              last_full_sync_at TEXT
+            );
             """
         )
 
@@ -121,6 +128,7 @@ def clear_all_data(database_path: str) -> None:
         connection.execute("DELETE FROM entity_states")
         connection.execute("DELETE FROM entities")
         connection.execute("DELETE FROM source_records")
+        connection.execute("DELETE FROM gmail_sync_state")
 
 
 def upsert_source_records(database_path: str, records: Iterable[StoredSourceRecord]) -> None:
@@ -150,6 +158,56 @@ def upsert_source_records(database_path: str, records: Iterable[StoredSourceReco
                     record.created_at,
                 ),
             )
+
+
+def list_existing_source_record_ids(database_path: str, ids: Iterable[str]) -> set[str]:
+    """Return the subset of source-record ids that already exist in SQLite."""
+    unique_ids = sorted({record_id for record_id in ids if record_id})
+
+    if not unique_ids:
+        return set()
+
+    placeholders = ", ".join("?" for _ in unique_ids)
+
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            f"SELECT id FROM source_records WHERE id IN ({placeholders})",
+            unique_ids,
+        ).fetchall()
+
+    return {str(row["id"]) for row in rows}
+
+
+def get_gmail_sync_state(database_path: str, user_id: str) -> StoredGmailSyncState | None:
+    """Load the persisted Gmail sync cursor for one user, if present."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM gmail_sync_state WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+    return _to_gmail_sync_state(row) if row is not None else None
+
+
+def upsert_gmail_sync_state(
+    database_path: str,
+    *,
+    user_id: str,
+    last_history_id: str | None,
+    last_full_sync_at: str | None,
+) -> None:
+    """Insert or update the resumable Gmail sync cursor for one user."""
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO gmail_sync_state (user_id, last_history_id, last_full_sync_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              last_history_id = excluded.last_history_id,
+              last_full_sync_at = excluded.last_full_sync_at
+            """,
+            (user_id, last_history_id, last_full_sync_at),
+        )
 
 
 def create_entity(database_path: str, canonical_key: str) -> StoredEntity:
@@ -610,4 +668,12 @@ def _to_trace_record(row: sqlite3.Row) -> StoredTraceRecord:
         input=json.loads(row["input"]),
         output=json.loads(row["output"]),
         created_at=str(row["created_at"]),
+    )
+
+
+def _to_gmail_sync_state(row: sqlite3.Row) -> StoredGmailSyncState:
+    return StoredGmailSyncState(
+        user_id=str(row["user_id"]),
+        last_history_id=str(row["last_history_id"]) if row["last_history_id"] is not None else None,
+        last_full_sync_at=str(row["last_full_sync_at"]) if row["last_full_sync_at"] is not None else None,
     )

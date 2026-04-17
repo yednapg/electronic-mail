@@ -96,6 +96,37 @@ class FeedResponse(BaseModel):
     worth_knowing: list[AttentionItem] = Field(default_factory=list)
 
 
+class GoogleAuthState(BaseModel):
+    """Resolved Google connection status for the local app."""
+
+    available: bool
+    connected: bool
+    connect_url: str | None = None
+
+
+class DashboardProfile(BaseModel):
+    """Identity information resolved from the connected Google account."""
+
+    email: str | None = None
+    display_name: str | None = None
+
+
+class DashboardBriefing(BaseModel):
+    """Natural-language top summary for the dashboard."""
+
+    headline: str
+    brief: str
+
+
+class DashboardResponse(BaseModel):
+    """Full dashboard payload consumed by the web app."""
+
+    auth: GoogleAuthState
+    profile: DashboardProfile | None = None
+    briefing: DashboardBriefing | None = None
+    feed: FeedResponse = Field(default_factory=FeedResponse)
+
+
 class TraceRecord(BaseModel):
     """Replayable trace event emitted by one stage of the backend pipeline."""
 

@@ -121,6 +121,42 @@ class FeedEntityJudgmentResponse(BaseModel):
     items: list[FeedEntityJudgmentOutput]
 
 
+class DashboardBriefingItemInput(BaseModel):
+    """Compact feed item context used for top-of-dashboard summarization."""
+
+    title: str
+    why_this_is_here: str
+    source: SourceType | None = None
+    timing_band: TimingBand
+    primary_action: str
+    due_at: str | None = None
+
+
+class DashboardBriefingInput(BaseModel):
+    """Inputs used to generate the dashboard headline and briefing copy."""
+
+    current_time: str
+    account_email: str | None = None
+    meeting_count: int
+    task_count: int
+    reply_count: int
+    payment_count: int
+    free_after_label: str
+    items: list[DashboardBriefingItemInput] = Field(default_factory=list)
+
+
+class DashboardBriefingOutput(BaseModel):
+    """Generated dashboard summary copy."""
+
+    display_name: str | None = None
+    headline: str
+    brief: str
+
+
+class DashboardBriefingResponse(BaseModel):
+    items: list[DashboardBriefingOutput]
+
+
 class EntityGroupingCandidateInput(BaseModel):
     """Existing entity candidate considered during record grouping."""
 

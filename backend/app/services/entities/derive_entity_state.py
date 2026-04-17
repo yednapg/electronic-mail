@@ -77,13 +77,25 @@ def extract_record_states(record: StoredSourceRecord) -> list[str]:
         states.append("processing")
     if re.search(r"\b(order received|received)\b", text, re.IGNORECASE):
         states.append("received")
+    if re.search(
+        r"\b(under review|taken up for|appropriate review|interim response|request has been raised|activation will be completed|subject to internal checks)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        states.append("processing")
     if re.search(r"\b(completed|paid)\b", text, re.IGNORECASE):
+        states.append("resolved")
+    if re.search(
+        r"\b(successfully reversed|final response has been shared|completed from our end|processed successfully)\b",
+        text,
+        re.IGNORECASE,
+    ):
         states.append("resolved")
     if re.search(r"\b(confirmed|scheduled)\b", text, re.IGNORECASE) or source == "calendar":
         states.append("scheduled")
     if re.search(r"\b(reply|let me know)\b", text, re.IGNORECASE):
         states.append("awaiting_reply")
-    if re.search(r"\b(due|expires|deadline)\b", text, re.IGNORECASE):
+    if re.search(r"\b(due|expires|deadline|respond by|within \d+ working days?)\b", text, re.IGNORECASE):
         states.append("pending_deadline")
 
     return states

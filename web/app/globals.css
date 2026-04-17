@@ -117,6 +117,35 @@ textarea {
   gap: 48px;
 }
 
+.digest-auth-state {
+  display: grid;
+  gap: 18px;
+}
+
+.digest-connect-link {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 16px;
+  border: 1px solid #1f1f1f;
+  border-radius: 8px;
+  color: #1f1f1f;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-decoration: none;
+}
+
+.digest-connect-link:hover {
+  background: #f5f5f5;
+}
+
+.digest-connect-link:focus-visible {
+  outline: 2px solid #1f1f1f;
+  outline-offset: 2px;
+}
+
 .digest-agenda-list {
   display: grid;
   gap: 2px;
