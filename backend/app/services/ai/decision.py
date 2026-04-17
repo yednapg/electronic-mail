@@ -100,15 +100,18 @@ Rules:
 - Read the whole timeline together, not just the latest subject line.
 - Title must be concise, human-readable, and useful in a personal feed.
 - Title must summarize the full entity from the user's perspective in natural language.
+- Titile should be descriptive, should be summarising instead of being to vauge or no context to the user. Like explanation but bit short.
 - Prefer titles like "HDFC Bank registered your credit card upgrade and limit increase request."
 - Avoid generic titles like "HDFC request acknowledged", "Bank update", or a bare copied subject line when the timeline provides richer context.
 - When several emails are about the same request, synthesize them into one natural title that reflects the latest meaningful state.
+- When the timeline includes two meaningful milestones that both change the user's understanding, include both in the title naturally, usually with "and" or "after".
+- Do not omit important artifacts or outcomes such as reports, statements, documents, approvals, compensation, refunds, receipts, or funding requirements when they are part of the entity's latest meaning.
 - If an item is informative but still worth surfacing, prefer action = none and keep the title as a natural status sentence.
 - Do not force verbs like review, track, join, or open when the timeline does not imply a concrete user action.
 - If the timeline shows the bank/vendor has acknowledged the request, registered it, taken it up for review, or promised a response within a few working days, prefer action = none unless the user is explicitly asked to do something.
 - If the provider has already completed the work from their side, prefer action = none and summarize the completed status accurately.
 - explanation should explain why this matters now.
-- action must be one of: reply, confirm, pay, join, review, send, approve, open, register, track, none.
+- action must be one of or could be something else: reply, confirm, pay, join, review, send, approve, open, register, track, none.
 - suggested_timing must be one of: now, today, later, hidden.
 - suggested_priority must be an integer from 0 to 100.
 - suggested_visibility is whether the item should appear at all.
