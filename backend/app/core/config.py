@@ -29,6 +29,15 @@ class Settings:
     def google_configured(self) -> bool:
         return bool(self.google_client_id and self.google_client_secret)
 
+    @property
+    def backend_origin(self) -> str:
+        redirect_suffix = "/auth/google/callback"
+
+        if self.google_redirect_uri.endswith(redirect_suffix):
+            return self.google_redirect_uri[: -len(redirect_suffix)]
+
+        return f"http://localhost:{self.port}"
+
 
 def _resolve_database_path(database_url: str) -> Path:
     """Normalize either a file: URL or plain path into an absolute SQLite path."""

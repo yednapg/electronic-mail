@@ -1,12 +1,7 @@
 /** Small view-model types consumed by the dashboard components. */
 export type DashboardSummaryData = {
-  greeting: string;
-  name: string;
-  meetingCount: number;
-  taskCount: number;
-  replyCount: number;
-  paymentCount: number;
-  freeAfterLabel: string;
+  headline: string;
+  brief: string;
 };
 
 export type DashboardAgendaItem = {

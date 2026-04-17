@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Resolve new source records onto existing entities or create fallback entities."""
 
+import re
+
 from app.db.models import StoredEntity
 from app.db.repository import (
     append_trace_record,
@@ -65,7 +67,41 @@ GROUPING_STOP_WORDS = {
     "acknowledgement",
     "acknowledge",
     "received",
+    "dear",
+    "customer",
+    "thank",
+    "thanks",
+    "writing",
+    "system",
+    "generated",
+    "response",
+    "regards",
+    "services",
+    "working",
+    "days",
+    "further",
+    "regarding",
+    "continuation",
+    "continue",
+    "inform",
+    "informed",
+    "please",
+    "kindly",
+    "shared",
+    "final",
+    "interim",
+    "review",
+    "appropriate",
+    "email",
+    "correspondence",
+    "reference",
+    "number",
+    "unique",
+    "support",
+    "customerservice",
 }
+
+REFERENCE_ID_PATTERN = re.compile(r"\b\d{8,10}\b")
 
 
 def resolve_entity_for_record(
@@ -201,9 +237,16 @@ def get_sender_domain(sender: str) -> str:
 
 
 def find_entity_candidates(database_path: str, record: SourceRecord) -> list[dict[str, object]]:
-    """Rank likely entity candidates using subject overlap and sender-domain hints."""
+    """Rank likely entity candidates using subject, issue-marker, and sender-domain hints."""
     normalized_subject = normalize_subject(string_value(record.raw_payload, "subject"))
     record_body = string_value(record.raw_payload, "body")
+    record_issue_markers = extract_issue_markers(
+        string_value(record.raw_payload, "subject"),
+        record_body,
+    )
+    record_reference_ids = extract_reference_ids(
+        f"{string_value(record.raw_payload, 'subject')} {record_body}",
+    )
     record_grouping_text = build_grouping_text(
         string_value(record.raw_payload, "subject"),
         record_body,
@@ -219,10 +262,23 @@ def find_entity_candidates(database_path: str, record: SourceRecord) -> list[dic
 
     for candidate_record, entity in list_candidate_records(database_path, sender_domain or None):
         candidate_subject = normalize_subject(candidate_record.subject or "")
+        candidate_body = payload_string(candidate_record.raw_payload, "body")
+        candidate_issue_markers = extract_issue_markers(candidate_record.subject or "", candidate_body)
+        candidate_reference_ids = extract_reference_ids(f"{candidate_record.subject or ''} {candidate_body}")
+
+        if (
+            record_issue_markers
+            and candidate_issue_markers
+            and record_issue_markers.isdisjoint(candidate_issue_markers)
+        ):
+            continue
+        if record_reference_ids and candidate_reference_ids and record_reference_ids.isdisjoint(candidate_reference_ids):
+            continue
+
         subject_confidence = get_subject_confidence(normalized_subject, candidate_subject)
         support_confidence = get_support_confidence(
             record_grouping_text,
-            build_grouping_text(candidate_record.subject or "", payload_string(candidate_record.raw_payload, "body")),
+            build_grouping_text(candidate_record.subject or "", candidate_body),
         )
 
         if subject_confidence <= 0 and support_confidence <= 0:
@@ -255,6 +311,22 @@ def find_entity_candidates(database_path: str, record: SourceRecord) -> list[dic
         entity = candidate["entity"]
         loaded_entity = loaded_by_entity.get(entity.id)
         candidate_summary = build_entity_summary(loaded_entity)
+        candidate_summary_issue_markers = extract_issue_markers(candidate_summary, "")
+        candidate_summary_reference_ids = extract_reference_ids(candidate_summary)
+
+        if (
+            record_issue_markers
+            and candidate_summary_issue_markers
+            and record_issue_markers.isdisjoint(candidate_summary_issue_markers)
+        ):
+            continue
+        if (
+            record_reference_ids
+            and candidate_summary_reference_ids
+            and record_reference_ids.isdisjoint(candidate_summary_reference_ids)
+        ):
+            continue
+
         summary_confidence = get_support_confidence(record_grouping_text, candidate_summary)
         confidence = max(float(candidate["confidence"]), summary_confidence)
         candidates.append(
@@ -394,3 +466,40 @@ def build_entity_summary(loaded_entity) -> str:
         parts.append(loaded_entity.state.current_state)
 
     return " ".join(part for part in parts if part).strip()
+
+
+def extract_issue_markers(subject: str, body: str) -> set[str]:
+    """Extract generic issue markers from meaningful token phrases in the email itself."""
+    subject_tokens = [token for token in _split_tokens(normalize_subject(subject)) if is_issue_token(token)]
+    body_tokens = [token for token in _split_tokens(body.lower()) if is_issue_token(token)]
+    markers: set[str] = set()
+
+    for phrase in extract_phrase_markers(subject_tokens):
+        markers.add(phrase)
+
+    for phrase in extract_phrase_markers(body_tokens[:80]):
+        markers.add(phrase)
+
+    return markers
+
+
+def is_issue_token(token: str) -> bool:
+    """Keep only content-bearing tokens that can describe a concrete issue."""
+    return len(token) > 2 and token not in GROUPING_STOP_WORDS and not token.isdigit()
+
+
+def extract_phrase_markers(tokens: list[str]) -> set[str]:
+    """Build short n-gram markers from normalized content tokens."""
+    markers: set[str] = set()
+
+    for size in (2, 3):
+        for index in range(len(tokens) - size + 1):
+            phrase_tokens = tokens[index : index + size]
+            markers.add(" ".join(phrase_tokens))
+
+    return markers
+
+
+def extract_reference_ids(text: str) -> set[str]:
+    """Extract bank/service reference ids that should keep separate cases apart."""
+    return set(REFERENCE_ID_PATTERN.findall(text))

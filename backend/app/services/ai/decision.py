@@ -12,6 +12,9 @@ from app.schemas.ai import (
     CalendarContextInput,
     CalendarContextOutput,
     CalendarContextResponse,
+    DashboardBriefingInput,
+    DashboardBriefingOutput,
+    DashboardBriefingResponse,
     DecideResponse,
     DecisionOutput,
     EntityGroupingRequest,
@@ -21,6 +24,7 @@ from app.schemas.ai import (
     FeedEntityJudgmentOutput,
     FeedEntityJudgmentResponse,
 )
+from app.schemas.domain import DashboardBriefing, DashboardProfile, FeedResponse
 
 SYSTEM_PROMPT = """You convert normalized Gmail and Calendar entities into decision-ready items.
 
@@ -28,7 +32,7 @@ Rules:
 - Only output items that require user attention.
 - One item per actionable entity.
 - Exactly one primary action per item.
-- Use direct action verbs: reply, confirm, pay, join, review, send, approve, open, register, track.
+- Use direct action verbs not directly linked to prompts but included in sentence: reply, confirm, pay, join, review, send, approve, open, register, track.
 - Do not use vague actions like "handle", "check", or "look into" when a clearer verb exists.
 - Do not use marketing words, hype, or repeated urgency.
 - Titles must be concise, human-readable, and action-first.
@@ -94,6 +98,10 @@ Rules:
 - Prefer titles like "Northstar Bank registered your credit card upgrade and limit increase request."
 - Avoid generic titles like "Northstar request acknowledged", "Bank update", or a bare copied subject line when the timeline provides richer context.
 - When several emails are about the same request, synthesize them into one natural title that reflects the latest meaningful state.
+- If an item is informative but still worth surfacing, prefer action = none and keep the title as a natural status sentence.
+- Do not force verbs like review, track, join, or open when the timeline does not imply a concrete user action.
+- If the timeline shows the bank/vendor has acknowledged the request, registered it, taken it up for review, or promised a response within a few working days, prefer action = none unless the user is explicitly asked to do something.
+- If the provider has already completed the work from their side, prefer action = none and summarize the completed status accurately.
 - explanation should explain why this matters now.
 - action must be one of: reply, confirm, pay, join, review, send, approve, open, register, track, none.
 - suggested_timing must be one of: now, today, later, hidden.
@@ -112,6 +120,32 @@ Return strict JSON only:
       "suggested_timing": "now|today|later|hidden",
       "suggested_priority": 0,
       "suggested_visibility": true
+    }
+  ]
+}
+"""
+
+DASHBOARD_BRIEFING_PROMPT = """You write the top briefing for a personal dashboard.
+
+Rules:
+- Use the exact numeric counts provided. Never invent or change counts.
+- headline must be a short greeting sentence.
+- If you can infer a first name confidently from the account_email, use it in headline as "Good morning, TestUser."
+- If the name is not clear, omit the name and keep the greeting natural.
+- brief must be one concise natural-language paragraph.
+- brief should summarize meetings, tasks, replies, payments, and how free the rest of the day looks.
+- Use the provided free_after_label exactly when you mention free time.
+- Keep the tone calm, practical, and personal.
+- Do not mention prompts, JSON, models, or system behavior.
+- Do not use markdown.
+
+Return strict JSON only:
+{
+  "items": [
+    {
+      "display_name": "string|null",
+      "headline": "string",
+      "brief": "string"
     }
   ]
 }
@@ -285,6 +319,22 @@ def resolve_entity_group(request: EntityGroupingRequest) -> EntityGroupingRespon
         _raise_missing_llm()
 
     return _resolve_entity_group_heuristically(request)
+
+
+def generate_dashboard_briefing(
+    feed: FeedResponse,
+    profile: DashboardProfile | None = None,
+) -> DashboardBriefing:
+    """Return the generated dashboard headline and summary paragraph."""
+    briefing_input = _build_dashboard_briefing_input(feed, profile)
+
+    if _has_llm_config():
+        return _generate_dashboard_briefing_with_llm(briefing_input)
+
+    if _llm_required():
+        _raise_missing_llm()
+
+    return _generate_dashboard_briefing_heuristically(briefing_input)
 
 
 def _decide_with_heuristics(entities: list[EntityInput]) -> list[DecisionOutput]:
@@ -514,6 +564,52 @@ def _judge_feed_entity_heuristically(
         suggested_priority=suggested_priority,
         suggested_visibility=suggested_visibility,
     )
+
+
+def _generate_dashboard_briefing_with_llm(
+    briefing_input: DashboardBriefingInput,
+) -> DashboardBriefing:
+    """Generate the dashboard top summary through the configured model."""
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model = os.getenv("OPENAI_MODEL", "gpt-5.4")
+    user_payload = briefing_input.model_dump()
+    completion = client.chat.completions.create(
+        model=model,
+        temperature=0.2,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": DASHBOARD_BRIEFING_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Write the dashboard greeting and summary from this mailbox context.\n\n"
+                    f"{json.dumps(user_payload, ensure_ascii=True)}"
+                ),
+            },
+        ],
+    )
+
+    content = completion.choices[0].message.content or '{"items":[]}'
+    _log_openai_exchange(
+        label="dashboard_briefing",
+        model=model,
+        payload=user_payload,
+        content=content,
+    )
+    parsed = DashboardBriefingResponse.model_validate(json.loads(content))
+    generated = parsed.items[0] if parsed.items else _build_dashboard_briefing_fallback_output(briefing_input)
+
+    headline = generated.headline.strip() or _build_dashboard_briefing_fallback_output(briefing_input).headline
+    brief = generated.brief.strip() or _build_dashboard_briefing_fallback_output(briefing_input).brief
+    return DashboardBriefing(headline=headline, brief=brief)
+
+
+def _generate_dashboard_briefing_heuristically(
+    briefing_input: DashboardBriefingInput,
+) -> DashboardBriefing:
+    """Fallback dashboard briefing when no LLM is configured."""
+    output = _build_dashboard_briefing_fallback_output(briefing_input)
+    return DashboardBriefing(headline=output.headline, brief=output.brief)
 
 
 def _resolve_entity_group_with_llm(request: EntityGroupingRequest) -> EntityGroupingResponse:
@@ -874,6 +970,119 @@ def _derive_feed_focus(entity: FeedEntityContextInput) -> str:
                 return candidate
 
     return _compact(entity.latest_subject)
+
+
+def _build_dashboard_briefing_input(
+    feed: FeedResponse,
+    profile: DashboardProfile | None,
+) -> DashboardBriefingInput:
+    """Compact the current feed into one summarization payload."""
+    visible_items = [*feed.now, *feed.today, *feed.worth_knowing]
+    agenda_items = [item for item in visible_items if item.source == "calendar"]
+    free_after_label = _compute_free_after_label(agenda_items)
+
+    return DashboardBriefingInput(
+        current_time=datetime.now().astimezone().isoformat(),
+        account_email=profile.email if profile is not None else None,
+        meeting_count=len(agenda_items),
+        task_count=sum(1 for item in visible_items if item.primary_action in _TASK_ACTIONS),
+        reply_count=sum(1 for item in visible_items if item.primary_action == "reply"),
+        payment_count=sum(1 for item in visible_items if item.primary_action == "pay"),
+        free_after_label=free_after_label,
+        items=[
+            {
+                "title": _truncate_text(item.title, 120),
+                "why_this_is_here": _truncate_text(item.why_this_is_here, 180),
+                "source": item.source,
+                "timing_band": item.timing_band,
+                "primary_action": item.primary_action,
+                "due_at": item.due_at,
+            }
+            for item in visible_items[:8]
+        ],
+    )
+
+
+def _build_dashboard_briefing_fallback_output(
+    briefing_input: DashboardBriefingInput,
+) -> DashboardBriefingOutput:
+    """Assemble a deterministic summary when the model is unavailable."""
+    greeting = _greeting_for_current_time(briefing_input.current_time)
+    display_name = _infer_display_name_from_email(briefing_input.account_email)
+    headline = f"{greeting}, {display_name}." if display_name else f"{greeting}."
+
+    brief = (
+        f"You have {briefing_input.meeting_count} meetings, {briefing_input.task_count} tasks, "
+        f"{briefing_input.reply_count} emails to reply to, and "
+        f"{briefing_input.payment_count} card payments due today. "
+        f"You're mostly free after {briefing_input.free_after_label}."
+    )
+
+    return DashboardBriefingOutput(
+        display_name=display_name,
+        headline=headline,
+        brief=brief,
+    )
+
+
+def _compute_free_after_label(items: list) -> str:
+    """Pick the latest visible calendar time for the free-time summary."""
+    latest_due_at: str | None = None
+
+    for item in items:
+        if item.due_at is None:
+            continue
+
+        parsed_due_at = _parse_iso(item.due_at)
+        if parsed_due_at is None:
+            continue
+
+        if latest_due_at is None or parsed_due_at > _parse_iso(latest_due_at):
+            latest_due_at = item.due_at
+
+    if latest_due_at is None:
+        return "the rest of the day"
+
+    parsed = _parse_iso(latest_due_at)
+    if parsed is None:
+        return "the rest of the day"
+
+    return parsed.astimezone().strftime("%H:%M")
+
+
+def _greeting_for_current_time(current_time: str) -> str:
+    """Return a time-of-day greeting from an ISO timestamp."""
+    parsed = _parse_iso(current_time)
+    hour = parsed.astimezone().hour if parsed is not None else datetime.now().hour
+
+    if hour >= 12 and hour < 18:
+        return "Good afternoon"
+    if hour >= 18:
+        return "Good evening"
+    return "Good morning"
+
+
+def _infer_display_name_from_email(account_email: str | None) -> str | None:
+    """Derive a first-name-like label from the mailbox email when possible."""
+    if not account_email or "@" not in account_email:
+        return None
+
+    local_part = account_email.split("@", 1)[0].strip().lower()
+    if not local_part:
+        return None
+
+    for separator in (".", "_", "-"):
+        if separator in local_part:
+            local_part = local_part.split(separator, 1)[0]
+            break
+
+    if not local_part.isalpha() or len(local_part) < 2:
+        return None
+
+    return local_part[:1].upper() + local_part[1:]
+
+
+_TASK_ACTIONS = {"open", "track", "confirm", "review", "join", "send", "approve", "register"}
 
 
 def _normalize_grouping_text(value: str) -> str:
