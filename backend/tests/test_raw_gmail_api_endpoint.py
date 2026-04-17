@@ -53,6 +53,35 @@ class RawGmailApiRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), [])
 
+    @patch("app.api.routes.feed.has_stored_google_tokens", return_value=True)
+    @patch("app.api.routes.feed.fetch_clean_gmail_api_messages")
+    def test_raw_gmail_api_clean_returns_readable_payloads(self, mock_fetch: Mock, _mock_tokens: Mock) -> None:
+        mock_fetch.return_value = [
+            {
+                "id": "message-1",
+                "thread_id": "thread-1",
+                "subject": "Hello",
+                "body": {"chosen": "Readable body"},
+                "parts": [{"part_id": "1", "mime_type": "text/html", "text_preview": "Readable body"}],
+            }
+        ]
+
+        response = self.client.get("/raw-gmail-api-clean")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            [
+                {
+                    "id": "message-1",
+                    "thread_id": "thread-1",
+                    "subject": "Hello",
+                    "body": {"chosen": "Readable body"},
+                    "parts": [{"part_id": "1", "mime_type": "text/html", "text_preview": "Readable body"}],
+                }
+            ],
+        )
+
     @patch("app.api.routes.feed.build_feed_from_entities")
     @patch("app.api.routes.feed.refresh_ai_suggestions_for_entities")
     @patch("app.api.routes.feed.rebuild_persistent_memory")

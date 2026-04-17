@@ -3,6 +3,7 @@ from __future__ import annotations
 """Entity-to-entity reconciliation for complaint chains that span multiple threads."""
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from app.db.models import LoadedEntity
 from app.db.repository import append_trace_record, list_all_loaded_entities, merge_entities
@@ -16,6 +17,7 @@ from app.services.entities.entity_resolver import (
     extract_message_reference_ids,
     get_sender_organization,
     get_support_confidence,
+    normalize_subject,
     payload_string,
 )
 
@@ -25,6 +27,7 @@ LOW_SIGNAL_ORGANIZATIONS = {
     "rameshpandey",
     "rbi",
 }
+STALE_ENTITY_GAP_DAYS = 180
 
 
 @dataclass
@@ -39,6 +42,23 @@ class EntityMergeProfile:
     named_markers: set[str]
     sender_organizations: set[str]
     latest_timestamp: str
+
+
+def _timestamp_gap_days(left: str, right: str) -> int | None:
+    """Return the whole-day gap between two ISO timestamps."""
+    try:
+        left_dt = datetime.fromisoformat(left.replace("Z", "+00:00"))
+        right_dt = datetime.fromisoformat(right.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    return abs((left_dt - right_dt).days)
+
+
+def _subject_root(subject: str) -> str:
+    """Normalize subjects down to their textual root, ignoring trailing numeric refs."""
+    tokens = [token for token in normalize_subject(subject).split() if not token.isdigit()]
+    return " ".join(tokens)
 
 
 def reconcile_entities(database_path: str) -> list[str]:
@@ -110,6 +130,8 @@ def build_merge_profile(entity: LoadedEntity) -> EntityMergeProfile:
         sender_organizations=sender_organizations,
         latest_timestamp=latest_timestamp,
     )
+
+
 def find_ai_merge(
     profiles: list[EntityMergeProfile],
 ) -> tuple[EntityMergeProfile, EntityMergeProfile, float, str, dict[str, object]] | None:
@@ -132,6 +154,20 @@ def find_ai_merge(
             shared_named_markers = sorted(source.named_markers & candidate.named_markers)
             candidate_meaningful_organizations = get_meaningful_organizations(candidate)
             shared_sender_organizations = sorted(source_meaningful_organizations & candidate_meaningful_organizations)
+            non_brand_named_markers = [
+                marker for marker in shared_named_markers if marker not in shared_sender_organizations
+            ]
+            timestamp_gap_days = _timestamp_gap_days(source.latest_timestamp, candidate.latest_timestamp)
+            same_subject_root = (
+                _subject_root(source.latest_subject)
+                and _subject_root(source.latest_subject) == _subject_root(candidate.latest_subject)
+            )
+            short_window_same_subject = (
+                bool(shared_sender_organizations)
+                and bool(same_subject_root)
+                and timestamp_gap_days is not None
+                and timestamp_gap_days <= 14
+            )
             both_low_signal_only = not source_meaningful_organizations and not candidate_meaningful_organizations
             source_brand_bridge = any(
                 organization in candidate.named_markers for organization in source_meaningful_organizations
@@ -149,47 +185,72 @@ def find_ai_merge(
             )
 
             if (
-                not shared_reference_ids
-                and not shared_named_markers
-                and support_confidence < 0.62
-                and len(shared_issue_markers) < 2
-                and not shared_sender_organizations
-                and not source_mentions_candidate
-                and not candidate_mentions_source
+                timestamp_gap_days is not None
+                and timestamp_gap_days > STALE_ENTITY_GAP_DAYS
+                and not shared_reference_ids
+                and not non_brand_named_markers
             ):
                 continue
             if (
-                source.reference_ids
-                and candidate.reference_ids
-                and not shared_reference_ids
-                and not shared_named_markers
-                and support_confidence < 0.78
-                and len(shared_issue_markers) < 3
+                not short_window_same_subject
+                and (
+                    not shared_reference_ids
+                    and not shared_named_markers
+                    and support_confidence < 0.62
+                    and len(shared_issue_markers) < 2
+                    and not shared_sender_organizations
+                    and not source_mentions_candidate
+                    and not candidate_mentions_source
+                )
             ):
                 continue
             if (
-                not shared_sender_organizations
-                and not shared_reference_ids
-                and not shared_named_markers
-                and not source_mentions_candidate
-                and not candidate_mentions_source
-                and len(shared_issue_markers) < 2
-            ):
-                continue
-            if both_low_signal_only and not shared_reference_ids and not shared_named_markers:
-                continue
-            if (
-                source_meaningful_organizations
-                and not shared_sender_organizations
-                and not source_brand_bridge
-                and not shared_reference_ids
+                not short_window_same_subject
+                and (
+                    source.reference_ids
+                    and candidate.reference_ids
+                    and not shared_reference_ids
+                    and not shared_named_markers
+                    and support_confidence < 0.78
+                    and len(shared_issue_markers) < 3
+                )
             ):
                 continue
             if (
-                candidate_meaningful_organizations
-                and not shared_sender_organizations
-                and not candidate_brand_bridge
-                and not shared_reference_ids
+                not short_window_same_subject
+                and (
+                    not shared_sender_organizations
+                    and not shared_reference_ids
+                    and not shared_named_markers
+                    and not source_mentions_candidate
+                    and not candidate_mentions_source
+                    and len(shared_issue_markers) < 2
+                )
+            ):
+                continue
+            if (
+                not short_window_same_subject
+                and both_low_signal_only and not shared_reference_ids and not shared_named_markers
+            ):
+                continue
+            if (
+                not short_window_same_subject
+                and (
+                    source_meaningful_organizations
+                    and not shared_sender_organizations
+                    and not source_brand_bridge
+                    and not shared_reference_ids
+                )
+            ):
+                continue
+            if (
+                not short_window_same_subject
+                and (
+                    candidate_meaningful_organizations
+                    and not shared_sender_organizations
+                    and not candidate_brand_bridge
+                    and not shared_reference_ids
+                )
             ):
                 continue
 
@@ -239,7 +300,7 @@ def find_ai_merge(
         )
         resolution = resolve_entity_group(request)
 
-        if resolution.entity_id is None or resolution.confidence <= 0.92:
+        if resolution.entity_id is None:
             continue
 
         target = by_id.get(resolution.entity_id)
@@ -248,6 +309,24 @@ def find_ai_merge(
             continue
 
         if target.loaded.entity.id == source.loaded.entity.id:
+            continue
+
+        shared_sender_organizations = sorted(
+            get_meaningful_organizations(source) & get_meaningful_organizations(target)
+        )
+        timestamp_gap_days = _timestamp_gap_days(source.latest_timestamp, target.latest_timestamp)
+        same_subject_root = (
+            _subject_root(source.latest_subject)
+            and _subject_root(source.latest_subject) == _subject_root(target.latest_subject)
+        )
+
+        if resolution.confidence <= 0.92 and not (
+            resolution.confidence > 0.8
+            and shared_sender_organizations
+            and timestamp_gap_days is not None
+            and timestamp_gap_days <= 14
+            and same_subject_root
+        ):
             continue
 
         ordered_target, ordered_source = choose_merge_direction(target, source)

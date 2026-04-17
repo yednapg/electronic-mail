@@ -15,6 +15,7 @@ from app.services.feed.memory_pipeline import (
     refresh_ai_suggestions_for_entities,
 )
 from app.services.integrations.google import (
+    fetch_clean_gmail_api_messages,
     fetch_google_source_records,
     fetch_raw_gmail_api_messages,
     fetch_raw_gmail_source_records,
@@ -55,6 +56,15 @@ def raw_gmail_api() -> list[dict[str, object]]:
         return []
 
     return fetch_raw_gmail_api_messages(settings)
+
+
+@router.get("/raw-gmail-api-clean")
+def raw_gmail_api_clean() -> list[dict[str, object]]:
+    """Return a readable Gmail API debugging view with decoded body text and part summaries."""
+    if not settings.google_configured or not has_stored_google_tokens():
+        return []
+
+    return fetch_clean_gmail_api_messages(settings)
 
 
 @router.post("/rebuild-memory", response_model=FeedResponse)
