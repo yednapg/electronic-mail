@@ -10,8 +10,19 @@
     "start": "npm run setup && npm run dev",
     "dev": "npm run dev:web",
     "dev:web": "npm run dev -w @electronic-mail/web",
-    "test": "npm run test -w @electronic-mail/web",
-    "typecheck": "npm run typecheck -w @electronic-mail/types && npm run typecheck -w @electronic-mail/web"
+    "backend:test": "cd backend && ../.venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'",
+    "backend:compile": "cd backend && ../.venv/bin/python -m compileall -q app tests db_init.py reset_data.py",
+    "web:test": "npm run test -w @electronic-mail/web",
+    "web:typecheck": "npm run typecheck -w @electronic-mail/types && npm run typecheck -w @electronic-mail/web",
+    "ios:generate": "cd ios/ElectronicMail && tuist generate",
+    "ios:fast-run": "bash scripts/ios-fast-run.sh",
+    "ios:typecheck": "xcodebuild build-for-testing -workspace ios/ElectronicMail/ElectronicMail.xcworkspace -scheme ElectronicMail -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO",
+    "ios:build": "xcodebuild -workspace ios/ElectronicMail/ElectronicMail.xcworkspace -scheme ElectronicMail -destination 'platform=iOS Simulator,name=iPhone 17' build",
+    "ios:test": "xcodebuild test -workspace ios/ElectronicMail/ElectronicMail.xcworkspace -scheme ElectronicMail -destination 'platform=iOS Simulator,name=iPhone 17'",
+    "test": "npm run web:test",
+    "typecheck": "npm run web:typecheck",
+    "verify": "npm run backend:test && npm run backend:compile && npm run web:typecheck && npm run web:test",
+    "verify:ios": "npm run ios:generate && npm run ios:typecheck && npm run ios:build && npm run ios:test"
   },
   "devDependencies": {
     "typescript": "^5.8.3"

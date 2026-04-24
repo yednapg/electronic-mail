@@ -6,6 +6,7 @@ import type {
   DashboardProfile,
   FeedResponse,
   GoogleAuthState,
+  TraceReplayResponse,
   TimingBand,
 } from '@electronic-mail/types';
 
@@ -18,5 +19,6 @@ export type {
   DashboardResponse,
   FeedResponse,
   GoogleAuthState,
+  TraceReplayResponse,
   TimingBand,
 };
