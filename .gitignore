@@ -18,6 +18,11 @@ __pycache__
 *.tsbuildinfo
 backend/dev.db
 backend/dev.db-journal
+**/xcuserdata/
+**/*.xcuserstate
+**/Derived/
+DerivedData/
+.build/
 
 *.log
 .coverage

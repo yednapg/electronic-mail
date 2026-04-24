@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 import os
@@ -17,6 +18,7 @@ load_dotenv(BACKEND_DIR / ".env")
 class Settings:
     """Resolved environment settings used across the backend."""
 
+    app_env: Literal["local", "staging", "production"]
     port: int
     database_url: str
     database_path: Path
@@ -26,10 +28,23 @@ class Settings:
     google_client_id: str
     google_client_secret: str
     google_redirect_uri: str
+    mobile_redirect_uri: str
+    openai_api_key: str
+    openai_model: str
+    openai_required: bool
+    openai_debug_logs: bool
 
     @property
     def google_configured(self) -> bool:
         return bool(self.google_client_id and self.google_client_secret)
+
+    @property
+    def openai_configured(self) -> bool:
+        return bool(self.openai_api_key)
+
+    @property
+    def is_production_like(self) -> bool:
+        return self.app_env in {"staging", "production"}
 
     @property
     def backend_origin(self) -> str:
@@ -39,6 +54,36 @@ class Settings:
             return self.google_redirect_uri[: -len(redirect_suffix)]
 
         return f"http://localhost:{self.port}"
+
+    def readiness_errors(self) -> list[str]:
+        """Return blocking config issues for production-like deployments."""
+        errors: list[str] = []
+
+        if self.app_env not in {"local", "staging", "production"}:
+            errors.append("APP_ENV must be one of local, staging, or production")
+
+        if not self.database_url.strip():
+            errors.append("DATABASE_URL is required")
+
+        if self.gmail_sync_scope not in {"full", "recent"}:
+            errors.append("GMAIL_SYNC_SCOPE must be either full or recent")
+
+        if self.gmail_recent_days < 1:
+            errors.append("GMAIL_RECENT_DAYS must be greater than 0")
+
+        if self.is_production_like:
+            if not self.google_configured:
+                errors.append("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required")
+            if self.openai_required and not self.openai_configured:
+                errors.append("OPENAI_API_KEY is required because OPENAI_REQUIRED is enabled")
+            if not self.google_redirect_uri.startswith("https://"):
+                errors.append("GOOGLE_REDIRECT_URI must be HTTPS outside local development")
+            if not self.cors_origin.startswith("https://"):
+                errors.append("CORS_ORIGIN must be HTTPS outside local development")
+            if not self.mobile_redirect_uri:
+                errors.append("MOBILE_REDIRECT_URI is required")
+
+        return errors
 
 
 def _resolve_database_path(database_url: str) -> Path:
@@ -54,8 +99,10 @@ def _resolve_database_path(database_url: str) -> Path:
 def load_settings() -> Settings:
     """Load environment variables once and expose a typed settings object."""
     database_url = os.getenv("DATABASE_URL", "file:./dev.db")
+    app_env = os.getenv("APP_ENV", "local").strip().lower() or "local"
 
     return Settings(
+        app_env=app_env,  # type: ignore[arg-type]
         port=int(os.getenv("PORT", "3001")),
         database_url=database_url,
         database_path=_resolve_database_path(database_url),
@@ -68,4 +115,9 @@ def load_settings() -> Settings:
             "GOOGLE_REDIRECT_URI",
             "http://localhost:3001/auth/google/callback",
         ),
+        mobile_redirect_uri=os.getenv("MOBILE_REDIRECT_URI", "electronicmail://auth/callback").strip(),
+        openai_api_key=os.getenv("OPENAI_API_KEY", "").strip().strip("\"'"),
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-5.4").strip().strip("\"'") or "gpt-5.4",
+        openai_required=os.getenv("OPENAI_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"},
+        openai_debug_logs=os.getenv("OPENAI_DEBUG_LOGS", "").strip().lower() in {"1", "true", "yes", "on"},
     )

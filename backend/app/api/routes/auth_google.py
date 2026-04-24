@@ -14,12 +14,15 @@ settings = load_settings()
 
 
 @router.get("/auth/google")
-def auth_google() -> RedirectResponse:
+def auth_google(redirect_to: str | None = None) -> RedirectResponse:
     """Start the Google OAuth consent flow."""
     if not settings.google_configured:
         raise HTTPException(status_code=500, detail="Google OAuth is not configured in backend/.env")
 
-    return RedirectResponse(get_google_auth_url(settings))
+    if redirect_to is not None and redirect_to != settings.mobile_redirect_uri:
+        raise HTTPException(status_code=400, detail="Unsupported OAuth redirect target")
+
+    return RedirectResponse(get_google_auth_url(settings, redirect_to=redirect_to))
 
 
 @router.get("/auth/google/callback")
@@ -36,8 +39,8 @@ def auth_google_callback(
         raise HTTPException(status_code=400, detail="Missing OAuth code")
 
     try:
-        handle_google_callback(settings, code, state)
+        redirect_url = handle_google_callback(settings, code, state)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail="Unable to link this Google account.") from exc
 
-    return RedirectResponse(f"{settings.cors_origin}/dashboard")
+    return RedirectResponse(redirect_url)

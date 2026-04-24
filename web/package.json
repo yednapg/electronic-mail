@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev --port 5173",
-    "test": "tsx --test app/**/*.test.ts",
+    "test": "tsx --test app/**/*.test.ts lib/**/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
