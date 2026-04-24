@@ -86,27 +86,31 @@ def _log_gmail_error(label: str, payload: dict[str, object]) -> None:
     )
 
 
-def get_google_auth_url(settings: Settings) -> str:
+def get_google_auth_url(settings: Settings, redirect_to: str | None = None) -> str:
     """Build the Google authorization URL for local OAuth setup."""
     flow = create_flow(settings)
     authorization_url, state = flow.authorization_url(access_type="offline", prompt="consent")
-    save_oauth_session(
-        {
-            "state": state,
-            "code_verifier": flow.code_verifier,
-        }
-    )
+    session = {
+        "state": state,
+        "code_verifier": flow.code_verifier,
+    }
+
+    if redirect_to is not None:
+        session["redirect_to"] = redirect_to
+
+    save_oauth_session(session)
     return authorization_url
 
 
-def handle_google_callback(settings: Settings, code: str, state: str | None = None) -> None:
-    """Exchange the OAuth code for tokens and persist them locally."""
+def handle_google_callback(settings: Settings, code: str, state: str | None = None) -> str:
+    """Exchange the OAuth code, persist tokens, and return the final client redirect."""
     session = load_oauth_session()
     if session is None:
         raise RuntimeError("Missing OAuth session. Start again from /auth/google.")
 
     expected_state = session.get("state")
     code_verifier = session.get("code_verifier")
+    redirect_to = session.get("redirect_to")
 
     if state is not None and expected_state and state != expected_state:
         clear_oauth_session()
@@ -135,6 +139,11 @@ def handle_google_callback(settings: Settings, code: str, state: str | None = No
         _reset_local_data_if_account_changed(settings, profile)
         save_google_account_profile(profile)
     clear_oauth_session()
+
+    if isinstance(redirect_to, str) and redirect_to == settings.mobile_redirect_uri:
+        return redirect_to
+
+    return f"{settings.cors_origin}/dashboard"
 
 
 def fetch_google_source_records(settings: Settings) -> list[SourceRecord]:

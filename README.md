@@ -1,104 +1,94 @@
 # Decision Pipeline System
 
-Repo with a TypeScript frontend and one Python backend.
+Production-oriented monorepo for the Decision Pipeline backend, web dashboard, and native iOS client.
+
+The FastAPI backend is the canonical source of truth. Web and iOS render backend output and trigger backend actions; they do not duplicate Gmail sync, grouping, memory, AI judgment, dashboard generation, trace replay, or Gmail mutation logic.
 
 ## Structure
 
 ```text
-.
-├── backend       # Unified FastAPI backend: API routes, AI services, integrations, SQLite
-├── web           # Next.js frontend
-├── packages
-│   └── types    # shared frontend TypeScript contracts
-├── scripts
-│   └── bootstrap.sh
-├── package.json
-└── package-lock.json
+backend/              FastAPI API, Gmail integration, SQLite persistence, AI/feed pipeline
+web/                  Next.js dashboard client
+ios/DecisionPipeline/ SwiftUI iOS client
+packages/types/       Shared TypeScript contracts for web-side code
+contracts/fixtures/   Shared JSON API contract fixtures
+docs/                 Architecture and environment notes
+scripts/              Local setup helpers
 ```
 
-## Prerequisites
+## Setup
+
+Prerequisites:
 
 - Node.js 20+
 - npm 10+
 - Python 3.11+
-
-## Frontend
-
-From repo root:
-
-```bash
-npm run setup
-npm run dev
-```
-
-This starts the Next.js UI on `http://localhost:5173`.
-
-## Setup (manual / one-time)
-
-If you prefer to run setup separately:
+- Tuist and Xcode for iOS work
 
 ```bash
 npm run setup
 ```
 
-What `setup` does:
+This installs Node and Python dependencies, creates `backend/.env` and `web/.env` from examples when missing, and initializes local SQLite.
 
-- Installs Node dependencies (`npm install`) if `node_modules` is missing.
-- Creates `.env` files in:
-  - `backend/.env`
-  - `web/.env`
-- Creates root `.venv` (if missing).
-- Installs Python dependencies for `backend` into root `.venv`.
-- Initializes the backend SQLite database with Python.
+## Development
 
-## Frontend-only npm commands
-
-```bash
-npm run dev
-npm run test
-npm run typecheck
-```
-
-## Backend Python commands
+Run the backend:
 
 ```bash
 cd backend
 ../.venv/bin/python -m uvicorn app.main:app --reload --port 3001
 ```
 
-Test backend:
+Run the web dashboard:
 
 ```bash
-cd backend
-../.venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'
+npm run dev:web
 ```
 
-Typecheck backend imports:
+Generate the iOS project:
 
 ```bash
-cd backend
-../.venv/bin/python -m compileall -q app tests db_init.py reset_data.py
+npm run ios:generate
 ```
 
-Initialize backend DB:
-
-```bash
-cd backend
-../.venv/bin/python db_init.py
-```
-
-Reset backend data:
-
-```bash
-cd backend
-../.venv/bin/python reset_data.py
-```
-
-## Useful endpoints
+The local URLs are:
 
 - Web: `http://localhost:5173`
-- Backend health: `http://localhost:3001/health`
-- Backend trace replay: `http://localhost:3001/trace/<entity_id>`
+- Backend: `http://localhost:3001`
 - Backend docs: `http://localhost:3001/docs`
+- Backend health: `http://localhost:3001/health`
+- Backend readiness: `http://localhost:3001/ready`
 
-Use the shared root `.venv` created by `npm run setup`.
+## Verification
+
+Run backend and web checks:
+
+```bash
+npm run verify
+```
+
+Run iOS checks once an iOS simulator runtime is installed:
+
+```bash
+npm run verify:ios
+```
+
+Individual commands:
+
+```bash
+npm run backend:test
+npm run backend:compile
+npm run web:typecheck
+npm run web:test
+npm run ios:typecheck
+npm run ios:build
+npm run ios:test
+```
+
+## Environment
+
+Local defaults use SQLite and local OAuth redirects. Production or TestFlight should use a hosted HTTPS backend.
+The AI pipeline uses OpenAI from the backend via `OPENAI_API_KEY` and `OPENAI_MODEL`; native clients do not hold model credentials or run canonical feed logic.
+
+See [architecture](docs/architecture.md) and [environments](docs/environments.md).

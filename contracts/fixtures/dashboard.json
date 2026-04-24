@@ -1,0 +1,68 @@
+{
+  "auth": {
+    "available": true,
+    "connected": true,
+    "connect_url": null
+  },
+  "profile": {
+    "email": "person@example.com",
+    "display_name": "Person"
+  },
+  "briefing": {
+    "headline": "Good morning.",
+    "brief": "You have two items that need attention."
+  },
+  "feed": {
+    "now": [
+      {
+        "id": "item-1",
+        "entity_id": "entity-1",
+        "user_id": "local-user",
+        "need_type": "awareness",
+        "action_type": "none",
+        "effort_level": "quick",
+        "timing_band": "now",
+        "action_confidence": "high",
+        "primary_action": "none",
+        "fallback_action": "open",
+        "title": "Groww confirmed your demat account has been closed and sent the client master report.",
+        "why_this_is_here": "This is a completed account-closure record with the related report attached.",
+        "due_at": null,
+        "importance_level": "high",
+        "lifecycle_state": "resolved",
+        "current_state": "done",
+        "source": "gmail",
+        "gmail_thread_id": "thread-1",
+        "gmail_thread_action": "archive",
+        "trace_id": "trace-1",
+        "created_at": "2026-04-24T10:00:00+00:00"
+      }
+    ],
+    "today": [],
+    "worth_knowing": [
+      {
+        "id": "item-2",
+        "entity_id": "entity-2",
+        "user_id": "local-user",
+        "need_type": "awareness",
+        "action_type": "none",
+        "effort_level": "quick",
+        "timing_band": "later",
+        "action_confidence": "medium",
+        "primary_action": "none",
+        "fallback_action": "open",
+        "title": "Zerodha asked for a callback about your email ID modification rejection.",
+        "why_this_is_here": "This is waiting on your availability for a support callback.",
+        "due_at": null,
+        "importance_level": "medium",
+        "lifecycle_state": "active",
+        "current_state": "waiting",
+        "source": "gmail",
+        "gmail_thread_id": "thread-2",
+        "gmail_thread_action": null,
+        "trace_id": "trace-2",
+        "created_at": "2026-04-24T10:05:00+00:00"
+      }
+    ]
+  }
+}

@@ -6,6 +6,7 @@ import type {
   DashboardProfile,
   FeedResponse,
   GoogleAuthState,
+  TraceReplayResponse,
   TimingBand,
 } from '@decision-pipeline/types';
 
@@ -18,5 +19,6 @@ export type {
   DashboardResponse,
   FeedResponse,
   GoogleAuthState,
+  TraceReplayResponse,
   TimingBand,
 };
