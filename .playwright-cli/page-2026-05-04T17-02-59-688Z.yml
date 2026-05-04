@@ -1,0 +1,21 @@
+- generic [active] [ref=e1]:
+  - main "Preparing your work list" [ref=e2]:
+    - generic [ref=e3]:
+      - img "Email becomes done" [ref=e4]:
+        - generic [ref=e5]: 📨
+        - generic [ref=e6]: →
+        - generic [ref=e7]: ✅
+      - generic [ref=e8]:
+        - heading "Turning your emails into a work list" [level=1] [ref=e9]:
+          - generic [ref=e10]: Turning your emails
+          - generic [ref=e11]: into a work list
+        - paragraph [ref=e12]: We are finding what actually needs your attention.
+      - generic "Preparing work list" [ref=e13]:
+        - generic [ref=e16]: Finding bills, invites, replies, and tasks
+        - generic [ref=e19]: Grouping related email threads
+        - generic [ref=e22]: Keeping only what needs attention
+        - generic [ref=e25]: Building your dashboard
+      - paragraph [ref=e26]: Your dashboard is almost ready.
+  - button "Open Next.js Dev Tools" [ref=e32] [cursor=pointer]:
+    - img [ref=e33]
+  - alert [ref=e36]

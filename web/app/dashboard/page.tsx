@@ -1,7 +1,7 @@
 /**
  * Server-rendered dashboard page that turns the feed response into UI view models.
  */
-import { getDashboard } from '../../lib/api';
+import { getDashboard, isDemoMode } from '../../lib/api';
 import {
   formatClockTime,
   formatDate,
@@ -11,10 +11,8 @@ import {
   toAgendaSortValue,
 } from '../../lib/formatting';
 import type { FeedItem, FeedResponse, GoogleAuthState, TimingBand } from '../../lib/types';
-import { DashboardAgenda } from '../../components/dashboard/DashboardAgenda';
+import { DashboardView } from '../../components/dashboard/DashboardView';
 import { DashboardMeta } from '../../components/dashboard/DashboardMeta';
-import { DashboardSection } from '../../components/dashboard/DashboardSection';
-import { DashboardSummary } from '../../components/dashboard/DashboardSummary';
 import type {
   DashboardAgendaItem,
   DashboardSectionData,
@@ -25,10 +23,11 @@ import type {
 export default async function DashboardPage() {
   // Build all derived view models once on the server so leaf components stay simple.
   const dashboard = await getDashboard();
-  const now = new Date();
+  const demoMode = isDemoMode();
+  const now = demoMode ? new Date('2023-02-01T09:00:00') : new Date();
 
   if (!dashboard.auth.connected) {
-    return <SignedOutDashboard now={now} auth={dashboard.auth} />;
+    return <SignedOutDashboard now={now} auth={dashboard.auth} liveMeta={!demoMode} />;
   }
 
   const agenda = buildAgenda(dashboard.feed);
@@ -36,33 +35,22 @@ export default async function DashboardPage() {
   const sections = buildSections(dashboard.feed);
 
   return (
-    <main className="digest-page">
-      <div className="digest-shell">
-        <DashboardMeta dateLabel={formatDate(now)} timeLabel={formatClockTime(now)} />
-        <DashboardSummary summary={summary} />
-        <DashboardAgenda items={agenda} />
-
-        <div className="digest-sections">
-          {sections.map((section) => (
-            <DashboardSection
-              key={section.id}
-              title={section.title}
-              items={section.items}
-              maxVisible={section.maxVisible}
-              collapsedByDefault={section.collapsedByDefault}
-            />
-          ))}
-        </div>
-      </div>
-    </main>
+    <DashboardView
+      dateLabel={formatDate(now)}
+      timeLabel={formatClockTime(now)}
+      liveMeta={!demoMode}
+      summary={summary}
+      agenda={agenda}
+      sections={sections}
+    />
   );
 }
 
-function SignedOutDashboard({ now, auth }: { now: Date; auth: GoogleAuthState }) {
+function SignedOutDashboard({ now, auth, liveMeta }: { now: Date; auth: GoogleAuthState; liveMeta: boolean }) {
   return (
     <main className="digest-page">
       <div className="digest-shell">
-        <DashboardMeta dateLabel={formatDate(now)} timeLabel={formatClockTime(now)} />
+        <DashboardMeta dateLabel={formatDate(now)} timeLabel={formatClockTime(now)} live={liveMeta} />
         <section className="digest-auth-state" aria-label="Connect Google">
           <p className="digest-summary">
             <span className="digest-summary-medium">Connect your Google account.</span>{' '}
@@ -100,29 +88,35 @@ export function buildSummary(dashboard: { briefing?: { headline: string; brief: 
 
 export function buildSections(feed: FeedResponse): DashboardSectionData[] {
   /** Keep section assembly separate so tests can validate ordering and copy in isolation. */
-  return [
+  const sections: DashboardSectionData[] = [
     {
       id: 'now',
       title: 'Now',
-      items: sortSectionFeedItems(feed.now).map(toSectionItem),
+      items: sortSectionFeedItems(feed.now).filter(shouldRenderSectionItem).map(toSectionItem),
       maxVisible: 4,
       collapsedByDefault: true,
     },
     {
       id: 'today',
       title: 'Today',
-      items: sortSectionFeedItems(feed.today).map(toSectionItem),
+      items: sortSectionFeedItems(feed.today).filter(shouldRenderSectionItem).map(toSectionItem),
       maxVisible: 5,
       collapsedByDefault: true,
     },
     {
       id: 'worth-knowing',
       title: 'Worth Knowing',
-      items: sortSectionFeedItems(feed.worth_knowing).map(toSectionItem),
+      items: sortSectionFeedItems(feed.worth_knowing).filter(shouldRenderSectionItem).map(toSectionItem),
       maxVisible: 3,
       collapsedByDefault: true,
     },
   ];
+
+  return sections.filter((section) => section.items.length > 0);
+}
+
+function shouldRenderSectionItem(item: FeedItem): boolean {
+  return item.source !== 'calendar';
 }
 
 export function toSectionItem(item: FeedItem): DashboardSectionItem {
@@ -134,6 +128,7 @@ export function toSectionItem(item: FeedItem): DashboardSectionItem {
         item.source === 'calendar' && item.why_this_is_here.trim().length > 0
           ? item.why_this_is_here
           : item.title,
+      detail: toSectionDetail(item),
       cta: toSectionCta(item),
     };
   }
@@ -141,6 +136,7 @@ export function toSectionItem(item: FeedItem): DashboardSectionItem {
   return {
     id: item.id,
     title: toActionSentence(item),
+    detail: toSectionDetail(item),
     cta: toSectionCta(item),
   };
 }
@@ -256,11 +252,19 @@ export function shouldKeepNaturalTitle(item: FeedItem, title: string): boolean {
     return true;
   }
 
+  if (/^within\b/i.test(title)) {
+    return true;
+  }
+
+  if (/\bis offering\b/i.test(title)) {
+    return true;
+  }
+
   if (/[.!?]$/.test(title)) {
     return true;
   }
 
-  return /^(you\b|your\b|you're\b|we\b|this\b|[A-Z][A-Za-z0-9&.'/-]+(?: [A-Z][A-Za-z0-9&.'/-]+){0,4} (?:updated|declined|approved|confirmed|registered|delivered|shipped|sent|accepted|resolved|says|changed|scheduled)\b)/i.test(
+  return /^(you\b|your\b|you're\b|we\b|this\b|[A-Z][A-Za-z0-9&.'/-]+(?: [A-Z][A-Za-z0-9&.'/-]+){0,4} (?:updated|declined|approved|confirmed|registered|delivered|shipped|sent|accepted|resolved|says|changed|scheduled|is offering)\b)/i.test(
     title,
   );
 }
@@ -296,6 +300,32 @@ export function stripDuePrefix(title: string): string {
 }
 
 export function toSectionCta(item: FeedItem): DashboardSectionItem['cta'] | undefined {
+  if (toSectionDetail(item) !== undefined) {
+    return undefined;
+  }
+
+  if (item.primary_action === 'confirm' && /^within\b/i.test(item.title.trim())) {
+    return {
+      label: 'RSVP',
+      tone: 'blue',
+      placement: 'prefix',
+    };
+  }
+
+  if (item.primary_action === 'register') {
+    return {
+      label: 'Register!',
+      tone: 'blue',
+    };
+  }
+
+  if (item.title.toLowerCase().includes('read notice') || item.title.toLowerCase().includes('ofs in ipo')) {
+    return {
+      label: 'Read Notice',
+      tone: 'green',
+    };
+  }
+
   if (item.source !== 'gmail' || item.gmail_thread_id === undefined || item.gmail_thread_id === null) {
     return undefined;
   }
@@ -327,6 +357,23 @@ export function toSectionCta(item: FeedItem): DashboardSectionItem['cta'] | unde
   return undefined;
 }
 
+export function toSectionDetail(item: FeedItem): DashboardSectionItem['detail'] | undefined {
+  if (item.primary_action !== 'confirm' || !/YC Startup School India/i.test(item.title)) {
+    return undefined;
+  }
+
+  return {
+    body: [
+      item.why_this_is_here.trim() || 'YC has accepted your application to attend Startup School India.',
+      'The talk is in Bangalore. Only confirm if you can attend.',
+      'YC will send a calendar invite after you RSVP.',
+    ],
+    confirmLabel: 'Yes, I can attend',
+    dismissLabel: 'No',
+    sourceLabel: 'Sources: 3 emails from YC',
+  };
+}
+
 function sortSectionFeedItems(items: FeedItem[]): FeedItem[] {
   /** Keep section ordering stable: due date first, then calendar items, then title. */
   return [...items].sort((left, right) => {
@@ -353,7 +400,7 @@ function sortSectionFeedItems(items: FeedItem[]): FeedItem[] {
       return 1;
     }
 
-    return left.title.localeCompare(right.title);
+    return 0;
   });
 }
 

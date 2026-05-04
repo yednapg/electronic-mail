@@ -1,0 +1,9 @@
+[   10126ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:5173/_next/static/chunks/node_modules_next_dist_115brz8._.js:2431
+[   10405ms] [LOG] [HMR] connected @ http://localhost:5173/_next/static/chunks/node_modules_next_dist_115brz8._.js:2431
+[   10573ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:5173/_next/static/chunks/node_modules_next_dist_115brz8._.js:2431
+[   11316ms] [LOG] [Fast Refresh] done in 844ms @ http://localhost:5173/_next/static/chunks/node_modules_next_dist_115brz8._.js:2431
+[   12304ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://localhost:5173/favicon.ico:0
+[   14191ms] [LOG] [Fast Refresh] rebuilding @ http://localhost:5173/_next/static/chunks/node_modules_next_dist_115brz8._.js:2431
+[   14601ms] [LOG] [Fast Refresh] done in 522ms @ http://localhost:5173/_next/static/chunks/node_modules_next_dist_115brz8._.js:2431
+[   15420ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:5173/_next/static/chunks/node_modules_next_dist_115brz8._.js:2431
+[   15579ms] [LOG] [HMR] connected @ http://localhost:5173/_next/static/chunks/node_modules_next_dist_115brz8._.js:2431

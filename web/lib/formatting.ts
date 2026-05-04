@@ -1,9 +1,9 @@
 /** Small date/time formatting helpers shared by dashboard components. */
 export function formatClockTime(date: Date): string {
-  return date.toLocaleTimeString('en-GB', {
-    hour: '2-digit',
+  return date.toLocaleTimeString('en-US', {
+    hour: 'numeric',
     minute: '2-digit',
-    hour12: false,
+    hour12: true,
   });
 }
 
@@ -23,7 +23,11 @@ export function formatScheduleTime(dateString: string): string {
     return '';
   }
 
-  return formatClockTime(date);
+  return date.toLocaleTimeString('en-GB', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
 }
 
 export function toAgendaSortValue(dateString: string, isTimed: boolean): number {
