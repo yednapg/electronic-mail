@@ -246,6 +246,10 @@ test('YC RSVP items expose expandable detail instead of an inline CTA', () => {
     confirmLabel: 'Yes, I can attend',
     dismissLabel: 'No',
     sourceLabel: 'Sources: 3 emails from YC',
+    links: {
+      rawHref: '/raw-feed?item=item-1',
+      traceHref: '/trace/entity-1',
+    },
   });
 });
 
@@ -268,4 +272,8 @@ test('demo inbox items expose current state, next move, and source evidence', ()
     'Payment reminder from alerts@hdfcbank.net',
     'No matching payment receipt found today',
   ]);
+  assert.deepEqual(detail?.links, {
+    rawHref: '/raw-feed?item=hdfc-card-bill',
+    traceHref: '/trace/entity-hdfc-card-bill',
+  });
 });

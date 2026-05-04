@@ -28,6 +28,10 @@ export type DashboardSectionItem = {
     confirmLabel: string;
     dismissLabel: string;
     sourceLabel: string;
+    links?: {
+      rawHref: string;
+      traceHref: string;
+    };
   };
   cta?: {
     label: string;

@@ -365,11 +365,11 @@ export function toSectionDetail(item: FeedItem): DashboardSectionItem['detail'] 
   const demoDetail = DEMO_DETAIL_BY_ITEM_ID[item.id];
 
   if (demoDetail !== undefined) {
-    return demoDetail;
+    return withDetailLinks(item, demoDetail);
   }
 
   if (item.primary_action === 'confirm' && /YC Startup School India/i.test(item.title)) {
-    return {
+    return withDetailLinks(item, {
       facts: toDetailFacts(item, 'Waiting on you', 'RSVP before the attendee list closes'),
       body: [
         item.why_this_is_here.trim() || 'YC has accepted your application to attend Startup School India.',
@@ -380,14 +380,14 @@ export function toSectionDetail(item: FeedItem): DashboardSectionItem['detail'] 
       confirmLabel: 'Yes, I can attend',
       dismissLabel: 'No',
       sourceLabel: 'Sources: 3 emails from YC',
-    };
+    });
   }
 
   if (item.gmail_thread_action !== undefined && item.gmail_thread_action !== null) {
     return undefined;
   }
 
-  return {
+  return withDetailLinks(item, {
     facts: toDetailFacts(item, toCurrentStateLabel(item), toNextMoveLabel(item)),
     body: [
       item.why_this_is_here.trim() || `This ${sourceLabelForItem(item)} item is still open.`,
@@ -397,7 +397,7 @@ export function toSectionDetail(item: FeedItem): DashboardSectionItem['detail'] 
     confirmLabel: primaryActionDoneLabel(item.primary_action),
     dismissLabel: 'Not needed',
     sourceLabel: sourceLabelForItem(item),
-  };
+  });
 }
 
 const DEMO_DETAIL_BY_ITEM_ID: Record<string, NonNullable<DashboardSectionItem['detail']>> = {
@@ -635,6 +635,22 @@ function toDetailFacts(item: FeedItem, current: string, next: string): NonNullab
   }
 
   return facts;
+}
+
+function withDetailLinks(
+  item: FeedItem,
+  detail: NonNullable<DashboardSectionItem['detail']>,
+): NonNullable<DashboardSectionItem['detail']> {
+  const itemId = encodeURIComponent(item.id);
+  const entityId = encodeURIComponent(item.entity_id);
+
+  return {
+    ...detail,
+    links: {
+      rawHref: `/raw-feed?item=${itemId}`,
+      traceHref: `/trace/${entityId}`,
+    },
+  };
 }
 
 function toCurrentStateLabel(item: FeedItem): string {
