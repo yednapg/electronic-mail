@@ -56,10 +56,11 @@ private struct LoadingView: View {
         VStack(spacing: 14) {
             ProgressView()
             Text("Loading dashboard")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+                .font(DigestPalette.rounded(size: 16))
+                .foregroundStyle(DigestPalette.muted)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.white)
     }
 }
 
@@ -71,8 +72,12 @@ private struct ErrorStateView: View {
     var body: some View {
         ContentUnavailableView {
             Label("Could not load dashboard", systemImage: "exclamationmark.triangle")
+                .font(DigestPalette.rounded(size: 20, weight: .bold))
+                .foregroundStyle(DigestPalette.text)
         } description: {
             Text(message)
+                .font(DigestPalette.rounded(size: 16))
+                .foregroundStyle(DigestPalette.muted)
         } actions: {
             HStack(spacing: 12) {
                 Button("Retry", action: retry)
@@ -81,6 +86,7 @@ private struct ErrorStateView: View {
                 Button("Backend Settings", action: settings)
                     .buttonStyle(.bordered)
             }
+            .font(DigestPalette.rounded(size: 15, weight: .semibold))
         }
     }
 }

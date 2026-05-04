@@ -18,9 +18,16 @@ export type DashboardSectionItem = {
   id: string;
   title: string;
   checked?: boolean;
+  detail?: {
+    body: string[];
+    confirmLabel: string;
+    dismissLabel: string;
+    sourceLabel: string;
+  };
   cta?: {
     label: string;
     tone: DashboardActionTone;
+    placement?: 'prefix' | 'suffix';
     action?: {
       kind: 'gmail-thread';
       threadId: string;
@@ -30,7 +37,7 @@ export type DashboardSectionItem = {
 };
 
 export type DashboardSectionData = {
-  id: string;
+  id: 'now' | 'today' | 'worth-knowing';
   title: 'Now' | 'Today' | 'Worth Knowing';
   items: DashboardSectionItem[];
   maxVisible?: number;

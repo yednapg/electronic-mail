@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { FeedItem, FeedResponse } from '../../lib/types';
-import { buildAgenda, buildSections, buildSummary, toActionSentence, toSectionCta } from './page';
+import { buildAgenda, buildSections, buildSummary, toActionSentence, toSectionCta, toSectionDetail } from './page';
 
 function createFeedItem(overrides: Partial<FeedItem> = {}): FeedItem {
   return {
@@ -139,9 +139,10 @@ test('dashboard renders a Worth Knowing section for low-priority overflow items'
     }),
   );
 
-  assert.equal(sections[2].title, 'Worth Knowing');
-  assert.equal(sections[2].id, 'worth-knowing');
-  assert.equal(sections[2].items.length, 1);
+  const worthKnowing = sections.find((section) => section.id === 'worth-knowing');
+
+  assert.equal(worthKnowing?.title, 'Worth Knowing');
+  assert.equal(worthKnowing?.items.length, 1);
 });
 
 test('dashboard summary renders backend-generated briefing copy without rewriting it', () => {
@@ -175,5 +176,26 @@ test('gmail items expose an explicit archive CTA when one thread can be mutated'
       threadId: 'thread-123',
       operation: 'archive',
     },
+  });
+});
+
+test('YC RSVP items expose expandable detail instead of an inline CTA', () => {
+  const item = createFeedItem({
+    title: 'RSVP for YC Startup School India',
+    primary_action: 'confirm',
+    why_this_is_here: 'YC has accepted your application to attend Startup School India.',
+  });
+
+  assert.equal(toActionSentence(item), 'RSVP for YC Startup School India');
+  assert.equal(toSectionCta(item), undefined);
+  assert.deepEqual(toSectionDetail(item), {
+    body: [
+      'YC has accepted your application to attend Startup School India.',
+      'The talk is in Bangalore. Only confirm if you can attend.',
+      'YC will send a calendar invite after you RSVP.',
+    ],
+    confirmLabel: 'Yes, I can attend',
+    dismissLabel: 'No',
+    sourceLabel: 'Sources: 3 emails from YC',
   });
 });

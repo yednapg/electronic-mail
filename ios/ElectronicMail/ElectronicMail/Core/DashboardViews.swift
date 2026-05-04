@@ -1,16 +1,21 @@
 import SwiftUI
 
-private enum DigestPalette {
-    static let text = Color(red: 0.129, green: 0.129, blue: 0.129)
-    static let muted = Color(red: 0.38, green: 0.38, blue: 0.38)
-    static let rule = Color(red: 0.929, green: 0.929, blue: 0.929)
-    static let agendaBackground = Color(red: 0.965, green: 0.965, blue: 0.965)
-    static let agendaBlue = Color(red: 0.227, green: 0.698, blue: 1.0)
-    static let agendaGreen = Color(red: 0.502, green: 0.792, blue: 0.196)
+enum DigestPalette {
+    static let text = Color(red: 0.02, green: 0.02, blue: 0.02)
+    static let muted = Color(red: 0.337, green: 0.337, blue: 0.337)
+    static let subtle = Color(red: 0.455, green: 0.455, blue: 0.455)
+    static let rule = Color(red: 0.867, green: 0.867, blue: 0.867)
+    static let agendaBackground = Color(red: 0.957, green: 0.957, blue: 0.957)
+    static let agendaBlue = Color(red: 0.125, green: 0.659, blue: 1.0)
+    static let agendaGreen = Color(red: 0.098, green: 0.78, blue: 0.18)
     static let agendaTeal = Color(red: 0.259, green: 0.839, blue: 0.788)
     static let agendaLime = Color(red: 0.345, green: 0.796, blue: 0.259)
-    static let ctaBlue = Color(red: 0.141, green: 0.643, blue: 1.0)
-    static let ctaGreen = Color(red: 0.259, green: 0.718, blue: 0.2)
+    static let ctaBlue = Color(red: 0.125, green: 0.659, blue: 1.0)
+    static let ctaGreen = Color(red: 0.098, green: 0.78, blue: 0.18)
+
+    static func rounded(size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight, design: .rounded)
+    }
 }
 
 struct SignedOutView: View {
@@ -32,7 +37,7 @@ struct SignedOutView: View {
                     Task { await store.connectGoogle() }
                 } label: {
                     Text("Continue with Google")
-                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .font(DigestPalette.rounded(size: 15, weight: .semibold))
                         .foregroundStyle(DigestPalette.text)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 10)
@@ -93,7 +98,7 @@ struct DashboardView: View {
 
             if dashboard.feed.isEmpty {
                 Text("Nothing needs attention.")
-                    .font(.system(size: 16, weight: .regular, design: .rounded))
+                    .font(DigestPalette.rounded(size: 16))
                     .foregroundStyle(DigestPalette.muted)
             }
         }
@@ -129,17 +134,15 @@ private struct DashboardMetaView: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline) {
             Text(DashboardPresentation.dateLabel(for: now))
-                .font(.system(size: 20, weight: .regular, design: .rounded))
+                .font(DigestPalette.rounded(size: 20))
                 .foregroundStyle(DigestPalette.text)
-                .tracking(-0.7)
 
             Spacer(minLength: 24)
 
             Text(DashboardPresentation.clockLabel(for: now))
-                .font(.system(size: 20, weight: .regular, design: .rounded))
+                .font(DigestPalette.rounded(size: 20))
                 .foregroundStyle(DigestPalette.text)
                 .monospacedDigit()
-                .tracking(-0.7)
         }
         .onReceive(timer) { value in
             now = value
@@ -157,10 +160,9 @@ private struct SummaryText: View {
             .fontWeight(.bold)
             + Text(brief)
             .fontWeight(.light))
-            .font(.system(size: horizontalSizeClass == .compact ? 19 : 23, weight: .light, design: .rounded))
+            .font(DigestPalette.rounded(size: horizontalSizeClass == .compact ? 19 : 23, weight: .light))
             .foregroundStyle(DigestPalette.text)
             .lineSpacing(horizontalSizeClass == .compact ? 3 : 2)
-            .tracking(-0.7)
             .fixedSize(horizontal: false, vertical: true)
             .padding(.top, horizontalSizeClass == .compact ? 26 : 30)
             .padding(.bottom, horizontalSizeClass == .compact ? 34 : 48)
@@ -175,21 +177,19 @@ private struct AgendaView: View {
         VStack(alignment: .leading, spacing: 2) {
             if items.isEmpty {
                 Text("No calendar items.")
-                    .font(.system(size: 16, weight: .regular, design: .rounded))
+                    .font(DigestPalette.rounded(size: 16))
                     .foregroundStyle(DigestPalette.muted)
             } else {
                 ForEach(items) { item in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text(item.time)
-                            .font(.system(size: horizontalSizeClass == .compact ? 15 : 16, weight: .semibold, design: .rounded))
+                            .font(DigestPalette.rounded(size: horizontalSizeClass == .compact ? 15 : 16, weight: .semibold))
                             .foregroundStyle(item.tone.color)
-                            .tracking(-0.3)
                             .frame(width: horizontalSizeClass == .compact ? 62 : 76, alignment: .leading)
 
                         Text(item.title)
-                            .font(.system(size: horizontalSizeClass == .compact ? 15 : 16, weight: .regular, design: .rounded))
+                            .font(DigestPalette.rounded(size: horizontalSizeClass == .compact ? 15 : 16))
                             .foregroundStyle(DigestPalette.muted)
-                            .tracking(-0.3)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -220,9 +220,8 @@ struct DashboardSectionView: View {
         if !items.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
                 Text(title)
-                    .font(.system(size: horizontalSizeClass == .compact ? 16 : 18, weight: .bold, design: .rounded))
+                    .font(DigestPalette.rounded(size: horizontalSizeClass == .compact ? 16 : 18, weight: .bold))
                     .foregroundStyle(DigestPalette.text)
-                    .tracking(-0.35)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.bottom, 11)
                     .overlay(alignment: .bottom) {
@@ -247,7 +246,7 @@ struct DashboardSectionView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    .font(.system(size: 15, weight: .regular, design: .rounded))
+                    .font(DigestPalette.rounded(size: 15))
                     .foregroundStyle(DigestPalette.muted)
                     .padding(.top, 12)
                 }
@@ -278,7 +277,7 @@ struct FeedItemRow: View {
 
                     if checked {
                         Image(systemName: "checkmark")
-                            .font(.system(size: 11, weight: .bold))
+                            .font(DigestPalette.rounded(size: 11, weight: .bold))
                             .foregroundStyle(Color.white)
                     }
                 }
@@ -328,10 +327,9 @@ private struct FlowingActionText: View {
                 .disabled(actionState == .loading || actionState == .done)
             }
         }
-        .font(.system(size: horizontalSizeClass == .compact ? 16 : 17, weight: .regular, design: .rounded))
+        .font(DigestPalette.rounded(size: horizontalSizeClass == .compact ? 16 : 17))
         .foregroundStyle(DigestPalette.text)
         .lineSpacing(horizontalSizeClass == .compact ? 3 : 2)
-        .tracking(-0.4)
         .fixedSize(horizontal: false, vertical: true)
     }
 
@@ -400,8 +398,8 @@ private enum DashboardPresentation {
 
     static func clockLabel(for date: Date) -> String {
         let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_GB")
-        formatter.dateFormat = "HH:mm"
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.dateFormat = "h:mm a"
         return formatter.string(from: date)
     }
 
@@ -615,7 +613,10 @@ private enum DashboardPresentation {
             return ""
         }
 
-        return clockLabel(for: date)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_GB")
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: date)
     }
 
     private static func feedSortValue(_ item: AttentionItem) -> TimeInterval? {

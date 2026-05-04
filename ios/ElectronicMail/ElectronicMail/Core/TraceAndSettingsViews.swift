@@ -20,38 +20,47 @@ struct TraceDetailView: View {
         case .loading:
             ProgressView()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.white)
         case .failed(let message):
             ContentUnavailableView {
                 Label("Trace unavailable", systemImage: "exclamationmark.triangle")
+                    .font(DigestPalette.rounded(size: 20, weight: .bold))
+                    .foregroundStyle(DigestPalette.text)
             } description: {
                 Text(message)
+                    .font(DigestPalette.rounded(size: 16))
+                    .foregroundStyle(DigestPalette.muted)
             } actions: {
                 Button("Retry") {
                     Task { await loadTrace() }
                 }
+                .font(DigestPalette.rounded(size: 15, weight: .semibold))
             }
         case .loaded(let trace):
             List {
                 Section("Entity") {
                     Text(trace.entityID)
-                        .font(.footnote.monospaced())
+                        .font(DigestPalette.rounded(size: 13, weight: .semibold))
+                        .foregroundStyle(DigestPalette.text)
                     Text("\(trace.sourceRecordIDs.count) source records")
-                        .foregroundStyle(.secondary)
+                        .font(DigestPalette.rounded(size: 15))
+                        .foregroundStyle(DigestPalette.muted)
                 }
 
                 Section("Pipeline") {
                     ForEach(trace.items) { item in
                         VStack(alignment: .leading, spacing: 6) {
                             Text(item.stage.replacingOccurrences(of: "_", with: " ").capitalized)
-                                .font(.headline)
+                                .font(DigestPalette.rounded(size: 16, weight: .bold))
+                                .foregroundStyle(DigestPalette.text)
                             Text(item.createdAt)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
+                                .font(DigestPalette.rounded(size: 12))
+                                .foregroundStyle(DigestPalette.subtle)
 
                             if !item.output.isEmpty {
                                 Text(outputSummary(item.output))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .font(DigestPalette.rounded(size: 13))
+                                    .foregroundStyle(DigestPalette.muted)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                         }
@@ -97,6 +106,7 @@ struct SettingsView: View {
             Form {
                 Section("Backend") {
                     TextField("Backend URL", text: $backendURL)
+                        .font(DigestPalette.rounded(size: 16))
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -107,11 +117,13 @@ struct SettingsView: View {
                     } label: {
                         Label("Save and Refresh", systemImage: "arrow.clockwise")
                     }
+                    .font(DigestPalette.rounded(size: 16, weight: .semibold))
                 }
 
                 if let profile = store.dashboard?.profile, let email = profile.email {
                     Section("Account") {
                         Label(email, systemImage: "envelope")
+                            .font(DigestPalette.rounded(size: 16))
                     }
                 }
             }
