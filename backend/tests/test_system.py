@@ -26,7 +26,8 @@ class SystemRouteTests(unittest.TestCase):
                 database_path=database_path,
                 google_configured=False,
                 openai_configured=False,
-                openai_model="gpt-5.4",
+                openai_model="gpt-5.4-mini",
+                openai_reasoning_effort="medium",
                 readiness_errors=lambda: [],
             )
 
@@ -37,7 +38,8 @@ class SystemRouteTests(unittest.TestCase):
         self.assertEqual(response.json()["status"], "ready")
         self.assertEqual(response.json()["database"], "sqlite")
         self.assertFalse(response.json()["openai_configured"])
-        self.assertEqual(response.json()["openai_model"], "gpt-5.4")
+        self.assertEqual(response.json()["openai_model"], "gpt-5.4-mini")
+        self.assertEqual(response.json()["openai_reasoning_effort"], "medium")
 
     def test_ready_reports_missing_production_config(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -48,7 +50,8 @@ class SystemRouteTests(unittest.TestCase):
                 database_path=database_path,
                 google_configured=False,
                 openai_configured=False,
-                openai_model="gpt-5.4",
+                openai_model="gpt-5.4-mini",
+                openai_reasoning_effort="medium",
                 readiness_errors=lambda: ["GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required"],
             )
 
@@ -66,7 +69,8 @@ class SystemRouteTests(unittest.TestCase):
                 database_path=Path(tmp_dir) / "missing.db",
                 google_configured=False,
                 openai_configured=False,
-                openai_model="gpt-5.4",
+                openai_model="gpt-5.4-mini",
+                openai_reasoning_effort="medium",
                 readiness_errors=lambda: [],
             )
 
