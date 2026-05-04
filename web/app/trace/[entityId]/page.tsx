@@ -1,5 +1,8 @@
 import type { TraceReplayResponse } from '@electronic-mail/types';
 
+import { isDemoMode } from '../../../lib/api';
+import { getDemoTrace } from '../../../lib/demo-evidence';
+
 type TracePageProps = {
   params: Promise<{
     entityId: string;
@@ -23,10 +26,15 @@ export default async function TracePage({ params }: TracePageProps) {
   let trace: TraceReplayResponse | null = null;
   let errorMessage: string | null = null;
 
-  try {
-    trace = await getTrace(entityId);
-  } catch (error) {
-    errorMessage = error instanceof Error ? error.message : 'Trace replay is unavailable.';
+  if (isDemoMode()) {
+    trace = getDemoTrace(entityId);
+    errorMessage = trace === null ? 'No demo trace exists for this entity.' : null;
+  } else {
+    try {
+      trace = await getTrace(entityId);
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : 'Trace replay is unavailable.';
+    }
   }
 
   return (

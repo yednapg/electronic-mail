@@ -1297,6 +1297,34 @@ a {
   font-weight: 400;
 }
 
+.attention-detail-links {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-top: 18px;
+  color: var(--page-text-muted);
+  font-size: var(--type-detail-source);
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+.attention-detail-links a {
+  color: var(--page-text);
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.attention-detail-links a:hover {
+  color: var(--copy-hover);
+}
+
+.attention-detail-links a:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+
 .attention-detail-source {
   margin-top: 22px;
   color: var(--detail-source);
@@ -1646,6 +1674,13 @@ a {
   .attention-detail-actions {
     gap: 16px;
     margin-top: 16px;
+  }
+
+  .attention-detail-links {
+    flex-wrap: wrap;
+    gap: 8px 11px;
+    margin-top: 15px;
+    font-size: var(--type-mobile-detail-source);
   }
 
   .attention-detail-source {
