@@ -19,7 +19,12 @@ export type DashboardSectionItem = {
   title: string;
   checked?: boolean;
   detail?: {
+    facts?: Array<{
+      label: string;
+      value: string;
+    }>;
     body: string[];
+    evidence?: string[];
     confirmLabel: string;
     dismissLabel: string;
     sourceLabel: string;

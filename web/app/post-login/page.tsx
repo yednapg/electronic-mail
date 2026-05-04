@@ -14,6 +14,9 @@ export default function PostLoginPage() {
             <span className="post-login-title-line">Preparing your dashboard</span>
           </h1>
           <RotatingStatus />
+          <a className="post-login-fallback-link" href="/dashboard">
+            See dashboard
+          </a>
         </div>
       </section>
     </main>
