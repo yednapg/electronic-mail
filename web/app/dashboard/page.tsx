@@ -93,7 +93,7 @@ export function buildSections(feed: FeedResponse): DashboardSectionData[] {
       id: 'now',
       title: 'Now',
       items: sortSectionFeedItems(feed.now).filter(shouldRenderSectionItem).map(toSectionItem),
-      maxVisible: 4,
+      maxVisible: 6,
       collapsedByDefault: true,
     },
     {
@@ -358,20 +358,359 @@ export function toSectionCta(item: FeedItem): DashboardSectionItem['cta'] | unde
 }
 
 export function toSectionDetail(item: FeedItem): DashboardSectionItem['detail'] | undefined {
-  if (item.primary_action !== 'confirm' || !/YC Startup School India/i.test(item.title)) {
+  if (item.source !== 'gmail') {
+    return undefined;
+  }
+
+  const demoDetail = DEMO_DETAIL_BY_ITEM_ID[item.id];
+
+  if (demoDetail !== undefined) {
+    return demoDetail;
+  }
+
+  if (item.primary_action === 'confirm' && /YC Startup School India/i.test(item.title)) {
+    return {
+      facts: toDetailFacts(item, 'Waiting on you', 'RSVP before the attendee list closes'),
+      body: [
+        item.why_this_is_here.trim() || 'YC has accepted your application to attend Startup School India.',
+        'The talk is in Bangalore. Only confirm if you can attend.',
+        'YC will send a calendar invite after you RSVP.',
+      ],
+      evidence: ['YC acceptance email', 'Follow-up RSVP reminder', 'Event details from the same thread'],
+      confirmLabel: 'Yes, I can attend',
+      dismissLabel: 'No',
+      sourceLabel: 'Sources: 3 emails from YC',
+    };
+  }
+
+  if (item.gmail_thread_action !== undefined && item.gmail_thread_action !== null) {
     return undefined;
   }
 
   return {
+    facts: toDetailFacts(item, toCurrentStateLabel(item), toNextMoveLabel(item)),
     body: [
-      item.why_this_is_here.trim() || 'YC has accepted your application to attend Startup School India.',
-      'The talk is in Bangalore. Only confirm if you can attend.',
-      'YC will send a calendar invite after you RSVP.',
+      item.why_this_is_here.trim() || `This ${sourceLabelForItem(item)} item is still open.`,
+      toNextMoveSentence(item),
     ],
+    evidence: [`Thread: ${item.gmail_thread_id ?? item.entity_id}`, `Pipeline trace: ${item.trace_id}`],
+    confirmLabel: primaryActionDoneLabel(item.primary_action),
+    dismissLabel: 'Not needed',
+    sourceLabel: sourceLabelForItem(item),
+  };
+}
+
+const DEMO_DETAIL_BY_ITEM_ID: Record<string, NonNullable<DashboardSectionItem['detail']>> = {
+  'rsvp-yc': {
+    facts: [
+      { label: 'Current', value: 'Waiting on you' },
+      { label: 'Due', value: '11:00 AM' },
+      { label: 'Next', value: 'RSVP before the list closes' },
+    ],
+    body: [
+      'YC accepted your application to attend Startup School India in Bangalore.',
+      'A reminder came in this morning. The thread says they will send the calendar invite after you confirm.',
+      'Next move: decide if you can attend and send the RSVP.',
+    ],
+    evidence: ['Acceptance email from YC', 'Reminder from startupschool@ycombinator.com', 'Event details in the same Gmail thread'],
     confirmLabel: 'Yes, I can attend',
     dismissLabel: 'No',
     sourceLabel: 'Sources: 3 emails from YC',
-  };
+  },
+  'northstar-card-bill': {
+    facts: [
+      { label: 'Current', value: 'Autopay is off' },
+      { label: 'Due', value: '5:00 PM today' },
+      { label: 'Next', value: 'Pay before 5 PM' },
+    ],
+    body: [
+      'The latest Northstar statement says autopay is not enabled for this card.',
+      'A reminder arrived this morning and the due amount is still marked unpaid.',
+      'Next move: pay the card before the 5 PM cutoff, then archive the reminder thread.',
+    ],
+    evidence: ['Northstar statement email', 'Payment reminder from alerts@northstarbank.example', 'No matching payment receipt found today'],
+    confirmLabel: 'Paid',
+    dismissLabel: 'Snooze',
+    sourceLabel: 'Sources: Northstar statement + reminder emails',
+  },
+  'github-pr-418': {
+    facts: [
+      { label: 'Current', value: 'Release waiting on review' },
+      { label: 'Due', value: '2:00 PM deploy window' },
+      { label: 'Next', value: 'Review diff and reply to Rahul' },
+    ],
+    body: [
+      'Rahul asked for one review before cutting the release branch.',
+      'The GitHub notification and Slack-forwarded email both point at the same PR.',
+      'Next move: review PR #418, leave a decision, and tell Rahul whether the deploy is unblocked.',
+    ],
+    evidence: ['GitHub notification for PR #418', 'Rahul follow-up email', 'Release calendar mention at 2 PM'],
+    confirmLabel: 'Reviewed',
+    dismissLabel: 'Later',
+    sourceLabel: 'Sources: GitHub + Rahul thread',
+  },
+  'airbnb-refund': {
+    facts: [
+      { label: 'Current', value: 'Refund case can reopen' },
+      { label: 'Due', value: 'Before 4:00 PM' },
+      { label: 'Next', value: 'Send screenshot' },
+    ],
+    body: [
+      'Airbnb support says they can reopen the refund if you send the payment screenshot.',
+      'They asked twice, and the latest message is still unreplied.',
+      'Next move: attach the screenshot and keep the case number in the reply.',
+    ],
+    evidence: ['Airbnb support reply', 'Case #AB-48820', 'Older refund approval email'],
+    confirmLabel: 'Replied',
+    dismissLabel: 'Skip',
+    sourceLabel: 'Sources: 3 Airbnb support emails',
+  },
+  'pycon-ticket': {
+    facts: [
+      { label: 'Current', value: 'Free ticket available' },
+      { label: 'Due', value: 'No hard deadline' },
+      { label: 'Next', value: 'Register if useful' },
+    ],
+    body: [
+      'PyCon DE & PyData sent a free remote ticket offer.',
+      'The offer is useful but not urgent, so it stays below the deadline work.',
+      'Next move: register only if you want the remote access link.',
+    ],
+    evidence: ['Offer email from PyCon DE & PyData', 'Registration link in the same thread'],
+    confirmLabel: 'Registered',
+    dismissLabel: 'Ignore',
+    sourceLabel: 'Sources: PyCon offer email',
+  },
+  'nse-notice': {
+    facts: [
+      { label: 'Current', value: 'Corporate action notice' },
+      { label: 'Due', value: 'Read today' },
+      { label: 'Next', value: 'Open notice before acting' },
+    ],
+    body: [
+      'NSE sent an OFS notice about selling shares in the IPO.',
+      'The language is financial and needs reading before any decision.',
+      'Next move: read the notice and decide whether to act or archive it.',
+    ],
+    evidence: ['NSE notice email', 'Broker forwarded the same OFS details'],
+    confirmLabel: 'Read',
+    dismissLabel: 'Archive',
+    sourceLabel: 'Sources: NSE + broker emails',
+  },
+  'mercury-form': {
+    facts: [
+      { label: 'Current', value: 'PDF ready to send' },
+      { label: 'Due', value: '6:00 PM' },
+      { label: 'Next', value: 'Send signed form' },
+    ],
+    body: [
+      'Mercury sent the final W-8BEN-E and the thread has the PDF attached.',
+      'The form blocks the banking setup for the demo account.',
+      'Next move: sign the PDF and reply in the same thread.',
+    ],
+    evidence: ['Mercury onboarding email', 'Attached W-8BEN-E PDF', 'Follow-up asking for same-day return'],
+    confirmLabel: 'Sent',
+    dismissLabel: 'Later',
+    sourceLabel: 'Sources: Mercury onboarding thread',
+  },
+  'vercel-invite': {
+    facts: [
+      { label: 'Current', value: 'Invite pending' },
+      { label: 'Due', value: 'Before evening demo' },
+      { label: 'Next', value: 'Approve Nikhil' },
+    ],
+    body: [
+      'Nikhil requested Vercel access so he can check preview deploys.',
+      'The invite is still pending and the demo branch has active changes.',
+      'Next move: approve the team invite, then archive the access email.',
+    ],
+    evidence: ['Vercel team invite email', 'Nikhil access request', 'Preview deploy link in thread'],
+    confirmLabel: 'Approved',
+    dismissLabel: 'Deny',
+    sourceLabel: 'Sources: Vercel + Nikhil thread',
+  },
+  'apple-replacement': {
+    facts: [
+      { label: 'Current', value: 'Replacement shipped' },
+      { label: 'Due', value: 'Return label expires tomorrow' },
+      { label: 'Next', value: 'Track delivery and return old case' },
+    ],
+    body: [
+      'Apple shipped the replacement AirPods case and sent a return label for the old one.',
+      'The label expires tomorrow, so this is not urgent yet but should stay visible today.',
+      'Next move: track the replacement and keep the return label handy.',
+    ],
+    evidence: ['Apple shipment email', 'Return label email', 'Support case update'],
+    confirmLabel: 'Tracked',
+    dismissLabel: 'Hide',
+    sourceLabel: 'Sources: Apple order + support emails',
+  },
+  'vendor-security': {
+    facts: [
+      { label: 'Current', value: 'Questionnaire waiting' },
+      { label: 'Due', value: 'Today' },
+      { label: 'Next', value: 'Review before replying' },
+    ],
+    body: [
+      'A founder prospect sent a security questionnaire before approving the pilot.',
+      'The thread has the spreadsheet attached and one follow-up asking for timing.',
+      'Next move: review the questions and decide what can be answered today.',
+    ],
+    evidence: ['Prospect email', 'Attached security questionnaire', 'Follow-up asking for ETA'],
+    confirmLabel: 'Reviewed',
+    dismissLabel: 'Later',
+    sourceLabel: 'Sources: prospect thread + attachment',
+  },
+  'linear-bug': {
+    facts: [
+      { label: 'Current', value: 'Bug report has a recording' },
+      { label: 'Due', value: 'Today' },
+      { label: 'Next', value: 'Reply with fix status' },
+    ],
+    body: [
+      'Maya sent a screen recording showing the onboarding loop still happening.',
+      'The latest build may already fix it, but she needs a clear answer.',
+      'Next move: check the recording, then reply with the fixed build or a repro question.',
+    ],
+    evidence: ['Maya bug report email', 'Attached screen recording', 'Latest deploy notification'],
+    confirmLabel: 'Replied',
+    dismissLabel: 'Later',
+    sourceLabel: 'Sources: Maya thread + deploy email',
+  },
+  'samsung-delivered': {
+    facts: [
+      { label: 'Current', value: 'Delivered at reception' },
+      { label: 'Due', value: 'No action' },
+      { label: 'Next', value: 'Pick up when free' },
+    ],
+    body: [
+      'Samsung says the monitor was delivered to reception.',
+      'This is useful context, but it should not compete with decisions or payments.',
+    ],
+    evidence: ['Samsung delivery email', 'Courier proof of delivery'],
+    confirmLabel: 'Noted',
+    dismissLabel: 'Hide',
+    sourceLabel: 'Sources: Samsung + courier emails',
+  },
+  'notion-export': {
+    facts: [
+      { label: 'Current', value: 'Backup ready' },
+      { label: 'Due', value: 'Link expires in 7 days' },
+      { label: 'Next', value: 'Download later' },
+    ],
+    body: [
+      'Notion finished exporting the workspace backup.',
+      'The link is available for 7 days, so it belongs in context, not in urgent work.',
+    ],
+    evidence: ['Notion export complete email', 'Workspace backup link'],
+    confirmLabel: 'Saved',
+    dismissLabel: 'Hide',
+    sourceLabel: 'Sources: Notion system email',
+  },
+  'aws-budget': {
+    facts: [
+      { label: 'Current', value: 'Budget warning' },
+      { label: 'Due', value: 'Watch today' },
+      { label: 'Next', value: 'Check spend if it rises again' },
+    ],
+    body: [
+      'AWS says the month is trending 18% above the warning budget.',
+      'It is not a blocker yet, but it is useful context before spinning up more services.',
+    ],
+    evidence: ['AWS budget alert', 'Previous monthly spend email'],
+    confirmLabel: 'Checked',
+    dismissLabel: 'Hide',
+    sourceLabel: 'Sources: AWS budget email',
+  },
+};
+
+function toDetailFacts(item: FeedItem, current: string, next: string): NonNullable<DashboardSectionItem['detail']>['facts'] {
+  const facts = [
+    { label: 'Current', value: current },
+    { label: 'Next', value: next },
+  ];
+
+  if (item.due_at !== undefined && item.due_at !== null && item.due_at.length > 0) {
+    facts.splice(1, 0, { label: 'Due', value: formatScheduleTime(item.due_at) });
+  }
+
+  return facts;
+}
+
+function toCurrentStateLabel(item: FeedItem): string {
+  if (item.current_state === 'waiting') {
+    return 'Waiting on someone else';
+  }
+
+  if (item.current_state === 'done') {
+    return 'Already done';
+  }
+
+  return 'Waiting on you';
+}
+
+function toNextMoveLabel(item: FeedItem): string {
+  switch (item.primary_action) {
+    case 'reply':
+      return 'Reply in the thread';
+    case 'confirm':
+      return 'Confirm or decline';
+    case 'pay':
+      return 'Make the payment';
+    case 'track':
+      return 'Check latest status';
+    case 'review':
+      return 'Review and decide';
+    case 'send':
+      return 'Send the missing item';
+    case 'approve':
+      return 'Approve or deny';
+    case 'register':
+      return 'Register if useful';
+    case 'open':
+      return 'Open and read';
+    default:
+      return 'Decide whether this matters';
+  }
+}
+
+function toNextMoveSentence(item: FeedItem): string {
+  return `Next move: ${toNextMoveLabel(item).toLowerCase()}.`;
+}
+
+function primaryActionDoneLabel(action: string): string {
+  switch (action) {
+    case 'reply':
+      return 'Replied';
+    case 'confirm':
+      return 'Confirmed';
+    case 'pay':
+      return 'Paid';
+    case 'track':
+      return 'Tracked';
+    case 'review':
+      return 'Reviewed';
+    case 'send':
+      return 'Sent';
+    case 'approve':
+      return 'Approved';
+    case 'register':
+      return 'Registered';
+    case 'open':
+      return 'Read';
+    default:
+      return 'Done';
+  }
+}
+
+function sourceLabelForItem(item: FeedItem): string {
+  if (item.source === 'calendar') {
+    return 'Source: Calendar';
+  }
+
+  return item.gmail_thread_id !== null && item.gmail_thread_id !== undefined
+    ? `Source: Gmail thread ${item.gmail_thread_id}`
+    : 'Source: Gmail';
 }
 
 function sortSectionFeedItems(items: FeedItem[]): FeedItem[] {
