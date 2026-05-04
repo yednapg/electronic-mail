@@ -12,7 +12,8 @@ export default function HomePage() {
 
         <div className="login-copy">
           <h1 className="login-title">
-            <span className="login-title-line">Emails turned into to-do list!</span>
+            <span className="login-title-line">Work first.</span>
+            <span className="login-title-line">Emails underneath.</span>
           </h1>
         </div>
 

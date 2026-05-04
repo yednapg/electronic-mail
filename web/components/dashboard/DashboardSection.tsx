@@ -1,7 +1,7 @@
 'use client';
 
 /** Render one checklist-style dashboard section and manage local checked state. */
-import { useState } from 'react';
+import { useState, type CSSProperties } from 'react';
 
 import type { DashboardSectionItem } from './types';
 
@@ -20,7 +20,6 @@ export function DashboardSection({
 }: DashboardSectionProps) {
   const hasOverflow = maxVisible !== undefined && items.length > maxVisible;
   const [expanded, setExpanded] = useState(!hasOverflow || !collapsedByDefault);
-  const [expandedItemId, setExpandedItemId] = useState<string | null>(null);
   const visibleItems = hasOverflow && !expanded ? items.slice(0, maxVisible) : items;
   const overflowCount = hasOverflow ? items.length - (maxVisible ?? items.length) : 0;
 
@@ -31,15 +30,8 @@ export function DashboardSection({
       </div>
 
       <ul className="attention-list">
-        {visibleItems.map((item) => (
-          <DashboardSectionItemRow
-            key={item.id}
-            item={item}
-            expanded={expandedItemId === item.id}
-            onToggleDetail={() => {
-              setExpandedItemId((currentId) => (currentId === item.id ? null : item.id));
-            }}
-          />
+        {visibleItems.map((item, index) => (
+          <DashboardSectionItemRow key={item.id} item={item} index={index} />
         ))}
       </ul>
 
@@ -59,20 +51,16 @@ export function DashboardSection({
 
 function DashboardSectionItemRow({
   item,
-  expanded,
-  onToggleDetail,
+  index,
 }: {
   item: DashboardSectionItem;
-  expanded: boolean;
-  onToggleDetail: () => void;
+  index: number;
 }) {
-  // Checkboxes are intentionally local-only; they are a UI affordance, not persisted state.
-  const [checked, setChecked] = useState(item.checked ?? false);
   const [ctaState, setCtaState] = useState<'idle' | 'loading' | 'done'>('idle');
   const detailId = `attention-detail-${item.id}`;
+  const checkboxId = `attention-check-${item.id}`;
   const copyClassName = [
     'attention-copy',
-    checked ? 'is-checked' : '',
     item.cta?.placement === 'prefix' ? 'has-prefix-cta' : '',
     item.cta && item.cta.placement !== 'prefix' ? 'has-suffix-cta' : '',
   ]
@@ -107,30 +95,22 @@ function DashboardSectionItemRow({
     }
   }
 
+  const itemStyle = { '--attention-index': index } as CSSProperties;
+
   return (
-    <li className={`attention-item ${item.detail ? 'attention-item-expandable' : ''}`}>
+    <li className={`attention-item ${item.detail ? 'attention-item-expandable' : ''}`} style={itemStyle}>
+      <input id={checkboxId} type="checkbox" className="attention-checkbox-input" defaultChecked={item.checked ?? false} />
       <div className="attention-item-line">
-        <button
-          type="button"
-          className={`attention-checkbox ${checked ? 'is-checked' : ''}`}
-          aria-pressed={checked}
-          aria-label={`${checked ? 'Untick' : 'Tick'} ${item.title}`}
-          onClick={() => setChecked((value) => !value)}
-        >
-          <span className="attention-checkbox-mark" aria-hidden="true">
-            {checked ? '✓' : ''}
-          </span>
-        </button>
+        <label className="attention-checkbox" htmlFor={checkboxId} aria-label={`Toggle ${item.title}`}>
+          <span className="attention-checkbox-mark" aria-hidden="true" />
+        </label>
         {item.detail ? (
-          <button
-            type="button"
-            className={`${copyClassName} attention-copy-button`}
-            aria-expanded={expanded}
-            aria-controls={detailId}
-            onClick={onToggleDetail}
-          >
-            <span>{item.title}</span>
-          </button>
+          <details className="attention-details-native">
+            <summary className={`${copyClassName} attention-copy-button`} aria-controls={detailId}>
+              <span>{item.title}</span>
+            </summary>
+            <DashboardItemDetail id={detailId} item={item} checkboxId={checkboxId} />
+          </details>
         ) : (
           <p className={copyClassName}>
             {item.cta?.placement === 'prefix' ? (
@@ -152,16 +132,6 @@ function DashboardSectionItemRow({
           </p>
         )}
       </div>
-
-      {item.detail ? (
-        <DashboardItemDetail
-          id={detailId}
-          item={item}
-          expanded={expanded}
-          onConfirm={() => setChecked(true)}
-          onDismiss={() => setChecked(false)}
-        />
-      ) : null}
     </li>
   );
 }
@@ -169,61 +139,55 @@ function DashboardSectionItemRow({
 function DashboardItemDetail({
   id,
   item,
-  expanded,
-  onConfirm,
-  onDismiss,
+  checkboxId,
 }: {
   id: string;
   item: DashboardSectionItem;
-  expanded: boolean;
-  onConfirm: () => void;
-  onDismiss: () => void;
+  checkboxId: string;
 }) {
-  const [decision, setDecision] = useState<'yes' | 'no' | null>(null);
-
   if (!item.detail) {
     return null;
   }
 
   return (
-    <div id={id} className={`attention-detail ${expanded ? 'is-expanded' : ''}`} aria-hidden={!expanded}>
+    <div id={id} className="attention-detail">
       <div className="attention-detail-clip">
         <div className="attention-detail-panel">
           <div className="attention-detail-body">
+            {item.detail.facts !== undefined && item.detail.facts.length > 0 ? (
+              <dl className="attention-detail-facts">
+                {item.detail.facts.map((fact) => (
+                  <div key={`${fact.label}-${fact.value}`} className="attention-detail-fact">
+                    <dt>{fact.label}</dt>
+                    <dd>{fact.value}</dd>
+                  </div>
+                ))}
+              </dl>
+            ) : null}
             {item.detail.body.map((line) => (
               <p key={line}>{line}</p>
             ))}
+            {item.detail.evidence !== undefined && item.detail.evidence.length > 0 ? (
+              <div className="attention-detail-evidence">
+                <p className="attention-detail-evidence-title">Source evidence</p>
+                <ul>
+                  {item.detail.evidence.map((line) => (
+                    <li key={line}>{line}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
           </div>
           <div className="attention-detail-actions" aria-label={`Actions for ${item.title}`}>
-            <button
-              type="button"
-              className={`attention-detail-action attention-detail-action-primary ${
-                decision === 'yes' ? 'is-selected' : ''
-              }`}
-              disabled={!expanded}
-              onClick={() => {
-                setDecision('yes');
-                onConfirm();
-              }}
-            >
+            <label htmlFor={checkboxId} className="attention-detail-action attention-detail-action-primary">
               {item.detail.confirmLabel}
-            </button>
+            </label>
             <span className="attention-detail-divider" aria-hidden="true">
               |
             </span>
-            <button
-              type="button"
-              className={`attention-detail-action attention-detail-action-secondary ${
-                decision === 'no' ? 'is-selected' : ''
-              }`}
-              disabled={!expanded}
-              onClick={() => {
-                setDecision('no');
-                onDismiss();
-              }}
-            >
+            <span className="attention-detail-action attention-detail-action-secondary">
               {item.detail.dismissLabel}
-            </button>
+            </span>
           </div>
           <p className="attention-detail-source">{item.detail.sourceLabel}</p>
         </div>

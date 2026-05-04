@@ -33,8 +33,12 @@ test('dashboard fetcher returns hardcoded demo data without fetching backend', a
 
     assert.equal(dashboard.auth.connected, true);
     assert.equal(dashboard.profile?.display_name, 'Gaurav Pandey');
-    assert.match(dashboard.briefing?.brief ?? '', /📆 3 meetings/);
-    assert.equal(dashboard.feed.now.length, 8);
+    assert.match(dashboard.briefing?.brief ?? '', /📆 5 meetings/);
+    assert.ok(dashboard.feed.now.length > 0);
+    assert.ok(dashboard.feed.today.length > 0);
+    assert.ok(dashboard.feed.worth_knowing.length > 0);
+    assert.ok(dashboard.feed.now.some((item) => item.id === 'hdfc-card-bill'));
+    assert.ok(dashboard.feed.today.some((item) => item.id === 'apple-replacement'));
   } finally {
     if (previousMode === undefined) {
       delete process.env.NEXT_PUBLIC_DEMO_MODE;

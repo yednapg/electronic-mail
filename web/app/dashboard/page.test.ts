@@ -145,6 +145,49 @@ test('dashboard renders a Worth Knowing section for low-priority overflow items'
   assert.equal(worthKnowing?.items.length, 1);
 });
 
+test('dashboard renders all work buckets when inbox items exist in each one', () => {
+  const sections = buildSections(
+    createFeed({
+      now: [
+        createFeedItem({
+          id: 'now-work',
+          entity_id: 'now-work',
+          source: 'gmail',
+          timing_band: 'now',
+          title: 'HDFC credit card bill due today',
+          primary_action: 'pay',
+        }),
+      ],
+      today: [
+        createFeedItem({
+          id: 'today-work',
+          entity_id: 'today-work',
+          source: 'gmail',
+          timing_band: 'today',
+          title: 'Vendor security questionnaire',
+          primary_action: 'review',
+        }),
+      ],
+      worth_knowing: [
+        createFeedItem({
+          id: 'later-context',
+          entity_id: 'later-context',
+          source: 'gmail',
+          timing_band: 'later',
+          need_type: 'awareness',
+          title: 'Your Samsung order #12304086779 was delivered.',
+          primary_action: 'none',
+        }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(
+    sections.map((section) => section.title),
+    ['Now', 'Today', 'Worth Knowing'],
+  );
+});
+
 test('dashboard summary renders backend-generated briefing copy without rewriting it', () => {
   const summary = buildSummary({
     briefing: {
@@ -181,6 +224,7 @@ test('gmail items expose an explicit archive CTA when one thread can be mutated'
 
 test('YC RSVP items expose expandable detail instead of an inline CTA', () => {
   const item = createFeedItem({
+    source: 'gmail',
     title: 'RSVP for YC Startup School India',
     primary_action: 'confirm',
     why_this_is_here: 'YC has accepted your application to attend Startup School India.',
@@ -189,13 +233,39 @@ test('YC RSVP items expose expandable detail instead of an inline CTA', () => {
   assert.equal(toActionSentence(item), 'RSVP for YC Startup School India');
   assert.equal(toSectionCta(item), undefined);
   assert.deepEqual(toSectionDetail(item), {
+    facts: [
+      { label: 'Current', value: 'Waiting on you' },
+      { label: 'Next', value: 'RSVP before the attendee list closes' },
+    ],
     body: [
       'YC has accepted your application to attend Startup School India.',
       'The talk is in Bangalore. Only confirm if you can attend.',
       'YC will send a calendar invite after you RSVP.',
     ],
+    evidence: ['YC acceptance email', 'Follow-up RSVP reminder', 'Event details from the same thread'],
     confirmLabel: 'Yes, I can attend',
     dismissLabel: 'No',
     sourceLabel: 'Sources: 3 emails from YC',
   });
+});
+
+test('demo inbox items expose current state, next move, and source evidence', () => {
+  const detail = toSectionDetail(
+    createFeedItem({
+      id: 'hdfc-card-bill',
+      entity_id: 'entity-hdfc-card-bill',
+      source: 'gmail',
+      title: 'HDFC credit card bill due today',
+      primary_action: 'pay',
+      why_this_is_here: 'The statement says autopay is off and the bill is due by 5 PM.',
+    }),
+  );
+
+  assert.equal(detail?.facts?.[0].value, 'Autopay is off');
+  assert.match(detail?.body.join(' ') ?? '', /Next move: pay the card/);
+  assert.deepEqual(detail?.evidence, [
+    'HDFC statement email',
+    'Payment reminder from alerts@hdfcbank.net',
+    'No matching payment receipt found today',
+  ]);
 });

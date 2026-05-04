@@ -11,6 +11,10 @@ type DemoItemInput = {
   action: string;
   source?: 'gmail' | 'calendar';
   dueAt?: string | null;
+  importance?: FeedItem['importance_level'];
+  lifecycle?: FeedItem['lifecycle_state'];
+  currentState?: FeedItem['current_state'];
+  threadId?: string | null;
   threadAction?: FeedItem['gmail_thread_action'];
 };
 
@@ -29,11 +33,11 @@ function demoItem(input: DemoItemInput): FeedItem {
     title: input.title,
     why_this_is_here: input.why,
     due_at: input.dueAt ?? null,
-    importance_level: input.timing === 'now' ? 'high' : 'medium',
-    lifecycle_state: input.action === 'none' ? 'scheduled' : 'active',
-    current_state: input.action === 'none' ? 'waiting' : 'open',
+    importance_level: input.importance ?? (input.timing === 'now' ? 'high' : 'medium'),
+    lifecycle_state: input.lifecycle ?? (input.action === 'none' ? 'scheduled' : 'active'),
+    current_state: input.currentState ?? (input.action === 'none' ? 'waiting' : 'open'),
     source: input.source ?? 'gmail',
-    gmail_thread_id: input.threadAction ? `demo-thread-${input.id}` : null,
+    gmail_thread_id: input.threadId ?? (input.threadAction ? `demo-thread-${input.id}` : null),
     gmail_thread_action: input.threadAction ?? null,
     trace_id: `trace-${input.id}`,
     created_at: DEMO_CREATED_AT,
@@ -53,7 +57,7 @@ export const demoDashboard: DashboardResponse = {
   briefing: {
     headline: 'Good morning, Gaurav.',
     brief:
-      'You have 📆 3 meetings, ✅ 2 tasks and 📨 5 emails to reply, you also have a 💸 1 credit card bill payment due today. You’re mostly free after 🌄 4 pm.',
+      'You have 📆 5 meetings, ✅ 8 open tasks and 📨 11 useful emails pulled into work. Your credit card bill and YC RSVP need a decision before noon. You’re mostly free after 🌄 4 pm.',
   },
   feed: {
     now: [
@@ -105,9 +109,38 @@ export const demoDashboard: DashboardResponse = {
       demoItem({
         id: 'rsvp-yc',
         title: 'RSVP for YC Startup School India',
-        why: 'YC has accepted your application to attend Startup School India.',
+        why: 'YC accepted your application and needs your RSVP before the Bangalore attendee list closes.',
         timing: 'now',
         action: 'confirm',
+        dueAt: '2023-02-01T11:00:00+05:30',
+        threadId: 'yc-startup-school-rsvp',
+      }),
+      demoItem({
+        id: 'hdfc-card-bill',
+        title: 'HDFC credit card bill due today',
+        why: 'The statement says autopay is off and the bill is due by 5 PM.',
+        timing: 'now',
+        action: 'pay',
+        dueAt: '2023-02-01T17:00:00+05:30',
+        threadId: 'hdfc-card-statement-feb',
+      }),
+      demoItem({
+        id: 'github-pr-418',
+        title: "Review PR #418 before Rahul's release",
+        why: 'Rahul asked for review before the 2 PM deploy window.',
+        timing: 'now',
+        action: 'review',
+        dueAt: '2023-02-01T14:00:00+05:30',
+        threadId: 'github-pr-418-release',
+      }),
+      demoItem({
+        id: 'airbnb-refund',
+        title: 'Reply to Airbnb refund request',
+        why: 'Support needs one more screenshot to reopen the refund case.',
+        timing: 'now',
+        action: 'reply',
+        dueAt: '2023-02-01T16:00:00+05:30',
+        threadId: 'airbnb-refund-ab-48820',
       }),
       demoItem({
         id: 'pycon-ticket',
@@ -115,6 +148,7 @@ export const demoDashboard: DashboardResponse = {
         why: 'The event is offering a free remote ticket.',
         timing: 'now',
         action: 'register',
+        threadId: 'pycon-free-remote-ticket',
       }),
       demoItem({
         id: 'nse-notice',
@@ -122,11 +156,87 @@ export const demoDashboard: DashboardResponse = {
         why: 'The notice needs to be read before taking action.',
         timing: 'now',
         action: 'open',
+        threadId: 'nse-ofs-ipo-notice',
       }),
     ],
     today: [
+      demoItem({
+        id: 'mercury-form',
+        title: 'Send signed Mercury banking form',
+        why: 'Mercury sent the final W-8BEN-E PDF and asked for it before end of day.',
+        timing: 'today',
+        action: 'send',
+        dueAt: '2023-02-01T18:00:00+05:30',
+        threadId: 'mercury-w8bene-final',
+      }),
+      demoItem({
+        id: 'vercel-invite',
+        title: 'Approve Vercel team invite for Nikhil',
+        why: 'Nikhil requested access to preview deploys for the demo branch.',
+        timing: 'today',
+        action: 'approve',
+        dueAt: '2023-02-01T19:00:00+05:30',
+        threadId: 'vercel-team-invite-nikhil',
+      }),
+      demoItem({
+        id: 'apple-replacement',
+        title: 'Track Apple order replacement',
+        why: 'Apple shipped the replacement AirPods case and the old return label expires tomorrow.',
+        timing: 'today',
+        action: 'track',
+        threadId: 'apple-replacement-airpods',
+      }),
+      demoItem({
+        id: 'vendor-security',
+        title: 'Review vendor security questionnaire',
+        why: 'A founder prospect sent a security questionnaire before approving the pilot.',
+        timing: 'today',
+        action: 'review',
+        threadId: 'vendor-security-pilot',
+      }),
+      demoItem({
+        id: 'linear-bug',
+        title: 'Reply to Linear bug report from Maya',
+        why: 'Maya attached a screen recording of the onboarding loop and asked if it is fixed.',
+        timing: 'today',
+        action: 'reply',
+        threadId: 'linear-onboarding-loop-maya',
+      }),
     ],
     worth_knowing: [
+      demoItem({
+        id: 'samsung-delivered',
+        title: 'Your Samsung order #12304086779 was delivered.',
+        why: 'The delivery email confirms the monitor arrived at reception.',
+        timing: 'later',
+        action: 'none',
+        importance: 'low',
+        lifecycle: 'resolved',
+        currentState: 'done',
+        threadId: 'samsung-monitor-delivered',
+      }),
+      demoItem({
+        id: 'notion-export',
+        title: 'Notion finished exporting your workspace backup.',
+        why: 'The export link is available for 7 days.',
+        timing: 'later',
+        action: 'none',
+        importance: 'low',
+        lifecycle: 'resolved',
+        currentState: 'done',
+        threadId: 'notion-workspace-export',
+      }),
+      demoItem({
+        id: 'aws-budget',
+        title: 'AWS says this month is trending 18% above budget.',
+        why: 'The budget alert crossed the warning threshold this morning.',
+        timing: 'later',
+        action: 'none',
+        importance: 'low',
+        lifecycle: 'active',
+        currentState: 'waiting',
+        threadId: 'aws-budget-alert-may',
+      }),
     ],
   },
 };

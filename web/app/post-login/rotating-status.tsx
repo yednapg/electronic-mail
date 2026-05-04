@@ -6,10 +6,10 @@ const STATUS_VISIBLE_MS = 1600;
 const STATUS_FADE_MS = 260;
 
 const statusMessages = [
-  'Checking Gmail and Calendar...',
-  'Finding replies, tasks, bills, and invites...',
-  "Turning it into today's list...",
-  'See demo.',
+  'Reading latest Gmail threads...',
+  'Grouping orders, bills, bugs, refunds, and approvals...',
+  'Finding current state and next move...',
+  'Keeping raw emails as evidence...',
 ];
 
 export function RotatingStatus() {

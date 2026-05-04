@@ -655,10 +655,41 @@ a {
   transform: translateY(0);
 }
 
+.post-login-fallback-link {
+  color: var(--page-text);
+  font-size: var(--type-transition-copy);
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: 0;
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.post-login-fallback-link:hover {
+  color: var(--copy-hover);
+}
+
+.post-login-fallback-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+
 @keyframes post-login-mark-in {
   0% {
     opacity: 0;
     transform: translateY(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes attention-item-in {
+  0% {
+    opacity: 0;
+    transform: translateY(5px);
   }
   100% {
     opacity: 1;
@@ -723,24 +754,26 @@ a {
 }
 
 .digest-agenda {
+  margin-top: var(--digest-first-block-gap);
   margin-bottom: 56px;
   padding: 22px 27px 21px;
   border-radius: 6px;
   background: var(--agenda-bg);
 }
 
-.digest-shell-brief-hidden .digest-agenda,
-.digest-shell:not(:has(.digest-summary)) .digest-agenda,
-.digest-shell-brief-hidden.digest-shell-calendar-hidden .digest-sections,
-.digest-shell:not(:has(.digest-summary)):not(:has(.digest-agenda)) .digest-sections,
-.digest-shell:not(:has(.digest-summary)):not(:has(.digest-agenda)) .digest-empty-state,
-.digest-shell-brief-hidden.digest-shell-calendar-hidden .digest-empty-state {
-  margin-top: var(--digest-first-block-gap);
+.digest-summary + .digest-agenda {
+  margin-top: 0;
 }
 
 .digest-sections {
   display: grid;
+  margin-top: var(--digest-first-block-gap);
   gap: 51px;
+}
+
+.digest-summary + .digest-sections,
+.digest-agenda + .digest-sections {
+  margin-top: 0;
 }
 
 .digest-auth-state {
@@ -843,6 +876,8 @@ a {
 
 .attention-item {
   display: block;
+  animation: attention-item-in 360ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation-delay: calc(var(--attention-index, 0) * 34ms);
 }
 
 .attention-item + .attention-item {
@@ -853,6 +888,15 @@ a {
   display: flex;
   align-items: flex-start;
   gap: 11px;
+}
+
+.attention-checkbox-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .digest-section-toggle {
@@ -967,9 +1011,24 @@ a {
   color: var(--checkbox-checked-text);
 }
 
+.attention-checkbox-input:checked + .attention-item-line .attention-checkbox {
+  border-color: var(--focus-ring);
+  background: var(--focus-ring);
+  color: var(--checkbox-checked-text);
+}
+
+.attention-checkbox-input:focus-visible + .attention-item-line .attention-checkbox {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
 .attention-checkbox-mark {
   font-size: var(--type-checkmark);
   line-height: 1;
+}
+
+.attention-checkbox-input:checked + .attention-item-line .attention-checkbox-mark::before {
+  content: "✓";
 }
 
 .attention-checkbox:focus-visible {
@@ -985,6 +1044,30 @@ a {
   line-height: 1.3;
   letter-spacing: 0;
   overflow-wrap: break-word;
+  transition:
+    color 160ms ease,
+    opacity 160ms ease;
+}
+
+.attention-checkbox-input:checked + .attention-item-line .attention-copy {
+  color: var(--page-text-subtle);
+  opacity: 0.64;
+  text-decoration: line-through;
+  text-decoration-thickness: 1.4px;
+  text-decoration-color: color-mix(in srgb, var(--page-text-subtle) 58%, transparent);
+}
+
+.attention-details-native {
+  min-width: 0;
+  flex: 1;
+}
+
+.attention-details-native > summary {
+  list-style: none;
+}
+
+.attention-details-native > summary::-webkit-details-marker {
+  display: none;
 }
 
 .attention-copy-button {
@@ -1049,7 +1132,7 @@ a {
 }
 
 .digest-empty-state {
-  margin: 9px 0 0;
+  margin: var(--digest-first-block-gap) 0 0;
   color: var(--page-text-muted);
   font-size: var(--type-debug-body);
   line-height: 1.35;
@@ -1076,6 +1159,14 @@ a {
   transform: translateY(0);
 }
 
+.attention-details-native[open] .attention-detail {
+  grid-template-rows: 1fr;
+  margin-top: 11px;
+  margin-bottom: 18px;
+  opacity: 1;
+  transform: translateY(0);
+}
+
 .attention-detail-clip {
   min-height: 0;
   overflow: hidden;
@@ -1093,12 +1184,73 @@ a {
   gap: 7px;
 }
 
+.attention-detail-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0 0 8px;
+}
+
+.attention-detail-fact {
+  min-width: 0;
+}
+
+.attention-detail-fact dt {
+  margin: 0 0 3px;
+  color: var(--page-text-subtle);
+  font-size: var(--type-debug);
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.attention-detail-fact dd {
+  margin: 0;
+  color: var(--page-text);
+  font-size: var(--type-detail);
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: 0;
+  overflow-wrap: break-word;
+}
+
 .attention-detail-body p,
 .attention-detail-source {
   margin: 0;
   font-size: var(--type-detail);
   font-weight: 400;
   line-height: 1.35;
+  letter-spacing: 0;
+}
+
+.attention-detail-evidence {
+  margin-top: 7px;
+  padding-top: 12px;
+  border-top: 1px solid var(--rule);
+}
+
+.attention-detail-evidence-title {
+  margin: 0 0 7px;
+  color: var(--page-text);
+  font-size: var(--type-detail-source);
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+.attention-detail-evidence ul {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 17px;
+  color: var(--detail-source);
+}
+
+.attention-detail-evidence li {
+  margin: 0;
+  font-size: var(--type-detail-source);
+  line-height: 1.32;
   letter-spacing: 0;
 }
 
@@ -1119,6 +1271,7 @@ a {
   line-height: 1.25;
   letter-spacing: 0;
   cursor: pointer;
+  text-decoration: none;
 }
 
 .attention-detail-action-primary {
@@ -1152,6 +1305,7 @@ a {
 
 @media (prefers-reduced-motion: reduce) {
   .attention-detail,
+  .attention-item,
   .post-login-status-text,
   .login-google-button,
   .attention-checkbox,
@@ -1392,6 +1546,15 @@ a {
     background: var(--focus-ring);
   }
 
+  .attention-checkbox-input:checked + .attention-item-line .attention-checkbox {
+    background: transparent;
+  }
+
+  .attention-checkbox-input:checked + .attention-item-line .attention-checkbox::before {
+    border-color: var(--focus-ring);
+    background: var(--focus-ring);
+  }
+
   .attention-checkbox-mark {
     position: relative;
     z-index: 1;
@@ -1448,11 +1611,36 @@ a {
     gap: 6px;
   }
 
+  .attention-detail-facts {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    margin-bottom: 9px;
+  }
+
+  .attention-detail-fact dt {
+    font-size: 11px;
+  }
+
+  .attention-detail-fact dd {
+    font-size: var(--type-mobile-detail);
+    line-height: 1.3;
+  }
+
   .attention-detail-body p,
   .attention-detail-action,
   .attention-detail-divider {
     font-size: var(--type-mobile-detail);
     line-height: 1.34;
+  }
+
+  .attention-detail-evidence {
+    margin-top: 6px;
+    padding-top: 10px;
+  }
+
+  .attention-detail-evidence-title,
+  .attention-detail-evidence li {
+    font-size: var(--type-mobile-detail-source);
   }
 
   .attention-detail-actions {
