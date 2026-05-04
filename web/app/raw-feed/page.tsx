@@ -13,31 +13,44 @@ async function getRawFeed(): Promise<SourceRecord[]> {
 }
 
 export default async function RawFeedPage() {
-  const records = await getRawFeed();
+  let records: SourceRecord[] = [];
+  let errorMessage: string | null = null;
+
+  try {
+    records = await getRawFeed();
+  } catch (error) {
+    errorMessage = error instanceof Error ? error.message : 'Raw feed is unavailable.';
+  }
 
   return (
     <main className="digest-page">
-      <div className="digest-shell">
-        <h1 className="digest-section-title">Raw Gmail Feed</h1>
-        <p className="attention-copy">Records: {records.length}</p>
+      <div className="debug-shell">
+        <header className="debug-header">
+          <h1 className="debug-title">Raw Gmail Feed</h1>
+          <p className="debug-copy">{errorMessage ?? `Records: ${records.length}`}</p>
+        </header>
 
-        <div className="digest-sections">
-          {records.map((record) => (
-            <section key={record.id} className="digest-section" aria-label={record.id}>
-              <div className="digest-section-header">
-                <h2 className="digest-section-title">
-                  {typeof record.raw_payload.subject === 'string' && record.raw_payload.subject
-                    ? record.raw_payload.subject
-                    : 'Untitled'}
-                </h2>
-              </div>
-              <p className="attention-copy">Source: {record.source}</p>
-              <p className="attention-copy">Thread: {record.thread_id}</p>
-              <p className="attention-copy">Received: {record.received_at}</p>
-              <pre className="trace-block">{JSON.stringify(record.raw_payload, null, 2)}</pre>
-            </section>
-          ))}
-        </div>
+        {errorMessage === null ? (
+          <div className="debug-sections">
+            {records.map((record) => (
+              <section key={record.id} className="digest-section" aria-label={record.id}>
+                <div className="debug-section-header">
+                  <h2 className="debug-section-title">
+                    {typeof record.raw_payload.subject === 'string' && record.raw_payload.subject
+                      ? record.raw_payload.subject
+                      : 'Untitled'}
+                  </h2>
+                </div>
+                <div className="debug-meta">
+                  <p className="debug-copy">Source: {record.source}</p>
+                  <p className="debug-copy">Thread: {record.thread_id}</p>
+                  <p className="debug-copy">Received: {record.received_at}</p>
+                </div>
+                <pre className="trace-block">{JSON.stringify(record.raw_payload, null, 2)}</pre>
+              </section>
+            ))}
+          </div>
+        ) : null}
       </div>
     </main>
   );

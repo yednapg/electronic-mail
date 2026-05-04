@@ -8,12 +8,18 @@ import { formatClockTime, formatDate } from '../../lib/formatting';
 type DashboardMetaProps = {
   dateLabel: string;
   timeLabel: string;
+  live?: boolean;
 };
 
-export function DashboardMeta({ dateLabel, timeLabel }: DashboardMetaProps) {
+export function DashboardMeta({ dateLabel, timeLabel, live = true }: DashboardMetaProps) {
   const [currentLabels, setCurrentLabels] = useState({ dateLabel, timeLabel });
 
   useEffect(() => {
+    if (!live) {
+      setCurrentLabels({ dateLabel, timeLabel });
+      return;
+    }
+
     // The initial labels are server-rendered; refresh client-side to keep the clock ticking.
     const syncLabels = () => {
       const now = new Date();
@@ -29,7 +35,7 @@ export function DashboardMeta({ dateLabel, timeLabel }: DashboardMetaProps) {
     const timer = setInterval(syncLabels, 1000);
 
     return () => clearInterval(timer);
-  }, []);
+  }, [dateLabel, live, timeLabel]);
 
   return (
     <header className="digest-meta" aria-label="Current date and time">
