@@ -1,34 +1,47 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { getBackendURL } from './api';
+import { getDashboard, isDemoMode } from './api';
 
-test('backend URL defaults to local backend', () => {
-  const previous = process.env.DECISION_PIPELINE_BACKEND_URL;
-  delete process.env.DECISION_PIPELINE_BACKEND_URL;
+test('demo mode is enabled by default on the demo branch', () => {
+  const previousMode = process.env.NEXT_PUBLIC_DEMO_MODE;
+
+  delete process.env.NEXT_PUBLIC_DEMO_MODE;
 
   try {
-    assert.equal(getBackendURL(), 'http://localhost:3001');
+    assert.equal(isDemoMode(), true);
   } finally {
-    if (previous === undefined) {
-      delete process.env.DECISION_PIPELINE_BACKEND_URL;
+    if (previousMode === undefined) {
+      delete process.env.NEXT_PUBLIC_DEMO_MODE;
     } else {
-      process.env.DECISION_PIPELINE_BACKEND_URL = previous;
+      process.env.NEXT_PUBLIC_DEMO_MODE = previousMode;
     }
   }
 });
 
-test('backend URL comes from env without trailing slash', () => {
-  const previous = process.env.DECISION_PIPELINE_BACKEND_URL;
-  process.env.DECISION_PIPELINE_BACKEND_URL = 'https://api.example.com/';
+test('dashboard fetcher returns hardcoded demo data without fetching backend', async () => {
+  const previousMode = process.env.NEXT_PUBLIC_DEMO_MODE;
+  const previousFetch = globalThis.fetch;
+
+  delete process.env.NEXT_PUBLIC_DEMO_MODE;
+  globalThis.fetch = (() => {
+    throw new Error('Demo dashboard should not fetch the backend');
+  }) as typeof fetch;
 
   try {
-    assert.equal(getBackendURL(), 'https://api.example.com');
+    const dashboard = await getDashboard();
+
+    assert.equal(dashboard.auth.connected, true);
+    assert.equal(dashboard.profile?.display_name, 'Gaurav Pandey');
+    assert.match(dashboard.briefing?.brief ?? '', /📆 3 meetings/);
+    assert.equal(dashboard.feed.now.length, 3);
   } finally {
-    if (previous === undefined) {
-      delete process.env.DECISION_PIPELINE_BACKEND_URL;
+    if (previousMode === undefined) {
+      delete process.env.NEXT_PUBLIC_DEMO_MODE;
     } else {
-      process.env.DECISION_PIPELINE_BACKEND_URL = previous;
+      process.env.NEXT_PUBLIC_DEMO_MODE = previousMode;
     }
+
+    globalThis.fetch = previousFetch;
   }
 });

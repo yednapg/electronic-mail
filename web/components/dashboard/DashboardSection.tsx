@@ -59,6 +59,11 @@ function DashboardSectionItemRow({ item }: { item: DashboardSectionItem }) {
       return;
     }
 
+    if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'false') {
+      setCtaState('done');
+      return;
+    }
+
     setCtaState('loading');
 
     try {

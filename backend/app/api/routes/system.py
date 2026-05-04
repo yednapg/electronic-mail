@@ -54,6 +54,7 @@ def ready() -> dict[str, object]:
         "google_configured": settings.google_configured,
         "openai_configured": settings.openai_configured,
         "openai_model": settings.openai_model,
+        "openai_reasoning_effort": settings.openai_reasoning_effort,
     }
 
 

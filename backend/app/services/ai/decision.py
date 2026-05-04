@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 
 from openai import OpenAI
@@ -152,10 +153,16 @@ DASHBOARD_BRIEFING_PROMPT = """You write the top briefing for a personal dashboa
 Rules:
 - Use the exact numeric counts provided. Never invent or change counts.
 - headline must be a short greeting sentence.
-- If you can infer a first name confidently from the account_email, use it in headline as "Good morning, Gaurav."
+- If profile_display_name is provided, use its first name in headline.
+- Otherwise, if name_candidates contains a clear account-owner name, use its first name in headline.
+- Otherwise, if you can infer a first name confidently from account_email, use it in headline.
 - If the name is not clear, omit the name and keep the greeting natural.
-- brief must be one concise natural-language paragraph.
-- brief should summarize meetings, tasks, replies, payments, and how free the rest of the day looks.
+- brief must be one compact natural-language summary, ideally one sentence and never more than two short sentences.
+- brief must summarize meetings, tasks, replies, payments, and how free the rest of the day looks.
+- Use a count-first structure: meetings, tasks, replies, payments, then free time.
+- Do not summarize individual inbox items, name specific threads, or mention examples such as visa documents or bank reminders.
+- Use relevant emojis inline before the category counts and the free-time phrase, chosen by you from the mailbox context.
+- Emojis must be generated as part of the brief text, not represented as placeholders or labels.
 - Use the provided free_after_label exactly when you mention free time.
 - Keep the tone calm, practical, and personal.
 - Do not mention prompts, JSON, models, or system behavior.
@@ -249,6 +256,43 @@ def _llm_required() -> bool:
     return os.getenv("OPENAI_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _openai_model() -> str:
+    """Resolve the configured OpenAI model for all LLM calls."""
+    return os.getenv("OPENAI_MODEL", "gpt-5.4-mini").strip().strip("\"'") or "gpt-5.4-mini"
+
+
+def _openai_reasoning_effort() -> str:
+    """Resolve reasoning effort for models that support it."""
+    value = os.getenv("OPENAI_REASONING_EFFORT", "medium").strip().strip("\"'").lower()
+
+    if value in {"low", "medium", "high"}:
+        return value
+
+    return "medium"
+
+
+def _create_chat_completion(
+    client: OpenAI,
+    *,
+    model: str,
+    temperature: float,
+    response_format: dict[str, str],
+    messages: list[dict[str, str]],
+):
+    """Create a chat completion while respecting model-specific parameter limits."""
+    kwargs = {
+        "model": model,
+        "reasoning_effort": _openai_reasoning_effort(),
+        "response_format": response_format,
+        "messages": messages,
+    }
+
+    if model != "gpt-5.4-mini":
+        kwargs["temperature"] = temperature
+
+    return client.chat.completions.create(**kwargs)
+
+
 def _raise_missing_llm() -> None:
     """Surface OpenAI misconfiguration clearly in environments that require it."""
     raise RuntimeError("OPENAI_API_KEY is required because OPENAI_REQUIRED is enabled.")
@@ -257,7 +301,7 @@ def _raise_missing_llm() -> None:
 def _decide_with_llm(entities: list[EntityInput]) -> list[DecisionOutput]:
     """Batch entity decisioning through the configured chat model."""
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    model = os.getenv("OPENAI_MODEL", "gpt-5.4")
+    model = _openai_model()
     items: list[DecisionOutput] = []
 
     for batch in _chunk_json_payloads(
@@ -267,7 +311,8 @@ def _decide_with_llm(entities: list[EntityInput]) -> list[DecisionOutput]:
         user_payload = {
             "entities": batch["entities"],
         }
-        completion = client.chat.completions.create(
+        completion = _create_chat_completion(
+            client,
             model=model,
             temperature=0.3,
             response_format={"type": "json_object"},
@@ -462,7 +507,7 @@ def _describe_calendar_context_with_llm(
 ) -> list[CalendarContextOutput]:
     """Batch calendar phrasing through the configured model."""
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    model = os.getenv("OPENAI_MODEL", "gpt-5.4")
+    model = _openai_model()
     outputs: list[CalendarContextOutput] = []
 
     compact_items = [
@@ -481,7 +526,8 @@ def _describe_calendar_context_with_llm(
         user_payload = {
             "items": batch["items"],
         }
-        completion = client.chat.completions.create(
+        completion = _create_chat_completion(
+            client,
             model=model,
             temperature=0.2,
             response_format={"type": "json_object"},
@@ -530,7 +576,7 @@ def _judge_feed_entities_with_llm(
 ) -> list[FeedEntityJudgmentOutput]:
     """Batch persisted entity judgment through the configured model."""
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    model = os.getenv("OPENAI_MODEL", "gpt-5.4")
+    model = _openai_model()
     outputs: list[FeedEntityJudgmentOutput] = []
 
     compact_entities = [
@@ -568,7 +614,8 @@ def _judge_feed_entities_with_llm(
         user_payload = {
             "entities": batch["entities"],
         }
-        completion = client.chat.completions.create(
+        completion = _create_chat_completion(
+            client,
             model=model,
             temperature=0.2,
             response_format={"type": "json_object"},
@@ -626,9 +673,10 @@ def _judge_feed_entity_heuristically(
 def _classify_entity_state_with_llm(records: list[StoredSourceRecord]) -> str:
     """Batch one entity timeline through the configured model."""
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    model = os.getenv("OPENAI_MODEL", "gpt-5.4")
+    model = _openai_model()
     user_payload = {"timeline": _compact_state_timeline(records)}
-    completion = client.chat.completions.create(
+    completion = _create_chat_completion(
+        client,
         model=model,
         temperature=0.0,
         response_format={"type": "json_object"},
@@ -739,9 +787,10 @@ def _generate_dashboard_briefing_with_llm(
 ) -> DashboardBriefing:
     """Generate the dashboard top summary through the configured model."""
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    model = os.getenv("OPENAI_MODEL", "gpt-5.4")
+    model = _openai_model()
     user_payload = briefing_input.model_dump()
-    completion = client.chat.completions.create(
+    completion = _create_chat_completion(
+        client,
         model=model,
         temperature=0.2,
         response_format={"type": "json_object"},
@@ -783,7 +832,7 @@ def _generate_dashboard_briefing_heuristically(
 def _resolve_entity_group_with_llm(request: EntityGroupingRequest) -> EntityGroupingResponse:
     """Ask the model whether a new record belongs to an existing entity."""
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    model = os.getenv("OPENAI_MODEL", "gpt-5.4")
+    model = _openai_model()
     user_payload = {
         "subject": _compact(request.subject),
         "snippet": _truncate_text(request.snippet, 220),
@@ -803,7 +852,8 @@ def _resolve_entity_group_with_llm(request: EntityGroupingRequest) -> EntityGrou
             for candidate in request.candidates[:5]
         ],
     }
-    completion = client.chat.completions.create(
+    completion = _create_chat_completion(
+        client,
         model=model,
         temperature=0.1,
         response_format={"type": "json_object"},
@@ -1144,6 +1194,8 @@ def _build_dashboard_briefing_input(
     return DashboardBriefingInput(
         current_time=datetime.now().astimezone().isoformat(),
         account_email=profile.email if profile is not None else None,
+        profile_display_name=profile.display_name if profile is not None else None,
+        name_candidates=_infer_name_candidates_from_items(visible_items),
         meeting_count=len(agenda_items),
         task_count=sum(1 for item in visible_items if item.primary_action in _TASK_ACTIONS),
         reply_count=sum(1 for item in visible_items if item.primary_action == "reply"),
@@ -1168,7 +1220,9 @@ def _build_dashboard_briefing_fallback_output(
 ) -> DashboardBriefingOutput:
     """Assemble a deterministic summary when the model is unavailable."""
     greeting = _greeting_for_current_time(briefing_input.current_time)
-    display_name = _infer_display_name_from_email(briefing_input.account_email)
+    display_name = _first_name(briefing_input.profile_display_name) or _infer_display_name_from_email(
+        briefing_input.account_email
+    )
     headline = f"{greeting}, {display_name}." if display_name else f"{greeting}."
 
     brief = (
@@ -1183,6 +1237,30 @@ def _build_dashboard_briefing_fallback_output(
         headline=headline,
         brief=brief,
     )
+
+
+def _first_name(display_name: str | None) -> str | None:
+    """Extract the first usable token from a profile display name."""
+    if display_name is None:
+        return None
+
+    parts = display_name.strip().split()
+
+    return parts[0] if parts else None
+
+
+def _infer_name_candidates_from_items(items: list) -> list[str]:
+    """Extract likely account-owner names from feed text without hardcoding identities."""
+    candidates: list[str] = []
+
+    for item in items:
+        text = f"{item.title} {item.why_this_is_here}"
+        for match in re.finditer(r"\bfor\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b", text):
+            candidate = match.group(1).strip()
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    return candidates[:3]
 
 
 def _compute_free_after_label(items: list) -> str:

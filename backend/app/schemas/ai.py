@@ -137,6 +137,8 @@ class DashboardBriefingInput(BaseModel):
 
     current_time: str
     account_email: str | None = None
+    profile_display_name: str | None = None
+    name_candidates: list[str] = Field(default_factory=list)
     meeting_count: int
     task_count: int
     reply_count: int

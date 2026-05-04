@@ -31,6 +31,7 @@ class Settings:
     mobile_redirect_uri: str
     openai_api_key: str
     openai_model: str
+    openai_reasoning_effort: Literal["low", "medium", "high"]
     openai_required: bool
     openai_debug_logs: bool
 
@@ -117,7 +118,18 @@ def load_settings() -> Settings:
         ),
         mobile_redirect_uri=os.getenv("MOBILE_REDIRECT_URI", "decisionpipeline://auth/callback").strip(),
         openai_api_key=os.getenv("OPENAI_API_KEY", "").strip().strip("\"'"),
-        openai_model=os.getenv("OPENAI_MODEL", "gpt-5.4").strip().strip("\"'") or "gpt-5.4",
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-5.4-mini").strip().strip("\"'") or "gpt-5.4-mini",
+        openai_reasoning_effort=_resolve_openai_reasoning_effort(),
         openai_required=os.getenv("OPENAI_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"},
         openai_debug_logs=os.getenv("OPENAI_DEBUG_LOGS", "").strip().lower() in {"1", "true", "yes", "on"},
     )
+
+
+def _resolve_openai_reasoning_effort() -> Literal["low", "medium", "high"]:
+    """Keep reasoning effort explicit and constrained to OpenAI-supported values."""
+    value = os.getenv("OPENAI_REASONING_EFFORT", "medium").strip().strip("\"'").lower()
+
+    if value in {"low", "medium", "high"}:
+        return value
+
+    return "medium"
