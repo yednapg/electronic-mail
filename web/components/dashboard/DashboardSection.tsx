@@ -189,6 +189,13 @@ function DashboardItemDetail({
               {item.detail.dismissLabel}
             </span>
           </div>
+          {item.detail.links ? (
+            <div className="attention-detail-links" aria-label={`Evidence links for ${item.title}`}>
+              <a href={item.detail.links.rawHref}>Raw emails</a>
+              <span aria-hidden="true">|</span>
+              <a href={item.detail.links.traceHref}>Pipeline history</a>
+            </div>
+          ) : null}
           <p className="attention-detail-source">{item.detail.sourceLabel}</p>
         </div>
       </div>
