@@ -77,7 +77,7 @@ Buttons should use plain, readable shapes. Auth buttons may include the provider
 
 Checkboxes are small square controls, not large toggles. They can be local-only UI state unless persistence is explicitly added.
 
-Tasks that need clarification can expand in place when the user clicks the task text. The expanded panel should be a soft gray block under the task row, with short explanatory lines, plain text actions, a muted source line, and a smooth height/opacity animation. Do not navigate away for this interaction.
+Tasks that need clarification can expand in place when the user clicks the task text. The opened task row and its detail should become one soft gray block, with short explanatory lines, plain text actions, a muted source line, and a smooth height/opacity animation. Do not add status columns, evidence lists, debug links, or navigation for this interaction.
 
 Debug surfaces such as raw feed and trace replay use the debug type scale above. Monospace is only for raw JSON/code blocks; headings and body text still use SF Pro Rounded.
 

@@ -154,29 +154,9 @@ function DashboardItemDetail({
       <div className="attention-detail-clip">
         <div className="attention-detail-panel">
           <div className="attention-detail-body">
-            {item.detail.facts !== undefined && item.detail.facts.length > 0 ? (
-              <dl className="attention-detail-facts">
-                {item.detail.facts.map((fact) => (
-                  <div key={`${fact.label}-${fact.value}`} className="attention-detail-fact">
-                    <dt>{fact.label}</dt>
-                    <dd>{fact.value}</dd>
-                  </div>
-                ))}
-              </dl>
-            ) : null}
             {item.detail.body.map((line) => (
               <p key={line}>{line}</p>
             ))}
-            {item.detail.evidence !== undefined && item.detail.evidence.length > 0 ? (
-              <div className="attention-detail-evidence">
-                <p className="attention-detail-evidence-title">Source evidence</p>
-                <ul>
-                  {item.detail.evidence.map((line) => (
-                    <li key={line}>{line}</li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
           </div>
           <div className="attention-detail-actions" aria-label={`Actions for ${item.title}`}>
             <label htmlFor={checkboxId} className="attention-detail-action attention-detail-action-primary">
@@ -189,13 +169,6 @@ function DashboardItemDetail({
               {item.detail.dismissLabel}
             </span>
           </div>
-          {item.detail.links ? (
-            <div className="attention-detail-links" aria-label={`Evidence links for ${item.title}`}>
-              <a href={item.detail.links.rawHref}>Raw emails</a>
-              <span aria-hidden="true">|</span>
-              <a href={item.detail.links.traceHref}>Pipeline history</a>
-            </div>
-          ) : null}
           <p className="attention-detail-source">{item.detail.sourceLabel}</p>
         </div>
       </div>

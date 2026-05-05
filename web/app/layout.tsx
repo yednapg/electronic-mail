@@ -119,6 +119,78 @@ const interactionScript = `
     return settings;
   }
 
+  function createTextElement(tagName, className, text) {
+    const element = document.createElement(tagName);
+    if (className.length > 0) {
+      element.className = className;
+    }
+    element.textContent = text;
+    return element;
+  }
+
+  function setComposeOpen(root, open) {
+    const button = root.querySelector('[data-compose-work-toggle]');
+    const panel = root.querySelector('[data-compose-work-panel]');
+    root.classList.toggle('is-open', open);
+
+    if (button !== null) {
+      button.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+
+    if (panel !== null) {
+      panel.hidden = !open;
+    }
+  }
+
+  function closeOpenCompose() {
+    document.querySelectorAll('[data-compose-work].is-open').forEach((root) => setComposeOpen(root, false));
+  }
+
+  function addComposeDraft(form) {
+    const panel = form.closest('[data-compose-work-panel]');
+    const status = panel?.querySelector('[data-compose-work-status]');
+    const drafts = panel?.querySelector('[data-compose-work-drafts]');
+    const formData = new FormData(form);
+    const task = String(formData.get('task') ?? '').trim();
+    const recipient = String(formData.get('recipient') ?? '').trim();
+    const mode = 'Task + email';
+
+    if (task.length === 0 || recipient.length === 0 || drafts === null || drafts === undefined) {
+      return;
+    }
+
+    const draft = document.createElement('article');
+    draft.className = 'compose-work-draft is-new';
+
+    const meta = document.createElement('div');
+    meta.className = 'compose-work-draft-meta';
+    meta.append(createTextElement('span', '', mode));
+    meta.append(
+      createTextElement(
+        'time',
+        '',
+        new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date()),
+      ),
+    );
+
+    draft.append(meta);
+    draft.append(createTextElement('p', 'compose-work-draft-title', task));
+    draft.append(createTextElement('p', 'compose-work-draft-recipient', 'To ' + recipient));
+
+    drafts.prepend(draft);
+
+    while (drafts.children.length > 3) {
+      drafts.lastElementChild?.remove();
+    }
+
+    if (status !== null && status !== undefined) {
+      status.textContent = 'Draft ready for ' + recipient + '.';
+    }
+
+    form.reset();
+    window.setTimeout(() => draft.classList.remove('is-new'), 320);
+  }
+
   try {
     applyTheme(getStoredTheme() ?? getSystemTheme());
     applyViewSettings(readViewSettings());
@@ -132,6 +204,7 @@ const interactionScript = `
     const themeButton = event.target.closest('[data-theme-toggle]');
     if (themeButton !== null) {
       event.preventDefault();
+      closeOpenCompose();
       const currentTheme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
       const nextTheme = currentTheme === 'dark' ? 'light' : 'dark';
       try {
@@ -141,13 +214,26 @@ const interactionScript = `
       return;
     }
 
+    const composeButton = event.target.closest('[data-compose-work-toggle]');
+    if (composeButton !== null) {
+      event.preventDefault();
+      const root = composeButton.closest('[data-compose-work]');
+      if (root !== null) {
+        setComposeOpen(root, !root.classList.contains('is-open'));
+      }
+      return;
+    }
+
     const resetButton = event.target.closest('[data-dashboard-view-reset]');
     if (resetButton !== null) {
       event.preventDefault();
+      closeOpenCompose();
       const settings = { ...defaultViewSettings };
       writeViewSettings(settings);
       applyViewSettings(settings);
+      return;
     }
+
   });
 
   document.addEventListener('change', (event) => {
@@ -163,6 +249,20 @@ const interactionScript = `
     const settings = readViewControls();
     writeViewSettings(settings);
     applyViewSettings(settings);
+  });
+
+  document.addEventListener('submit', (event) => {
+    if (!(event.target instanceof HTMLFormElement)) {
+      return;
+    }
+
+    const form = event.target;
+    if (!form.matches('[data-compose-work-form]')) {
+      return;
+    }
+
+    event.preventDefault();
+    addComposeDraft(form);
   });
 
   const syncAfterDomReady = () => {
