@@ -52,7 +52,7 @@ Avoid nested cards. Use cards only for actual repeated records or debug blocks; 
 
 ## Colors
 
-Use a mostly neutral palette with matching light and dark tokens. On first visit, follow the OS/browser `prefers-color-scheme` setting. After the user clicks the bottom-left theme icon, persist that explicit light or dark choice.
+Use a mostly neutral palette with matching light and dark tokens. On first visit, follow the OS/browser `prefers-color-scheme` setting. After the user clicks the top-right theme icon, persist that explicit light or dark choice.
 
 - Light page: `#ffffff`
 - Dark page: flat warm charcoal, not pure black and not blue-tinted.
@@ -69,9 +69,9 @@ Do not introduce gradients, vignettes, page-specific palettes, or decorative bac
 
 Login, post-login, dashboard, raw feed, trace, and iOS screens should share the same shell, font family, color tokens, and section rhythm.
 
-The bottom-left theme icon is global. It should be icon-only, compact, flat, and switch between explicit light and dark modes while falling back to the OS/browser theme on first visit.
+The theme icon is global and lives at the top right. It should be icon-only, compact, flat, and switch between explicit light and dark modes while falling back to the OS/browser theme on first visit.
 
-The dashboard has a small top-right settings icon. It opens a compact flat panel for demo-safe view controls: Brief, Calendar, Now, Today, and Worth Knowing. These switches only change what is visible in the UI; they should not mutate backend data or task state.
+The dashboard has a small top-right settings icon adjacent to the theme icon. It opens a compact flat panel for demo-safe view controls: Brief, Calendar, Now, Today, and Worth Knowing. These switches only change what is visible in the UI; they should not mutate backend data or task state.
 
 Buttons should use plain, readable shapes. Auth buttons may include the provider brand icon. Checklist CTAs should look like text links: bold, colored, and underlined.
 
