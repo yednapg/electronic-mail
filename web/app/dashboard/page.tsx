@@ -408,14 +408,13 @@ const DEMO_DETAIL_BY_ITEM_ID: Record<string, NonNullable<DashboardSectionItem['d
       { label: 'Next', value: 'RSVP before the list closes' },
     ],
     body: [
-      'YC accepted your application to attend Startup School India in Bangalore.',
-      'A reminder came in this morning. The thread says they will send the calendar invite after you confirm.',
-      'Next move: decide if you can attend and send the RSVP.',
+      'YC has accepted your application to attend Startup School India.',
+      'The talk is in Bangalore. Only confirm if you can attend. YC will send you a confirmation email with a calendar event once you RSVP.',
     ],
     evidence: ['Acceptance email from YC', 'Reminder from startupschool@ycombinator.com', 'Event details in the same Gmail thread'],
     confirmLabel: 'Yes, I can attend',
     dismissLabel: 'No',
-    sourceLabel: 'Sources: 3 emails from YC',
+    sourceLabel: 'Source: 3 emails from YC',
   },
   'northstar-card-bill': {
     facts: [

@@ -108,7 +108,7 @@ export const demoDashboard: DashboardResponse = {
       }),
       demoItem({
         id: 'rsvp-yc',
-        title: 'RSVP for YC Startup School India',
+        title: 'RSVP within 72 hrs to confirm your spot for YC Startup School India',
         why: 'YC accepted your application and needs your RSVP before the Bangalore attendee list closes.',
         timing: 'now',
         action: 'confirm',
