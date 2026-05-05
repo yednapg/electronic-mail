@@ -257,9 +257,9 @@ a {
 
 .theme-toggle {
   position: fixed;
-  left: 22px;
-  bottom: 22px;
-  z-index: 20;
+  top: 22px;
+  right: 22px;
+  z-index: 31;
   width: 42px;
   height: 42px;
   display: inline-flex;
@@ -297,10 +297,22 @@ a {
   stroke-width: 2;
 }
 
+.theme-toggle-sun {
+  display: none;
+}
+
+:root[data-theme="dark"] .theme-toggle-moon {
+  display: none;
+}
+
+:root[data-theme="dark"] .theme-toggle-sun {
+  display: inline-flex;
+}
+
 .view-settings {
   position: fixed;
   top: 22px;
-  right: 22px;
+  right: 72px;
   z-index: 30;
   display: grid;
   justify-items: end;
@@ -322,6 +334,11 @@ a {
     background 160ms ease,
     border-color 160ms ease,
     transform 160ms ease;
+  list-style: none;
+}
+
+.view-settings-button::-webkit-details-marker {
+  display: none;
 }
 
 .view-settings-button:hover {
@@ -360,7 +377,7 @@ a {
     transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-.view-settings.is-open .view-settings-popover {
+.view-settings[open] .view-settings-popover {
   grid-template-rows: 1fr;
   opacity: 1;
   pointer-events: auto;
@@ -410,10 +427,6 @@ a {
   color: var(--page-text);
 }
 
-.view-settings-reset:disabled {
-  cursor: default;
-}
-
 .view-settings-reset:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
@@ -444,11 +457,16 @@ a {
   background: var(--button-bg-hover);
 }
 
-.view-setting-row:disabled {
-  cursor: default;
+.view-setting-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
 }
 
-.view-setting-row:focus-visible {
+.view-setting-row:focus-within {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
@@ -474,7 +492,7 @@ a {
     border-color 140ms ease;
 }
 
-.view-setting-switch.is-enabled {
+.view-setting-input:checked + .view-setting-switch {
   border-color: var(--focus-ring);
   background: var(--focus-ring);
 }
@@ -492,7 +510,7 @@ a {
     transform 140ms ease;
 }
 
-.view-setting-switch.is-enabled .view-setting-switch-knob {
+.view-setting-input:checked + .view-setting-switch .view-setting-switch-knob {
   background: var(--checkbox-checked-text);
   transform: translateX(14px);
 }
@@ -741,6 +759,10 @@ a {
   font-weight: 300;
 }
 
+:root[data-show-brief="false"] .digest-summary {
+  display: none;
+}
+
 .digest-summary-light {
   font-weight: 300;
 }
@@ -761,7 +783,7 @@ a {
   background: var(--agenda-bg);
 }
 
-.digest-summary + .digest-agenda {
+:root:not([data-show-brief="false"]) .digest-summary + .digest-agenda {
   margin-top: 0;
 }
 
@@ -771,9 +793,21 @@ a {
   gap: 51px;
 }
 
-.digest-summary + .digest-sections,
-.digest-agenda + .digest-sections {
+:root:not([data-show-brief="false"]) .digest-summary + .digest-sections,
+:root:not([data-show-calendar="false"]) .digest-agenda + .digest-sections,
+:root:not([data-show-brief="false"])[data-show-calendar="false"] .digest-sections {
   margin-top: 0;
+}
+
+:root[data-show-calendar="false"] .digest-agenda,
+:root[data-show-now="false"] [data-dashboard-section="now"],
+:root[data-show-today="false"] [data-dashboard-section="today"],
+:root[data-show-worth-knowing="false"] [data-dashboard-section="worth-knowing"] {
+  display: none;
+}
+
+:root[data-show-now="false"][data-show-today="false"][data-show-worth-knowing="false"] .digest-sections {
+  display: none;
 }
 
 .digest-auth-state {
@@ -1132,10 +1166,25 @@ a {
 }
 
 .digest-empty-state {
+  display: none;
   margin: var(--digest-first-block-gap) 0 0;
   color: var(--page-text-muted);
   font-size: var(--type-debug-body);
   line-height: 1.35;
+}
+
+:root[data-show-brief="false"] .digest-summary,
+:root[data-show-calendar="false"] .digest-agenda,
+:root[data-show-now="false"] [data-dashboard-section="now"],
+:root[data-show-today="false"] [data-dashboard-section="today"],
+:root[data-show-worth-knowing="false"] [data-dashboard-section="worth-knowing"],
+:root[data-show-now="false"][data-show-today="false"][data-show-worth-knowing="false"] .digest-sections {
+  display: none;
+}
+
+:root[data-show-brief="false"][data-show-calendar="false"][data-show-now="false"][data-show-today="false"][data-show-worth-knowing="false"]
+  .digest-empty-state {
+  display: block;
 }
 
 .attention-detail {
@@ -1347,9 +1396,16 @@ a {
 }
 
 @media (max-width: 640px) {
-  .view-settings {
+  .theme-toggle {
     top: calc(env(safe-area-inset-top, 0px) + 14px);
     right: calc(env(safe-area-inset-right, 0px) + 14px);
+    width: 40px;
+    height: 40px;
+  }
+
+  .view-settings {
+    top: calc(env(safe-area-inset-top, 0px) + 14px);
+    right: calc(env(safe-area-inset-right, 0px) + 62px);
   }
 
   .view-settings-button {
