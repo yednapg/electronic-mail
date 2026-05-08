@@ -72,6 +72,7 @@ class GmailBatchResult:
     threads_fetched: int
     latest_history_id: str | None
     new_count: int
+    failed_message_ids: list[str]
 
 
 def _gmail_debug_enabled() -> bool:
@@ -217,7 +218,10 @@ def fetch_raw_gmail_source_records(settings: Settings) -> list[SourceRecord]:
         scope=resolve_gmail_sync_scope(settings.gmail_sync_scope),
         recent_days=settings.gmail_recent_days,
     )
-    messages, _threads_fetched, _history_id = fetch_thread_messages_for_message_ids(gmail_service, message_ids)
+    messages, _threads_fetched, _history_id, _failed_message_ids = fetch_thread_messages_for_message_ids(
+        gmail_service,
+        message_ids,
+    )
     return normalize_gmail_messages(
         messages,
         scope=resolve_gmail_sync_scope(settings.gmail_sync_scope),
@@ -238,7 +242,10 @@ def fetch_raw_gmail_api_messages(settings: Settings) -> list[dict[str, object]]:
         scope=resolve_gmail_sync_scope(settings.gmail_sync_scope),
         recent_days=settings.gmail_recent_days,
     )
-    messages, _threads_fetched, _history_id = fetch_thread_messages_for_message_ids(gmail_service, message_ids)
+    messages, _threads_fetched, _history_id, _failed_message_ids = fetch_thread_messages_for_message_ids(
+        gmail_service,
+        message_ids,
+    )
     return messages
 
 
@@ -620,6 +627,8 @@ def sync_gmail_source_records(
     new_count = 0
     latest_history_id: str | None = None
     mailbox_history_id: str | None = None
+    fetched_thread_ids: set[str] = set()
+    failed_message_ids: set[str] = set()
 
     def report(stage: str) -> None:
         if progress_callback is not None:
@@ -640,11 +649,13 @@ def sync_gmail_source_records(
                 page.message_ids,
                 scope=sync_scope,
                 recent_days=settings.gmail_recent_days,
+                fetched_thread_ids=fetched_thread_ids,
             )
             imported_count += len(set(page.message_ids))
             threads_fetched += batch.threads_fetched
             new_count += batch.new_count
             latest_history_id = max_history_id(latest_history_id, batch.latest_history_id)
+            failed_message_ids.update(batch.failed_message_ids)
             if collect_records:
                 records_by_id.update({record.id: record for record in batch.records})
             report("gmail_persisted")
@@ -655,6 +666,11 @@ def sync_gmail_source_records(
         )
         if history_events:
             upsert_gmail_history_events(database_path, history_events)
+        deleted_message_ids = {
+            event.message_id
+            for event in history_events
+            if event.event_type == "messagesDeleted"
+        }
         if needs_full_sync:
             used_full_sync = True
             message_ids = []
@@ -673,11 +689,13 @@ def sync_gmail_source_records(
                     page.message_ids,
                     scope=sync_scope,
                     recent_days=settings.gmail_recent_days,
+                    fetched_thread_ids=fetched_thread_ids,
                 )
                 imported_count += len(set(page.message_ids))
                 threads_fetched += batch.threads_fetched
                 new_count += batch.new_count
                 latest_history_id = max_history_id(latest_history_id, batch.latest_history_id)
+                failed_message_ids.update(batch.failed_message_ids)
                 if collect_records:
                     records_by_id.update({record.id: record for record in batch.records})
                 report("gmail_persisted")
@@ -691,22 +709,35 @@ def sync_gmail_source_records(
                     batch_ids,
                     scope=sync_scope,
                     recent_days=settings.gmail_recent_days,
+                    fetched_thread_ids=fetched_thread_ids,
+                    deleted_message_ids=deleted_message_ids,
                 )
                 imported_count += len(set(batch_ids))
                 threads_fetched += batch.threads_fetched
                 new_count += batch.new_count
                 latest_history_id = max_history_id(latest_history_id, batch.latest_history_id)
+                failed_message_ids.update(batch.failed_message_ids)
                 if collect_records:
                     records_by_id.update({record.id: record for record in batch.records})
                 report("gmail_persisted")
 
     resolved_history_id = mailbox_history_id or latest_history_id or (sync_state.last_history_id if sync_state else None)
-    upsert_gmail_sync_state(
-        database_path,
-        user_id=DEV_USER_ID,
-        last_history_id=resolved_history_id,
-        last_full_sync_at=utc_now_iso() if used_full_sync else (sync_state.last_full_sync_at if sync_state else None),
-    )
+    if failed_message_ids:
+        _log_gmail_error(
+            "gmail_sync_incomplete",
+            {
+                "failedMessageIds": sorted(failed_message_ids),
+                "lastHistoryIdPreserved": sync_state.last_history_id if sync_state else None,
+                "resolvedHistoryIdNotCommitted": resolved_history_id,
+            },
+        )
+    else:
+        upsert_gmail_sync_state(
+            database_path,
+            user_id=DEV_USER_ID,
+            last_history_id=resolved_history_id,
+            last_full_sync_at=utc_now_iso() if used_full_sync else (sync_state.last_full_sync_at if sync_state else None),
+        )
 
     total_source_records = get_source_record_count(database_path)
     records = sorted(records_by_id.values(), key=lambda record: record.received_at, reverse=True)
@@ -786,6 +817,7 @@ def iter_gmail_message_id_pages(
         if not page_token:
             break
 
+
 def persist_gmail_message_id_batch(
     settings: Settings,
     gmail_service,
@@ -793,13 +825,20 @@ def persist_gmail_message_id_batch(
     *,
     scope: str,
     recent_days: int,
+    fetched_thread_ids: set[str] | None = None,
+    deleted_message_ids: set[str] | None = None,
 ) -> GmailBatchResult:
     """Hydrate, normalize, and commit one bounded Gmail message-id batch."""
     if not message_ids:
-        return GmailBatchResult(records=[], threads_fetched=0, latest_history_id=None, new_count=0)
+        return GmailBatchResult(records=[], threads_fetched=0, latest_history_id=None, new_count=0, failed_message_ids=[])
 
     database_path = str(settings.database_path)
-    messages, threads_fetched, latest_history_id = fetch_thread_messages_for_message_ids(gmail_service, message_ids)
+    messages, threads_fetched, latest_history_id, failed_message_ids = fetch_thread_messages_for_message_ids(
+        gmail_service,
+        message_ids,
+        fetched_thread_ids=fetched_thread_ids,
+    )
+    retryable_failed_message_ids = sorted(set(failed_message_ids) - (deleted_message_ids or set()))
     if messages:
         upsert_gmail_message_snapshots(
             database_path,
@@ -817,6 +856,7 @@ def persist_gmail_message_id_batch(
         threads_fetched=threads_fetched,
         latest_history_id=latest_history_id,
         new_count=new_count,
+        failed_message_ids=retryable_failed_message_ids,
     )
 
 
@@ -993,10 +1033,14 @@ def gmail_history_event_id(
 def fetch_thread_messages_for_message_ids(
     gmail_service,
     message_ids: list[str],
-) -> tuple[list[dict[str, object]], int, str | None]:
+    *,
+    fetched_thread_ids: set[str] | None = None,
+) -> tuple[list[dict[str, object]], int, str | None, list[str]]:
     """Fetch each changed message in full, then ingest the entire thread for full context."""
     thread_messages: dict[str, dict[str, object]] = {}
-    fetched_threads: set[str] = set()
+    fetched_threads = set() if fetched_thread_ids is None else fetched_thread_ids
+    fetched_thread_count = 0
+    failed_message_ids: set[str] = set()
     latest_history_id: str | None = None
 
     for message_id in message_ids:
@@ -1023,6 +1067,7 @@ def fetch_thread_messages_for_message_ids(
                     "error": str(error),
                 },
             )
+            failed_message_ids.add(str(message_id))
             continue
 
         latest_history_id = max_history_id(
@@ -1032,6 +1077,7 @@ def fetch_thread_messages_for_message_ids(
         full_message_id = full_message.get("id")
         if full_message_id:
             thread_messages[str(full_message_id)] = full_message
+            failed_message_ids.discard(str(full_message_id))
 
         thread_id = full_message.get("threadId")
         if not thread_id or str(thread_id) in fetched_threads:
@@ -1052,6 +1098,7 @@ def fetch_thread_messages_for_message_ids(
                 },
             )
             fetched_threads.add(str(thread_id))
+            fetched_thread_count += 1
         except Exception as error:  # pragma: no cover - exercised via behavior, not exception type
             _log_gmail_error(
                 "gmail_thread_fetch_failed",
@@ -1073,8 +1120,9 @@ def fetch_thread_messages_for_message_ids(
             thread_message_id = thread_message.get("id")
             if thread_message_id:
                 thread_messages[str(thread_message_id)] = thread_message
+                failed_message_ids.discard(str(thread_message_id))
 
-    return list(thread_messages.values()), len(fetched_threads), latest_history_id
+    return list(thread_messages.values()), fetched_thread_count, latest_history_id, sorted(failed_message_ids)
 
 
 def normalize_gmail_messages(
