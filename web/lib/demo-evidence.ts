@@ -1,4 +1,10 @@
-import type { SourceRecord, TraceRecord, TraceReplayResponse, TraceStage } from '@decision-pipeline/types';
+import type {
+  SourceRecord,
+  ThreadReaderResponse,
+  TraceRecord,
+  TraceReplayResponse,
+  TraceStage,
+} from '@decision-pipeline/types';
 
 import { demoDashboard } from './demo-dashboard';
 import type { FeedItem } from './types';
@@ -119,6 +125,43 @@ export function getDemoSourceRecords(itemId?: string): SourceRecord[] {
   });
 }
 
+export function getDemoThread(entityId: string): ThreadReaderResponse | null {
+  const item = getDemoFeedItems().find((candidate) => candidate.entity_id === entityId || candidate.id === entityId);
+
+  if (item === undefined) {
+    return null;
+  }
+
+  const records = getDemoSourceRecords(item.id);
+  const gmailThreadIds = Array.from(
+    new Set(records.filter((record) => record.source === 'gmail').map((record) => record.thread_id)),
+  );
+
+  return {
+    entity_id: item.entity_id,
+    user_id: item.user_id,
+    source: records.at(-1)?.source ?? item.source ?? null,
+    gmail_thread_id: gmailThreadIds.length === 1 ? gmailThreadIds[0] : null,
+    subject: stringPayload(records.at(-1)?.raw_payload, 'subject') ?? item.title,
+    messages: records.map((record) => ({
+      id: record.id,
+      source: record.source,
+      thread_id: record.thread_id,
+      from_address: stringPayload(record.raw_payload, 'from'),
+      to: stringPayload(record.raw_payload, 'to'),
+      cc: stringPayload(record.raw_payload, 'cc'),
+      bcc: stringPayload(record.raw_payload, 'bcc'),
+      subject: stringPayload(record.raw_payload, 'subject'),
+      body: stringPayload(record.raw_payload, 'body') ?? '',
+      snippet: stringPayload(record.raw_payload, 'snippet'),
+      label_ids: Array.isArray(record.raw_payload.label_ids)
+        ? record.raw_payload.label_ids.map((label) => String(label))
+        : [],
+      received_at: record.received_at,
+    })),
+  };
+}
+
 export function getDemoTrace(entityId: string): TraceReplayResponse | null {
   const item = getDemoFeedItems().find((candidate) => candidate.entity_id === entityId || candidate.id === entityId);
 
@@ -191,4 +234,9 @@ function toFallbackEmail(item: FeedItem): DemoEmail {
     body: item.why_this_is_here,
     receivedAt: item.created_at,
   };
+}
+
+function stringPayload(payload: Record<string, unknown> | undefined, key: string): string | null {
+  const value = payload?.[key];
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
 }

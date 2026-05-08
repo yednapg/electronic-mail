@@ -481,6 +481,16 @@ function DashboardItemDetail({
             <span className="attention-detail-action attention-detail-action-secondary">
               {item.detail.dismissLabel}
             </span>
+            {item.detail.links?.threadHref ? (
+              <>
+                <span className="attention-detail-divider" aria-hidden="true">
+                  |
+                </span>
+                <a className="attention-detail-action" href={item.detail.links.threadHref}>
+                  Read email
+                </a>
+              </>
+            ) : null}
           </div>
           <p className="attention-detail-source">{item.detail.sourceLabel}</p>
         </div>

@@ -612,6 +612,7 @@ function withDetailLinks(
   return {
     ...detail,
     links: {
+      threadHref: `/entities/${entityId}/thread`,
       rawHref: `/raw-feed?item=${itemId}`,
       traceHref: `/trace/${entityId}`,
     },

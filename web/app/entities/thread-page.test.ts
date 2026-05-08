@@ -1,0 +1,49 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+
+import type { ThreadReaderResponse } from '../../lib/types';
+import { ThreadDetail } from './[entityId]/thread/page';
+
+const thread: ThreadReaderResponse = {
+  entity_id: 'entity-1',
+  user_id: 'local-user',
+  source: 'gmail',
+  gmail_thread_id: 'thread-1',
+  subject: 'HDFC credit card statement due today',
+  messages: [
+    {
+      id: 'source-1',
+      source: 'gmail',
+      thread_id: 'thread-1',
+      from_address: 'alerts@hdfcbank.net',
+      to: 'gaurav@example.com',
+      subject: 'HDFC credit card statement due today',
+      body: 'Your card statement is due today. Autopay is not enabled. Pay before 5 PM to avoid late fees.',
+      snippet: 'Autopay is not enabled for this card. Please pay before 5 PM.',
+      label_ids: ['INBOX'],
+      received_at: '2026-04-24T10:00:00+00:00',
+    },
+  ],
+};
+
+test('thread detail renders persisted subject body snippet and source', () => {
+  const html = renderToStaticMarkup(React.createElement(ThreadDetail, { entityId: 'entity-1', thread, errorMessage: null }));
+
+  assert.match(html, /HDFC credit card statement due today/);
+  assert.match(html, /Autopay is not enabled for this card/);
+  assert.match(html, /Pay before 5 PM/);
+  assert.match(html, /Gmail/);
+  assert.match(html, /alerts@hdfcbank.net/);
+});
+
+test('thread detail does not expose Gmail mutation actions or backend ids', () => {
+  const html = renderToStaticMarkup(React.createElement(ThreadDetail, { entityId: 'entity-1', thread, errorMessage: null }));
+
+  assert.doesNotMatch(html, /Archive/);
+  assert.doesNotMatch(html, /Unarchive/);
+  assert.doesNotMatch(html, /Mark read/);
+  assert.doesNotMatch(html, /Entity:/);
+  assert.doesNotMatch(html, /thread-1/);
+});

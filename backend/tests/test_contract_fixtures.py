@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 
 from app.api.routes.gmail import GmailThreadMutationResponse
-from app.schemas.domain import DashboardResponse, GoogleAuthState, TraceReplayResponse
+from app.schemas.domain import DashboardResponse, GoogleAuthState, ThreadReaderResponse, TraceReplayResponse
 
 
 FIXTURES_DIR = Path(__file__).resolve().parents[2] / "contracts" / "fixtures"
@@ -34,6 +34,13 @@ class ContractFixtureTests(unittest.TestCase):
 
         self.assertEqual(trace.entity_id, "entity-1")
         self.assertEqual(trace.items[0].stage, "grouping")
+
+    def test_thread_reader_fixture_matches_backend_schema(self) -> None:
+        thread = ThreadReaderResponse.model_validate(load_fixture("thread-reader.json"))
+
+        self.assertEqual(thread.entity_id, "entity-1")
+        self.assertEqual(thread.messages[0].source, "gmail")
+        self.assertIn("Pay before 5 PM", thread.messages[0].body)
 
     def test_gmail_mutation_fixtures_match_backend_schema(self) -> None:
         archive = GmailThreadMutationResponse.model_validate(load_fixture("gmail-thread-archive.json"))
