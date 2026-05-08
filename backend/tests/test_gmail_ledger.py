@@ -8,11 +8,16 @@ from types import SimpleNamespace
 from app.db.models import StoredGmailMessageSnapshot, StoredSourceRecord
 from app.db.repository import (
     DEFAULT_USER_ID,
+    attach_record_to_entity,
+    create_entity,
+    get_feed_projection_count,
     get_gmail_sync_state,
     initialize_database,
     list_gmail_history_events,
     list_gmail_message_snapshots,
+    list_source_records_by_ids,
     list_unlinked_source_records,
+    upsert_feed_projection,
     upsert_gmail_message_snapshots,
     upsert_gmail_sync_state,
     upsert_source_records,
@@ -511,6 +516,56 @@ class GmailLedgerTests(unittest.TestCase):
         self.assertTrue(snapshots["message-deleted"].tombstoned)
         self.assertEqual(snapshots["message-deleted"].fetch_status, "deleted")
         self.assertEqual(get_gmail_sync_state(self.database_path, DEFAULT_USER_ID).last_history_id, "107")
+
+    def test_incremental_delete_removes_local_work_projection_without_mutating_gmail(self) -> None:
+        upsert_gmail_sync_state(
+            self.database_path,
+            user_id=DEFAULT_USER_ID,
+            last_history_id="100",
+            last_full_sync_at="2024-04-05T09:00:00+00:00",
+        )
+        source_record = StoredSourceRecord(
+            id="message-deleted",
+            source="gmail",
+            thread_id="thread-deleted",
+            subject="Deleted task",
+            sender="sender@example.com",
+            timestamp="2024-04-05T10:00:00+00:00",
+            raw_payload={"user_id": DEFAULT_USER_ID, "message_id": "message-deleted", "subject": "Deleted task"},
+            created_at="2024-04-05T10:00:00+00:00",
+        )
+        upsert_source_records(self.database_path, [source_record])
+        entity = create_entity(self.database_path, "gmail-thread:thread-deleted")
+        attach_record_to_entity(self.database_path, entity.id, source_record.id)
+        upsert_feed_projection(
+            self.database_path,
+            user_id=DEFAULT_USER_ID,
+            entity_id=entity.id,
+            pipeline_output={"entity": {"id": entity.id}, "attention_item": None, "suppressed": True},
+        )
+        service = FakeGmailService(
+            database_path=self.database_path,
+            history_response={
+                "historyId": "107",
+                "history": [
+                    {
+                        "id": "106",
+                        "messagesDeleted": [{"message": {"id": "message-deleted", "threadId": "thread-deleted"}}],
+                    }
+                ],
+            },
+            message_errors={"message-deleted": "deleted message cannot be fetched"},
+        )
+
+        records = sync_gmail_source_records(self.settings, service)
+
+        self.assertEqual(records, [])
+        self.assertEqual(list_source_records_by_ids(self.database_path, ["message-deleted"]), [])
+        self.assertEqual(list_unlinked_source_records(self.database_path), [])
+        self.assertEqual(get_feed_projection_count(self.database_path), 0)
+        [snapshot] = list_gmail_message_snapshots(self.database_path)
+        self.assertTrue(snapshot.tombstoned)
+        self.assertEqual(service.mutations, [])
 
     def test_incremental_sync_keeps_cursor_when_changed_message_fetch_fails(self) -> None:
         upsert_gmail_sync_state(

@@ -53,7 +53,8 @@ def initialize_database(database_path: str) -> None:
               sender TEXT,
               timestamp TEXT NOT NULL,
               raw_payload TEXT NOT NULL,
-              created_at TEXT NOT NULL
+              created_at TEXT NOT NULL,
+              deleted_at TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_source_records_timestamp
@@ -61,6 +62,9 @@ def initialize_database(database_path: str) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_source_records_user_timestamp
               ON source_records(user_id, timestamp DESC, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_source_records_user_active_timestamp
+              ON source_records(user_id, deleted_at, timestamp DESC, id DESC);
 
             CREATE INDEX IF NOT EXISTS idx_source_records_thread
               ON source_records(source, thread_id);
@@ -283,6 +287,7 @@ def initialize_database(database_path: str) -> None:
             """
         )
         _ensure_column(connection, "source_records", "user_id", "TEXT NOT NULL DEFAULT 'google-dev-user'")
+        _ensure_column(connection, "source_records", "deleted_at", "TEXT")
         _ensure_column(connection, "entities", "user_id", "TEXT NOT NULL DEFAULT 'google-dev-user'")
         _ensure_column(connection, "gmail_message_snapshots", "internal_date", "TEXT")
         _ensure_column(connection, "dashboard_import_jobs", "stage", "TEXT NOT NULL DEFAULT 'queued'")
@@ -361,9 +366,9 @@ def upsert_source_records(database_path: str, records: Iterable[StoredSourceReco
             connection.execute(
                 """
                 INSERT INTO source_records (
-                  id, user_id, source, thread_id, subject, sender, timestamp, raw_payload, created_at
+                  id, user_id, source, thread_id, subject, sender, timestamp, raw_payload, created_at, deleted_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   user_id = excluded.user_id,
                   source = excluded.source,
@@ -371,7 +376,8 @@ def upsert_source_records(database_path: str, records: Iterable[StoredSourceReco
                   subject = excluded.subject,
                   sender = excluded.sender,
                   timestamp = excluded.timestamp,
-                  raw_payload = excluded.raw_payload
+                  raw_payload = excluded.raw_payload,
+                  deleted_at = excluded.deleted_at
                 """,
                 (
                     record.id,
@@ -383,8 +389,58 @@ def upsert_source_records(database_path: str, records: Iterable[StoredSourceReco
                     record.timestamp,
                     json.dumps(record.raw_payload, ensure_ascii=True),
                     record.created_at,
+                    record.deleted_at,
                 ),
             )
+
+
+def mark_source_records_deleted(
+    database_path: str,
+    source_record_ids: Iterable[str],
+    *,
+    deleted_at: str | None = None,
+) -> list[str]:
+    """Mark source records as externally deleted and remove their active work projections."""
+    unique_ids = sorted({source_record_id for source_record_id in source_record_ids if source_record_id})
+
+    if not unique_ids:
+        return []
+
+    tombstoned_at = deleted_at or utc_now_iso()
+    placeholders = ", ".join("?" for _ in unique_ids)
+
+    with connect(database_path) as connection:
+        entity_rows = connection.execute(
+            f"""
+            SELECT DISTINCT entity_id
+            FROM entity_members
+            WHERE source_record_id IN ({placeholders})
+            """,
+            unique_ids,
+        ).fetchall()
+        entity_ids = [str(row["entity_id"]) for row in entity_rows]
+
+        connection.execute(
+            f"""
+            UPDATE source_records
+            SET deleted_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            [tombstoned_at, *unique_ids],
+        )
+        connection.execute(
+            f"DELETE FROM entity_members WHERE source_record_id IN ({placeholders})",
+            unique_ids,
+        )
+
+        if entity_ids:
+            entity_placeholders = ", ".join("?" for _ in entity_ids)
+            connection.execute(
+                f"DELETE FROM feed_projections WHERE entity_id IN ({entity_placeholders})",
+                entity_ids,
+            )
+
+    return entity_ids
 
 
 def upsert_source_record_summary(
@@ -474,6 +530,7 @@ def list_source_records_by_ids(database_path: str, ids: Iterable[str]) -> list[S
             SELECT *
             FROM source_records
             WHERE id IN ({placeholders})
+              AND deleted_at IS NULL
             ORDER BY timestamp DESC, id DESC
             """,
             unique_ids,
@@ -1135,9 +1192,9 @@ def get_feed_projection_count(database_path: str, *, user_id: str = DEFAULT_USER
 
 
 def get_source_record_count(database_path: str) -> int:
-    """Return the total number of persisted source records."""
+    """Return the total number of active persisted source records."""
     with connect(database_path) as connection:
-        return int(connection.execute("SELECT COUNT(*) FROM source_records").fetchone()[0])
+        return int(connection.execute("SELECT COUNT(*) FROM source_records WHERE deleted_at IS NULL").fetchone()[0])
 
 
 def get_history_source_record_count(database_path: str, *, user_id: str = DEFAULT_USER_ID) -> int:
@@ -1145,7 +1202,7 @@ def get_history_source_record_count(database_path: str, *, user_id: str = DEFAUL
     with connect(database_path) as connection:
         return int(
             connection.execute(
-                "SELECT COUNT(*) FROM source_records WHERE user_id = ?",
+                "SELECT COUNT(*) FROM source_records WHERE user_id = ? AND deleted_at IS NULL",
                 (user_id,),
             ).fetchone()[0]
         )
@@ -1168,6 +1225,7 @@ def list_source_record_ids(
             SELECT id
             FROM source_records
             WHERE user_id = ?
+              AND deleted_at IS NULL
             ORDER BY timestamp DESC, id DESC
             LIMIT ? OFFSET ?
             """,
@@ -1195,6 +1253,7 @@ def list_history_source_records(
               SELECT *
               FROM source_records
               WHERE user_id = ?
+                AND deleted_at IS NULL
               ORDER BY timestamp DESC, id DESC
               LIMIT ? OFFSET ?
             ),
@@ -1271,6 +1330,7 @@ def list_unlinked_source_records(database_path: str) -> list[StoredSourceRecord]
             FROM source_records
             LEFT JOIN entity_members ON entity_members.source_record_id = source_records.id
             WHERE entity_members.id IS NULL
+              AND source_records.deleted_at IS NULL
             ORDER BY timestamp ASC
             """
         ).fetchall()
@@ -1331,6 +1391,7 @@ def find_entity_by_thread_id(database_path: str, source: str, thread_id: str) ->
                 JOIN source_records ON source_records.id = entity_members.source_record_id
                 WHERE source_records.source = ?
                   AND source_records.thread_id = ?
+                  AND source_records.deleted_at IS NULL
                 LIMIT 1
                 """,
                 (source, thread_id),
@@ -1347,6 +1408,7 @@ def list_candidate_records(database_path: str, sender_domain: str | None) -> lis
         JOIN entity_members ON entity_members.source_record_id = source_records.id
         JOIN entities ON entities.id = entity_members.entity_id
         WHERE source_records.subject IS NOT NULL
+          AND source_records.deleted_at IS NULL
     """
     params: list[str] = []
 
@@ -1453,6 +1515,7 @@ def list_loaded_entities(database_path: str, entity_ids: list[str]) -> list[Load
             FROM entity_members
             JOIN source_records ON source_records.id = entity_members.source_record_id
             WHERE entity_members.entity_id IN ({placeholders})
+              AND source_records.deleted_at IS NULL
             ORDER BY source_records.timestamp ASC
             """,
             entity_ids,
@@ -1811,6 +1874,7 @@ def list_source_records_for_entity(database_path: str, entity_id: str) -> list[S
             FROM entity_members
             JOIN source_records ON source_records.id = entity_members.source_record_id
             WHERE entity_members.entity_id = ?
+              AND source_records.deleted_at IS NULL
             ORDER BY source_records.timestamp ASC, source_records.id ASC
             """,
             (entity_id,),
@@ -1866,6 +1930,7 @@ def _to_source_record(row: sqlite3.Row) -> StoredSourceRecord:
         timestamp=str(row["timestamp"]),
         raw_payload=json.loads(row["raw_payload"]),
         created_at=str(row["created_at"]),
+        deleted_at=str(row["deleted_at"]) if "deleted_at" in row.keys() and row["deleted_at"] is not None else None,
     )
 
 
