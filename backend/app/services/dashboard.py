@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Backend dashboard assembly for auth, feed, and natural-language briefing."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
@@ -11,8 +11,10 @@ from app.db.models import StoredDashboardImportJob
 from app.db.repository import (
     DEFAULT_USER_ID,
     create_dashboard_import_job,
+    get_active_dashboard_import_job,
     get_dashboard_import_job,
     get_latest_dashboard_import_job,
+    mark_stale_dashboard_import_jobs_failed,
     mark_dashboard_import_job_failed,
     mark_dashboard_import_job_running,
     mark_dashboard_import_job_succeeded,
@@ -42,6 +44,10 @@ from app.services.integrations.google import (
 from app.services.source_record_summaries import refresh_source_record_summaries
 
 
+IMPORT_JOB_STALE_AFTER_SECONDS = 30 * 60
+STALE_IMPORT_JOB_MESSAGE = "Dashboard import job became stale before completing."
+
+
 def build_dashboard_response(settings: Settings) -> DashboardResponse:
     """Return the full dashboard payload for the current local user."""
     auth = get_google_auth_state(settings)
@@ -68,13 +74,45 @@ def create_queued_dashboard_import_job(
     user_id: str = DEFAULT_USER_ID,
 ) -> DashboardImportJobResponse:
     """Create a queued backend-owned dashboard import/preparation job."""
+    job, _should_start = create_or_reuse_dashboard_import_job(settings, user_id=user_id)
+    return job
+
+
+def create_or_reuse_dashboard_import_job(
+    settings: Settings,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> tuple[DashboardImportJobResponse, bool]:
+    """Create one import job unless a fresh queued/running job already owns the work."""
+    database_path = str(settings.database_path)
+    stale_before = (datetime.now(timezone.utc) - timedelta(seconds=IMPORT_JOB_STALE_AFTER_SECONDS)).isoformat()
+    mark_stale_dashboard_import_jobs_failed(
+        database_path,
+        user_id=user_id,
+        stale_before=stale_before,
+        error_message=STALE_IMPORT_JOB_MESSAGE,
+    )
+    active_job = get_active_dashboard_import_job(database_path, user_id=user_id)
+    if active_job is not None:
+        return to_dashboard_import_job_response(active_job), False
+
+    job = create_dashboard_import_job(database_path, user_id=user_id)
+    return to_dashboard_import_job_response(job), True
+
+
+def create_new_dashboard_import_job(
+    settings: Settings,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> DashboardImportJobResponse:
+    """Create a queued job without single-flight reuse for explicit compatibility paths."""
     job = create_dashboard_import_job(str(settings.database_path), user_id=user_id)
     return to_dashboard_import_job_response(job)
 
 
 def start_dashboard_import_job(settings: Settings, *, user_id: str = DEFAULT_USER_ID) -> DashboardImportJobResponse:
     """Create and run a backend-owned dashboard import/preparation job inline."""
-    job = create_dashboard_import_job(str(settings.database_path), user_id=user_id)
+    job = create_new_dashboard_import_job(settings, user_id=user_id)
     return to_dashboard_import_job_response(run_dashboard_import_job(settings, job.id))
 
 

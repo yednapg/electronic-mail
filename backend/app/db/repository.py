@@ -239,6 +239,9 @@ def initialize_database(database_path: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_dashboard_import_jobs_latest
               ON dashboard_import_jobs(user_id, created_at DESC);
 
+            CREATE INDEX IF NOT EXISTS idx_dashboard_import_jobs_active
+              ON dashboard_import_jobs(user_id, status, updated_at DESC);
+
             CREATE TABLE IF NOT EXISTS manual_tasks (
               id TEXT PRIMARY KEY,
               user_id TEXT NOT NULL,
@@ -905,6 +908,55 @@ def get_latest_dashboard_import_job(
             (user_id,),
         ).fetchone()
     return _to_dashboard_import_job(row) if row is not None else None
+
+
+def get_active_dashboard_import_job(
+    database_path: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> StoredDashboardImportJob | None:
+    """Load the newest queued/running import job for one user."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM dashboard_import_jobs
+            WHERE user_id = ?
+              AND status IN ('queued', 'running')
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+    return _to_dashboard_import_job(row) if row is not None else None
+
+
+def mark_stale_dashboard_import_jobs_failed(
+    database_path: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    stale_before: str,
+    error_message: str,
+) -> int:
+    """Fail queued/running import jobs that have not reported progress recently."""
+    now = utc_now_iso()
+    with connect(database_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE dashboard_import_jobs
+            SET status = 'failed',
+                stage = 'failed',
+                result_status = 'failed',
+                error_message = ?,
+                completed_at = ?,
+                updated_at = ?
+            WHERE user_id = ?
+              AND status IN ('queued', 'running')
+              AND updated_at < ?
+            """,
+            (error_message, now, now, user_id, stale_before),
+        )
+        return int(cursor.rowcount)
 
 
 def create_entity(database_path: str, canonical_key: str, user_id: str = DEFAULT_USER_ID) -> StoredEntity:
