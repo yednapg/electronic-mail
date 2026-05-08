@@ -73,28 +73,30 @@ def hydrate_persistent_memory(
 ) -> list[str]:
     """Resolve records to entities, backfill missing links, and derive state."""
     touched_entity_ids: set[str] = set()
+    explicit_source_records = source_records is not None
     ordered_records = sorted(source_records or [], key=lambda record: record.received_at)
 
     for record in ordered_records:
         entity, _ = resolve_entity_for_record(database_path, record)
         touched_entity_ids.add(entity.id)
 
-    for record in list_unlinked_source_records(database_path):
-        source_record = SourceRecord(
-            id=record.id,
-            user_id="local-user",
-            source=record.source,
-            thread_id=record.thread_id or "",
-            raw_payload=record.raw_payload,
-            received_at=record.timestamp,
-        )
-        entity, _ = resolve_entity_for_record(database_path, source_record)
-        touched_entity_ids.add(entity.id)
+    if not explicit_source_records:
+        for record in list_unlinked_source_records(database_path):
+            source_record = SourceRecord(
+                id=record.id,
+                user_id="local-user",
+                source=record.source,
+                thread_id=record.thread_id or "",
+                raw_payload=record.raw_payload,
+                received_at=record.timestamp,
+            )
+            entity, _ = resolve_entity_for_record(database_path, source_record)
+            touched_entity_ids.add(entity.id)
 
-    for entity_id in list_entities_missing_state_ids(database_path):
-        touched_entity_ids.add(entity_id)
+        for entity_id in list_entities_missing_state_ids(database_path):
+            touched_entity_ids.add(entity_id)
 
-    touched_entity_ids.update(reconcile_entities(database_path))
+        touched_entity_ids.update(reconcile_entities(database_path))
 
     for entity_id in touched_entity_ids:
         loaded = get_loaded_entity(database_path, entity_id)
