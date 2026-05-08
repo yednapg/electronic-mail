@@ -36,6 +36,8 @@ class RepositorySchemaTests(unittest.TestCase):
                 "idx_trace_records_entity_created",
                 "idx_trace_records_source_record",
                 "idx_feed_projections_user_updated",
+                "idx_dashboard_import_jobs_latest",
+                "idx_dashboard_import_jobs_active",
             }.issubset(indexes)
         )
         self.assertIn("deleted_at", source_record_columns)
