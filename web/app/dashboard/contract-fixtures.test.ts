@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import type { DashboardResponse, GoogleAuthState, TraceReplayResponse } from '../../lib/types';
+import type { DashboardResponse, GoogleAuthState, ThreadReaderResponse, TraceReplayResponse } from '../../lib/types';
 import { buildSections, buildSummary } from './page';
 
 function fixturePath(name: string): string {
@@ -47,4 +47,13 @@ test('auth and trace fixtures match shared TypeScript contracts', () => {
   assert.equal(auth.connected, true);
   assert.equal(trace.entity_id, 'entity-1');
   assert.equal(trace.items[0].output.merged, true);
+});
+
+test('thread reader fixture includes persisted source evidence', () => {
+  const thread = readFixture<ThreadReaderResponse>('thread-reader.json');
+
+  assert.equal(thread.entity_id, 'entity-1');
+  assert.equal(thread.messages[0].source, 'gmail');
+  assert.match(thread.messages[0].body, /Pay before 5 PM/);
+  assert.match(thread.messages[0].snippet ?? '', /Autopay is not enabled/);
 });

@@ -1,5 +1,5 @@
-/** Dashboard fetcher shared by the server-rendered dashboard page. */
-import type { DashboardResponse, HistoryResponse } from './types';
+/** Dashboard fetcher shared by server-rendered app routes. */
+import type { DashboardResponse, HistoryResponse, ThreadReaderResponse } from './types';
 import type {
   EntityOutcomeResponse,
   GmailDraftRequest,
@@ -8,6 +8,7 @@ import type {
   TaskResponse,
 } from '@electronic-mail/types';
 import { demoDashboard } from './demo-dashboard';
+import { getDemoThread } from './demo-evidence';
 import { demoHistory } from './demo-history';
 
 const DEFAULT_BACKEND_URL = 'http://localhost:3001';
@@ -45,6 +46,22 @@ export async function getHistory({ limit = 60, offset = 0 } = {}): Promise<Histo
     cache: 'no-store',
   });
   if (!res.ok) throw new Error('Failed to fetch history');
+  return res.json();
+}
+
+export async function getEntityThread(entityId: string): Promise<ThreadReaderResponse> {
+  if (isDemoMode()) {
+    const thread = getDemoThread(entityId);
+    if (thread === null) {
+      throw new Error('Thread not found');
+    }
+    return thread;
+  }
+
+  const res = await fetch(`${getBackendURL()}/v1/entities/${encodeURIComponent(entityId)}/thread`, {
+    cache: 'no-store',
+  });
+  if (!res.ok) throw new Error('Failed to fetch entity thread');
   return res.json();
 }
 
