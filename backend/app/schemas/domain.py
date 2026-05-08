@@ -16,6 +16,7 @@ ActionConfidence = Literal["high", "medium", "low"]
 LifecycleState = Literal["active", "scheduled", "resolved", "suppressed"]
 EntityCurrentState = Literal["open", "waiting", "done"]
 GmailThreadAction = Literal["archive", "unarchive", "mark_read"]
+DashboardImportJobStatus = Literal["queued", "running", "succeeded", "failed"]
 TraceStage = Literal[
     "ingestion",
     "normalization",
@@ -129,6 +130,23 @@ class DashboardResponse(BaseModel):
     profile: DashboardProfile | None = None
     briefing: DashboardBriefing | None = None
     feed: FeedResponse = Field(default_factory=FeedResponse)
+
+
+class DashboardImportJobResponse(BaseModel):
+    """Durable status for backend-owned dashboard import/preparation."""
+
+    id: str
+    user_id: str
+    status: DashboardImportJobStatus
+    source_records: int
+    changed_entities: int
+    refreshed_entities: int
+    result_status: str | None = None
+    error_message: str | None = None
+    created_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    updated_at: str
 
 
 class TraceRecord(BaseModel):

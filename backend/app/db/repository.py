@@ -10,6 +10,7 @@ from typing import Iterator, Iterable
 from uuid import uuid4
 
 from app.db.models import (
+    StoredDashboardImportJob,
     StoredEntityOutcome,
     LoadedEntity,
     StoredGmailDraft,
@@ -123,6 +124,24 @@ def initialize_database(database_path: str) -> None:
               last_full_sync_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS dashboard_import_jobs (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              status TEXT NOT NULL,
+              source_records INTEGER NOT NULL DEFAULT 0,
+              changed_entities INTEGER NOT NULL DEFAULT 0,
+              refreshed_entities INTEGER NOT NULL DEFAULT 0,
+              result_status TEXT,
+              error_message TEXT,
+              created_at TEXT NOT NULL,
+              started_at TEXT,
+              completed_at TEXT,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dashboard_import_jobs_latest
+              ON dashboard_import_jobs(user_id, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS manual_tasks (
               id TEXT PRIMARY KEY,
               user_id TEXT NOT NULL,
@@ -209,6 +228,7 @@ def clear_all_data(database_path: str) -> None:
         connection.execute("DELETE FROM entities")
         connection.execute("DELETE FROM source_records")
         connection.execute("DELETE FROM gmail_sync_state")
+        connection.execute("DELETE FROM dashboard_import_jobs")
 
 
 def clear_derived_memory(database_path: str) -> None:
@@ -307,6 +327,154 @@ def upsert_gmail_sync_state(
             """,
             (user_id, last_history_id, last_full_sync_at),
         )
+
+
+def create_dashboard_import_job(database_path: str, *, user_id: str = DEFAULT_USER_ID) -> StoredDashboardImportJob:
+    """Create a queued dashboard import/preparation job."""
+    now = utc_now_iso()
+    job = StoredDashboardImportJob(
+        id=str(uuid4()),
+        user_id=user_id,
+        status="queued",
+        source_records=0,
+        changed_entities=0,
+        refreshed_entities=0,
+        result_status=None,
+        error_message=None,
+        created_at=now,
+        started_at=None,
+        completed_at=None,
+        updated_at=now,
+    )
+
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO dashboard_import_jobs (
+              id, user_id, status, source_records, changed_entities, refreshed_entities,
+              result_status, error_message, created_at, started_at, completed_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job.id,
+                job.user_id,
+                job.status,
+                job.source_records,
+                job.changed_entities,
+                job.refreshed_entities,
+                job.result_status,
+                job.error_message,
+                job.created_at,
+                job.started_at,
+                job.completed_at,
+                job.updated_at,
+            ),
+        )
+
+    return job
+
+
+def mark_dashboard_import_job_running(database_path: str, job_id: str) -> StoredDashboardImportJob:
+    """Transition a dashboard import/preparation job to running."""
+    now = utc_now_iso()
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE dashboard_import_jobs
+            SET status = ?, started_at = COALESCE(started_at, ?), completed_at = NULL,
+                error_message = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            ("running", now, now, job_id),
+        )
+    return require_dashboard_import_job(database_path, job_id)
+
+
+def mark_dashboard_import_job_succeeded(
+    database_path: str,
+    job_id: str,
+    *,
+    result_status: str,
+    source_records: int,
+    changed_entities: int,
+    refreshed_entities: int,
+) -> StoredDashboardImportJob:
+    """Persist a successful dashboard import/preparation result."""
+    now = utc_now_iso()
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE dashboard_import_jobs
+            SET status = ?, source_records = ?, changed_entities = ?, refreshed_entities = ?,
+                result_status = ?, error_message = NULL, completed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                "succeeded",
+                source_records,
+                changed_entities,
+                refreshed_entities,
+                result_status,
+                now,
+                now,
+                job_id,
+            ),
+        )
+    return require_dashboard_import_job(database_path, job_id)
+
+
+def mark_dashboard_import_job_failed(database_path: str, job_id: str, *, error_message: str) -> StoredDashboardImportJob:
+    """Persist a failed dashboard import/preparation result."""
+    now = utc_now_iso()
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE dashboard_import_jobs
+            SET status = ?, result_status = ?, error_message = ?, completed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            ("failed", "failed", error_message, now, now, job_id),
+        )
+    return require_dashboard_import_job(database_path, job_id)
+
+
+def get_dashboard_import_job(database_path: str, job_id: str) -> StoredDashboardImportJob | None:
+    """Load one dashboard import/preparation job by id."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM dashboard_import_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+    return _to_dashboard_import_job(row) if row is not None else None
+
+
+def require_dashboard_import_job(database_path: str, job_id: str) -> StoredDashboardImportJob:
+    """Load one dashboard import/preparation job, raising when the id is invalid."""
+    job = get_dashboard_import_job(database_path, job_id)
+    if job is None:
+        raise ValueError(f"Dashboard import job not found: {job_id}")
+    return job
+
+
+def get_latest_dashboard_import_job(
+    database_path: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> StoredDashboardImportJob | None:
+    """Load the newest dashboard import/preparation job for a user."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM dashboard_import_jobs
+            WHERE user_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+    return _to_dashboard_import_job(row) if row is not None else None
 
 
 def create_entity(database_path: str, canonical_key: str, user_id: str = DEFAULT_USER_ID) -> StoredEntity:
@@ -1183,6 +1351,23 @@ def _to_gmail_draft(row: sqlite3.Row) -> StoredGmailDraft:
         body=str(row["body"]),
         status=str(row["status"]),
         created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _to_dashboard_import_job(row: sqlite3.Row) -> StoredDashboardImportJob:
+    return StoredDashboardImportJob(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        status=str(row["status"]),
+        source_records=int(row["source_records"]),
+        changed_entities=int(row["changed_entities"]),
+        refreshed_entities=int(row["refreshed_entities"]),
+        result_status=str(row["result_status"]) if row["result_status"] is not None else None,
+        error_message=str(row["error_message"]) if row["error_message"] is not None else None,
+        created_at=str(row["created_at"]),
+        started_at=str(row["started_at"]) if row["started_at"] is not None else None,
+        completed_at=str(row["completed_at"]) if row["completed_at"] is not None else None,
         updated_at=str(row["updated_at"]),
     )
 
