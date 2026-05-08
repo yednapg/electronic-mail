@@ -55,6 +55,15 @@ def initialize_database(database_path: str) -> None:
               created_at TEXT NOT NULL
             );
 
+            CREATE INDEX IF NOT EXISTS idx_source_records_timestamp
+              ON source_records(timestamp DESC, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_source_records_user_timestamp
+              ON source_records(user_id, timestamp DESC, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_source_records_thread
+              ON source_records(source, thread_id);
+
             CREATE TABLE IF NOT EXISTS entities (
               id TEXT PRIMARY KEY,
               user_id TEXT NOT NULL DEFAULT 'google-dev-user',
@@ -62,6 +71,12 @@ def initialize_database(database_path: str) -> None:
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_entities_created
+              ON entities(created_at ASC, id ASC);
+
+            CREATE INDEX IF NOT EXISTS idx_entities_user_created
+              ON entities(user_id, created_at ASC, id ASC);
 
             CREATE TABLE IF NOT EXISTS entity_members (
               id TEXT PRIMARY KEY,
@@ -71,6 +86,9 @@ def initialize_database(database_path: str) -> None:
               FOREIGN KEY(source_record_id) REFERENCES source_records(id) ON DELETE CASCADE,
               UNIQUE(entity_id, source_record_id)
             );
+
+            CREATE INDEX IF NOT EXISTS idx_entity_members_entity
+              ON entity_members(entity_id);
 
             CREATE TABLE IF NOT EXISTS entity_thread_memberships (
               id TEXT PRIMARY KEY,
@@ -120,6 +138,12 @@ def initialize_database(database_path: str) -> None:
               FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE,
               FOREIGN KEY(source_record_id) REFERENCES source_records(id) ON DELETE CASCADE
             );
+
+            CREATE INDEX IF NOT EXISTS idx_trace_records_entity_created
+              ON trace_records(entity_id, created_at ASC, id ASC);
+
+            CREATE INDEX IF NOT EXISTS idx_trace_records_source_record
+              ON trace_records(source_record_id);
 
             CREATE TABLE IF NOT EXISTS gmail_sync_state (
               user_id TEXT PRIMARY KEY,
