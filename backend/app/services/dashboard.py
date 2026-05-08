@@ -191,7 +191,9 @@ def _prepare_dashboard_state(settings: Settings, *, job_id: str | None = None) -
         ),
         collect_records=False,
     )
-    imported_count = latest_imported_count + len(source_records)
+    gmail_source_records = [record for record in source_records if record.source == "gmail"]
+    non_gmail_source_records = [record for record in source_records if record.source != "gmail"]
+    imported_count = max(latest_imported_count, len(gmail_source_records)) + len(non_gmail_source_records)
     update_progress("memory_hydration", imported_count=imported_count, source_records=imported_count)
     changed_entity_ids = hydrate_persistent_memory(database_path, source_records or None)
     update_progress("ai_refresh", changed_entities=len(changed_entity_ids))

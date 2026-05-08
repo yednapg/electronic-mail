@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from app.db.models import StoredGmailMessageSnapshot
+from app.db.models import StoredGmailMessageSnapshot, StoredSourceRecord
 from app.db.repository import (
     DEFAULT_USER_ID,
     get_gmail_sync_state,
@@ -15,6 +15,7 @@ from app.db.repository import (
     list_unlinked_source_records,
     upsert_gmail_message_snapshots,
     upsert_gmail_sync_state,
+    upsert_source_records,
 )
 from app.services.integrations.google import sync_gmail_source_records
 from app.services.integrations.google import persist_gmail_message_id_batch
@@ -360,6 +361,34 @@ class GmailLedgerTests(unittest.TestCase):
             ["message-1", "message-2", "message-3"],
         )
         self.assertEqual(get_gmail_sync_state(self.database_path, DEFAULT_USER_ID).last_history_id, "202")
+
+    def test_collect_records_false_returns_only_changed_records_for_hydration(self) -> None:
+        old_record = StoredSourceRecord(
+            id="old-message",
+            source="gmail",
+            thread_id="old-thread",
+            subject="Old message",
+            sender="old@example.com",
+            timestamp="2024-04-04T08:00:00+00:00",
+            raw_payload={"message_id": "old-message", "subject": "Old message"},
+            created_at="2024-04-04T08:00:00+00:00",
+        )
+        upsert_source_records(self.database_path, [old_record])
+        message = build_message(message_id="message-1", thread_id="thread-1", history_id="200")
+        service = FakeGmailService(
+            database_path=self.database_path,
+            list_ids=["message-1"],
+            messages={"message-1": message},
+            threads={"thread-1": [message]},
+        )
+
+        records = sync_gmail_source_records(self.settings, service, collect_records=False)
+
+        self.assertEqual([record.id for record in records], ["message-1"])
+        self.assertEqual(
+            {record.id for record in list_unlinked_source_records(self.database_path)},
+            {"old-message", "message-1"},
+        )
 
     def test_batch_persistence_is_idempotent(self) -> None:
         message = build_message(message_id="message-1", thread_id="thread-1", history_id="200")
