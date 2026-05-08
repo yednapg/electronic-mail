@@ -18,7 +18,7 @@ from app.db.repository import (
     update_dashboard_import_job_progress,
 )
 from app.main import app
-from app.schemas.domain import DashboardBriefing, DashboardProfile, FeedResponse, GoogleAuthState
+from app.schemas.domain import DashboardBriefing, DashboardProfile, FeedResponse, GoogleAuthState, SourceRecord
 
 
 class DashboardImportJobRepositoryTests(unittest.TestCase):
@@ -136,7 +136,24 @@ class DashboardImportJobRouteTests(unittest.TestCase):
             self.assertIsNotNone(progress_callback)
             progress_callback("gmail_listing", 0, 2)
             progress_callback("gmail_persisted", 2, 2)
-            return []
+            return [
+                SourceRecord(
+                    id="gmail-1",
+                    user_id="google-dev-user",
+                    source="gmail",
+                    thread_id="thread-1",
+                    raw_payload={"subject": "One"},
+                    received_at="2026-04-17T10:00:00+00:00",
+                ),
+                SourceRecord(
+                    id="gmail-2",
+                    user_id="google-dev-user",
+                    source="gmail",
+                    thread_id="thread-2",
+                    raw_payload={"subject": "Two"},
+                    received_at="2026-04-17T11:00:00+00:00",
+                ),
+            ]
 
         mock_fetch_source_records.side_effect = fake_fetch_source_records
         changed_entity_ids = {"entity-1", "entity-3"}
@@ -158,6 +175,9 @@ class DashboardImportJobRouteTests(unittest.TestCase):
         self.assertEqual(payload["changed_entities"], len(changed_entity_ids))
         self.assertEqual(payload["refreshed_entities"], len(changed_entity_ids))
         mock_fetch_source_records.assert_called_once()
+        mock_hydrate.assert_called_once()
+        hydrated_records = mock_hydrate.call_args.args[1]
+        self.assertEqual([record.id for record in hydrated_records], ["gmail-1", "gmail-2"])
         mock_refresh.assert_called_once()
         refresh_args = mock_refresh.call_args.args
         self.assertEqual(refresh_args[0], str(self.database_path))

@@ -353,6 +353,29 @@ def list_existing_source_record_ids(database_path: str, ids: Iterable[str]) -> s
     return {str(row["id"]) for row in rows}
 
 
+def list_source_records_by_ids(database_path: str, ids: Iterable[str]) -> list[StoredSourceRecord]:
+    """Return a bounded set of source records by primary key."""
+    unique_ids = sorted({record_id for record_id in ids if record_id})
+
+    if not unique_ids:
+        return []
+
+    placeholders = ", ".join("?" for _ in unique_ids)
+
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT *
+            FROM source_records
+            WHERE id IN ({placeholders})
+            ORDER BY timestamp DESC, id DESC
+            """,
+            unique_ids,
+        ).fetchall()
+
+    return [_to_source_record(row) for row in rows]
+
+
 def get_gmail_sync_state(database_path: str, user_id: str) -> StoredGmailSyncState | None:
     """Load the persisted Gmail sync cursor for one user, if present."""
     with connect(database_path) as connection:
