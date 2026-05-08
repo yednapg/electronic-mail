@@ -14,6 +14,8 @@ from app.db.models import (
     StoredEntityOutcome,
     LoadedEntity,
     StoredGmailDraft,
+    StoredGmailHistoryEvent,
+    StoredGmailMessageSnapshot,
     StoredEntity,
     StoredEntityAiSuggestion,
     StoredEntityState,
@@ -124,6 +126,44 @@ def initialize_database(database_path: str) -> None:
               last_full_sync_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS gmail_message_snapshots (
+              user_id TEXT NOT NULL,
+              message_id TEXT NOT NULL,
+              thread_id TEXT,
+              history_id TEXT,
+              internal_date TEXT,
+              label_ids TEXT NOT NULL,
+              raw_payload TEXT NOT NULL,
+              fetch_status TEXT NOT NULL,
+              tombstoned INTEGER NOT NULL DEFAULT 0,
+              tombstoned_at TEXT,
+              last_fetched_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(user_id, message_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_gmail_message_snapshots_thread
+              ON gmail_message_snapshots(user_id, thread_id);
+
+            CREATE INDEX IF NOT EXISTS idx_gmail_message_snapshots_history
+              ON gmail_message_snapshots(user_id, history_id);
+
+            CREATE TABLE IF NOT EXISTS gmail_history_events (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              history_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              message_id TEXT NOT NULL,
+              thread_id TEXT,
+              label_ids TEXT NOT NULL,
+              message_payload TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_gmail_history_events_message
+              ON gmail_history_events(user_id, message_id, history_id);
+
             CREATE TABLE IF NOT EXISTS dashboard_import_jobs (
               id TEXT PRIMARY KEY,
               user_id TEXT NOT NULL,
@@ -191,6 +231,13 @@ def initialize_database(database_path: str) -> None:
         )
         _ensure_column(connection, "source_records", "user_id", "TEXT NOT NULL DEFAULT 'google-dev-user'")
         _ensure_column(connection, "entities", "user_id", "TEXT NOT NULL DEFAULT 'google-dev-user'")
+        _ensure_column(connection, "gmail_message_snapshots", "internal_date", "TEXT")
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_gmail_message_snapshots_internal_date
+              ON gmail_message_snapshots(user_id, internal_date)
+            """
+        )
 
 
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -217,6 +264,8 @@ def connect(database_path: str) -> Iterator[sqlite3.Connection]:
 def clear_all_data(database_path: str) -> None:
     """Remove all persisted runtime data while preserving the schema."""
     with connect(database_path) as connection:
+        connection.execute("DELETE FROM gmail_history_events")
+        connection.execute("DELETE FROM gmail_message_snapshots")
         connection.execute("DELETE FROM gmail_drafts")
         connection.execute("DELETE FROM entity_outcomes")
         connection.execute("DELETE FROM manual_tasks")
@@ -327,6 +376,148 @@ def upsert_gmail_sync_state(
             """,
             (user_id, last_history_id, last_full_sync_at),
         )
+
+
+def upsert_gmail_message_snapshots(
+    database_path: str,
+    snapshots: Iterable[StoredGmailMessageSnapshot],
+) -> None:
+    """Persist Gmail message snapshots without mutating Gmail itself."""
+    with connect(database_path) as connection:
+        for snapshot in snapshots:
+            connection.execute(
+                """
+                INSERT INTO gmail_message_snapshots (
+                  user_id, message_id, thread_id, history_id, internal_date, label_ids, raw_payload, fetch_status,
+                  tombstoned, tombstoned_at, last_fetched_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, message_id) DO UPDATE SET
+                  thread_id = excluded.thread_id,
+                  history_id = excluded.history_id,
+                  internal_date = excluded.internal_date,
+                  label_ids = excluded.label_ids,
+                  raw_payload = excluded.raw_payload,
+                  fetch_status = excluded.fetch_status,
+                  tombstoned = excluded.tombstoned,
+                  tombstoned_at = excluded.tombstoned_at,
+                  last_fetched_at = excluded.last_fetched_at,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    snapshot.user_id,
+                    snapshot.message_id,
+                    snapshot.thread_id,
+                    snapshot.history_id,
+                    snapshot.internal_date,
+                    json.dumps(snapshot.label_ids, ensure_ascii=True),
+                    json.dumps(snapshot.raw_payload, ensure_ascii=True),
+                    snapshot.fetch_status,
+                    1 if snapshot.tombstoned else 0,
+                    snapshot.tombstoned_at,
+                    snapshot.last_fetched_at,
+                    snapshot.created_at,
+                    snapshot.updated_at,
+                ),
+            )
+
+
+def upsert_gmail_history_events(
+    database_path: str,
+    events: Iterable[StoredGmailHistoryEvent],
+) -> None:
+    """Persist Gmail History API events and apply tombstones to local snapshots."""
+    with connect(database_path) as connection:
+        for event in events:
+            connection.execute(
+                """
+                INSERT INTO gmail_history_events (
+                  id, user_id, history_id, event_type, message_id, thread_id, label_ids,
+                  message_payload, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    event.id,
+                    event.user_id,
+                    event.history_id,
+                    event.event_type,
+                    event.message_id,
+                    event.thread_id,
+                    json.dumps(event.label_ids, ensure_ascii=True),
+                    json.dumps(event.message_payload, ensure_ascii=True),
+                    event.created_at,
+                ),
+            )
+
+            if event.event_type == "messagesDeleted":
+                connection.execute(
+                    """
+                    INSERT INTO gmail_message_snapshots (
+                      user_id, message_id, thread_id, history_id, internal_date, label_ids, raw_payload,
+                      fetch_status, tombstoned, tombstoned_at, last_fetched_at, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, 1, ?, NULL, ?, ?)
+                    ON CONFLICT(user_id, message_id) DO UPDATE SET
+                      history_id = excluded.history_id,
+                      internal_date = excluded.internal_date,
+                      fetch_status = excluded.fetch_status,
+                      tombstoned = 1,
+                      tombstoned_at = excluded.tombstoned_at,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        event.user_id,
+                        event.message_id,
+                        event.thread_id,
+                        event.history_id,
+                        json.dumps(event.label_ids, ensure_ascii=True),
+                        json.dumps(event.message_payload, ensure_ascii=True),
+                        "deleted",
+                        event.created_at,
+                        event.created_at,
+                        event.created_at,
+                    ),
+                )
+
+
+def list_gmail_message_snapshots(
+    database_path: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> list[StoredGmailMessageSnapshot]:
+    """Return Gmail message snapshots for tests and local diagnostics."""
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM gmail_message_snapshots
+            WHERE user_id = ?
+            ORDER BY message_id ASC
+            """,
+            (user_id,),
+        ).fetchall()
+    return [_to_gmail_message_snapshot(row) for row in rows]
+
+
+def list_gmail_history_events(
+    database_path: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> list[StoredGmailHistoryEvent]:
+    """Return Gmail history events for tests and local diagnostics."""
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM gmail_history_events
+            WHERE user_id = ?
+            ORDER BY history_id ASC, event_type ASC, message_id ASC
+            """,
+            (user_id,),
+        ).fetchall()
+    return [_to_gmail_history_event(row) for row in rows]
 
 
 def create_dashboard_import_job(database_path: str, *, user_id: str = DEFAULT_USER_ID) -> StoredDashboardImportJob:
@@ -1352,6 +1543,38 @@ def _to_gmail_draft(row: sqlite3.Row) -> StoredGmailDraft:
         status=str(row["status"]),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+    )
+
+
+def _to_gmail_message_snapshot(row: sqlite3.Row) -> StoredGmailMessageSnapshot:
+    return StoredGmailMessageSnapshot(
+        user_id=str(row["user_id"]),
+        message_id=str(row["message_id"]),
+        thread_id=str(row["thread_id"]) if row["thread_id"] is not None else None,
+        history_id=str(row["history_id"]) if row["history_id"] is not None else None,
+        internal_date=str(row["internal_date"]) if row["internal_date"] is not None else None,
+        label_ids=list(json.loads(row["label_ids"])),
+        raw_payload=json.loads(row["raw_payload"]),
+        fetch_status=str(row["fetch_status"]),
+        tombstoned=bool(row["tombstoned"]),
+        tombstoned_at=str(row["tombstoned_at"]) if row["tombstoned_at"] is not None else None,
+        last_fetched_at=str(row["last_fetched_at"]) if row["last_fetched_at"] is not None else None,
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _to_gmail_history_event(row: sqlite3.Row) -> StoredGmailHistoryEvent:
+    return StoredGmailHistoryEvent(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        history_id=str(row["history_id"]),
+        event_type=str(row["event_type"]),
+        message_id=str(row["message_id"]),
+        thread_id=str(row["thread_id"]) if row["thread_id"] is not None else None,
+        label_ids=list(json.loads(row["label_ids"])),
+        message_payload=json.loads(row["message_payload"]),
+        created_at=str(row["created_at"]),
     )
 
 

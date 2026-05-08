@@ -105,6 +105,40 @@ class StoredGmailSyncState:
 
 
 @dataclass
+class StoredGmailMessageSnapshot:
+    """Durable local snapshot of a Gmail message and label state."""
+
+    user_id: str
+    message_id: str
+    thread_id: str | None
+    history_id: str | None
+    internal_date: str | None
+    label_ids: list[str]
+    raw_payload: dict[str, Any]
+    fetch_status: str
+    tombstoned: bool
+    tombstoned_at: str | None
+    last_fetched_at: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class StoredGmailHistoryEvent:
+    """Durable Gmail History API event captured before message hydration."""
+
+    id: str
+    user_id: str
+    history_id: str
+    event_type: str
+    message_id: str
+    thread_id: str | None
+    label_ids: list[str]
+    message_payload: dict[str, Any]
+    created_at: str
+
+
+@dataclass
 class StoredDashboardImportJob:
     """Durable backend-owned dashboard import/preparation job status."""
 
