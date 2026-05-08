@@ -7,17 +7,21 @@ import re
 
 from app.db.models import LoadedEntity
 from app.db.repository import (
+    DEFAULT_USER_ID,
     append_trace_record,
     clear_derived_memory,
+    get_feed_projection_count,
     get_entity_member_count,
     get_latest_entity_outcomes,
     get_loaded_entity,
     get_source_record_count,
+    list_feed_projection_payloads,
     list_all_loaded_entities,
     list_loaded_entities,
     list_entities_missing_state_ids,
     list_unlinked_source_records,
     upsert_ai_suggestion,
+    upsert_feed_projection,
 )
 from app.schemas.ai import FeedEntityContextInput, FeedEntityJudgmentOutput
 from app.schemas.domain import AttentionItem, FeedResponse, PipelineEntity, PipelineOutput, SourceRecord
@@ -165,6 +169,50 @@ def refresh_ai_suggestions_for_entities(database_path: str, entity_ids: list[str
             )
 
         upsert_ai_suggestion(database_path, entity_id=entity.entity.id, **normalized)
+
+
+def refresh_feed_projections_for_entities(
+    database_path: str,
+    entity_ids: list[str],
+    current_time: str,
+    *,
+    record_trace: bool = True,
+) -> None:
+    """Refresh cached feed projections only for entities touched by the current change."""
+    unique_entity_ids = sorted(set(entity_ids))
+
+    if not unique_entity_ids:
+        return
+
+    entities = list_loaded_entities(database_path, unique_entity_ids)
+    outcomes = get_latest_entity_outcomes(database_path, user_id=DEFAULT_USER_ID)
+
+    for entity in entities:
+        output = to_pipeline_output(
+            database_path,
+            entity,
+            current_time,
+            latest_outcome=outcomes.get(entity.entity.id),
+            record_trace=record_trace,
+        )
+        upsert_feed_projection(
+            database_path,
+            user_id=DEFAULT_USER_ID,
+            entity_id=entity.entity.id,
+            pipeline_output=output.model_dump(),
+        )
+
+
+def build_feed_from_projection_cache(database_path: str) -> FeedResponse | None:
+    """Build the feed from persisted per-entity projections when the cache is populated."""
+    if get_feed_projection_count(database_path, user_id=DEFAULT_USER_ID) == 0:
+        return None
+
+    outputs = [
+        PipelineOutput.model_validate(payload)
+        for payload in list_feed_projection_payloads(database_path, user_id=DEFAULT_USER_ID)
+    ]
+    return build_feed(outputs)
 
 
 def build_feed_from_entities(

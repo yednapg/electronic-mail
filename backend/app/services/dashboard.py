@@ -27,8 +27,10 @@ from app.schemas.domain import (
 )
 from app.services.ai.decision import generate_dashboard_briefing
 from app.services.feed.memory_pipeline import (
+    build_feed_from_projection_cache,
     build_feed_from_entities,
     hydrate_persistent_memory,
+    refresh_feed_projections_for_entities,
     refresh_ai_suggestions_for_entities,
 )
 from app.services.integrations.google import (
@@ -46,9 +48,10 @@ def build_dashboard_response(settings: Settings) -> DashboardResponse:
     if not auth.connected:
         return DashboardResponse(auth=auth, feed=FeedResponse())
 
-    feed = build_feed_from_entities(
+    current_time = datetime.now(timezone.utc).isoformat()
+    feed = build_feed_from_projection_cache(str(settings.database_path)) or build_feed_from_entities(
         str(settings.database_path),
-        datetime.now(timezone.utc).isoformat(),
+        current_time,
         record_trace=False,
     )
     profile = load_google_account_profile()
@@ -204,7 +207,13 @@ def _prepare_dashboard_state(settings: Settings, *, job_id: str | None = None) -
     refresh_entity_ids = sorted(set(changed_entity_ids))
     refresh_ai_suggestions_for_entities(database_path, refresh_entity_ids)
     update_progress("feed_build", refreshed_entities=len(refresh_entity_ids))
-    feed = build_feed_from_entities(database_path, datetime.now(timezone.utc).isoformat())
+    current_time = datetime.now(timezone.utc).isoformat()
+    refresh_feed_projections_for_entities(database_path, refresh_entity_ids, current_time)
+    feed = build_feed_from_projection_cache(database_path) or build_feed_from_entities(
+        database_path,
+        current_time,
+        record_trace=False,
+    )
     profile = load_google_account_profile() or fetch_google_account_profile(settings)
     update_progress("briefing", refreshed_entities=len(refresh_entity_ids))
     save_dashboard_briefing_cache(settings, generate_dashboard_briefing(feed, profile))

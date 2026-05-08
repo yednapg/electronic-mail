@@ -30,6 +30,7 @@ class RepositorySchemaTests(unittest.TestCase):
                 "idx_entity_members_entity",
                 "idx_trace_records_entity_created",
                 "idx_trace_records_source_record",
+                "idx_feed_projections_user_updated",
             }.issubset(indexes)
         )
 
