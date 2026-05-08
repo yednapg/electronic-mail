@@ -1,10 +1,31 @@
 /** Demo landing screen that sends users into the dashboard flow. */
 import Link from 'next/link';
+import { redirect } from 'next/navigation';
 
 import { AppMark } from '../components/AppMark';
+import { getBackendURL, getDashboard, isDemoMode } from '../lib/api';
 import { DEMO_SIGN_IN_ROUTE } from '../lib/demo-flow';
+import type { DashboardResponse } from '../lib/types';
 
-export default function HomePage() {
+export default async function HomePage() {
+  const demoMode = isDemoMode();
+  let signInHref = demoMode ? DEMO_SIGN_IN_ROUTE : `${getBackendURL()}/auth/google`;
+  let dashboard: DashboardResponse | null = null;
+
+  if (!demoMode) {
+    try {
+      dashboard = await getDashboard();
+    } catch {
+      signInHref = `${getBackendURL()}/auth/google`;
+    }
+  }
+
+  if (dashboard?.auth.connected) {
+    redirect('/dashboard');
+  }
+
+  signInHref = dashboard?.auth.connect_url ?? signInHref;
+
   return (
     <main className="login-page">
       <div className="login-shell">
@@ -17,7 +38,7 @@ export default function HomePage() {
           </h1>
         </div>
 
-        <Link className="login-google-button" href={DEMO_SIGN_IN_ROUTE}>
+        <Link className="login-google-button" href={signInHref}>
           <span className="login-google-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" role="img" aria-hidden="true">
               <path

@@ -507,6 +507,8 @@ private enum DashboardPresentation {
             return DigestCTA(label: "Archive", tone: .green)
         case .unarchive:
             return DigestCTA(label: "Unarchive", tone: .blue)
+        case .markRead:
+            return DigestCTA(label: "Mark read", tone: .blue)
         case .none:
             return nil
         }

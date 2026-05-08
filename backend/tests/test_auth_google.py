@@ -72,6 +72,19 @@ class GoogleAuthRouteTests(unittest.TestCase):
         self.assertEqual(response.headers["location"], "electronicmail://auth/callback")
         mock_callback.assert_called_once_with(self.settings, "code-1", "state-1")
 
+    @patch("app.api.routes.auth_google.handle_google_callback")
+    def test_auth_google_callback_restarts_when_local_session_is_missing(self, mock_callback: Mock) -> None:
+        mock_callback.side_effect = RuntimeError("Missing OAuth session. Start again from /auth/google.")
+
+        response = self.client.get(
+            "/auth/google/callback",
+            params={"code": "code-1", "state": "state-1"},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(response.headers["location"], "/auth/google")
+
 
 if __name__ == "__main__":
     unittest.main()

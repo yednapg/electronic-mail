@@ -181,7 +181,7 @@ class EntityStateAndFeedTests(unittest.TestCase):
         self.assertEqual(feed.now, [])
         self.assertEqual(feed.worth_knowing, [])
 
-    def test_hidden_ai_judgment_surfaces_done_item_in_worth_knowing(self) -> None:
+    def test_hidden_ai_judgment_suppresses_done_item(self) -> None:
         loaded_entity = LoadedEntity(
             entity=StoredEntity(
                 id="entity-hidden",
@@ -224,16 +224,16 @@ class EntityStateAndFeedTests(unittest.TestCase):
             initialize_database(db_file.name)
             output = to_pipeline_output(db_file.name, loaded_entity, "2026-04-17T12:00:00+00:00")
 
-        self.assertFalse(output.suppressed)
-        self.assertIsNotNone(output.attention_item)
+        self.assertTrue(output.suppressed)
+        self.assertIsNone(output.attention_item)
 
         feed = build_feed([output])
 
         self.assertEqual(feed.now, [])
         self.assertEqual(feed.today, [])
-        self.assertEqual([item.entity_id for item in feed.worth_knowing], ["entity-hidden"])
+        self.assertEqual(feed.worth_knowing, [])
 
-    def test_visible_done_item_is_not_suppressed(self) -> None:
+    def test_visible_done_item_is_suppressed_by_backend_state(self) -> None:
         loaded_entity = LoadedEntity(
             entity=StoredEntity(
                 id="entity-done-visible",
@@ -276,16 +276,14 @@ class EntityStateAndFeedTests(unittest.TestCase):
             initialize_database(db_file.name)
             output = to_pipeline_output(db_file.name, loaded_entity, "2026-04-17T12:00:00+00:00")
 
-        self.assertFalse(output.suppressed)
-        self.assertIsNotNone(output.attention_item)
-        assert output.attention_item is not None
-        self.assertEqual(output.attention_item.timing_band, "later")
+        self.assertTrue(output.suppressed)
+        self.assertIsNone(output.attention_item)
 
         feed = build_feed([output])
 
         self.assertEqual(feed.now, [])
         self.assertEqual(feed.today, [])
-        self.assertEqual([item.entity_id for item in feed.worth_knowing], ["entity-done-visible"])
+        self.assertEqual(feed.worth_knowing, [])
 
     def test_normalize_judgment_enriches_title_with_missing_artifact_context(self) -> None:
         entity = LoadedEntity(

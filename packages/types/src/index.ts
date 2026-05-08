@@ -12,8 +12,8 @@ export type ActionConfidence = 'high' | 'medium' | 'low';
 export type LifecycleState = 'active' | 'scheduled' | 'resolved' | 'suppressed';
 export type EntityCurrentState = 'open' | 'waiting' | 'done';
 
-export type SourceType = 'gmail' | 'calendar';
-export type GmailThreadAction = 'archive' | 'unarchive';
+export type SourceType = 'gmail' | 'calendar' | 'manual';
+export type GmailThreadAction = 'archive' | 'unarchive' | 'mark_read';
 
 export type FeedbackType = 'acted' | 'ignored' | 'snoozed' | 'dismissed';
 
@@ -167,6 +167,88 @@ export interface TraceReplayResponse {
   readonly entity_id: string;
   readonly source_record_ids: string[];
   readonly items: TraceRecord[];
+}
+
+export interface TaskCreateRequest {
+  readonly title: string;
+  readonly notes?: string | null;
+  readonly section?: 'now' | 'today' | 'later';
+  readonly due_at?: string | null;
+}
+
+export interface TaskUpdateRequest {
+  readonly title?: string | null;
+  readonly notes?: string | null;
+  readonly section?: 'now' | 'today' | 'later' | null;
+  readonly due_at?: string | null;
+  readonly status?: 'open' | 'done' | null;
+}
+
+export interface TaskResponse {
+  readonly id: string;
+  readonly user_id: string;
+  readonly entity_id: string;
+  readonly title: string;
+  readonly notes?: string | null;
+  readonly section: 'now' | 'today' | 'later';
+  readonly due_at?: string | null;
+  readonly status: 'open' | 'done';
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface EntityOutcomeResponse {
+  readonly id: string;
+  readonly user_id: string;
+  readonly entity_id: string;
+  readonly outcome_type: 'complete' | 'snooze' | 'dismiss';
+  readonly snooze_until?: string | null;
+  readonly note?: string | null;
+  readonly created_at: string;
+}
+
+export interface GmailDraftRequest {
+  readonly to: string;
+  readonly cc?: string | null;
+  readonly bcc?: string | null;
+  readonly subject: string;
+  readonly body: string;
+  readonly entity_id?: string | null;
+  readonly thread_id?: string | null;
+}
+
+export interface GmailDraftResponse extends GmailDraftRequest {
+  readonly id: string;
+  readonly user_id: string;
+  readonly gmail_draft_id: string;
+  readonly gmail_message_id?: string | null;
+  readonly status: 'draft' | 'sent' | 'deleted';
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface ThreadMessage {
+  readonly id: string;
+  readonly source: SourceType;
+  readonly thread_id?: string | null;
+  readonly from_address?: string | null;
+  readonly to?: string | null;
+  readonly cc?: string | null;
+  readonly bcc?: string | null;
+  readonly subject?: string | null;
+  readonly body: string;
+  readonly snippet?: string | null;
+  readonly label_ids: string[];
+  readonly received_at: string;
+}
+
+export interface ThreadReaderResponse {
+  readonly entity_id: string;
+  readonly user_id: string;
+  readonly source?: SourceType | null;
+  readonly gmail_thread_id?: string | null;
+  readonly subject?: string | null;
+  readonly messages: ThreadMessage[];
 }
 
 /**

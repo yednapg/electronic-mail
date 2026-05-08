@@ -1,5 +1,12 @@
 /** Dashboard fetcher shared by the server-rendered dashboard page. */
 import type { DashboardResponse } from './types';
+import type {
+  EntityOutcomeResponse,
+  GmailDraftRequest,
+  GmailDraftResponse,
+  TaskCreateRequest,
+  TaskResponse,
+} from '@electronic-mail/types';
 import { demoDashboard } from './demo-dashboard';
 
 const DEFAULT_BACKEND_URL = 'http://localhost:3001';
@@ -21,5 +28,38 @@ export async function getDashboard(): Promise<DashboardResponse> {
     cache: 'no-store',
   });
   if (!res.ok) throw new Error('Failed to fetch dashboard');
+  return res.json();
+}
+
+export async function createTask(request: TaskCreateRequest): Promise<TaskResponse> {
+  return postJSON('/v1/tasks', request);
+}
+
+export async function createGmailDraft(request: GmailDraftRequest): Promise<GmailDraftResponse> {
+  return postJSON('/v1/gmail/drafts', request);
+}
+
+export async function completeEntity(entityId: string): Promise<EntityOutcomeResponse> {
+  return postJSON(`/v1/entities/${encodeURIComponent(entityId)}/complete`, {});
+}
+
+export async function snoozeEntity(entityId: string, snoozeUntil: string): Promise<EntityOutcomeResponse> {
+  return postJSON(`/v1/entities/${encodeURIComponent(entityId)}/snooze`, { snooze_until: snoozeUntil });
+}
+
+export async function dismissEntity(entityId: string): Promise<EntityOutcomeResponse> {
+  return postJSON(`/v1/entities/${encodeURIComponent(entityId)}/dismiss`, {});
+}
+
+async function postJSON<Response>(path: string, body: unknown): Promise<Response> {
+  const res = await fetch(`${getBackendURL()}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Backend request failed: ${path}`);
   return res.json();
 }

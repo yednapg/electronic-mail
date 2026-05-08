@@ -58,6 +58,45 @@ final class MockDashboardAPIClient: DashboardAPIProviding {
         TraceReplayResponse(entityID: entityID, sourceRecordIDs: [], items: [])
     }
 
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        TaskResponse(
+            id: "task-1",
+            userID: "google-dev-user",
+            entityID: "entity-task-1",
+            title: request.title,
+            notes: request.notes,
+            section: request.section ?? "today",
+            dueAt: request.dueAt,
+            status: "open",
+            createdAt: "2026-05-05T00:00:00+00:00",
+            updatedAt: "2026-05-05T00:00:00+00:00"
+        )
+    }
+
+    func completeEntity(_ entityID: String) async throws -> EntityOutcomeResponse {
+        EntityOutcomeResponse(id: "outcome-1", userID: "google-dev-user", entityID: entityID, outcomeType: "complete", snoozeUntil: nil, note: nil, createdAt: "2026-05-05T00:00:00+00:00")
+    }
+
+    func snoozeEntity(_ entityID: String, until snoozeUntil: String) async throws -> EntityOutcomeResponse {
+        EntityOutcomeResponse(id: "outcome-1", userID: "google-dev-user", entityID: entityID, outcomeType: "snooze", snoozeUntil: snoozeUntil, note: nil, createdAt: "2026-05-05T00:00:00+00:00")
+    }
+
+    func dismissEntity(_ entityID: String) async throws -> EntityOutcomeResponse {
+        EntityOutcomeResponse(id: "outcome-1", userID: "google-dev-user", entityID: entityID, outcomeType: "dismiss", snoozeUntil: nil, note: nil, createdAt: "2026-05-05T00:00:00+00:00")
+    }
+
+    func thread(entityID: String) async throws -> ThreadReaderResponse {
+        ThreadReaderResponse(entityID: entityID, userID: "google-dev-user", source: nil, gmailThreadID: nil, subject: nil, messages: [])
+    }
+
+    func createDraft(_ request: GmailDraftRequest) async throws -> GmailDraftResponse {
+        GmailDraftResponse(id: "draft-1", userID: "google-dev-user", entityID: request.entityID, gmailDraftID: "gmail-draft-1", gmailMessageID: nil, threadID: request.threadID, to: request.to, cc: request.cc, bcc: request.bcc, subject: request.subject, body: request.body, status: "draft", createdAt: "2026-05-05T00:00:00+00:00", updatedAt: "2026-05-05T00:00:00+00:00")
+    }
+
+    func sendDraft(_ draftID: String) async throws -> GmailDraftResponse {
+        GmailDraftResponse(id: draftID, userID: "google-dev-user", entityID: nil, gmailDraftID: "gmail-draft-1", gmailMessageID: "message-1", threadID: nil, to: "to@example.com", cc: nil, bcc: nil, subject: "Subject", body: "Body", status: "sent", createdAt: "2026-05-05T00:00:00+00:00", updatedAt: "2026-05-05T00:00:00+00:00")
+    }
+
     func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
         archivedThreadID = threadID
         return GmailThreadMutationResponse(threadID: threadID, action: .archive)
@@ -66,6 +105,10 @@ final class MockDashboardAPIClient: DashboardAPIProviding {
     func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
         unarchivedThreadID = threadID
         return GmailThreadMutationResponse(threadID: threadID, action: .unarchive)
+    }
+
+    func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .markRead)
     }
 }
 

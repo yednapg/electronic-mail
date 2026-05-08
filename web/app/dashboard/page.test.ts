@@ -202,7 +202,7 @@ test('dashboard summary renders backend-generated briefing copy without rewritin
   });
 });
 
-test('gmail items expose an explicit archive CTA when one thread can be mutated', () => {
+test('gmail archive actions stay out of compact feed rows', () => {
   const cta = toSectionCta(
     createFeedItem({
       source: 'gmail',
@@ -211,15 +211,7 @@ test('gmail items expose an explicit archive CTA when one thread can be mutated'
     }),
   );
 
-  assert.deepEqual(cta, {
-    label: 'Archive',
-    tone: 'green',
-    action: {
-      kind: 'gmail-thread',
-      threadId: 'thread-123',
-      operation: 'archive',
-    },
-  });
+  assert.equal(cta, undefined);
 });
 
 test('YC RSVP items expose expandable detail instead of an inline CTA', () => {

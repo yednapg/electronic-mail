@@ -57,11 +57,7 @@ def to_feed_candidate(output: PipelineOutput) -> tuple[PipelineOutput, Attention
     timing_band = attention_item.timing_band
 
     if timing_band == "hidden":
-        timing_band = "later"
-        data = attention_item.model_dump()
-        data["timing_band"] = "later"
-        data["importance_level"] = "low"
-        attention_item = AttentionItem.model_validate(data)
+        return None
 
     return output, attention_item, map_timing_band_to_section(timing_band)
 

@@ -41,6 +41,8 @@ def auth_google_callback(
     try:
         redirect_url = handle_google_callback(settings, code, state)
     except RuntimeError as exc:
+        if "Start again from /auth/google" in str(exc):
+            return RedirectResponse("/auth/google")
         raise HTTPException(status_code=400, detail="Unable to link this Google account.") from exc
 
     return RedirectResponse(redirect_url)

@@ -1,4 +1,3 @@
-import { DashboardComposer } from './DashboardComposer';
 import { DashboardAgenda } from './DashboardAgenda';
 import { DashboardMeta } from './DashboardMeta';
 import { DashboardSection } from './DashboardSection';
@@ -36,7 +35,6 @@ export function DashboardView({ dateLabel, timeLabel, liveMeta, summary, agenda,
   return (
     <main className="digest-page">
       <DashboardSettingsPanel />
-      <DashboardComposer />
       <div className="digest-shell">
         <DashboardMeta dateLabel={dateLabel} timeLabel={timeLabel} live={liveMeta} />
         <DashboardSummary summary={summary} />
@@ -47,6 +45,7 @@ export function DashboardView({ dateLabel, timeLabel, liveMeta, summary, agenda,
             {sections.map((section) => (
               <div key={section.id} className="digest-section-slot" data-dashboard-section={section.id}>
                 <DashboardSection
+                  sectionId={section.id}
                   title={section.title}
                   items={section.items}
                   maxVisible={section.maxVisible}
