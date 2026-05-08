@@ -7,6 +7,7 @@ import {
   POST_LOGIN_MINIMUM_MS,
   POST_LOGIN_READY_TIMEOUT_MS,
 } from '../../lib/demo-flow';
+import { waitForDashboardImportJob } from '../../lib/dashboard-import';
 
 const STATUS_VISIBLE_MS = 1600;
 const STATUS_FADE_MS = 260;
@@ -26,17 +27,9 @@ function wait(ms: number): Promise<void> {
 
 async function waitForDashboardReady(): Promise<void> {
   if (process.env.NEXT_PUBLIC_DEMO_MODE === 'false') {
-    const response = await fetch('/api/dashboard/prepare', {
-      method: 'POST',
-      cache: 'no-store',
-      headers: {
-        Accept: 'application/json',
-      },
+    await waitForDashboardImportJob({
+      timeoutMs: POST_LOGIN_READY_TIMEOUT_MS,
     });
-
-    if (!response.ok) {
-      throw new Error('Dashboard preparation failed.');
-    }
     return;
   }
 
