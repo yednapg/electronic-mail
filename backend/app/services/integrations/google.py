@@ -2,7 +2,8 @@ from __future__ import annotations
 
 """Google OAuth, Gmail thread actions, and Calendar ingestion helpers."""
 
-from base64 import urlsafe_b64decode
+from base64 import urlsafe_b64decode, urlsafe_b64encode
+from email.message import EmailMessage
 from email.utils import getaddresses
 import html
 import json
@@ -45,6 +46,7 @@ CALENDAR_MAX_RESULTS = 20
 CALENDAR_WINDOW_DAYS = 7
 GMAIL_SYNC_SCOPES = {"full", "recent"}
 GMAIL_INBOX_LABEL = "INBOX"
+GMAIL_UNREAD_LABEL = "UNREAD"
 HTML_TAG_PATTERN = re.compile(r"(?is)<[^>]+>")
 
 
@@ -104,7 +106,7 @@ def get_google_auth_url(settings: Settings, redirect_to: str | None = None) -> s
 
 def handle_google_callback(settings: Settings, code: str, state: str | None = None) -> str:
     """Exchange the OAuth code, persist tokens, and return the final client redirect."""
-    session = load_oauth_session()
+    session = load_oauth_session(state)
     if session is None:
         raise RuntimeError("Missing OAuth session. Start again from /auth/google.")
 
@@ -113,11 +115,11 @@ def handle_google_callback(settings: Settings, code: str, state: str | None = No
     redirect_to = session.get("redirect_to")
 
     if state is not None and expected_state and state != expected_state:
-        clear_oauth_session()
+        clear_oauth_session(state)
         raise RuntimeError("OAuth state mismatch. Start again from /auth/google.")
 
     if not isinstance(code_verifier, str) or not code_verifier.strip():
-        clear_oauth_session()
+        clear_oauth_session(state)
         raise RuntimeError("Missing OAuth code verifier. Start again from /auth/google.")
 
     flow = create_flow(settings)
@@ -138,12 +140,12 @@ def handle_google_callback(settings: Settings, code: str, state: str | None = No
     if profile is not None:
         _reset_local_data_if_account_changed(settings, profile)
         save_google_account_profile(profile)
-    clear_oauth_session()
+    clear_oauth_session(state)
 
     if isinstance(redirect_to, str) and redirect_to == settings.mobile_redirect_uri:
         return redirect_to
 
-    return f"{settings.cors_origin}/dashboard"
+    return f"{settings.cors_origin}/post-login"
 
 
 def fetch_google_source_records(settings: Settings) -> list[SourceRecord]:
@@ -224,6 +226,68 @@ def unarchive_gmail_thread(settings: Settings, thread_id: str) -> dict[str, obje
         thread_id,
         add_label_ids=[GMAIL_INBOX_LABEL],
     )
+
+
+def mark_gmail_thread_read(settings: Settings, thread_id: str) -> dict[str, object]:
+    """Mark one Gmail thread read from an explicit user action."""
+    return modify_gmail_thread_labels(
+        settings,
+        thread_id,
+        remove_label_ids=[GMAIL_UNREAD_LABEL],
+    )
+
+
+def create_gmail_draft(
+    settings: Settings,
+    *,
+    to: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+    subject: str,
+    body: str,
+    thread_id: str | None = None,
+) -> dict[str, object]:
+    """Create one Gmail draft from an explicit user action."""
+    gmail_service = create_gmail_service(settings)
+    message_body = {"raw": build_raw_email(to=to, cc=cc, bcc=bcc, subject=subject, body=body)}
+    if thread_id:
+        message_body["threadId"] = thread_id
+    return gmail_service.users().drafts().create(userId="me", body={"message": message_body}).execute()
+
+
+def update_gmail_draft(
+    settings: Settings,
+    gmail_draft_id: str,
+    *,
+    to: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+    subject: str,
+    body: str,
+    thread_id: str | None = None,
+) -> dict[str, object]:
+    """Replace one existing Gmail draft from an explicit user action."""
+    gmail_service = create_gmail_service(settings)
+    message_body = {"raw": build_raw_email(to=to, cc=cc, bcc=bcc, subject=subject, body=body)}
+    if thread_id:
+        message_body["threadId"] = thread_id
+    return gmail_service.users().drafts().update(
+        userId="me",
+        id=gmail_draft_id,
+        body={"id": gmail_draft_id, "message": message_body},
+    ).execute()
+
+
+def send_gmail_draft(settings: Settings, gmail_draft_id: str) -> dict[str, object]:
+    """Send one existing Gmail draft from an explicit user action."""
+    gmail_service = create_gmail_service(settings)
+    return gmail_service.users().drafts().send(userId="me", body={"id": gmail_draft_id}).execute()
+
+
+def delete_gmail_draft(settings: Settings, gmail_draft_id: str) -> None:
+    """Delete one existing Gmail draft from an explicit user action."""
+    gmail_service = create_gmail_service(settings)
+    gmail_service.users().drafts().delete(userId="me", id=gmail_draft_id).execute()
 
 
 def persist_source_records(settings: Settings, records: list[SourceRecord]) -> None:
@@ -432,20 +496,70 @@ def _reset_local_data_if_account_changed(settings: Settings, profile: DashboardP
 
 def save_oauth_session(session: dict[str, object]) -> None:
     """Persist the temporary OAuth PKCE session between redirect and callback."""
-    OAUTH_SESSION_FILE_PATH.write_text(json.dumps(session, indent=2))
+    state = session.get("state")
+    if not isinstance(state, str) or not state.strip():
+        OAUTH_SESSION_FILE_PATH.write_text(json.dumps(session, indent=2))
+        return
+
+    sessions = load_oauth_sessions()
+    sessions[state] = session
+    OAUTH_SESSION_FILE_PATH.write_text(json.dumps({"sessions": sessions}, indent=2))
 
 
-def load_oauth_session() -> dict[str, object] | None:
+def load_oauth_session(state: str | None = None) -> dict[str, object] | None:
     """Load the temporary OAuth session used to complete the PKCE token exchange."""
     if not OAUTH_SESSION_FILE_PATH.exists():
         return None
 
-    return json.loads(OAUTH_SESSION_FILE_PATH.read_text())
+    payload = json.loads(OAUTH_SESSION_FILE_PATH.read_text())
+    sessions = payload.get("sessions")
+    if isinstance(sessions, dict):
+        if isinstance(state, str) and state in sessions and isinstance(sessions[state], dict):
+            return sessions[state]
+        if state is None and len(sessions) == 1:
+            only_session = next(iter(sessions.values()))
+            return only_session if isinstance(only_session, dict) else None
+        return None
+
+    expected_state = payload.get("state")
+    if state is None or state == expected_state:
+        return payload
+    return None
 
 
-def clear_oauth_session() -> None:
-    """Remove any stale OAuth session file after success or mismatch."""
+def load_oauth_sessions() -> dict[str, dict[str, object]]:
+    """Load all pending OAuth sessions keyed by state."""
+    if not OAUTH_SESSION_FILE_PATH.exists():
+        return {}
+
+    try:
+        payload = json.loads(OAUTH_SESSION_FILE_PATH.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+    sessions = payload.get("sessions")
+    if isinstance(sessions, dict):
+        return {str(key): value for key, value in sessions.items() if isinstance(value, dict)}
+
+    state = payload.get("state")
+    if isinstance(state, str) and state.strip():
+        return {state: payload}
+    return {}
+
+
+def clear_oauth_session(state: str | None = None) -> None:
+    """Remove OAuth session state after success or mismatch."""
     if OAUTH_SESSION_FILE_PATH.exists():
+        if state is None:
+            OAUTH_SESSION_FILE_PATH.unlink()
+            return
+
+        sessions = load_oauth_sessions()
+        sessions.pop(state, None)
+        if sessions:
+            OAUTH_SESSION_FILE_PATH.write_text(json.dumps({"sessions": sessions}, indent=2))
+            return
+
         OAUTH_SESSION_FILE_PATH.unlink()
 
 
@@ -982,6 +1096,34 @@ def modify_gmail_thread_labels(
         },
     )
     return response
+
+
+def create_gmail_service(settings: Settings):
+    """Build an authorized Gmail service or fail with a user-facing runtime error."""
+    credentials = create_authorized_credentials(settings)
+    if credentials is None:
+        raise RuntimeError("Google account is not connected")
+    return build("gmail", "v1", credentials=credentials)
+
+
+def build_raw_email(
+    *,
+    to: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+    subject: str,
+    body: str,
+) -> str:
+    """Encode a simple UTF-8 text email for Gmail API draft/send endpoints."""
+    message = EmailMessage()
+    message["To"] = to
+    if cc:
+        message["Cc"] = cc
+    if bcc:
+        message["Bcc"] = bcc
+    message["Subject"] = subject
+    message.set_content(body)
+    return urlsafe_b64encode(message.as_bytes()).decode("utf-8")
 
 
 def extract_gmail_body(payload: dict[str, object]) -> str:

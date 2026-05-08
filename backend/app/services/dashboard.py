@@ -3,8 +3,10 @@ from __future__ import annotations
 """Backend dashboard assembly for auth, feed, and natural-language briefing."""
 
 from datetime import datetime, timezone
+import json
 
 from app.core.config import Settings
+from app.db.repository import list_all_loaded_entities
 from app.schemas.domain import DashboardBriefing, DashboardProfile, DashboardResponse, FeedResponse
 from app.services.ai.decision import generate_dashboard_briefing
 from app.services.feed.memory_pipeline import (
@@ -16,6 +18,7 @@ from app.services.integrations.google import (
     fetch_google_account_profile,
     fetch_google_source_records,
     get_google_auth_state,
+    load_google_account_profile,
 )
 
 
@@ -26,15 +29,54 @@ def build_dashboard_response(settings: Settings) -> DashboardResponse:
     if not auth.connected:
         return DashboardResponse(auth=auth, feed=FeedResponse())
 
-    source_records = fetch_google_source_records(settings)
-    changed_entity_ids = hydrate_persistent_memory(str(settings.database_path), source_records)
-    refresh_ai_suggestions_for_entities(str(settings.database_path), changed_entity_ids)
     feed = build_feed_from_entities(str(settings.database_path), datetime.now(timezone.utc).isoformat())
-    profile = fetch_google_account_profile(settings)
-    briefing = generate_dashboard_briefing(feed, profile)
+    profile = load_google_account_profile() or fetch_google_account_profile(settings)
+    briefing = load_dashboard_briefing_cache(settings) or generate_dashboard_briefing(feed, profile)
 
     resolved_profile = _merge_profile(profile, briefing)
     return DashboardResponse(auth=auth, profile=resolved_profile, briefing=briefing, feed=feed)
+
+
+def prepare_dashboard_state(settings: Settings) -> dict[str, object]:
+    """Run the slow Gmail/Calendar and AI prep before the dashboard is shown."""
+    auth = get_google_auth_state(settings)
+    if not auth.connected:
+        return {"status": "not_connected", "source_records": 0, "changed_entities": 0}
+
+    source_records = fetch_google_source_records(settings)
+    changed_entity_ids = hydrate_persistent_memory(str(settings.database_path), source_records)
+    refresh_entity_ids = [
+        entity.entity.id
+        for entity in list_all_loaded_entities(str(settings.database_path))
+    ]
+    refresh_ai_suggestions_for_entities(str(settings.database_path), refresh_entity_ids)
+    feed = build_feed_from_entities(str(settings.database_path), datetime.now(timezone.utc).isoformat())
+    profile = load_google_account_profile() or fetch_google_account_profile(settings)
+    save_dashboard_briefing_cache(settings, generate_dashboard_briefing(feed, profile))
+    return {
+        "status": "ready",
+        "source_records": len(source_records),
+        "changed_entities": len(changed_entity_ids),
+        "refreshed_entities": len(refresh_entity_ids),
+    }
+
+
+def load_dashboard_briefing_cache(settings: Settings) -> DashboardBriefing | None:
+    """Load the last prepared dashboard summary from backend-owned state."""
+    cache_path = settings.database_path.with_name(".dashboard-briefing.json")
+    if not cache_path.exists():
+        return None
+
+    try:
+        return DashboardBriefing.model_validate(json.loads(cache_path.read_text()))
+    except Exception:
+        return None
+
+
+def save_dashboard_briefing_cache(settings: Settings, briefing: DashboardBriefing) -> None:
+    """Persist the prepared dashboard summary for fast dashboard rendering."""
+    cache_path = settings.database_path.with_name(".dashboard-briefing.json")
+    cache_path.write_text(json.dumps(briefing.model_dump(), indent=2))
 
 
 def _merge_profile(

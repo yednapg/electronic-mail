@@ -73,6 +73,8 @@ The theme icon is global and lives at the top right. It should be icon-only, com
 
 The dashboard has a small top-right settings icon adjacent to the theme icon. It opens a compact flat panel for demo-safe view controls: Brief, Calendar, Now, Today, and Worth Knowing. These switches only change what is visible in the UI; they should not mutate backend data or task state.
 
+Each dashboard section owns its own inline add affordance. Put a plain text plus sign at the right edge of the section header rule, not inside a circle and not in a global bottom toolbar. Opening it inserts a compact inline composer in that section, with a single title input, a Todo/Email switch, and one action. New local items should appear in the same section where the plus was used.
+
 Buttons should use plain, readable shapes. Auth buttons may include the provider brand icon. Checklist CTAs should look like text links: bold, colored, and underlined.
 
 Checkboxes are small square controls, not large toggles. They can be local-only UI state unless persistence is explicitly added.

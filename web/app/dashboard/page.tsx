@@ -124,6 +124,7 @@ export function toSectionItem(item: FeedItem): DashboardSectionItem {
   if (item.need_type === 'awareness') {
     return {
       id: item.id,
+      entityId: item.entity_id,
       title:
         item.source === 'calendar' && item.why_this_is_here.trim().length > 0
           ? item.why_this_is_here
@@ -135,6 +136,7 @@ export function toSectionItem(item: FeedItem): DashboardSectionItem {
 
   return {
     id: item.id,
+    entityId: item.entity_id,
     title: toActionSentence(item),
     detail: toSectionDetail(item),
     cta: toSectionCta(item),
@@ -300,10 +302,6 @@ export function stripDuePrefix(title: string): string {
 }
 
 export function toSectionCta(item: FeedItem): DashboardSectionItem['cta'] | undefined {
-  if (toSectionDetail(item) !== undefined) {
-    return undefined;
-  }
-
   if (item.primary_action === 'confirm' && /^within\b/i.test(item.title.trim())) {
     return {
       label: 'RSVP',
@@ -323,34 +321,6 @@ export function toSectionCta(item: FeedItem): DashboardSectionItem['cta'] | unde
     return {
       label: 'Read Notice',
       tone: 'green',
-    };
-  }
-
-  if (item.source !== 'gmail' || item.gmail_thread_id === undefined || item.gmail_thread_id === null) {
-    return undefined;
-  }
-
-  if (item.gmail_thread_action === 'archive') {
-    return {
-      label: 'Archive',
-      tone: 'green',
-      action: {
-        kind: 'gmail-thread',
-        threadId: item.gmail_thread_id,
-        operation: 'archive',
-      },
-    };
-  }
-
-  if (item.gmail_thread_action === 'unarchive') {
-    return {
-      label: 'Unarchive',
-      tone: 'blue',
-      action: {
-        kind: 'gmail-thread',
-        threadId: item.gmail_thread_id,
-        operation: 'unarchive',
-      },
     };
   }
 
@@ -381,10 +351,6 @@ export function toSectionDetail(item: FeedItem): DashboardSectionItem['detail'] 
       dismissLabel: 'No',
       sourceLabel: 'Sources: 3 emails from YC',
     });
-  }
-
-  if (item.gmail_thread_action !== undefined && item.gmail_thread_action !== null) {
-    return undefined;
   }
 
   return withDetailLinks(item, {

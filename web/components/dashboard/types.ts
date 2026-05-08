@@ -16,6 +16,7 @@ export type DashboardActionTone = 'blue' | 'green';
 
 export type DashboardSectionItem = {
   id: string;
+  entityId?: string;
   title: string;
   checked?: boolean;
   detail?: {

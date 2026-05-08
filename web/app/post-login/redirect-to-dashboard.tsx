@@ -15,6 +15,21 @@ function wait(ms: number): Promise<void> {
 }
 
 async function waitForDashboardReady(): Promise<void> {
+  if (process.env.NEXT_PUBLIC_DEMO_MODE === 'false') {
+    const response = await fetch('/api/dashboard/prepare', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        Accept: 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error('Dashboard preparation failed.');
+    }
+    return;
+  }
+
   const response = await fetch(DEMO_DASHBOARD_ROUTE, {
     cache: 'no-store',
     credentials: 'same-origin',
@@ -30,9 +45,25 @@ async function waitForDashboardReady(): Promise<void> {
 
 export function RedirectToDashboard() {
   useEffect(() => {
-    let cancelled = false;
+    function redirectToDashboard() {
+      window.location.assign(DEMO_DASHBOARD_ROUTE);
+    }
+
+    const fallbackTimer = window.setTimeout(() => {
+      redirectToDashboard();
+    }, POST_LOGIN_READY_TIMEOUT_MS);
 
     async function redirectWhenReady() {
+      if (process.env.NEXT_PUBLIC_DEMO_MODE === 'false') {
+        await Promise.all([
+          wait(POST_LOGIN_MINIMUM_MS),
+          waitForDashboardReady(),
+        ]);
+
+        redirectToDashboard();
+        return;
+      }
+
       await Promise.all([
         wait(POST_LOGIN_MINIMUM_MS),
         Promise.race([
@@ -41,15 +72,16 @@ export function RedirectToDashboard() {
         ]),
       ]);
 
-      if (!cancelled) {
-        window.location.replace(DEMO_DASHBOARD_ROUTE);
-      }
+      redirectToDashboard();
     }
 
-    void redirectWhenReady();
+    void redirectWhenReady().catch(async () => {
+      await wait(POST_LOGIN_MINIMUM_MS);
+      redirectToDashboard();
+    });
 
     return () => {
-      cancelled = true;
+      window.clearTimeout(fallbackTimer);
     };
   }, []);
 

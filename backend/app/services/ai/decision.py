@@ -1252,11 +1252,30 @@ def _first_name(display_name: str | None) -> str | None:
 def _infer_name_candidates_from_items(items: list) -> list[str]:
     """Extract likely account-owner names from feed text without hardcoding identities."""
     candidates: list[str] = []
+    non_person_tokens = {
+        "Account",
+        "Children",
+        "Code",
+        "District",
+        "Impact",
+        "Intelligence",
+        "Invitation",
+        "Letter",
+        "Level",
+        "Meetup",
+        "National",
+        "New",
+        "Opening",
+        "Registration",
+        "Summit",
+    }
 
     for item in items:
         text = f"{item.title} {item.why_this_is_here}"
         for match in re.finditer(r"\bfor\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b", text):
             candidate = match.group(1).strip()
+            if any(token in non_person_tokens for token in candidate.split()):
+                continue
             if candidate not in candidates:
                 candidates.append(candidate)
 

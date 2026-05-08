@@ -3,6 +3,7 @@ import Foundation
 public enum SourceType: String, Codable, Equatable {
     case gmail
     case calendar
+    case manual
 }
 
 public enum TimingBand: String, Codable, Equatable {
@@ -21,6 +22,7 @@ public enum EntityCurrentState: String, Codable, Equatable {
 public enum GmailThreadAction: String, Codable, Equatable {
     case archive
     case unarchive
+    case markRead = "mark_read"
 }
 
 public enum NeedType: String, Codable, Equatable {
@@ -137,6 +139,168 @@ public struct GmailThreadMutationResponse: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case threadID = "thread_id"
         case action
+    }
+}
+
+public struct TaskCreateRequest: Codable, Equatable {
+    let title: String
+    let notes: String?
+    let section: String?
+    let dueAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case notes
+        case section
+        case dueAt = "due_at"
+    }
+}
+
+public struct TaskResponse: Codable, Equatable {
+    let id: String
+    let userID: String
+    let entityID: String
+    let title: String
+    let notes: String?
+    let section: String
+    let dueAt: String?
+    let status: String
+    let createdAt: String
+    let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case userID = "user_id"
+        case entityID = "entity_id"
+        case title
+        case notes
+        case section
+        case dueAt = "due_at"
+        case status
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+public struct EntityOutcomeResponse: Codable, Equatable {
+    let id: String
+    let userID: String
+    let entityID: String
+    let outcomeType: String
+    let snoozeUntil: String?
+    let note: String?
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case userID = "user_id"
+        case entityID = "entity_id"
+        case outcomeType = "outcome_type"
+        case snoozeUntil = "snooze_until"
+        case note
+        case createdAt = "created_at"
+    }
+}
+
+public struct GmailDraftRequest: Codable, Equatable {
+    let to: String
+    let cc: String?
+    let bcc: String?
+    let subject: String
+    let body: String
+    let entityID: String?
+    let threadID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case to
+        case cc
+        case bcc
+        case subject
+        case body
+        case entityID = "entity_id"
+        case threadID = "thread_id"
+    }
+}
+
+public struct GmailDraftResponse: Codable, Equatable {
+    let id: String
+    let userID: String
+    let entityID: String?
+    let gmailDraftID: String
+    let gmailMessageID: String?
+    let threadID: String?
+    let to: String
+    let cc: String?
+    let bcc: String?
+    let subject: String
+    let body: String
+    let status: String
+    let createdAt: String
+    let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case userID = "user_id"
+        case entityID = "entity_id"
+        case gmailDraftID = "gmail_draft_id"
+        case gmailMessageID = "gmail_message_id"
+        case threadID = "thread_id"
+        case to
+        case cc
+        case bcc
+        case subject
+        case body
+        case status
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+public struct ThreadReaderResponse: Codable, Equatable {
+    let entityID: String
+    let userID: String
+    let source: SourceType?
+    let gmailThreadID: String?
+    let subject: String?
+    let messages: [ThreadMessage]
+
+    enum CodingKeys: String, CodingKey {
+        case entityID = "entity_id"
+        case userID = "user_id"
+        case source
+        case gmailThreadID = "gmail_thread_id"
+        case subject
+        case messages
+    }
+}
+
+public struct ThreadMessage: Codable, Equatable, Identifiable {
+    public let id: String
+    let source: SourceType
+    let threadID: String?
+    let fromAddress: String?
+    let to: String?
+    let cc: String?
+    let bcc: String?
+    let subject: String?
+    let body: String
+    let snippet: String?
+    let labelIDs: [String]
+    let receivedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case source
+        case threadID = "thread_id"
+        case fromAddress = "from_address"
+        case to
+        case cc
+        case bcc
+        case subject
+        case body
+        case snippet
+        case labelIDs = "label_ids"
+        case receivedAt = "received_at"
     }
 }
 
