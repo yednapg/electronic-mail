@@ -206,3 +206,16 @@ class StoredGmailDraft:
     status: str
     created_at: str
     updated_at: str
+
+
+@dataclass
+class StoredHistorySourceRecord:
+    """Read-only history projection row assembled from persisted backend state."""
+
+    source_record: StoredSourceRecord
+    entity_id: str | None
+    current_state: str | None
+    suggestion_title: str | None
+    suggestion_summary: str | None
+    outcome_type: str | None
+    outcome_created_at: str | None

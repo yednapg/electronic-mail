@@ -12,6 +12,7 @@ from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.entities import router as entities_router
 from app.api.routes.feed import router as feed_router
 from app.api.routes.system import router as system_router
+from app.api.routes.history import router as history_router
 from app.api.routes.tasks import router as tasks_router
 from app.api.routes.trace import router as trace_router
 from app.core.config import load_settings
@@ -37,5 +38,6 @@ app.include_router(feed_router)
 app.include_router(gmail_router)
 app.include_router(tasks_router)
 app.include_router(entities_router)
+app.include_router(history_router)
 app.include_router(trace_router)
 app.include_router(ai_router)
