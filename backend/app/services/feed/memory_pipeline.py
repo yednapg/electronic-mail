@@ -167,12 +167,26 @@ def refresh_ai_suggestions_for_entities(database_path: str, entity_ids: list[str
         upsert_ai_suggestion(database_path, entity_id=entity.entity.id, **normalized)
 
 
-def build_feed_from_entities(database_path: str, current_time: str) -> FeedResponse:
+def build_feed_from_entities(
+    database_path: str,
+    current_time: str,
+    *,
+    record_trace: bool = True,
+) -> FeedResponse:
     """Convert all loaded entities into pipeline outputs and then section them into a feed."""
     entities = list_all_loaded_entities(database_path)
     outcomes = get_latest_entity_outcomes(database_path, user_id="google-dev-user")
-    outputs = [to_pipeline_output(database_path, entity, current_time, latest_outcome=outcomes.get(entity.entity.id)) for entity in entities]
-    feed = build_feed(outputs, database_path)
+    outputs = [
+        to_pipeline_output(
+            database_path,
+            entity,
+            current_time,
+            latest_outcome=outcomes.get(entity.entity.id),
+            record_trace=record_trace,
+        )
+        for entity in entities
+    ]
+    feed = build_feed(outputs, database_path if record_trace else None)
     source_records = get_source_record_count(database_path)
     feed_items = len(feed.now) + len(feed.today) + len(feed.worth_knowing)
 
@@ -197,7 +211,14 @@ def build_feed_from_entities(database_path: str, current_time: str) -> FeedRespo
     return feed
 
 
-def to_pipeline_output(database_path: str, entity: LoadedEntity, current_time: str, latest_outcome=None) -> PipelineOutput:
+def to_pipeline_output(
+    database_path: str,
+    entity: LoadedEntity,
+    current_time: str,
+    latest_outcome=None,
+    *,
+    record_trace: bool = True,
+) -> PipelineOutput:
     """Turn one loaded entity into a visible feed item whenever enough context exists."""
     latest_record = entity.members[-1] if entity.members else None
     state = entity.state
@@ -205,59 +226,61 @@ def to_pipeline_output(database_path: str, entity: LoadedEntity, current_time: s
 
     if latest_record is None:
         pipeline_entity = to_pipeline_entity(entity, None)
-        append_trace_record(
-            database_path,
-            stage="output",
-            user_id="local-user",
-            entity_id=pipeline_entity.id,
-            source_record_id=source_record_id,
-            trace_id=pipeline_entity.id,
-            input={"reason": "missing_state"},
-            output={"surfaced": False, "suppressed": True, "suppression_reason": "missing_state"},
-        )
+        if record_trace:
+            append_trace_record(
+                database_path,
+                stage="output",
+                user_id="local-user",
+                entity_id=pipeline_entity.id,
+                source_record_id=source_record_id,
+                trace_id=pipeline_entity.id,
+                input={"reason": "missing_state"},
+                output={"surfaced": False, "suppressed": True, "suppression_reason": "missing_state"},
+            )
         return create_suppressed_output(pipeline_entity, "missing_state")
 
     if state is None:
         pipeline_entity = to_pipeline_entity(entity, latest_record.source)
         attention_item = create_missing_state_attention_item(entity, latest_record)
-        append_trace_record(
-            database_path,
-            stage="action_selection",
-            user_id="local-user",
-            entity_id=pipeline_entity.id,
-            source_record_id=source_record_id,
-            trace_id=pipeline_entity.id,
-            input={
-                "current_state": "open",
-                "used_ai_suggestion": False,
-                "reason": "missing_state_fallback",
-            },
-            output={
-                "need_type": attention_item.need_type,
-                "action_type": attention_item.action_type,
-                "effort_level": attention_item.effort_level,
-                "primary_action": attention_item.primary_action,
-                "fallback_action": attention_item.fallback_action,
-                "downgraded_from_hidden": False,
-            },
-        )
-        append_trace_record(
-            database_path,
-            stage="timing",
-            user_id="local-user",
-            entity_id=pipeline_entity.id,
-            source_record_id=source_record_id,
-            trace_id=pipeline_entity.id,
-            input={
-                "due_at": attention_item.due_at,
-                "current_state": "open",
-            },
-            output={
-                "timing_band": attention_item.timing_band,
-                "importance_level": attention_item.importance_level,
-                "action_confidence": attention_item.action_confidence,
-            },
-        )
+        if record_trace:
+            append_trace_record(
+                database_path,
+                stage="action_selection",
+                user_id="local-user",
+                entity_id=pipeline_entity.id,
+                source_record_id=source_record_id,
+                trace_id=pipeline_entity.id,
+                input={
+                    "current_state": "open",
+                    "used_ai_suggestion": False,
+                    "reason": "missing_state_fallback",
+                },
+                output={
+                    "need_type": attention_item.need_type,
+                    "action_type": attention_item.action_type,
+                    "effort_level": attention_item.effort_level,
+                    "primary_action": attention_item.primary_action,
+                    "fallback_action": attention_item.fallback_action,
+                    "downgraded_from_hidden": False,
+                },
+            )
+            append_trace_record(
+                database_path,
+                stage="timing",
+                user_id="local-user",
+                entity_id=pipeline_entity.id,
+                source_record_id=source_record_id,
+                trace_id=pipeline_entity.id,
+                input={
+                    "due_at": attention_item.due_at,
+                    "current_state": "open",
+                },
+                output={
+                    "timing_band": attention_item.timing_band,
+                    "importance_level": attention_item.importance_level,
+                    "action_confidence": attention_item.action_confidence,
+                },
+            )
         return PipelineOutput(
             entity=pipeline_entity,
             attention_item=attention_item,
@@ -291,16 +314,17 @@ def to_pipeline_output(database_path: str, entity: LoadedEntity, current_time: s
         not suggestion.suggested_visibility or suggestion.suggested_timing == "hidden"
         )
     )
-    append_trace_record(
-        database_path,
-        stage="lifecycle_transition",
-        user_id="local-user",
-        entity_id=pipeline_entity.id,
-        source_record_id=source_record_id,
-        trace_id=pipeline_entity.id,
-        input={"current_state": normalized_state},
-        output={"lifecycle_state": pipeline_entity.lifecycle_state},
-    )
+    if record_trace:
+        append_trace_record(
+            database_path,
+            stage="lifecycle_transition",
+            user_id="local-user",
+            entity_id=pipeline_entity.id,
+            source_record_id=source_record_id,
+            trace_id=pipeline_entity.id,
+            input={"current_state": normalized_state},
+            output={"lifecycle_state": pipeline_entity.lifecycle_state},
+        )
 
     attention_item = (
         to_fallback_attention_item(entity, latest_record, current_time)
@@ -312,43 +336,44 @@ def to_pipeline_output(database_path: str, entity: LoadedEntity, current_time: s
             force_worth_knowing=force_worth_knowing,
         )
     )
-    append_trace_record(
-        database_path,
-        stage="action_selection",
-        user_id="local-user",
-        entity_id=pipeline_entity.id,
-        source_record_id=source_record_id,
-        trace_id=pipeline_entity.id,
-        input={
-            "current_state": normalized_state,
-            "used_ai_suggestion": suggestion is not None,
-        },
-        output={
-            "need_type": attention_item.need_type,
-            "action_type": attention_item.action_type,
-            "effort_level": attention_item.effort_level,
-            "primary_action": attention_item.primary_action,
-            "fallback_action": attention_item.fallback_action,
-            "downgraded_from_hidden": force_worth_knowing,
-        },
-    )
-    append_trace_record(
-        database_path,
-        stage="timing",
-        user_id="local-user",
-        entity_id=pipeline_entity.id,
-        source_record_id=source_record_id,
-        trace_id=pipeline_entity.id,
-        input={
-            "due_at": attention_item.due_at,
-            "current_state": normalized_state,
-        },
-        output={
-            "timing_band": attention_item.timing_band,
-            "importance_level": attention_item.importance_level,
-            "action_confidence": attention_item.action_confidence,
-        },
-    )
+    if record_trace:
+        append_trace_record(
+            database_path,
+            stage="action_selection",
+            user_id="local-user",
+            entity_id=pipeline_entity.id,
+            source_record_id=source_record_id,
+            trace_id=pipeline_entity.id,
+            input={
+                "current_state": normalized_state,
+                "used_ai_suggestion": suggestion is not None,
+            },
+            output={
+                "need_type": attention_item.need_type,
+                "action_type": attention_item.action_type,
+                "effort_level": attention_item.effort_level,
+                "primary_action": attention_item.primary_action,
+                "fallback_action": attention_item.fallback_action,
+                "downgraded_from_hidden": force_worth_knowing,
+            },
+        )
+        append_trace_record(
+            database_path,
+            stage="timing",
+            user_id="local-user",
+            entity_id=pipeline_entity.id,
+            source_record_id=source_record_id,
+            trace_id=pipeline_entity.id,
+            input={
+                "due_at": attention_item.due_at,
+                "current_state": normalized_state,
+            },
+            output={
+                "timing_band": attention_item.timing_band,
+                "importance_level": attention_item.importance_level,
+                "action_confidence": attention_item.action_confidence,
+            },
+        )
 
     return PipelineOutput(
         entity=pipeline_entity,
