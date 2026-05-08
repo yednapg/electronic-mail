@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter
 
 from app.core.config import load_settings
+from app.db.repository import list_source_record_ids
 from app.schemas.domain import FeedResponse, SourceRecord
 from app.services.feed.memory_pipeline import (
     build_feed_from_projection_cache,
@@ -23,6 +24,7 @@ from app.services.integrations.google import (
     fetch_raw_gmail_source_records,
     has_stored_google_tokens,
 )
+from app.services.source_record_summaries import refresh_source_record_summaries
 
 
 router = APIRouter()
@@ -37,6 +39,7 @@ def feed() -> FeedResponse:
     if settings.google_configured and has_stored_google_tokens():
         source_records = fetch_google_source_records(settings)
 
+    refresh_source_record_summaries(str(settings.database_path), [record.id for record in source_records])
     changed_entity_ids = hydrate_persistent_memory(str(settings.database_path), source_records)
     refresh_ai_suggestions_for_entities(str(settings.database_path), changed_entity_ids)
     current_time = datetime.now(timezone.utc).isoformat()
@@ -78,6 +81,10 @@ def raw_gmail_api_clean() -> list[dict[str, object]]:
 @router.post("/rebuild-memory", response_model=FeedResponse)
 def rebuild_memory() -> FeedResponse:
     """Rebuild entity memory from persisted source records without re-syncing Gmail."""
+    refresh_source_record_summaries(
+        str(settings.database_path),
+        list_source_record_ids(str(settings.database_path)),
+    )
     changed_entity_ids = rebuild_persistent_memory(str(settings.database_path))
     refresh_ai_suggestions_for_entities(str(settings.database_path), changed_entity_ids)
     current_time = datetime.now(timezone.utc).isoformat()

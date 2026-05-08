@@ -18,9 +18,12 @@ from app.db.repository import (
     initialize_database,
     upsert_ai_suggestion,
     upsert_entity_state,
+    upsert_source_record_summary,
     upsert_source_records,
 )
 from app.main import app
+from app.services.ai.decision import SourceRecordSummaryBatch
+from app.services.source_record_summaries import refresh_source_record_summaries
 
 
 def make_record(
@@ -135,6 +138,30 @@ class HistoryRouteTests(unittest.TestCase):
         self.assertEqual(payload["total"], 3)
         self.assertEqual([row["source_record_id"] for row in flatten_history_rows(payload)], ["record-2"])
 
+    @patch("app.services.source_record_summaries.summarize_source_records")
+    def test_history_uses_backend_owned_source_record_summary(self, mock_summarize: Mock) -> None:
+        record = make_record(
+            record_id="message-1",
+            thread_id="thread-1",
+            received_at="2026-05-08T09:00:00+00:00",
+            subject="Order update",
+            snippet="Apple says your iPhone has shipped.",
+        )
+        upsert_source_records(str(self.database_path), [record])
+        mock_summarize.return_value = SourceRecordSummaryBatch(
+            model="test-summary-model",
+            summaries={"message-1": "Apple shipped your iPhone order."},
+        )
+
+        refreshed = refresh_source_record_summaries(str(self.database_path), ["message-1"])
+        response = self.client.get("/v1/history")
+
+        self.assertEqual(refreshed, 1)
+        row = flatten_history_rows(response.json())[0]
+        self.assertEqual(row["title"], "Apple shipped your iPhone order.")
+        self.assertEqual(row["summary"], "Apple shipped your iPhone order.")
+        mock_summarize.assert_called_once()
+
     @patch("app.services.integrations.google.fetch_google_source_records")
     @patch("app.api.routes.gmail.archive_gmail_thread_service")
     def test_history_enriches_rows_without_touching_gmail(
@@ -155,6 +182,14 @@ class HistoryRouteTests(unittest.TestCase):
         entity = create_entity(str(self.database_path), "gmail-thread:thread-1")
         attach_record_to_entity(str(self.database_path), entity.id, record.id)
         upsert_entity_state(str(self.database_path), entity.id, "received", None)
+        upsert_source_record_summary(
+            str(self.database_path),
+            source_record_id=record.id,
+            user_id=DEFAULT_USER_ID,
+            summary="Support received your refund request.",
+            model="test-summary-model",
+            generated_from_hash="hash-1",
+        )
         upsert_ai_suggestion(
             str(self.database_path),
             entity_id=entity.id,
@@ -186,10 +221,10 @@ class HistoryRouteTests(unittest.TestCase):
         self.assertEqual(row["thread_id"], "thread-1")
         self.assertEqual(row["received_at"], "2026-05-08T09:00:00+00:00")
         self.assertEqual(row["subject"], "Your refund request")
-        self.assertEqual(row["title"], "Refund request is being reviewed")
+        self.assertEqual(row["title"], "Support received your refund request.")
         self.assertEqual(row["sender"], "Support <support@example.com>")
         self.assertEqual(row["snippet"], "We received your refund request.")
-        self.assertEqual(row["summary"], "The provider acknowledged your refund and is reviewing it.")
+        self.assertEqual(row["summary"], "Support received your refund request.")
         self.assertEqual(row["current_state"], "waiting")
         self.assertEqual(row["lifecycle_state"], "active")
         self.assertEqual(row["outcome_type"], "snooze")

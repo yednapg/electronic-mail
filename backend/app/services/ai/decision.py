@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from openai import OpenAI
@@ -25,6 +26,7 @@ from app.schemas.ai import (
     FeedEntityContextInput,
     FeedEntityJudgmentOutput,
     FeedEntityJudgmentResponse,
+    SourceRecordSummaryResponse,
 )
 from app.schemas.domain import DashboardBriefing, DashboardProfile, FeedResponse
 
@@ -148,6 +150,27 @@ Rules:
 }
 """
 
+SOURCE_RECORD_SUMMARY_PROMPT = """You write compact summaries for individual persisted email or calendar records.
+
+Rules:
+- Summarize this one record only, not the whole thread or entity.
+- Preserve concrete facts: request, status, document, order, amount, deadline, or sender action.
+- If the message is a routine receipt or status update, say what happened plainly.
+- Do not invent missing context.
+- Keep each summary under 160 characters.
+- Do not mention prompts, JSON, models, or system behavior.
+
+Return strict JSON only:
+{
+  "items": [
+    {
+      "id": "string",
+      "summary": "string"
+    }
+  ]
+}
+"""
+
 DASHBOARD_BRIEFING_PROMPT = """You write the top briefing for a personal dashboard.
 
 Rules:
@@ -208,6 +231,14 @@ MAX_SUMMARY_CHARS = 280
 MAX_SENDER_CHARS = 120
 MAX_PARTICIPANTS = 8
 MAX_BATCH_JSON_CHARS = 18000
+
+
+@dataclass(frozen=True)
+class SourceRecordSummaryBatch:
+    """Generated summaries plus the model/source that produced them."""
+
+    model: str
+    summaries: dict[str, str]
 
 
 def _openai_debug_enabled() -> bool:
@@ -384,6 +415,20 @@ def classify_entity_state(records: list[StoredSourceRecord]) -> str:
             return _classify_entity_state_heuristically(records)
 
     return _classify_entity_state_heuristically(records)
+
+
+def summarize_source_records(records: list[StoredSourceRecord]) -> SourceRecordSummaryBatch:
+    """Generate compact summaries for individual persisted records."""
+    if not records:
+        return SourceRecordSummaryBatch(model="none", summaries={})
+
+    if _has_llm_config():
+        return _summarize_source_records_with_llm(records)
+
+    return SourceRecordSummaryBatch(
+        model="heuristic-source-summary-v1",
+        summaries={record.id: _summarize_source_record_heuristically(record) for record in records},
+    )
 
 
 def normalize_entity_state(current_state: str | None) -> str:
@@ -705,6 +750,50 @@ def _classify_entity_state_with_llm(records: list[StoredSourceRecord]) -> str:
     return normalized
 
 
+def _summarize_source_records_with_llm(records: list[StoredSourceRecord]) -> SourceRecordSummaryBatch:
+    """Batch individual source-record summaries through the configured model."""
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model = _openai_model()
+    summaries: dict[str, str] = {}
+    compact_records = [_compact_source_record_for_summary(record) for record in records]
+
+    for batch in _chunk_json_payloads(compact_records, key="records"):
+        user_payload = {"records": batch["records"]}
+        completion = _create_chat_completion(
+            client,
+            model=model,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SOURCE_RECORD_SUMMARY_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "Write compact summaries for these individual records.\n\n"
+                        f"{json.dumps(user_payload, ensure_ascii=True)}"
+                    ),
+                },
+            ],
+        )
+        content = completion.choices[0].message.content or '{"items":[]}'
+        _log_openai_exchange(
+            label="source_record_summaries",
+            model=model,
+            payload=user_payload,
+            content=content,
+        )
+        parsed = SourceRecordSummaryResponse.model_validate(json.loads(content))
+        for item in parsed.items:
+            summary = _truncate_text(item.summary, 160)
+            if summary:
+                summaries[item.id] = summary
+
+    for record in records:
+        summaries.setdefault(record.id, _summarize_source_record_heuristically(record))
+
+    return SourceRecordSummaryBatch(model=model, summaries=summaries)
+
+
 def _classify_entity_state_heuristically(records: list[StoredSourceRecord]) -> str:
     """Fallback classification based on coarse lifecycle cues in the timeline."""
     text = " ".join(
@@ -765,6 +854,55 @@ def _classify_entity_state_heuristically(records: list[StoredSourceRecord]) -> s
         return "waiting"
 
     return "open"
+
+
+def _compact_source_record_for_summary(record: StoredSourceRecord) -> dict[str, object]:
+    payload = record.raw_payload
+    return {
+        "id": record.id,
+        "source": record.source,
+        "subject": _truncate_text(record.subject or _payload_string(payload, "subject") or "", MAX_SUBJECT_CHARS),
+        "sender": _truncate_text(
+            record.sender or _payload_string(payload, "from") or _payload_string(payload, "sender") or "",
+            MAX_SENDER_CHARS,
+        )
+        or None,
+        "timestamp": record.timestamp,
+        "snippet": _truncate_text(_payload_string(payload, "snippet") or "", 240) or None,
+        "body": _truncate_text(_payload_string(payload, "body") or "", 700) or None,
+    }
+
+
+def _summarize_source_record_heuristically(record: StoredSourceRecord) -> str:
+    """Fallback single-record summary for history rows when no LLM is configured."""
+    payload = record.raw_payload
+    subject = _compact(record.subject or _payload_string(payload, "subject") or "Untitled message")
+    detail = _first_sentence(
+        _payload_string(payload, "snippet")
+        or _payload_string(payload, "summary")
+        or _payload_string(payload, "body")
+        or ""
+    )
+
+    if record.source == "calendar":
+        return _truncate_text(f"{subject} is on your calendar.", 160)
+
+    if detail and detail.lower() not in subject.lower():
+        return _truncate_text(f"{subject}: {detail}", 160)
+
+    return _truncate_text(subject, 160)
+
+
+def _first_sentence(value: str) -> str:
+    compacted = " ".join(value.split()).strip()
+    if not compacted:
+        return ""
+
+    for separator in (". ", "! ", "? ", "\n"):
+        if separator in compacted:
+            return compacted.split(separator, 1)[0].strip().rstrip(".!?")
+
+    return compacted
 
 
 def build_record_text(record: StoredSourceRecord) -> str:
