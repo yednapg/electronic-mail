@@ -18,6 +18,7 @@ class StoredSourceRecord:
     timestamp: str
     raw_payload: dict[str, Any]
     created_at: str
+    deleted_at: str | None = None
 
 
 @dataclass

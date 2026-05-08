@@ -29,6 +29,7 @@ from app.db.repository import (
     initialize_database,
     list_existing_source_record_ids,
     list_source_records_by_ids,
+    mark_source_records_deleted,
     upsert_gmail_history_events,
     upsert_gmail_message_snapshots,
     upsert_gmail_sync_state,
@@ -674,6 +675,8 @@ def sync_gmail_source_records(
             for event in history_events
             if event.event_type == "messagesDeleted"
         }
+        if deleted_message_ids:
+            mark_source_records_deleted(database_path, deleted_message_ids)
         if needs_full_sync:
             used_full_sync = True
             message_ids = []
