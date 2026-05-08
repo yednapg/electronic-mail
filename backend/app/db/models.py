@@ -145,6 +145,9 @@ class StoredDashboardImportJob:
     id: str
     user_id: str
     status: str
+    stage: str
+    imported_count: int
+    total_count: int | None
     source_records: int
     changed_entities: int
     refreshed_entities: int

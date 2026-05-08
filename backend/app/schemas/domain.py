@@ -138,6 +138,9 @@ class DashboardImportJobResponse(BaseModel):
     id: str
     user_id: str
     status: DashboardImportJobStatus
+    stage: str
+    imported_count: int
+    total_count: int | None = None
     source_records: int
     changed_entities: int
     refreshed_entities: int

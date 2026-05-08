@@ -7,7 +7,7 @@ import {
   POST_LOGIN_MINIMUM_MS,
   POST_LOGIN_READY_TIMEOUT_MS,
 } from '../../lib/demo-flow';
-import { waitForDashboardImportJob } from '../../lib/dashboard-import';
+import { formatDashboardImportStatus, waitForDashboardImportJob } from '../../lib/dashboard-import';
 
 const STATUS_VISIBLE_MS = 1600;
 const STATUS_FADE_MS = 260;
@@ -25,10 +25,11 @@ function wait(ms: number): Promise<void> {
   });
 }
 
-async function waitForDashboardReady(): Promise<void> {
+async function waitForDashboardReady(onStatus?: (message: string) => void): Promise<void> {
   if (process.env.NEXT_PUBLIC_DEMO_MODE === 'false') {
     await waitForDashboardImportJob({
       timeoutMs: POST_LOGIN_READY_TIMEOUT_MS,
+      onUpdate: (job) => onStatus?.(formatDashboardImportStatus(job)),
     });
     return;
   }
@@ -48,8 +49,10 @@ async function waitForDashboardReady(): Promise<void> {
 
 export function RotatingStatus() {
   const [activeIndex, setActiveIndex] = useState(0);
+  const [liveStatus, setLiveStatus] = useState<string | null>(null);
   const [visible, setVisible] = useState(true);
   const swapTimeoutRef = useRef<number | null>(null);
+  const activeMessage = liveStatus ?? statusMessages[activeIndex];
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -82,7 +85,7 @@ export function RotatingStatus() {
       if (process.env.NEXT_PUBLIC_DEMO_MODE === 'false') {
         await Promise.all([
           wait(POST_LOGIN_MINIMUM_MS),
-          waitForDashboardReady(),
+          waitForDashboardReady(setLiveStatus),
         ]);
 
         redirectToDashboard();
@@ -111,12 +114,12 @@ export function RotatingStatus() {
   }, []);
 
   return (
-    <p className="post-login-rotating-status" aria-live="polite" aria-label={statusMessages[activeIndex]}>
+    <p className="post-login-rotating-status" aria-live="polite" aria-label={activeMessage}>
       <span
         className={`post-login-status-text ${visible ? 'post-login-status-text-visible' : ''}`}
         aria-hidden="true"
       >
-        {statusMessages[activeIndex]}
+        {activeMessage}
       </span>
     </p>
   );

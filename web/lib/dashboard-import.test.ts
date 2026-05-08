@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   DashboardImportError,
   createDashboardImportJob,
+  formatDashboardImportStatus,
   waitForDashboardImportJob,
 } from './dashboard-import';
 
@@ -22,6 +23,9 @@ function job(status: 'queued' | 'running' | 'succeeded' | 'failed', errorMessage
     id: 'job-1',
     user_id: 'google-dev-user',
     status,
+    stage: status === 'queued' ? 'queued' : status === 'running' ? 'gmail_fetching' : status === 'succeeded' ? 'completed' : 'failed',
+    imported_count: status === 'succeeded' ? 11 : status === 'running' ? 4 : 0,
+    total_count: 11,
     source_records: status === 'succeeded' ? 11 : 0,
     changed_entities: status === 'succeeded' ? 4 : 0,
     refreshed_entities: status === 'succeeded' ? 4 : 0,
@@ -50,6 +54,7 @@ test('dashboard import job starts through the local proxy route', async () => {
 
 test('dashboard import polling waits until the backend job succeeds', async () => {
   const calls: string[] = [];
+  const updates: string[] = [];
   const responses = [
     response(job('queued'), { status: 202 }),
     response(job('running')),
@@ -64,15 +69,28 @@ test('dashboard import polling waits until the backend job succeeds', async () =
     return Promise.resolve(next);
   }) as typeof fetch;
 
-  const completed = await waitForDashboardImportJob({ fetcher, timeoutMs: 1000, pollMs: 0 });
+  const completed = await waitForDashboardImportJob({
+    fetcher,
+    timeoutMs: 1000,
+    pollMs: 0,
+    onUpdate: (updatedJob) => updates.push(updatedJob.stage),
+  });
 
   assert.equal(completed.status, 'succeeded');
   assert.equal(completed.source_records, 11);
+  assert.deepEqual(updates, ['queued', 'gmail_fetching', 'completed']);
   assert.deepEqual(calls, [
     '/api/dashboard/import-jobs',
     '/api/dashboard/import-jobs/job-1',
     '/api/dashboard/import-jobs/job-1',
   ]);
+});
+
+test('dashboard import status formats backend-owned progress stages', () => {
+  const running = job('running');
+
+  assert.equal(formatDashboardImportStatus(running), 'Fetching Gmail threads 4/11...');
+  assert.equal(formatDashboardImportStatus(job('succeeded')), 'Dashboard is ready.');
 });
 
 test('dashboard import polling surfaces backend failure state', async () => {

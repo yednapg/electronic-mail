@@ -17,6 +17,7 @@ from app.db.repository import (
     mark_dashboard_import_job_failed,
     mark_dashboard_import_job_running,
     mark_dashboard_import_job_succeeded,
+    update_dashboard_import_job_progress,
 )
 from app.schemas.domain import (
     DashboardBriefing,
@@ -75,7 +76,7 @@ def run_dashboard_import_job(settings: Settings, job_id: str) -> StoredDashboard
     mark_dashboard_import_job_running(str(settings.database_path), job_id)
 
     try:
-        result = _prepare_dashboard_state(settings)
+        result = _prepare_dashboard_state(settings, job_id=job_id)
     except Exception as exc:
         return mark_dashboard_import_job_failed(str(settings.database_path), job_id, error_message=str(exc))
 
@@ -115,6 +116,9 @@ def prepare_dashboard_state(settings: Settings) -> dict[str, object]:
         "refreshed_entities": job.refreshed_entities,
         "job_id": job.id,
         "job_status": job.status,
+        "job_stage": job.stage,
+        "imported_count": job.imported_count,
+        "total_count": job.total_count,
     }
     if job.error_message:
         response["error_message"] = job.error_message
@@ -127,6 +131,9 @@ def to_dashboard_import_job_response(job: StoredDashboardImportJob) -> Dashboard
         id=job.id,
         user_id=job.user_id,
         status=job.status,
+        stage=job.stage,
+        imported_count=job.imported_count,
+        total_count=job.total_count,
         source_records=job.source_records,
         changed_entities=job.changed_entities,
         refreshed_entities=job.refreshed_entities,
@@ -139,10 +146,34 @@ def to_dashboard_import_job_response(job: StoredDashboardImportJob) -> Dashboard
     )
 
 
-def _prepare_dashboard_state(settings: Settings) -> dict[str, object]:
+def _prepare_dashboard_state(settings: Settings, *, job_id: str | None = None) -> dict[str, object]:
     """Run the explicit Gmail/Calendar and AI prep before the dashboard is shown."""
+    database_path = str(settings.database_path)
+    latest_imported_count = 0
+
+    def update_progress(
+        stage: str,
+        imported_count: int | None = None,
+        total_count: int | None = None,
+        **counts: int,
+    ) -> None:
+        nonlocal latest_imported_count
+        if imported_count is not None:
+            latest_imported_count = imported_count
+        if job_id is None:
+            return
+        update_dashboard_import_job_progress(
+            database_path,
+            job_id,
+            stage=stage,
+            imported_count=imported_count,
+            total_count=total_count,
+            **counts,
+        )
+
     auth = get_google_auth_state(settings)
     if not auth.connected:
+        update_progress("not_connected", imported_count=0, total_count=0)
         return {
             "status": "not_connected",
             "source_records": 0,
@@ -150,19 +181,34 @@ def _prepare_dashboard_state(settings: Settings) -> dict[str, object]:
             "refreshed_entities": 0,
         }
 
-    source_records = fetch_google_source_records(settings)
-    changed_entity_ids = hydrate_persistent_memory(str(settings.database_path), source_records)
+    update_progress("gmail_sync", imported_count=0)
+    source_records = fetch_google_source_records(
+        settings,
+        progress_callback=lambda stage, imported_count, total_count: update_progress(
+            stage,
+            imported_count=imported_count,
+            total_count=total_count,
+            source_records=imported_count,
+        ),
+        collect_records=False,
+    )
+    imported_count = latest_imported_count + len(source_records)
+    update_progress("memory_hydration", imported_count=imported_count, source_records=imported_count)
+    changed_entity_ids = hydrate_persistent_memory(database_path, source_records or None)
+    update_progress("ai_refresh", changed_entities=len(changed_entity_ids))
     refresh_entity_ids = [
         entity.entity.id
-        for entity in list_all_loaded_entities(str(settings.database_path))
+        for entity in list_all_loaded_entities(database_path)
     ]
-    refresh_ai_suggestions_for_entities(str(settings.database_path), refresh_entity_ids)
-    feed = build_feed_from_entities(str(settings.database_path), datetime.now(timezone.utc).isoformat())
+    refresh_ai_suggestions_for_entities(database_path, refresh_entity_ids)
+    update_progress("feed_build", refreshed_entities=len(refresh_entity_ids))
+    feed = build_feed_from_entities(database_path, datetime.now(timezone.utc).isoformat())
     profile = load_google_account_profile() or fetch_google_account_profile(settings)
+    update_progress("briefing", refreshed_entities=len(refresh_entity_ids))
     save_dashboard_briefing_cache(settings, generate_dashboard_briefing(feed, profile))
     return {
         "status": "ready",
-        "source_records": len(source_records),
+        "source_records": imported_count,
         "changed_entities": len(changed_entity_ids),
         "refreshed_entities": len(refresh_entity_ids),
     }
