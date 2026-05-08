@@ -30,6 +30,7 @@ export type DashboardSectionItem = {
     dismissLabel: string;
     sourceLabel: string;
     links?: {
+      threadHref: string;
       rawHref: string;
       traceHref: string;
     };

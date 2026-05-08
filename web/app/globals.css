@@ -1873,6 +1873,130 @@ a {
   font-size: var(--type-detail-source);
 }
 
+.thread-reader-shell {
+  width: min(calc(100vw - 48px), 760px);
+}
+
+.thread-reader-header {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 26px;
+}
+
+.thread-reader-back {
+  width: fit-content;
+  color: var(--page-text-subtle);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0;
+  text-decoration: none;
+}
+
+.thread-reader-back:hover,
+.thread-reader-back:focus-visible {
+  color: var(--page-text);
+}
+
+.thread-reader-title {
+  margin: 0;
+  color: var(--page-text);
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1.12;
+  letter-spacing: 0;
+}
+
+.thread-reader-meta,
+.thread-reader-empty {
+  margin: 0;
+  color: var(--page-text-muted);
+  font-size: var(--type-detail-source);
+  line-height: 1.4;
+  letter-spacing: 0;
+}
+
+.thread-reader-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+}
+
+.thread-message-list {
+  display: grid;
+  gap: 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.thread-message-card {
+  padding: 16px 18px;
+  border: 1px solid var(--dashboard-surface-border);
+  border-radius: var(--dashboard-surface-radius);
+  background: var(--dashboard-surface-bg);
+}
+
+.thread-message-header {
+  display: grid;
+  gap: 4px;
+}
+
+.thread-message-subject {
+  margin: 0;
+  color: var(--page-text);
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+.thread-message-source,
+.thread-message-snippet,
+.thread-message-body {
+  margin: 0;
+  font-size: var(--type-detail-source);
+  line-height: 1.42;
+  letter-spacing: 0;
+}
+
+.thread-message-source {
+  color: var(--detail-source);
+}
+
+.thread-message-fields {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 11px;
+  margin: 13px 0 0;
+  color: var(--page-text-muted);
+  font-size: var(--type-detail-source);
+  line-height: 1.35;
+}
+
+.thread-message-fields dt {
+  color: var(--detail-source);
+  font-weight: 700;
+}
+
+.thread-message-fields dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.thread-message-snippet {
+  margin-top: 14px;
+  color: var(--page-text);
+  font-weight: 700;
+}
+
+.thread-message-body {
+  margin-top: 8px;
+  color: var(--page-text-muted);
+  white-space: pre-wrap;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .attention-detail,
   .attention-item,
@@ -2301,6 +2425,23 @@ a {
   .attention-detail-source {
     margin-top: 17px;
     font-size: var(--type-mobile-detail-source);
+  }
+
+  .thread-reader-shell {
+    width: min(100%, 42rem);
+  }
+
+  .thread-reader-title {
+    font-size: 24px;
+  }
+
+  .thread-message-card {
+    padding: 14px 15px;
+  }
+
+  .thread-message-fields {
+    grid-template-columns: 1fr;
+    gap: 2px;
   }
 
   .attention-copy.has-suffix-cta .attention-action {

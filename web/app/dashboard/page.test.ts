@@ -239,6 +239,7 @@ test('YC RSVP items expose expandable detail instead of an inline CTA', () => {
     dismissLabel: 'No',
     sourceLabel: 'Sources: 3 emails from YC',
     links: {
+      threadHref: '/entities/entity-1/thread',
       rawHref: '/raw-feed?item=item-1',
       traceHref: '/trace/entity-1',
     },
@@ -265,6 +266,7 @@ test('demo inbox items expose current state, next move, and source evidence', ()
     'No matching payment receipt found today',
   ]);
   assert.deepEqual(detail?.links, {
+    threadHref: '/entities/entity-northstar-card-bill/thread',
     rawHref: '/raw-feed?item=northstar-card-bill',
     traceHref: '/trace/entity-northstar-card-bill',
   });
