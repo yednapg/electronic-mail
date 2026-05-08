@@ -16,6 +16,7 @@ from app.db.models import (
     StoredGmailDraft,
     StoredGmailHistoryEvent,
     StoredGmailMessageSnapshot,
+    StoredHistorySourceRecord,
     StoredEntity,
     StoredEntityAiSuggestion,
     StoredEntityState,
@@ -938,6 +939,90 @@ def get_source_record_count(database_path: str) -> int:
     """Return the total number of persisted source records."""
     with connect(database_path) as connection:
         return int(connection.execute("SELECT COUNT(*) FROM source_records").fetchone()[0])
+
+
+def get_history_source_record_count(database_path: str, *, user_id: str = DEFAULT_USER_ID) -> int:
+    """Return the total number of source records available to the history projection."""
+    with connect(database_path) as connection:
+        return int(
+            connection.execute(
+                "SELECT COUNT(*) FROM source_records WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()[0]
+        )
+
+
+def list_history_source_records(
+    database_path: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[StoredHistorySourceRecord]:
+    """Page persisted source records with app-owned entity/state/suggestion/outcome enrichment."""
+    bounded_limit = max(1, min(limit, 250))
+    bounded_offset = max(0, offset)
+
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            WITH paged_source_records AS (
+              SELECT *
+              FROM source_records
+              WHERE user_id = ?
+              ORDER BY timestamp DESC, id DESC
+              LIMIT ? OFFSET ?
+            ),
+            latest_outcomes AS (
+              SELECT *
+              FROM (
+                SELECT
+                  entity_outcomes.*,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY entity_id
+                    ORDER BY created_at DESC, id DESC
+                  ) AS row_number
+                FROM entity_outcomes
+                WHERE user_id = ?
+              )
+              WHERE row_number = 1
+            )
+            SELECT
+              paged_source_records.*,
+              entity_members.entity_id AS history_entity_id,
+              entity_states.current_state AS history_current_state,
+              entity_ai_suggestions.title AS history_suggestion_title,
+              entity_ai_suggestions.explanation AS history_suggestion_summary,
+              latest_outcomes.outcome_type AS history_outcome_type,
+              latest_outcomes.created_at AS history_outcome_created_at
+            FROM paged_source_records
+            LEFT JOIN entity_members ON entity_members.source_record_id = paged_source_records.id
+            LEFT JOIN entity_states ON entity_states.entity_id = entity_members.entity_id
+            LEFT JOIN entity_ai_suggestions ON entity_ai_suggestions.entity_id = entity_members.entity_id
+            LEFT JOIN latest_outcomes ON latest_outcomes.entity_id = entity_members.entity_id
+            ORDER BY paged_source_records.timestamp DESC, paged_source_records.id DESC
+            """,
+            (user_id, bounded_limit, bounded_offset, user_id),
+        ).fetchall()
+
+    return [
+        StoredHistorySourceRecord(
+            source_record=_to_source_record(row),
+            entity_id=str(row["history_entity_id"]) if row["history_entity_id"] is not None else None,
+            current_state=str(row["history_current_state"]) if row["history_current_state"] is not None else None,
+            suggestion_title=str(row["history_suggestion_title"])
+            if row["history_suggestion_title"] is not None
+            else None,
+            suggestion_summary=str(row["history_suggestion_summary"])
+            if row["history_suggestion_summary"] is not None
+            else None,
+            outcome_type=str(row["history_outcome_type"]) if row["history_outcome_type"] is not None else None,
+            outcome_created_at=str(row["history_outcome_created_at"])
+            if row["history_outcome_created_at"] is not None
+            else None,
+        )
+        for row in rows
+    ]
 
 
 def get_entity_member_count(database_path: str) -> int:

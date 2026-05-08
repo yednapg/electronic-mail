@@ -1,3 +1,5 @@
+import Link from 'next/link';
+
 import { DashboardAgenda } from './DashboardAgenda';
 import { DashboardMeta } from './DashboardMeta';
 import { DashboardSection } from './DashboardSection';
@@ -78,6 +80,9 @@ function DashboardSettingsPanel() {
               Reset
             </button>
           </div>
+          <Link href="/history" className="view-settings-link">
+            History
+          </Link>
           <div className="view-settings-options">
             {VIEW_SETTING_OPTIONS.map((option) => (
               <label

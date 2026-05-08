@@ -6,6 +6,11 @@ import type {
   DashboardProfile,
   FeedResponse,
   GoogleAuthState,
+  HistoryDayGroup,
+  HistoryItem,
+  HistoryMonthGroup,
+  HistoryResponse,
+  HistoryYearGroup,
   TraceReplayResponse,
   TimingBand,
 } from '@electronic-mail/types';
@@ -19,6 +24,11 @@ export type {
   DashboardResponse,
   FeedResponse,
   GoogleAuthState,
+  HistoryDayGroup,
+  HistoryItem,
+  HistoryMonthGroup,
+  HistoryResponse,
+  HistoryYearGroup,
   TraceReplayResponse,
   TimingBand,
 };

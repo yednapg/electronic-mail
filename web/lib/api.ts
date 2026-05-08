@@ -1,5 +1,5 @@
 /** Dashboard fetcher shared by the server-rendered dashboard page. */
-import type { DashboardResponse } from './types';
+import type { DashboardResponse, HistoryResponse } from './types';
 import type {
   EntityOutcomeResponse,
   GmailDraftRequest,
@@ -8,6 +8,7 @@ import type {
   TaskResponse,
 } from '@electronic-mail/types';
 import { demoDashboard } from './demo-dashboard';
+import { demoHistory } from './demo-history';
 
 const DEFAULT_BACKEND_URL = 'http://localhost:3001';
 
@@ -28,6 +29,22 @@ export async function getDashboard(): Promise<DashboardResponse> {
     cache: 'no-store',
   });
   if (!res.ok) throw new Error('Failed to fetch dashboard');
+  return res.json();
+}
+
+export async function getHistory({ limit = 60, offset = 0 } = {}): Promise<HistoryResponse> {
+  if (isDemoMode()) {
+    return demoHistory;
+  }
+
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  });
+  const res = await fetch(`${getBackendURL()}/v1/history?${params.toString()}`, {
+    cache: 'no-store',
+  });
+  if (!res.ok) throw new Error('Failed to fetch history');
   return res.json();
 }
 
