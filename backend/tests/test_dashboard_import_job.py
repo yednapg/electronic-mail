@@ -219,6 +219,8 @@ class DashboardImportJobRouteTests(unittest.TestCase):
         self.assertEqual(persisted["status"], "succeeded")
         self.assertEqual(persisted["changed_entities"], len(changed_entity_ids))
         self.assertEqual(persisted["refreshed_entities"], len(changed_entity_ids))
+        mock_hydrate.assert_called_once()
+        self.assertEqual(mock_hydrate.call_args.args[1], [])
         mock_refresh.assert_called_once()
         refresh_args = mock_refresh.call_args.args
         self.assertEqual(refresh_args[0], str(self.database_path))
