@@ -25,6 +25,7 @@ class RepositorySchemaTests(unittest.TestCase):
                 "idx_source_records_timestamp",
                 "idx_source_records_user_timestamp",
                 "idx_source_records_thread",
+                "idx_source_record_summaries_user_generated",
                 "idx_entities_created",
                 "idx_entities_user_created",
                 "idx_entity_members_entity",

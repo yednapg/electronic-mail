@@ -97,7 +97,7 @@ def to_history_row(row: StoredHistorySourceRecord) -> HistoryRow:
         thread_id=record.thread_id,
         received_at=record.timestamp,
         subject=string_payload(payload, "subject") or record.subject,
-        title=row.suggestion_title or string_payload(payload, "title") or record.subject,
+        title=row.source_summary or string_payload(payload, "title") or record.subject or row.suggestion_title,
         sender=string_payload(payload, "from") or string_payload(payload, "sender") or record.sender,
         snippet=compact_text(
             string_payload(payload, "snippet")
@@ -105,7 +105,7 @@ def to_history_row(row: StoredHistorySourceRecord) -> HistoryRow:
             or string_payload(payload, "notes")
             or string_payload(payload, "body")
         ),
-        summary=row.suggestion_summary or string_payload(payload, "summary"),
+        summary=row.source_summary or row.suggestion_summary or string_payload(payload, "summary"),
         current_state=current_state,  # type: ignore[arg-type]
         lifecycle_state=to_lifecycle_state(current_state),  # type: ignore[arg-type]
         outcome_type=normalize_outcome_type(row.outcome_type),  # type: ignore[arg-type]

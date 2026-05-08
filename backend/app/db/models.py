@@ -139,6 +139,18 @@ class StoredGmailHistoryEvent:
 
 
 @dataclass
+class StoredSourceRecordSummary:
+    """Generated compact summary for one persisted source record."""
+
+    source_record_id: str
+    user_id: str
+    summary: str
+    model: str
+    generated_from_hash: str
+    generated_at: str
+
+
+@dataclass
 class StoredDashboardImportJob:
     """Durable backend-owned dashboard import/preparation job status."""
 
@@ -214,6 +226,7 @@ class StoredHistorySourceRecord:
 
     source_record: StoredSourceRecord
     entity_id: str | None
+    source_summary: str | None
     current_state: str | None
     suggestion_title: str | None
     suggestion_summary: str | None

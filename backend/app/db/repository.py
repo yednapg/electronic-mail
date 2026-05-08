@@ -17,6 +17,7 @@ from app.db.models import (
     StoredGmailHistoryEvent,
     StoredGmailMessageSnapshot,
     StoredHistorySourceRecord,
+    StoredSourceRecordSummary,
     StoredEntity,
     StoredEntityAiSuggestion,
     StoredEntityState,
@@ -63,6 +64,19 @@ def initialize_database(database_path: str) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_source_records_thread
               ON source_records(source, thread_id);
+
+            CREATE TABLE IF NOT EXISTS source_record_summaries (
+              source_record_id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              summary TEXT NOT NULL,
+              model TEXT NOT NULL,
+              generated_from_hash TEXT NOT NULL,
+              generated_at TEXT NOT NULL,
+              FOREIGN KEY(source_record_id) REFERENCES source_records(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_source_record_summaries_user_generated
+              ON source_record_summaries(user_id, generated_at DESC, source_record_id);
 
             CREATE TABLE IF NOT EXISTS entities (
               id TEXT PRIMARY KEY,
@@ -318,6 +332,7 @@ def clear_all_data(database_path: str) -> None:
         connection.execute("DELETE FROM entity_thread_memberships")
         connection.execute("DELETE FROM entity_states")
         connection.execute("DELETE FROM entities")
+        connection.execute("DELETE FROM source_record_summaries")
         connection.execute("DELETE FROM source_records")
         connection.execute("DELETE FROM gmail_sync_state")
         connection.execute("DELETE FROM dashboard_import_jobs")
@@ -370,6 +385,60 @@ def upsert_source_records(database_path: str, records: Iterable[StoredSourceReco
                     record.created_at,
                 ),
             )
+
+
+def upsert_source_record_summary(
+    database_path: str,
+    *,
+    source_record_id: str,
+    user_id: str,
+    summary: str,
+    model: str,
+    generated_from_hash: str,
+) -> None:
+    """Persist a compact generated summary for one source record."""
+    generated_at = utc_now_iso()
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO source_record_summaries (
+              source_record_id, user_id, summary, model, generated_from_hash, generated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_record_id) DO UPDATE SET
+              user_id = excluded.user_id,
+              summary = excluded.summary,
+              model = excluded.model,
+              generated_from_hash = excluded.generated_from_hash,
+              generated_at = excluded.generated_at
+            """,
+            (source_record_id, user_id, summary, model, generated_from_hash, generated_at),
+        )
+
+
+def list_source_record_summary_hashes(
+    database_path: str,
+    source_record_ids: Iterable[str],
+) -> dict[str, str]:
+    """Return existing summary input hashes keyed by source record id."""
+    unique_ids = sorted({source_record_id for source_record_id in source_record_ids if source_record_id})
+
+    if not unique_ids:
+        return {}
+
+    placeholders = ", ".join("?" for _ in unique_ids)
+
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT source_record_id, generated_from_hash
+            FROM source_record_summaries
+            WHERE source_record_id IN ({placeholders})
+            """,
+            unique_ids,
+        ).fetchall()
+
+    return {str(row["source_record_id"]): str(row["generated_from_hash"]) for row in rows}
 
 
 def list_existing_source_record_ids(database_path: str, ids: Iterable[str]) -> set[str]:
@@ -1082,6 +1151,32 @@ def get_history_source_record_count(database_path: str, *, user_id: str = DEFAUL
         )
 
 
+def list_source_record_ids(
+    database_path: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    limit: int = 10000,
+    offset: int = 0,
+) -> list[str]:
+    """Return source-record ids in history order for bounded refresh workflows."""
+    bounded_limit = max(1, min(limit, 10000))
+    bounded_offset = max(0, offset)
+
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT id
+            FROM source_records
+            WHERE user_id = ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (user_id, bounded_limit, bounded_offset),
+        ).fetchall()
+
+    return [str(row["id"]) for row in rows]
+
+
 def list_history_source_records(
     database_path: str,
     *,
@@ -1120,12 +1215,15 @@ def list_history_source_records(
             SELECT
               paged_source_records.*,
               entity_members.entity_id AS history_entity_id,
+              source_record_summaries.summary AS history_source_summary,
               entity_states.current_state AS history_current_state,
               entity_ai_suggestions.title AS history_suggestion_title,
               entity_ai_suggestions.explanation AS history_suggestion_summary,
               latest_outcomes.outcome_type AS history_outcome_type,
               latest_outcomes.created_at AS history_outcome_created_at
             FROM paged_source_records
+            LEFT JOIN source_record_summaries
+              ON source_record_summaries.source_record_id = paged_source_records.id
             LEFT JOIN entity_members ON entity_members.source_record_id = paged_source_records.id
             LEFT JOIN entity_states ON entity_states.entity_id = entity_members.entity_id
             LEFT JOIN entity_ai_suggestions ON entity_ai_suggestions.entity_id = entity_members.entity_id
@@ -1136,10 +1234,13 @@ def list_history_source_records(
         ).fetchall()
 
     return [
-        StoredHistorySourceRecord(
-            source_record=_to_source_record(row),
-            entity_id=str(row["history_entity_id"]) if row["history_entity_id"] is not None else None,
-            current_state=str(row["history_current_state"]) if row["history_current_state"] is not None else None,
+            StoredHistorySourceRecord(
+                source_record=_to_source_record(row),
+                entity_id=str(row["history_entity_id"]) if row["history_entity_id"] is not None else None,
+                source_summary=str(row["history_source_summary"])
+                if row["history_source_summary"] is not None
+                else None,
+                current_state=str(row["history_current_state"]) if row["history_current_state"] is not None else None,
             suggestion_title=str(row["history_suggestion_title"])
             if row["history_suggestion_title"] is not None
             else None,

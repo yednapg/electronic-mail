@@ -39,6 +39,7 @@ from app.services.integrations.google import (
     get_google_auth_state,
     load_google_account_profile,
 )
+from app.services.source_record_summaries import refresh_source_record_summaries
 
 
 def build_dashboard_response(settings: Settings) -> DashboardResponse:
@@ -201,6 +202,8 @@ def _prepare_dashboard_state(settings: Settings, *, job_id: str | None = None) -
     gmail_source_records = [record for record in source_records if record.source == "gmail"]
     non_gmail_source_records = [record for record in source_records if record.source != "gmail"]
     imported_count = max(latest_imported_count, len(gmail_source_records)) + len(non_gmail_source_records)
+    update_progress("source_summary", imported_count=imported_count, source_records=imported_count)
+    refresh_source_record_summaries(database_path, [record.id for record in source_records])
     update_progress("memory_hydration", imported_count=imported_count, source_records=imported_count)
     changed_entity_ids = hydrate_persistent_memory(database_path, source_records)
     update_progress("ai_refresh", changed_entities=len(changed_entity_ids))

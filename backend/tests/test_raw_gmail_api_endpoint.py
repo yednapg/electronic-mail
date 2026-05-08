@@ -87,8 +87,12 @@ class RawGmailApiRouteTests(unittest.TestCase):
     @patch("app.api.routes.feed.refresh_feed_projections_for_entities")
     @patch("app.api.routes.feed.refresh_ai_suggestions_for_entities")
     @patch("app.api.routes.feed.rebuild_persistent_memory")
+    @patch("app.api.routes.feed.refresh_source_record_summaries")
+    @patch("app.api.routes.feed.list_source_record_ids", return_value=["record-1"])
     def test_rebuild_memory_recomputes_feed_from_stored_records(
         self,
+        mock_list_source_record_ids: Mock,
+        mock_refresh_source_summaries: Mock,
         mock_rebuild: Mock,
         mock_refresh: Mock,
         mock_refresh_projection: Mock,
@@ -101,6 +105,8 @@ class RawGmailApiRouteTests(unittest.TestCase):
         response = self.client.post("/rebuild-memory")
 
         self.assertEqual(response.status_code, 200)
+        mock_list_source_record_ids.assert_called_once()
+        mock_refresh_source_summaries.assert_called_once()
         mock_rebuild.assert_called_once()
         mock_refresh.assert_called_once()
         mock_refresh_projection.assert_called_once()
