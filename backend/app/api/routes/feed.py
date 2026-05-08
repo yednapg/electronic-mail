@@ -9,9 +9,11 @@ from fastapi import APIRouter
 from app.core.config import load_settings
 from app.schemas.domain import FeedResponse, SourceRecord
 from app.services.feed.memory_pipeline import (
+    build_feed_from_projection_cache,
     build_feed_from_entities,
     hydrate_persistent_memory,
     rebuild_persistent_memory,
+    refresh_feed_projections_for_entities,
     refresh_ai_suggestions_for_entities,
 )
 from app.services.integrations.google import (
@@ -37,7 +39,13 @@ def feed() -> FeedResponse:
 
     changed_entity_ids = hydrate_persistent_memory(str(settings.database_path), source_records)
     refresh_ai_suggestions_for_entities(str(settings.database_path), changed_entity_ids)
-    return build_feed_from_entities(str(settings.database_path), datetime.now(timezone.utc).isoformat())
+    current_time = datetime.now(timezone.utc).isoformat()
+    refresh_feed_projections_for_entities(str(settings.database_path), changed_entity_ids, current_time)
+    return build_feed_from_projection_cache(str(settings.database_path)) or build_feed_from_entities(
+        str(settings.database_path),
+        current_time,
+        record_trace=False,
+    )
 
 
 @router.get("/raw-feed", response_model=list[SourceRecord])
@@ -72,4 +80,10 @@ def rebuild_memory() -> FeedResponse:
     """Rebuild entity memory from persisted source records without re-syncing Gmail."""
     changed_entity_ids = rebuild_persistent_memory(str(settings.database_path))
     refresh_ai_suggestions_for_entities(str(settings.database_path), changed_entity_ids)
-    return build_feed_from_entities(str(settings.database_path), datetime.now(timezone.utc).isoformat())
+    current_time = datetime.now(timezone.utc).isoformat()
+    refresh_feed_projections_for_entities(str(settings.database_path), changed_entity_ids, current_time)
+    return build_feed_from_projection_cache(str(settings.database_path)) or build_feed_from_entities(
+        str(settings.database_path),
+        current_time,
+        record_trace=False,
+    )

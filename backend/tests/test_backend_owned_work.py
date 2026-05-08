@@ -12,7 +12,11 @@ from app.api.routes import gmail as gmail_routes
 from app.api.routes import tasks as task_routes
 from app.db.repository import initialize_database, list_trace_records_for_entity
 from app.main import app
-from app.services.feed.memory_pipeline import build_feed_from_entities, rebuild_persistent_memory
+from app.services.feed.memory_pipeline import (
+    build_feed_from_entities,
+    build_feed_from_projection_cache,
+    rebuild_persistent_memory,
+)
 
 
 class BackendOwnedWorkRouteTests(unittest.TestCase):
@@ -44,6 +48,10 @@ class BackendOwnedWorkRouteTests(unittest.TestCase):
 
         initial_feed = build_feed_from_entities(self.db_file.name, "2026-05-05T00:00:00+00:00")
         self.assertEqual([item.entity_id for item in initial_feed.today], [task["entity_id"]])
+        cached_initial_feed = build_feed_from_projection_cache(self.db_file.name)
+        self.assertIsNotNone(cached_initial_feed)
+        assert cached_initial_feed is not None
+        self.assertEqual([item.entity_id for item in cached_initial_feed.today], [task["entity_id"]])
 
         complete_response = self.client.post(f"/v1/entities/{task['entity_id']}/complete", json={})
 
@@ -54,6 +62,12 @@ class BackendOwnedWorkRouteTests(unittest.TestCase):
         self.assertEqual(completed_feed.now, [])
         self.assertEqual(completed_feed.today, [])
         self.assertEqual(completed_feed.worth_knowing, [])
+        cached_completed_feed = build_feed_from_projection_cache(self.db_file.name)
+        self.assertIsNotNone(cached_completed_feed)
+        assert cached_completed_feed is not None
+        self.assertEqual(cached_completed_feed.now, [])
+        self.assertEqual(cached_completed_feed.today, [])
+        self.assertEqual(cached_completed_feed.worth_knowing, [])
 
     def test_rebuild_memory_preserves_manual_tasks(self) -> None:
         create_response = self.client.post(
@@ -73,6 +87,7 @@ class BackendOwnedWorkRouteTests(unittest.TestCase):
             json={"title": "Trace only during prep", "section": "today"},
         )
         task = create_response.json()
+        initial_trace_count = len(list_trace_records_for_entity(self.db_file.name, task["entity_id"]))
 
         feed = build_feed_from_entities(
             self.db_file.name,
@@ -81,7 +96,7 @@ class BackendOwnedWorkRouteTests(unittest.TestCase):
         )
 
         self.assertEqual([item.entity_id for item in feed.today], [task["entity_id"]])
-        self.assertEqual(list_trace_records_for_entity(self.db_file.name, task["entity_id"]), [])
+        self.assertEqual(len(list_trace_records_for_entity(self.db_file.name, task["entity_id"])), initial_trace_count)
 
         build_feed_from_entities(self.db_file.name, "2026-05-05T00:00:00+00:00")
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Backend-owned manual task endpoints."""
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, HTTPException, status
 
 from app.core.config import load_settings
@@ -13,6 +15,7 @@ from app.db.repository import (
     update_manual_task,
 )
 from app.schemas.domain import TaskCreateRequest, TaskResponse, TaskUpdateRequest
+from app.services.feed.memory_pipeline import refresh_feed_projections_for_entities
 
 
 router = APIRouter(tags=["tasks"])
@@ -34,6 +37,7 @@ def create_task(request: TaskCreateRequest) -> TaskResponse:
         section=request.section,
         due_at=request.due_at,
     )
+    refresh_task_projection(task.entity_id)
     return to_task_response(task)
 
 
@@ -83,4 +87,12 @@ def to_task_response(task) -> TaskResponse:
         status=task.status,
         created_at=task.created_at,
         updated_at=task.updated_at,
+    )
+
+
+def refresh_task_projection(entity_id: str) -> None:
+    refresh_feed_projections_for_entities(
+        str(settings.database_path),
+        [entity_id],
+        datetime.now(timezone.utc).isoformat(),
     )

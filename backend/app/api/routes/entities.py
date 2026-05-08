@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Backend-owned entity state and thread-reader endpoints."""
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, HTTPException, status
 
 from app.core.config import load_settings
@@ -21,6 +23,7 @@ from app.schemas.domain import (
     ThreadMessage,
     ThreadReaderResponse,
 )
+from app.services.feed.memory_pipeline import refresh_feed_projections_for_entities
 
 
 router = APIRouter(tags=["entities"])
@@ -42,6 +45,7 @@ def complete_entity(entity_id: str, request: EntityOutcomeRequest | None = None)
         outcome_type="complete",
         note=request.note if request is not None else None,
     )
+    refresh_entity_projection(entity_id)
     return to_outcome_response(outcome)
 
 
@@ -57,6 +61,7 @@ def snooze_entity(entity_id: str, request: EntitySnoozeRequest) -> EntityOutcome
         snooze_until=request.snooze_until,
         note=request.note,
     )
+    refresh_entity_projection(entity_id)
     return to_outcome_response(outcome)
 
 
@@ -71,6 +76,7 @@ def dismiss_entity(entity_id: str, request: EntityOutcomeRequest | None = None) 
         outcome_type="dismiss",
         note=request.note if request is not None else None,
     )
+    refresh_entity_projection(entity_id)
     return to_outcome_response(outcome)
 
 
@@ -132,3 +138,11 @@ def to_thread_message(record) -> ThreadMessage:
 def string_payload(payload: dict[str, object], key: str) -> str | None:
     value = payload.get(key)
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def refresh_entity_projection(entity_id: str) -> None:
+    refresh_feed_projections_for_entities(
+        str(settings.database_path),
+        [entity_id],
+        datetime.now(timezone.utc).isoformat(),
+    )
