@@ -164,6 +164,45 @@ export interface DashboardImportJobResponse {
   readonly updated_at: string;
 }
 
+export interface HistoryItem {
+  readonly source_record_id: string;
+  readonly entity_id?: string | null;
+  readonly source: SourceType;
+  readonly thread_id?: string | null;
+  readonly received_at: string;
+  readonly subject?: string | null;
+  readonly title?: string | null;
+  readonly sender?: string | null;
+  readonly snippet?: string | null;
+  readonly summary?: string | null;
+  readonly current_state?: EntityCurrentState | null;
+  readonly lifecycle_state?: LifecycleState | null;
+  readonly outcome_type?: 'complete' | 'snooze' | 'dismiss' | null;
+  readonly outcome_created_at?: string | null;
+}
+
+export interface HistoryDayGroup {
+  readonly date: string;
+  readonly rows: HistoryItem[];
+}
+
+export interface HistoryMonthGroup {
+  readonly month: string;
+  readonly days: HistoryDayGroup[];
+}
+
+export interface HistoryYearGroup {
+  readonly year: string;
+  readonly months: HistoryMonthGroup[];
+}
+
+export interface HistoryResponse {
+  readonly limit: number;
+  readonly offset: number;
+  readonly total: number;
+  readonly years: HistoryYearGroup[];
+}
+
 /**
  * Debug trace for each pipeline stage
  */

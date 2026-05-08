@@ -296,3 +296,52 @@ class ThreadReaderResponse(BaseModel):
     gmail_thread_id: str | None = None
     subject: str | None = None
     messages: list[ThreadMessage] = Field(default_factory=list)
+
+
+class HistoryRow(BaseModel):
+    """One compact historical line backed by a persisted source record."""
+
+    source_record_id: str
+    entity_id: str | None = None
+    source: SourceType
+    thread_id: str | None = None
+    received_at: str
+    subject: str | None = None
+    title: str | None = None
+    sender: str | None = None
+    snippet: str | None = None
+    summary: str | None = None
+    current_state: EntityCurrentState | None = None
+    lifecycle_state: LifecycleState | None = None
+    outcome_type: Literal["complete", "snooze", "dismiss"] | None = None
+    outcome_created_at: str | None = None
+
+
+class HistoryDayGroup(BaseModel):
+    """History rows for one calendar day."""
+
+    date: str
+    rows: list[HistoryRow] = Field(default_factory=list)
+
+
+class HistoryMonthGroup(BaseModel):
+    """History days for one calendar month."""
+
+    month: str
+    days: list[HistoryDayGroup] = Field(default_factory=list)
+
+
+class HistoryYearGroup(BaseModel):
+    """History months for one calendar year."""
+
+    year: str
+    months: list[HistoryMonthGroup] = Field(default_factory=list)
+
+
+class HistoryResponse(BaseModel):
+    """Paginated persisted-history projection grouped for the history UI."""
+
+    limit: int
+    offset: int
+    total: int
+    years: list[HistoryYearGroup] = Field(default_factory=list)
