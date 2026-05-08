@@ -19,11 +19,15 @@ class RepositorySchemaTests(unittest.TestCase):
                         "SELECT name FROM sqlite_master WHERE type = 'index'"
                     ).fetchall()
                 }
+                source_record_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(source_records)").fetchall()
+                }
 
         self.assertTrue(
             {
                 "idx_source_records_timestamp",
                 "idx_source_records_user_timestamp",
+                "idx_source_records_user_active_timestamp",
                 "idx_source_records_thread",
                 "idx_source_record_summaries_user_generated",
                 "idx_entities_created",
@@ -34,6 +38,7 @@ class RepositorySchemaTests(unittest.TestCase):
                 "idx_feed_projections_user_updated",
             }.issubset(indexes)
         )
+        self.assertIn("deleted_at", source_record_columns)
 
 
 if __name__ == "__main__":
