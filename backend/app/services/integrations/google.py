@@ -5,6 +5,7 @@ from __future__ import annotations
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from email.message import EmailMessage
 from email.utils import getaddresses
+import hashlib
 import html
 import json
 import os
@@ -17,7 +18,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from app.core.config import BACKEND_DIR, Settings
-from app.db.models import StoredSourceRecord
+from app.db.models import StoredGmailHistoryEvent, StoredGmailMessageSnapshot, StoredSourceRecord
 from app.db.repository import (
     append_trace_record,
     clear_all_data,
@@ -25,6 +26,8 @@ from app.db.repository import (
     get_source_record_count,
     initialize_database,
     list_existing_source_record_ids,
+    upsert_gmail_history_events,
+    upsert_gmail_message_snapshots,
     upsert_gmail_sync_state,
     upsert_source_records,
     utc_now_iso,
@@ -569,6 +572,7 @@ def sync_gmail_source_records(settings: Settings, gmail_service) -> list[SourceR
     sync_state = get_gmail_sync_state(database_path, DEV_USER_ID)
     used_full_sync = sync_state is None or not sync_state.last_history_id
     sync_scope = resolve_gmail_sync_scope(settings.gmail_sync_scope)
+    history_events: list[StoredGmailHistoryEvent] = []
 
     if used_full_sync:
         message_ids = fetch_all_gmail_message_ids(
@@ -578,10 +582,12 @@ def sync_gmail_source_records(settings: Settings, gmail_service) -> list[SourceR
         )
         mailbox_history_id = None
     else:
-        message_ids, mailbox_history_id, needs_full_sync = fetch_incremental_gmail_message_ids(
+        message_ids, mailbox_history_id, needs_full_sync, history_events = fetch_incremental_gmail_changes(
             gmail_service,
             sync_state.last_history_id,
         )
+        if history_events:
+            upsert_gmail_history_events(database_path, history_events)
         if needs_full_sync:
             used_full_sync = True
             message_ids = fetch_all_gmail_message_ids(
@@ -592,6 +598,11 @@ def sync_gmail_source_records(settings: Settings, gmail_service) -> list[SourceR
             mailbox_history_id = None
 
     messages, threads_fetched, latest_history_id = fetch_thread_messages_for_message_ids(gmail_service, message_ids)
+    if messages:
+        upsert_gmail_message_snapshots(
+            database_path,
+            [gmail_message_snapshot_from_payload(message) for message in messages],
+        )
     records = normalize_gmail_messages(
         messages,
         scope=sync_scope,
@@ -677,7 +688,20 @@ def fetch_incremental_gmail_message_ids(
     start_history_id: str,
 ) -> tuple[list[str], str | None, bool]:
     """List Gmail message ids changed since the stored history cursor."""
+    message_ids, latest_history_id, needs_full_sync, _events = fetch_incremental_gmail_changes(
+        gmail_service,
+        start_history_id,
+    )
+    return message_ids, latest_history_id, needs_full_sync
+
+
+def fetch_incremental_gmail_changes(
+    gmail_service,
+    start_history_id: str,
+) -> tuple[list[str], str | None, bool, list[StoredGmailHistoryEvent]]:
+    """List changed Gmail ids and preserve History API events before hydration."""
     ids: set[str] = set()
+    events_by_id: dict[str, StoredGmailHistoryEvent] = {}
     page_token: str | None = None
     latest_history_id: str | None = None
 
@@ -712,6 +736,8 @@ def fetch_incremental_gmail_message_ids(
                     str(history_entry.get("id")) if history_entry.get("id") is not None else None,
                 )
                 ids.update(extract_history_message_ids(history_entry))
+                for event in extract_gmail_history_events(history_entry):
+                    events_by_id[event.id] = event
 
             page_token = listed.get("nextPageToken")
             if not page_token:
@@ -725,10 +751,10 @@ def fetch_incremental_gmail_message_ids(
                     "error": str(error),
                 },
             )
-            return [], None, True
+            return [], None, True, []
         raise
 
-    return sorted(ids), latest_history_id, False
+    return sorted(ids), latest_history_id, False, list(events_by_id.values())
 
 
 def extract_history_message_ids(history_entry: dict[str, object]) -> set[str]:
@@ -752,6 +778,73 @@ def extract_history_message_ids(history_entry: dict[str, object]) -> set[str]:
                 ids.add(str(message_id))
 
     return ids
+
+
+def extract_gmail_history_events(history_entry: dict[str, object]) -> list[StoredGmailHistoryEvent]:
+    """Project Gmail History API records into durable local ledger events."""
+    events: list[StoredGmailHistoryEvent] = []
+    history_id = str(history_entry.get("id") or "")
+    created_at = utc_now_iso()
+
+    for event_type in ("messagesAdded", "messagesDeleted", "labelsAdded", "labelsRemoved"):
+        values = history_entry.get(event_type)
+        if not isinstance(values, list):
+            continue
+
+        for index, value in enumerate(values):
+            if not isinstance(value, dict):
+                continue
+            message = value.get("message") if isinstance(value.get("message"), dict) else value
+            if not isinstance(message, dict):
+                continue
+            message_id = message.get("id")
+            if not message_id:
+                continue
+            label_ids = value.get("labelIds") if isinstance(value.get("labelIds"), list) else None
+            if label_ids is None:
+                label_ids = message.get("labelIds") if isinstance(message.get("labelIds"), list) else []
+
+            normalized_label_ids = [str(label_id) for label_id in label_ids]
+            event = StoredGmailHistoryEvent(
+                id=gmail_history_event_id(
+                    history_id=history_id,
+                    event_type=event_type,
+                    message_id=str(message_id),
+                    label_ids=normalized_label_ids,
+                    index=index,
+                ),
+                user_id=DEV_USER_ID,
+                history_id=history_id,
+                event_type=event_type,
+                message_id=str(message_id),
+                thread_id=str(message.get("threadId")) if message.get("threadId") is not None else None,
+                label_ids=normalized_label_ids,
+                message_payload=message,
+                created_at=created_at,
+            )
+            events.append(event)
+
+    return events
+
+
+def gmail_history_event_id(
+    *,
+    history_id: str,
+    event_type: str,
+    message_id: str,
+    label_ids: list[str],
+    index: int,
+) -> str:
+    """Build a deterministic event id so repeated history pages are idempotent."""
+    payload = {
+        "history_id": history_id,
+        "event_type": event_type,
+        "message_id": message_id,
+        "label_ids": label_ids,
+        "index": index,
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"gmail-history:{digest}"
 
 
 def fetch_thread_messages_for_message_ids(
@@ -882,6 +975,27 @@ def max_history_id(left: str | None, right: str | None) -> str | None:
     if right is None:
         return left
     return left if int(left) >= int(right) else right
+
+
+def gmail_message_snapshot_from_payload(message: dict[str, object]) -> StoredGmailMessageSnapshot:
+    """Build a local Gmail ledger snapshot from a full Gmail API message payload."""
+    now = utc_now_iso()
+    label_ids = message.get("labelIds") if isinstance(message.get("labelIds"), list) else []
+    return StoredGmailMessageSnapshot(
+        user_id=DEV_USER_ID,
+        message_id=str(message.get("id") or ""),
+        thread_id=str(message.get("threadId")) if message.get("threadId") is not None else None,
+        history_id=str(message.get("historyId")) if message.get("historyId") is not None else None,
+        internal_date=to_gmail_internal_date_iso(message.get("internalDate")),
+        label_ids=[str(label_id) for label_id in label_ids],
+        raw_payload=message,
+        fetch_status="fetched",
+        tombstoned=False,
+        tombstoned_at=None,
+        last_fetched_at=now,
+        created_at=now,
+        updated_at=now,
+    )
 
 
 def fetch_upcoming_calendar_records(calendar_service) -> list[SourceRecord]:
