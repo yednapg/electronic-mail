@@ -121,6 +121,29 @@ class FeedEntityJudgmentResponse(BaseModel):
     items: list[FeedEntityJudgmentOutput]
 
 
+class SourceRecordSummaryInput(BaseModel):
+    """Compact source record payload for per-message history summaries."""
+
+    id: str
+    source: SourceType
+    subject: str
+    sender: str | None = None
+    timestamp: str
+    snippet: str | None = None
+    body: str | None = None
+
+
+class SourceRecordSummaryOutput(BaseModel):
+    """Generated summary for one persisted source record."""
+
+    id: str
+    summary: str
+
+
+class SourceRecordSummaryResponse(BaseModel):
+    items: list[SourceRecordSummaryOutput]
+
+
 class DashboardBriefingItemInput(BaseModel):
     """Compact feed item context used for top-of-dashboard summarization."""
 
