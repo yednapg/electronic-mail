@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from app.api.routes import entities as entity_routes
 from app.api.routes import gmail as gmail_routes
 from app.api.routes import tasks as task_routes
-from app.db.repository import initialize_database
+from app.db.repository import initialize_database, list_trace_records_for_entity
 from app.main import app
 from app.services.feed.memory_pipeline import build_feed_from_entities, rebuild_persistent_memory
 
@@ -66,6 +66,26 @@ class BackendOwnedWorkRouteTests(unittest.TestCase):
         feed = build_feed_from_entities(self.db_file.name, "2026-05-05T00:00:00+00:00")
 
         self.assertEqual([item.entity_id for item in feed.today], [task["entity_id"]])
+
+    def test_read_only_feed_build_does_not_append_trace_rows(self) -> None:
+        create_response = self.client.post(
+            "/v1/tasks",
+            json={"title": "Trace only during prep", "section": "today"},
+        )
+        task = create_response.json()
+
+        feed = build_feed_from_entities(
+            self.db_file.name,
+            "2026-05-05T00:00:00+00:00",
+            record_trace=False,
+        )
+
+        self.assertEqual([item.entity_id for item in feed.today], [task["entity_id"]])
+        self.assertEqual(list_trace_records_for_entity(self.db_file.name, task["entity_id"]), [])
+
+        build_feed_from_entities(self.db_file.name, "2026-05-05T00:00:00+00:00")
+
+        self.assertGreater(len(list_trace_records_for_entity(self.db_file.name, task["entity_id"])), 0)
 
     @patch("app.api.routes.gmail.create_gmail_draft")
     def test_gmail_draft_creation_is_explicit_and_persisted(self, mock_create_draft: Mock) -> None:
