@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -19,6 +20,10 @@ from app.db.repository import (
 )
 from app.main import app
 from app.schemas.domain import DashboardBriefing, DashboardProfile, FeedResponse, GoogleAuthState, SourceRecord
+from app.services.dashboard import (
+    STALE_IMPORT_JOB_MESSAGE,
+    create_or_reuse_dashboard_import_job,
+)
 
 
 class DashboardImportJobRepositoryTests(unittest.TestCase):
@@ -88,6 +93,39 @@ class DashboardImportJobRouteTests(unittest.TestCase):
         self.addCleanup(self.settings_patch.stop)
         self.addCleanup(self.tmp_dir.cleanup)
         self.client = TestClient(app)
+
+    def test_create_or_reuse_import_job_keeps_single_active_job(self) -> None:
+        existing = create_dashboard_import_job(str(self.database_path))
+
+        job, should_start = create_or_reuse_dashboard_import_job(self.settings)
+
+        self.assertFalse(should_start)
+        self.assertEqual(job.id, existing.id)
+        self.assertEqual(job.status, "queued")
+
+    def test_stale_import_job_is_failed_before_new_job_is_created(self) -> None:
+        stale = mark_dashboard_import_job_running(
+            str(self.database_path),
+            create_dashboard_import_job(str(self.database_path)).id,
+        )
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                """
+                UPDATE dashboard_import_jobs
+                SET updated_at = ?, started_at = ?
+                WHERE id = ?
+                """,
+                ("2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00", stale.id),
+            )
+
+        job, should_start = create_or_reuse_dashboard_import_job(self.settings)
+
+        self.assertTrue(should_start)
+        self.assertNotEqual(job.id, stale.id)
+        failed_stale = get_dashboard_import_job(str(self.database_path), stale.id)
+        self.assertIsNotNone(failed_stale)
+        self.assertEqual(failed_stale.status, "failed")
+        self.assertEqual(failed_stale.error_message, STALE_IMPORT_JOB_MESSAGE)
 
     @patch("app.services.dashboard.fetch_google_account_profile")
     @patch("app.services.dashboard.fetch_google_source_records")
