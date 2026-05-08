@@ -7,13 +7,20 @@ from unittest.mock import patch
 
 from app.db.models import LoadedEntity, StoredEntity, StoredEntityAiSuggestion, StoredEntityState
 from app.db.models import StoredSourceRecord
-from app.db.repository import initialize_database
+from app.db.repository import (
+    attach_record_to_entity,
+    create_entity,
+    initialize_database,
+    list_loaded_entities,
+    upsert_entity_state,
+    upsert_source_records,
+)
 from app.schemas.ai import FeedEntityJudgmentOutput
 from app.schemas.domain import AttentionItem, PipelineEntity, PipelineOutput
 from app.services.ai.decision import classify_entity_state
 from app.services.entities.derive_entity_state import derive_state
 from app.services.feed.build_feed import build_feed
-from app.services.feed.memory_pipeline import normalize_judgment, to_pipeline_output
+from app.services.feed.memory_pipeline import normalize_judgment, refresh_ai_suggestions_for_entities, to_pipeline_output
 
 
 def make_record(
@@ -375,6 +382,60 @@ class EntityStateAndFeedTests(unittest.TestCase):
         self.assertIsNotNone(normalized)
         assert normalized is not None
         self.assertEqual(normalized["title"], "The bank acknowledged your request.")
+
+    def test_refresh_ai_suggestions_loads_only_requested_entities(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".db") as db_file:
+            initialize_database(db_file.name)
+            target_record = make_record(
+                record_id="record-target",
+                source="gmail",
+                subject="Please review the release",
+                body="Can you review this before launch?",
+            )
+            untouched_record = make_record(
+                record_id="record-untouched",
+                source="gmail",
+                subject="FYI only",
+                body="No action needed.",
+                timestamp="2026-04-17T11:00:00+00:00",
+            )
+            upsert_source_records(db_file.name, [target_record, untouched_record])
+            target = create_entity(db_file.name, "gmail-thread:target")
+            untouched = create_entity(db_file.name, "gmail-thread:untouched")
+            attach_record_to_entity(db_file.name, target.id, target_record.id)
+            attach_record_to_entity(db_file.name, untouched.id, untouched_record.id)
+            upsert_entity_state(db_file.name, target.id, "open", None)
+            upsert_entity_state(db_file.name, untouched.id, "open", None)
+
+            with (
+                patch(
+                    "app.services.feed.memory_pipeline.list_all_loaded_entities",
+                    side_effect=AssertionError("refresh should not scan every loaded entity"),
+                ) as mock_all_loaded,
+                patch(
+                    "app.services.feed.memory_pipeline.judge_feed_entities",
+                    return_value=[
+                        FeedEntityJudgmentOutput(
+                            id=target.id,
+                            title="Review the release before launch.",
+                            explanation="The email asks for review before launch.",
+                            action="review",
+                            suggested_timing="today",
+                            suggested_priority=80,
+                            suggested_visibility=True,
+                        )
+                    ],
+                ) as mock_judge,
+            ):
+                refresh_ai_suggestions_for_entities(db_file.name, [target.id])
+
+            mock_all_loaded.assert_not_called()
+            mock_judge.assert_called_once()
+            self.assertEqual([context.id for context in mock_judge.call_args.args[0]], [target.id])
+
+            loaded = {entity.entity.id: entity for entity in list_loaded_entities(db_file.name, [target.id, untouched.id])}
+            self.assertIsNotNone(loaded[target.id].ai_suggestion)
+            self.assertIsNone(loaded[untouched.id].ai_suggestion)
 
 
 if __name__ == "__main__":
