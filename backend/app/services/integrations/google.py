@@ -28,6 +28,7 @@ from app.db.repository import (
     get_source_record_count,
     initialize_database,
     list_existing_source_record_ids,
+    list_source_records_by_ids,
     upsert_gmail_history_events,
     upsert_gmail_message_snapshots,
     upsert_gmail_sync_state,
@@ -621,6 +622,7 @@ def sync_gmail_source_records(
     sync_scope = resolve_gmail_sync_scope(settings.gmail_sync_scope)
     history_events: list[StoredGmailHistoryEvent] = []
     records_by_id: dict[str, SourceRecord] = {}
+    changed_record_ids: set[str] = set()
     imported_count = 0
     total_count: int | None = None
     threads_fetched = 0
@@ -656,6 +658,7 @@ def sync_gmail_source_records(
             new_count += batch.new_count
             latest_history_id = max_history_id(latest_history_id, batch.latest_history_id)
             failed_message_ids.update(batch.failed_message_ids)
+            changed_record_ids.update(record.id for record in batch.records)
             if collect_records:
                 records_by_id.update({record.id: record for record in batch.records})
             report("gmail_persisted")
@@ -696,6 +699,7 @@ def sync_gmail_source_records(
                 new_count += batch.new_count
                 latest_history_id = max_history_id(latest_history_id, batch.latest_history_id)
                 failed_message_ids.update(batch.failed_message_ids)
+                changed_record_ids.update(record.id for record in batch.records)
                 if collect_records:
                     records_by_id.update({record.id: record for record in batch.records})
                 report("gmail_persisted")
@@ -717,6 +721,7 @@ def sync_gmail_source_records(
                 new_count += batch.new_count
                 latest_history_id = max_history_id(latest_history_id, batch.latest_history_id)
                 failed_message_ids.update(batch.failed_message_ids)
+                changed_record_ids.update(record.id for record in batch.records)
                 if collect_records:
                     records_by_id.update({record.id: record for record in batch.records})
                 report("gmail_persisted")
@@ -740,7 +745,13 @@ def sync_gmail_source_records(
         )
 
     total_source_records = get_source_record_count(database_path)
-    records = sorted(records_by_id.values(), key=lambda record: record.received_at, reverse=True)
+    if collect_records:
+        records = sorted(records_by_id.values(), key=lambda record: record.received_at, reverse=True)
+    else:
+        records = [
+            source_record_from_stored_source_record(record)
+            for record in list_source_records_by_ids(database_path, changed_record_ids)
+        ]
     fetched_count = imported_count if not collect_records else len(records_by_id)
     if total_source_records < fetched_count:
         print(
@@ -760,6 +771,19 @@ def sync_gmail_source_records(
     )
 
     return records
+
+
+def source_record_from_stored_source_record(record: StoredSourceRecord) -> SourceRecord:
+    """Adapt one persisted source row back into the domain source-record schema."""
+    user_id = record.raw_payload.get("user_id") if isinstance(record.raw_payload.get("user_id"), str) else DEV_USER_ID
+    return SourceRecord(
+        id=record.id,
+        user_id=user_id,
+        source=record.source,
+        thread_id=record.thread_id or "",
+        raw_payload=record.raw_payload,
+        received_at=record.timestamp,
+    )
 
 
 def fetch_all_gmail_message_ids(gmail_service, *, scope: str, recent_days: int) -> list[str]:
