@@ -13,7 +13,6 @@ from app.db.repository import (
     create_dashboard_import_job,
     get_dashboard_import_job,
     get_latest_dashboard_import_job,
-    list_all_loaded_entities,
     mark_dashboard_import_job_failed,
     mark_dashboard_import_job_running,
     mark_dashboard_import_job_succeeded,
@@ -196,10 +195,7 @@ def _prepare_dashboard_state(settings: Settings, *, job_id: str | None = None) -
     update_progress("memory_hydration", imported_count=imported_count, source_records=imported_count)
     changed_entity_ids = hydrate_persistent_memory(database_path, source_records or None)
     update_progress("ai_refresh", changed_entities=len(changed_entity_ids))
-    refresh_entity_ids = [
-        entity.entity.id
-        for entity in list_all_loaded_entities(database_path)
-    ]
+    refresh_entity_ids = sorted(set(changed_entity_ids))
     refresh_ai_suggestions_for_entities(database_path, refresh_entity_ids)
     update_progress("feed_build", refreshed_entities=len(refresh_entity_ids))
     feed = build_feed_from_entities(database_path, datetime.now(timezone.utc).isoformat())
