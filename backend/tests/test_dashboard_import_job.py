@@ -15,6 +15,7 @@ from app.db.repository import (
     initialize_database,
     mark_dashboard_import_job_running,
     mark_dashboard_import_job_succeeded,
+    update_dashboard_import_job_progress,
 )
 from app.main import app
 from app.schemas.domain import DashboardBriefing, DashboardProfile, FeedResponse, GoogleAuthState
@@ -28,13 +29,30 @@ class DashboardImportJobRepositoryTests(unittest.TestCase):
 
             queued = create_dashboard_import_job(database_path)
             self.assertEqual(queued.status, "queued")
+            self.assertEqual(queued.stage, "queued")
+            self.assertEqual(queued.imported_count, 0)
+            self.assertIsNone(queued.total_count)
             self.assertIsNone(queued.started_at)
             self.assertIsNone(queued.completed_at)
 
             running = mark_dashboard_import_job_running(database_path, queued.id)
             self.assertEqual(running.status, "running")
+            self.assertEqual(running.stage, "starting")
             self.assertIsNotNone(running.started_at)
             self.assertIsNone(running.completed_at)
+
+            progress = update_dashboard_import_job_progress(
+                database_path,
+                queued.id,
+                stage="gmail_persisted",
+                imported_count=2,
+                total_count=5,
+                source_records=2,
+            )
+            self.assertEqual(progress.stage, "gmail_persisted")
+            self.assertEqual(progress.imported_count, 2)
+            self.assertEqual(progress.total_count, 5)
+            self.assertEqual(progress.source_records, 2)
 
             succeeded = mark_dashboard_import_job_succeeded(
                 database_path,
@@ -45,7 +63,10 @@ class DashboardImportJobRepositoryTests(unittest.TestCase):
                 refreshed_entities=4,
             )
             self.assertEqual(succeeded.status, "succeeded")
+            self.assertEqual(succeeded.stage, "completed")
             self.assertEqual(succeeded.result_status, "ready")
+            self.assertEqual(succeeded.imported_count, 3)
+            self.assertEqual(succeeded.total_count, 5)
             self.assertEqual(succeeded.source_records, 3)
             self.assertEqual(succeeded.changed_entities, 2)
             self.assertEqual(succeeded.refreshed_entities, 4)
@@ -111,7 +132,15 @@ class DashboardImportJobRouteTests(unittest.TestCase):
         mock_fetch_profile: Mock,
     ) -> None:
         mock_auth.return_value = GoogleAuthState(available=True, connected=True)
-        mock_fetch_source_records.return_value = []
+        def fake_fetch_source_records(settings, *, progress_callback=None, collect_records=True):
+            self.assertIs(settings, self.settings)
+            self.assertFalse(collect_records)
+            self.assertIsNotNone(progress_callback)
+            progress_callback("gmail_listing", 0, 2)
+            progress_callback("gmail_persisted", 2, 2)
+            return []
+
+        mock_fetch_source_records.side_effect = fake_fetch_source_records
         mock_hydrate.return_value = {"entity-1"}
         mock_entities.return_value = [SimpleNamespace(entity=SimpleNamespace(id="entity-1"))]
         mock_build_feed.return_value = FeedResponse()
@@ -124,10 +153,13 @@ class DashboardImportJobRouteTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["status"], "ready")
         self.assertEqual(payload["job_status"], "succeeded")
-        self.assertEqual(payload["source_records"], 0)
+        self.assertEqual(payload["job_stage"], "completed")
+        self.assertEqual(payload["source_records"], 2)
+        self.assertEqual(payload["imported_count"], 2)
+        self.assertEqual(payload["total_count"], 2)
         self.assertEqual(payload["changed_entities"], 1)
         self.assertEqual(payload["refreshed_entities"], 1)
-        mock_fetch_source_records.assert_called_once_with(self.settings)
+        mock_fetch_source_records.assert_called_once()
         mock_refresh.assert_called_once_with(str(self.database_path), ["entity-1"])
 
     @patch("app.services.dashboard.fetch_google_source_records", side_effect=RuntimeError("sync exploded"))

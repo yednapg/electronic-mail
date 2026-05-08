@@ -150,6 +150,9 @@ export interface DashboardImportJobResponse {
   readonly id: string;
   readonly user_id: string;
   readonly status: DashboardImportJobStatus;
+  readonly stage: string;
+  readonly imported_count: number;
+  readonly total_count?: number | null;
   readonly source_records: number;
   readonly changed_entities: number;
   readonly refreshed_entities: number;
