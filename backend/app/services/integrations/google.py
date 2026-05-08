@@ -10,6 +10,8 @@ import html
 import json
 import os
 import re
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -51,6 +53,25 @@ GMAIL_SYNC_SCOPES = {"full", "recent"}
 GMAIL_INBOX_LABEL = "INBOX"
 GMAIL_UNREAD_LABEL = "UNREAD"
 HTML_TAG_PATTERN = re.compile(r"(?is)<[^>]+>")
+GmailSyncProgressCallback = Callable[[str, int, int | None], None]
+
+
+@dataclass
+class GmailMessageIdPage:
+    """One bounded page of Gmail message ids from messages.list."""
+
+    message_ids: list[str]
+    total_count: int | None
+
+
+@dataclass
+class GmailBatchResult:
+    """Persisted result for one bounded Gmail hydration batch."""
+
+    records: list[SourceRecord]
+    threads_fetched: int
+    latest_history_id: str | None
+    new_count: int
 
 
 def _gmail_debug_enabled() -> bool:
@@ -151,7 +172,12 @@ def handle_google_callback(settings: Settings, code: str, state: str | None = No
     return f"{settings.cors_origin}/post-login"
 
 
-def fetch_google_source_records(settings: Settings) -> list[SourceRecord]:
+def fetch_google_source_records(
+    settings: Settings,
+    *,
+    progress_callback: GmailSyncProgressCallback | None = None,
+    collect_records: bool = True,
+) -> list[SourceRecord]:
     """Sync Gmail incrementally, fetch calendar updates, and return changed records."""
     credentials = create_authorized_credentials(settings)
 
@@ -161,11 +187,19 @@ def fetch_google_source_records(settings: Settings) -> list[SourceRecord]:
     initialize_database(str(settings.database_path))
     gmail_service = build("gmail", "v1", credentials=credentials)
     calendar_service = build("calendar", "v3", credentials=credentials)
-    gmail_records = sync_gmail_source_records(settings, gmail_service)
+    gmail_records = sync_gmail_source_records(
+        settings,
+        gmail_service,
+        progress_callback=progress_callback,
+        collect_records=collect_records,
+    )
     calendar_records = fetch_upcoming_calendar_records(calendar_service)
 
     if calendar_records:
         persist_source_records(settings, calendar_records)
+
+    if not collect_records:
+        return calendar_records
 
     return sorted(gmail_records + calendar_records, key=lambda record: record.received_at, reverse=True)
 
@@ -566,21 +600,54 @@ def clear_oauth_session(state: str | None = None) -> None:
         OAUTH_SESSION_FILE_PATH.unlink()
 
 
-def sync_gmail_source_records(settings: Settings, gmail_service) -> list[SourceRecord]:
+def sync_gmail_source_records(
+    settings: Settings,
+    gmail_service,
+    *,
+    progress_callback: GmailSyncProgressCallback | None = None,
+    collect_records: bool = True,
+) -> list[SourceRecord]:
     """Run resumable Gmail sync with full initial load and history-based incremental updates."""
     database_path = str(settings.database_path)
     sync_state = get_gmail_sync_state(database_path, DEV_USER_ID)
     used_full_sync = sync_state is None or not sync_state.last_history_id
     sync_scope = resolve_gmail_sync_scope(settings.gmail_sync_scope)
     history_events: list[StoredGmailHistoryEvent] = []
+    records_by_id: dict[str, SourceRecord] = {}
+    imported_count = 0
+    total_count: int | None = None
+    threads_fetched = 0
+    new_count = 0
+    latest_history_id: str | None = None
+    mailbox_history_id: str | None = None
+
+    def report(stage: str) -> None:
+        if progress_callback is not None:
+            progress_callback(stage, imported_count, total_count)
 
     if used_full_sync:
-        message_ids = fetch_all_gmail_message_ids(
-            gmail_service,
-            scope=sync_scope,
-            recent_days=settings.gmail_recent_days,
-        )
-        mailbox_history_id = None
+        report("gmail_listing")
+        for page in iter_gmail_message_id_pages(gmail_service, scope=sync_scope, recent_days=settings.gmail_recent_days):
+            total_count = page.total_count if page.total_count is not None else total_count
+            if not page.message_ids:
+                report("gmail_fetching")
+                continue
+
+            report("gmail_fetching")
+            batch = persist_gmail_message_id_batch(
+                settings,
+                gmail_service,
+                page.message_ids,
+                scope=sync_scope,
+                recent_days=settings.gmail_recent_days,
+            )
+            imported_count += len(set(page.message_ids))
+            threads_fetched += batch.threads_fetched
+            new_count += batch.new_count
+            latest_history_id = max_history_id(latest_history_id, batch.latest_history_id)
+            if collect_records:
+                records_by_id.update({record.id: record for record in batch.records})
+            report("gmail_persisted")
     else:
         message_ids, mailbox_history_id, needs_full_sync, history_events = fetch_incremental_gmail_changes(
             gmail_service,
@@ -590,29 +657,48 @@ def sync_gmail_source_records(settings: Settings, gmail_service) -> list[SourceR
             upsert_gmail_history_events(database_path, history_events)
         if needs_full_sync:
             used_full_sync = True
-            message_ids = fetch_all_gmail_message_ids(
-                gmail_service,
-                scope=sync_scope,
-                recent_days=settings.gmail_recent_days,
-            )
+            message_ids = []
             mailbox_history_id = None
+            report("gmail_listing")
+            for page in iter_gmail_message_id_pages(gmail_service, scope=sync_scope, recent_days=settings.gmail_recent_days):
+                total_count = page.total_count if page.total_count is not None else total_count
+                if not page.message_ids:
+                    report("gmail_fetching")
+                    continue
 
-    messages, threads_fetched, latest_history_id = fetch_thread_messages_for_message_ids(gmail_service, message_ids)
-    if messages:
-        upsert_gmail_message_snapshots(
-            database_path,
-            [gmail_message_snapshot_from_payload(message) for message in messages],
-        )
-    records = normalize_gmail_messages(
-        messages,
-        scope=sync_scope,
-        recent_days=settings.gmail_recent_days,
-    )
-    existing_ids = list_existing_source_record_ids(database_path, (record.id for record in records))
-    new_count = len([record for record in records if record.id not in existing_ids])
-
-    if records:
-        persist_source_records(settings, records)
+                report("gmail_fetching")
+                batch = persist_gmail_message_id_batch(
+                    settings,
+                    gmail_service,
+                    page.message_ids,
+                    scope=sync_scope,
+                    recent_days=settings.gmail_recent_days,
+                )
+                imported_count += len(set(page.message_ids))
+                threads_fetched += batch.threads_fetched
+                new_count += batch.new_count
+                latest_history_id = max_history_id(latest_history_id, batch.latest_history_id)
+                if collect_records:
+                    records_by_id.update({record.id: record for record in batch.records})
+                report("gmail_persisted")
+        else:
+            total_count = len(message_ids)
+            for batch_ids in chunked(message_ids, GMAIL_PAGE_SIZE):
+                report("gmail_fetching")
+                batch = persist_gmail_message_id_batch(
+                    settings,
+                    gmail_service,
+                    batch_ids,
+                    scope=sync_scope,
+                    recent_days=settings.gmail_recent_days,
+                )
+                imported_count += len(set(batch_ids))
+                threads_fetched += batch.threads_fetched
+                new_count += batch.new_count
+                latest_history_id = max_history_id(latest_history_id, batch.latest_history_id)
+                if collect_records:
+                    records_by_id.update({record.id: record for record in batch.records})
+                report("gmail_persisted")
 
     resolved_history_id = mailbox_history_id or latest_history_id or (sync_state.last_history_id if sync_state else None)
     upsert_gmail_sync_state(
@@ -623,7 +709,8 @@ def sync_gmail_source_records(settings: Settings, gmail_service) -> list[SourceR
     )
 
     total_source_records = get_source_record_count(database_path)
-    fetched_count = len({record.id for record in records})
+    records = sorted(records_by_id.values(), key=lambda record: record.received_at, reverse=True)
+    fetched_count = imported_count if not collect_records else len(records_by_id)
     if total_source_records < fetched_count:
         print(
             "GMAIL SYNC INVARIANT VIOLATION",
@@ -647,6 +734,20 @@ def sync_gmail_source_records(settings: Settings, gmail_service) -> list[SourceR
 def fetch_all_gmail_message_ids(gmail_service, *, scope: str, recent_days: int) -> list[str]:
     """List Gmail message ids for either full-mailbox or recent-window sync."""
     ids: list[str] = []
+
+    for page in iter_gmail_message_id_pages(gmail_service, scope=scope, recent_days=recent_days):
+        ids.extend(page.message_ids)
+
+    return ids
+
+
+def iter_gmail_message_id_pages(
+    gmail_service,
+    *,
+    scope: str,
+    recent_days: int,
+) -> Iterable[GmailMessageIdPage]:
+    """Yield Gmail message ids one API page at a time."""
     page_token: str | None = None
     query = None if scope == "full" else f"newer_than:{recent_days}d"
 
@@ -671,16 +772,58 @@ def fetch_all_gmail_message_ids(gmail_service, *, scope: str, recent_days: int) 
         )
         _log_gmail_debug("gmail_list_response", {"request": request_payload, "response": listed})
 
+        page_ids: list[str] = []
         for message in listed.get("messages", []):
             message_id = message.get("id")
             if message_id:
-                ids.append(str(message_id))
+                page_ids.append(str(message_id))
+
+        estimate = listed.get("resultSizeEstimate")
+        total_count = int(estimate) if isinstance(estimate, int) else None
+        yield GmailMessageIdPage(message_ids=page_ids, total_count=total_count)
 
         page_token = listed.get("nextPageToken")
         if not page_token:
             break
 
-    return ids
+def persist_gmail_message_id_batch(
+    settings: Settings,
+    gmail_service,
+    message_ids: list[str],
+    *,
+    scope: str,
+    recent_days: int,
+) -> GmailBatchResult:
+    """Hydrate, normalize, and commit one bounded Gmail message-id batch."""
+    if not message_ids:
+        return GmailBatchResult(records=[], threads_fetched=0, latest_history_id=None, new_count=0)
+
+    database_path = str(settings.database_path)
+    messages, threads_fetched, latest_history_id = fetch_thread_messages_for_message_ids(gmail_service, message_ids)
+    if messages:
+        upsert_gmail_message_snapshots(
+            database_path,
+            [gmail_message_snapshot_from_payload(message) for message in messages],
+        )
+    records = normalize_gmail_messages(messages, scope=scope, recent_days=recent_days)
+    existing_ids = list_existing_source_record_ids(database_path, (record.id for record in records))
+    new_count = len([record for record in records if record.id not in existing_ids])
+
+    if records:
+        persist_source_records(settings, records)
+
+    return GmailBatchResult(
+        records=records,
+        threads_fetched=threads_fetched,
+        latest_history_id=latest_history_id,
+        new_count=new_count,
+    )
+
+
+def chunked(values: list[str], size: int) -> Iterable[list[str]]:
+    """Yield bounded chunks from a small incremental id set."""
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
 
 
 def fetch_incremental_gmail_message_ids(

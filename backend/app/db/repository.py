@@ -168,6 +168,9 @@ def initialize_database(database_path: str) -> None:
               id TEXT PRIMARY KEY,
               user_id TEXT NOT NULL,
               status TEXT NOT NULL,
+              stage TEXT NOT NULL DEFAULT 'queued',
+              imported_count INTEGER NOT NULL DEFAULT 0,
+              total_count INTEGER,
               source_records INTEGER NOT NULL DEFAULT 0,
               changed_entities INTEGER NOT NULL DEFAULT 0,
               refreshed_entities INTEGER NOT NULL DEFAULT 0,
@@ -232,6 +235,9 @@ def initialize_database(database_path: str) -> None:
         _ensure_column(connection, "source_records", "user_id", "TEXT NOT NULL DEFAULT 'google-dev-user'")
         _ensure_column(connection, "entities", "user_id", "TEXT NOT NULL DEFAULT 'google-dev-user'")
         _ensure_column(connection, "gmail_message_snapshots", "internal_date", "TEXT")
+        _ensure_column(connection, "dashboard_import_jobs", "stage", "TEXT NOT NULL DEFAULT 'queued'")
+        _ensure_column(connection, "dashboard_import_jobs", "imported_count", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "dashboard_import_jobs", "total_count", "INTEGER")
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_gmail_message_snapshots_internal_date
@@ -527,6 +533,9 @@ def create_dashboard_import_job(database_path: str, *, user_id: str = DEFAULT_US
         id=str(uuid4()),
         user_id=user_id,
         status="queued",
+        stage="queued",
+        imported_count=0,
+        total_count=None,
         source_records=0,
         changed_entities=0,
         refreshed_entities=0,
@@ -542,15 +551,19 @@ def create_dashboard_import_job(database_path: str, *, user_id: str = DEFAULT_US
         connection.execute(
             """
             INSERT INTO dashboard_import_jobs (
-              id, user_id, status, source_records, changed_entities, refreshed_entities,
-              result_status, error_message, created_at, started_at, completed_at, updated_at
+              id, user_id, status, stage, imported_count, total_count, source_records,
+              changed_entities, refreshed_entities, result_status, error_message,
+              created_at, started_at, completed_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.id,
                 job.user_id,
                 job.status,
+                job.stage,
+                job.imported_count,
+                job.total_count,
                 job.source_records,
                 job.changed_entities,
                 job.refreshed_entities,
@@ -574,10 +587,46 @@ def mark_dashboard_import_job_running(database_path: str, job_id: str) -> Stored
             """
             UPDATE dashboard_import_jobs
             SET status = ?, started_at = COALESCE(started_at, ?), completed_at = NULL,
-                error_message = NULL, updated_at = ?
+                stage = ?, error_message = NULL, updated_at = ?
             WHERE id = ?
             """,
-            ("running", now, now, job_id),
+            ("running", now, "starting", now, job_id),
+        )
+    return require_dashboard_import_job(database_path, job_id)
+
+
+def update_dashboard_import_job_progress(
+    database_path: str,
+    job_id: str,
+    *,
+    stage: str | None = None,
+    imported_count: int | None = None,
+    total_count: int | None = None,
+    source_records: int | None = None,
+    changed_entities: int | None = None,
+    refreshed_entities: int | None = None,
+) -> StoredDashboardImportJob:
+    """Persist incremental dashboard import progress."""
+    current = require_dashboard_import_job(database_path, job_id)
+    now = utc_now_iso()
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE dashboard_import_jobs
+            SET stage = ?, imported_count = ?, total_count = ?, source_records = ?,
+                changed_entities = ?, refreshed_entities = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                stage if stage is not None else current.stage,
+                imported_count if imported_count is not None else current.imported_count,
+                total_count if total_count is not None else current.total_count,
+                source_records if source_records is not None else current.source_records,
+                changed_entities if changed_entities is not None else current.changed_entities,
+                refreshed_entities if refreshed_entities is not None else current.refreshed_entities,
+                now,
+                job_id,
+            ),
         )
     return require_dashboard_import_job(database_path, job_id)
 
@@ -593,16 +642,19 @@ def mark_dashboard_import_job_succeeded(
 ) -> StoredDashboardImportJob:
     """Persist a successful dashboard import/preparation result."""
     now = utc_now_iso()
+    current = require_dashboard_import_job(database_path, job_id)
     with connect(database_path) as connection:
         connection.execute(
             """
             UPDATE dashboard_import_jobs
-            SET status = ?, source_records = ?, changed_entities = ?, refreshed_entities = ?,
+            SET status = ?, stage = ?, imported_count = ?, source_records = ?, changed_entities = ?, refreshed_entities = ?,
                 result_status = ?, error_message = NULL, completed_at = ?, updated_at = ?
             WHERE id = ?
             """,
             (
                 "succeeded",
+                "completed",
+                max(current.imported_count, source_records),
                 source_records,
                 changed_entities,
                 refreshed_entities,
@@ -622,10 +674,10 @@ def mark_dashboard_import_job_failed(database_path: str, job_id: str, *, error_m
         connection.execute(
             """
             UPDATE dashboard_import_jobs
-            SET status = ?, result_status = ?, error_message = ?, completed_at = ?, updated_at = ?
+            SET status = ?, stage = ?, result_status = ?, error_message = ?, completed_at = ?, updated_at = ?
             WHERE id = ?
             """,
-            ("failed", "failed", error_message, now, now, job_id),
+            ("failed", "failed", "failed", error_message, now, now, job_id),
         )
     return require_dashboard_import_job(database_path, job_id)
 
@@ -1583,6 +1635,9 @@ def _to_dashboard_import_job(row: sqlite3.Row) -> StoredDashboardImportJob:
         id=str(row["id"]),
         user_id=str(row["user_id"]),
         status=str(row["status"]),
+        stage=str(row["stage"]),
+        imported_count=int(row["imported_count"]),
+        total_count=int(row["total_count"]) if row["total_count"] is not None else None,
         source_records=int(row["source_records"]),
         changed_entities=int(row["changed_entities"]),
         refreshed_entities=int(row["refreshed_entities"]),

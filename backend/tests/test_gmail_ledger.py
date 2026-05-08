@@ -17,6 +17,7 @@ from app.db.repository import (
     upsert_gmail_sync_state,
 )
 from app.services.integrations.google import sync_gmail_source_records
+from app.services.integrations.google import persist_gmail_message_id_batch
 
 
 def build_message(
@@ -58,10 +59,17 @@ class FakeMessagesResource:
     def __init__(self, service):
         self.service = service
 
-    def list(self, **_kwargs):
-        return FakeRequest(
-            lambda: {"messages": [{"id": message_id} for message_id in self.service.list_ids]}
-        )
+    def list(self, **kwargs):
+        def execute():
+            page_token = kwargs.get("pageToken")
+            self.service.list_calls.append(page_token)
+            if page_token in self.service.list_errors:
+                raise RuntimeError(self.service.list_errors[page_token])
+            if self.service.list_pages is not None:
+                return self.service.list_pages.get(page_token, {"messages": []})
+            return {"messages": [{"id": message_id} for message_id in self.service.list_ids]}
+
+        return FakeRequest(execute)
 
     def get(self, *, id: str, **_kwargs):
         def execute():
@@ -125,6 +133,8 @@ class FakeGmailService:
         *,
         database_path: str,
         list_ids: list[str] | None = None,
+        list_pages: dict[str | None, dict[str, object]] | None = None,
+        list_errors: dict[str | None, str] | None = None,
         messages: dict[str, dict[str, object]] | None = None,
         threads: dict[str, list[dict[str, object]]] | None = None,
         history_response: dict[str, object] | None = None,
@@ -133,6 +143,8 @@ class FakeGmailService:
     ):
         self.database_path = database_path
         self.list_ids = list_ids or []
+        self.list_pages = list_pages
+        self.list_errors = list_errors or {}
         self.messages = messages or {}
         self.threads = threads or {}
         self.history_response = history_response or {"historyId": "0", "history": []}
@@ -140,6 +152,7 @@ class FakeGmailService:
         self.assert_history_persisted_before_hydration = assert_history_persisted_before_hydration
         self.message_gets: list[str] = []
         self.thread_gets: list[str] = []
+        self.list_calls: list[str | None] = []
         self.mutations: list[str] = []
 
     def users(self):
@@ -242,6 +255,124 @@ class GmailLedgerTests(unittest.TestCase):
         self.assertEqual(snapshot.label_ids, ["CATEGORY_UPDATES"])
         [source_record] = list_unlinked_source_records(self.database_path)
         self.assertEqual(source_record.raw_payload["label_ids"], ["CATEGORY_UPDATES"])
+
+    def test_full_sync_processes_paginated_mailbox_pages(self) -> None:
+        first = build_message(message_id="message-1", thread_id="thread-1", history_id="200")
+        second = build_message(message_id="message-2", thread_id="thread-2", history_id="201")
+        third = build_message(message_id="message-3", thread_id="thread-3", history_id="202")
+        progress: list[tuple[str, int, int | None]] = []
+        service = FakeGmailService(
+            database_path=self.database_path,
+            list_pages={
+                None: {
+                    "messages": [{"id": "message-1"}, {"id": "message-2"}],
+                    "nextPageToken": "page-2",
+                    "resultSizeEstimate": 3,
+                },
+                "page-2": {
+                    "messages": [{"id": "message-3"}],
+                    "resultSizeEstimate": 3,
+                },
+            },
+            messages={"message-1": first, "message-2": second, "message-3": third},
+            threads={"thread-1": [first], "thread-2": [second], "thread-3": [third]},
+        )
+
+        records = sync_gmail_source_records(
+            self.settings,
+            service,
+            progress_callback=lambda stage, imported, total: progress.append((stage, imported, total)),
+        )
+
+        self.assertEqual([record.id for record in records], ["message-1", "message-2", "message-3"])
+        self.assertEqual(service.list_calls, [None, "page-2"])
+        self.assertEqual([snapshot.message_id for snapshot in list_gmail_message_snapshots(self.database_path)], ["message-1", "message-2", "message-3"])
+        self.assertIn(("gmail_persisted", 2, 3), progress)
+        self.assertIn(("gmail_persisted", 3, 3), progress)
+        self.assertEqual(get_gmail_sync_state(self.database_path, DEFAULT_USER_ID).last_history_id, "202")
+
+    def test_full_sync_deduplicates_thread_messages_across_pages(self) -> None:
+        first = build_message(message_id="message-1", thread_id="thread-1", history_id="200")
+        second = build_message(message_id="message-2", thread_id="thread-1", history_id="201")
+        progress: list[tuple[str, int, int | None]] = []
+        service = FakeGmailService(
+            database_path=self.database_path,
+            list_pages={
+                None: {
+                    "messages": [{"id": "message-1"}],
+                    "nextPageToken": "page-2",
+                    "resultSizeEstimate": 2,
+                },
+                "page-2": {
+                    "messages": [{"id": "message-2"}],
+                    "resultSizeEstimate": 2,
+                },
+            },
+            messages={"message-1": first, "message-2": second},
+            threads={"thread-1": [first, second]},
+        )
+
+        records = sync_gmail_source_records(
+            self.settings,
+            service,
+            progress_callback=lambda stage, imported, total: progress.append((stage, imported, total)),
+        )
+
+        self.assertEqual([record.id for record in records], ["message-1", "message-2"])
+        self.assertEqual([snapshot.message_id for snapshot in list_gmail_message_snapshots(self.database_path)], ["message-1", "message-2"])
+        self.assertIn(("gmail_persisted", 1, 2), progress)
+        self.assertIn(("gmail_persisted", 2, 2), progress)
+
+    def test_batch_persistence_is_idempotent(self) -> None:
+        message = build_message(message_id="message-1", thread_id="thread-1", history_id="200")
+        service = FakeGmailService(
+            database_path=self.database_path,
+            messages={"message-1": message},
+            threads={"thread-1": [message]},
+        )
+
+        first = persist_gmail_message_id_batch(
+            self.settings,
+            service,
+            ["message-1"],
+            scope="full",
+            recent_days=30,
+        )
+        second = persist_gmail_message_id_batch(
+            self.settings,
+            service,
+            ["message-1"],
+            scope="full",
+            recent_days=30,
+        )
+
+        self.assertEqual(first.new_count, 1)
+        self.assertEqual(second.new_count, 0)
+        self.assertEqual([record.id for record in list_unlinked_source_records(self.database_path)], ["message-1"])
+        self.assertEqual([snapshot.message_id for snapshot in list_gmail_message_snapshots(self.database_path)], ["message-1"])
+
+    def test_full_sync_preserves_committed_pages_when_later_page_fails(self) -> None:
+        message = build_message(message_id="message-1", thread_id="thread-1", history_id="200")
+        service = FakeGmailService(
+            database_path=self.database_path,
+            list_pages={
+                None: {
+                    "messages": [{"id": "message-1"}],
+                    "nextPageToken": "page-2",
+                    "resultSizeEstimate": 2,
+                },
+            },
+            list_errors={"page-2": "page failed"},
+            messages={"message-1": message},
+            threads={"thread-1": [message]},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "page failed"):
+            sync_gmail_source_records(self.settings, service)
+
+        self.assertEqual([record.id for record in list_unlinked_source_records(self.database_path)], ["message-1"])
+        self.assertEqual([snapshot.message_id for snapshot in list_gmail_message_snapshots(self.database_path)], ["message-1"])
+        self.assertIsNone(get_gmail_sync_state(self.database_path, DEFAULT_USER_ID))
 
     def test_incremental_sync_preserves_delete_and_label_history_events(self) -> None:
         upsert_gmail_sync_state(
