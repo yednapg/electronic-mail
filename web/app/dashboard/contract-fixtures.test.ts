@@ -34,7 +34,7 @@ test('dashboard fixture maps to dashboard view models', () => {
 
   const sections = buildSections(dashboard.feed);
   assert.equal(sections[0].items[0].id, 'item-1');
-  assert.equal(sections[0].items[0].cta?.label, 'Archive');
+  assert.equal(sections[0].items[0].cta, undefined);
   const worthKnowing = sections.find((section) => section.id === 'worth-knowing');
 
   assert.equal(worthKnowing?.items[0].id, 'item-2');

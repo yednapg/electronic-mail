@@ -10,6 +10,7 @@ from app.db.repository import (
     append_trace_record,
     clear_derived_memory,
     get_entity_member_count,
+    get_latest_entity_outcomes,
     get_loaded_entity,
     get_source_record_count,
     list_all_loaded_entities,
@@ -166,7 +167,8 @@ def refresh_ai_suggestions_for_entities(database_path: str, entity_ids: list[str
 def build_feed_from_entities(database_path: str, current_time: str) -> FeedResponse:
     """Convert all loaded entities into pipeline outputs and then section them into a feed."""
     entities = list_all_loaded_entities(database_path)
-    outputs = [to_pipeline_output(database_path, entity, current_time) for entity in entities]
+    outcomes = get_latest_entity_outcomes(database_path, user_id="google-dev-user")
+    outputs = [to_pipeline_output(database_path, entity, current_time, latest_outcome=outcomes.get(entity.entity.id)) for entity in entities]
     feed = build_feed(outputs, database_path)
     source_records = get_source_record_count(database_path)
     feed_items = len(feed.now) + len(feed.today) + len(feed.worth_knowing)
@@ -192,7 +194,7 @@ def build_feed_from_entities(database_path: str, current_time: str) -> FeedRespo
     return feed
 
 
-def to_pipeline_output(database_path: str, entity: LoadedEntity, current_time: str) -> PipelineOutput:
+def to_pipeline_output(database_path: str, entity: LoadedEntity, current_time: str, latest_outcome=None) -> PipelineOutput:
     """Turn one loaded entity into a visible feed item whenever enough context exists."""
     latest_record = entity.members[-1] if entity.members else None
     state = entity.state
@@ -262,6 +264,24 @@ def to_pipeline_output(database_path: str, entity: LoadedEntity, current_time: s
 
     pipeline_entity = to_pipeline_entity(entity, latest_record.source)
     normalized_state = normalize_entity_state(state.current_state)
+    if latest_outcome is not None:
+        if latest_outcome.outcome_type == "complete":
+            pipeline_entity = pipeline_entity.model_copy(update={"current_state": "done", "lifecycle_state": "resolved"})
+            return create_suppressed_output(pipeline_entity, "completed_by_user")
+        if latest_outcome.outcome_type == "dismiss":
+            pipeline_entity = pipeline_entity.model_copy(update={"lifecycle_state": "suppressed"})
+            return create_suppressed_output(pipeline_entity, "dismissed_by_user")
+        if latest_outcome.outcome_type == "snooze":
+            if latest_outcome.snooze_until is None or latest_outcome.snooze_until > current_time:
+                pipeline_entity = pipeline_entity.model_copy(
+                    update={"due_at": latest_outcome.snooze_until, "lifecycle_state": "scheduled"}
+                )
+                return create_suppressed_output(pipeline_entity, "snoozed_by_user")
+
+    if normalized_state == "done":
+        pipeline_entity = pipeline_entity.model_copy(update={"lifecycle_state": "resolved"})
+        return create_suppressed_output(pipeline_entity, "resolved_state")
+
     suggestion = get_usable_suggestion(entity)
     force_worth_knowing = normalized_state == "done" or (
         suggestion is not None and (
@@ -607,20 +627,9 @@ def resolve_gmail_thread_id(entity: LoadedEntity, source: str | None) -> str | N
     return thread_ids[0]
 
 
-def resolve_gmail_thread_action(entity: LoadedEntity, latest_record) -> str | None:
-    """Choose the explicit Gmail thread action allowed for the current entity snapshot."""
-    thread_id = resolve_gmail_thread_id(entity, latest_record.source)
-
-    if thread_id is None or latest_record.source != "gmail":
-        return None
-
-    raw_labels = latest_record.raw_payload.get("label_ids")
-
-    if not isinstance(raw_labels, list):
-        return None
-
-    labels = {str(label).upper() for label in raw_labels}
-    return "archive" if "INBOX" in labels else "unarchive"
+def resolve_gmail_thread_action(_entity: LoadedEntity, _latest_record) -> str | None:
+    """Keep Gmail mutations out of the compact backend feed projection."""
+    return None
 
 
 def payload_string(payload: dict[str, object], key: str) -> str | None:

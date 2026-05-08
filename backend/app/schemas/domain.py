@@ -7,7 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-SourceType = Literal["gmail", "calendar"]
+SourceType = Literal["gmail", "calendar", "manual"]
 NeedType = Literal["decision", "awareness"]
 ActionType = Literal["inline", "external", "none"]
 EffortLevel = Literal["quick", "deep"]
@@ -15,7 +15,7 @@ TimingBand = Literal["now", "today", "later", "hidden"]
 ActionConfidence = Literal["high", "medium", "low"]
 LifecycleState = Literal["active", "scheduled", "resolved", "suppressed"]
 EntityCurrentState = Literal["open", "waiting", "done"]
-GmailThreadAction = Literal["archive", "unarchive"]
+GmailThreadAction = Literal["archive", "unarchive", "mark_read"]
 TraceStage = Literal[
     "ingestion",
     "normalization",
@@ -151,3 +151,127 @@ class TraceReplayResponse(BaseModel):
     entity_id: str
     source_record_ids: list[str] = Field(default_factory=list)
     items: list[TraceRecord] = Field(default_factory=list)
+
+
+class TaskCreateRequest(BaseModel):
+    """Create a backend-owned manual task."""
+
+    title: str
+    notes: str | None = None
+    section: Literal["now", "today", "later"] = "today"
+    due_at: str | None = None
+
+
+class TaskUpdateRequest(BaseModel):
+    """Patch a backend-owned manual task."""
+
+    title: str | None = None
+    notes: str | None = None
+    section: Literal["now", "today", "later"] | None = None
+    due_at: str | None = None
+    status: Literal["open", "done"] | None = None
+
+
+class TaskResponse(BaseModel):
+    """Backend-owned manual task response."""
+
+    id: str
+    user_id: str
+    entity_id: str
+    title: str
+    notes: str | None = None
+    section: Literal["now", "today", "later"]
+    due_at: str | None = None
+    status: Literal["open", "done"]
+    created_at: str
+    updated_at: str
+
+
+class EntityOutcomeRequest(BaseModel):
+    """Explicit app-state outcome for one entity."""
+
+    note: str | None = None
+
+
+class EntitySnoozeRequest(EntityOutcomeRequest):
+    """Snooze an entity until a backend-owned timestamp."""
+
+    snooze_until: str
+
+
+class EntityOutcomeResponse(BaseModel):
+    """Persisted entity outcome."""
+
+    id: str
+    user_id: str
+    entity_id: str
+    outcome_type: Literal["complete", "snooze", "dismiss"]
+    snooze_until: str | None = None
+    note: str | None = None
+    created_at: str
+
+
+class GmailDraftRequest(BaseModel):
+    """Create or update an explicit Gmail draft."""
+
+    to: str
+    cc: str | None = None
+    bcc: str | None = None
+    subject: str
+    body: str
+    entity_id: str | None = None
+    thread_id: str | None = None
+
+
+class GmailDraftResponse(BaseModel):
+    """Local/backend representation of a Gmail draft."""
+
+    id: str
+    user_id: str
+    entity_id: str | None = None
+    gmail_draft_id: str
+    gmail_message_id: str | None = None
+    thread_id: str | None = None
+    to: str
+    cc: str | None = None
+    bcc: str | None = None
+    subject: str
+    body: str
+    status: Literal["draft", "sent", "deleted"]
+    created_at: str
+    updated_at: str
+
+
+class GmailThreadMutationResponse(BaseModel):
+    """Response payload for explicit Gmail thread mutations."""
+
+    thread_id: str
+    action: GmailThreadAction
+
+
+class ThreadMessage(BaseModel):
+    """One message in a backend-owned thread reader payload."""
+
+    id: str
+    source: SourceType
+    thread_id: str | None = None
+    from_address: str | None = None
+    to: str | None = None
+    cc: str | None = None
+    bcc: str | None = None
+    subject: str | None = None
+    body: str
+    snippet: str | None = None
+    label_ids: list[str] = Field(default_factory=list)
+    received_at: str
+
+
+class ThreadReaderResponse(BaseModel):
+    """Thread reader payload shared by web and iOS."""
+
+    entity_id: str
+    user_id: str
+    source: SourceType | None = None
+    gmail_thread_id: str | None = None
+    subject: str | None = None
+    messages: list[ThreadMessage] = Field(default_factory=list)

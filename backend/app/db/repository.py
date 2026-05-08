@@ -10,15 +10,21 @@ from typing import Iterator, Iterable
 from uuid import uuid4
 
 from app.db.models import (
+    StoredEntityOutcome,
     LoadedEntity,
+    StoredGmailDraft,
     StoredEntity,
     StoredEntityAiSuggestion,
     StoredEntityState,
     StoredGmailSyncState,
+    StoredManualTask,
     StoredSourceRecord,
     StoredEntityThreadMembership,
     StoredTraceRecord,
 )
+
+
+DEFAULT_USER_ID = "google-dev-user"
 
 
 def utc_now_iso() -> str:
@@ -35,6 +41,7 @@ def initialize_database(database_path: str) -> None:
 
             CREATE TABLE IF NOT EXISTS source_records (
               id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL DEFAULT 'google-dev-user',
               source TEXT NOT NULL,
               thread_id TEXT,
               subject TEXT,
@@ -46,6 +53,7 @@ def initialize_database(database_path: str) -> None:
 
             CREATE TABLE IF NOT EXISTS entities (
               id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL DEFAULT 'google-dev-user',
               canonical_key TEXT NOT NULL UNIQUE,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
@@ -114,8 +122,64 @@ def initialize_database(database_path: str) -> None:
               last_history_id TEXT,
               last_full_sync_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS manual_tasks (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              entity_id TEXT NOT NULL UNIQUE,
+              title TEXT NOT NULL,
+              notes TEXT,
+              section TEXT NOT NULL,
+              due_at TEXT,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS entity_outcomes (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              entity_id TEXT NOT NULL,
+              outcome_type TEXT NOT NULL,
+              snooze_until TEXT,
+              note TEXT,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_entity_outcomes_latest
+              ON entity_outcomes(user_id, entity_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS gmail_drafts (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              entity_id TEXT,
+              gmail_draft_id TEXT NOT NULL UNIQUE,
+              gmail_message_id TEXT,
+              thread_id TEXT,
+              to_recipients TEXT NOT NULL,
+              cc_recipients TEXT,
+              bcc_recipients TEXT,
+              subject TEXT NOT NULL,
+              body TEXT NOT NULL,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE SET NULL
+            );
             """
         )
+        _ensure_column(connection, "source_records", "user_id", "TEXT NOT NULL DEFAULT 'google-dev-user'")
+        _ensure_column(connection, "entities", "user_id", "TEXT NOT NULL DEFAULT 'google-dev-user'")
+
+
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    """Add a column to older local SQLite databases when needed."""
+    rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+    if any(str(row["name"]) == column for row in rows):
+        return
+    connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 @contextmanager
@@ -134,6 +198,9 @@ def connect(database_path: str) -> Iterator[sqlite3.Connection]:
 def clear_all_data(database_path: str) -> None:
     """Remove all persisted runtime data while preserving the schema."""
     with connect(database_path) as connection:
+        connection.execute("DELETE FROM gmail_drafts")
+        connection.execute("DELETE FROM entity_outcomes")
+        connection.execute("DELETE FROM manual_tasks")
         connection.execute("DELETE FROM trace_records")
         connection.execute("DELETE FROM entity_ai_suggestions")
         connection.execute("DELETE FROM entity_members")
@@ -145,14 +212,18 @@ def clear_all_data(database_path: str) -> None:
 
 
 def clear_derived_memory(database_path: str) -> None:
-    """Remove derived entity memory while preserving synced source records."""
+    """Remove derived source memory while preserving synced records and manual tasks."""
     with connect(database_path) as connection:
         connection.execute("DELETE FROM trace_records")
-        connection.execute("DELETE FROM entity_ai_suggestions")
-        connection.execute("DELETE FROM entity_members")
-        connection.execute("DELETE FROM entity_thread_memberships")
-        connection.execute("DELETE FROM entity_states")
-        connection.execute("DELETE FROM entities")
+        connection.execute(
+            "DELETE FROM entity_ai_suggestions WHERE entity_id NOT IN (SELECT entity_id FROM manual_tasks)"
+        )
+        connection.execute("DELETE FROM entity_members WHERE entity_id NOT IN (SELECT entity_id FROM manual_tasks)")
+        connection.execute(
+            "DELETE FROM entity_thread_memberships WHERE entity_id NOT IN (SELECT entity_id FROM manual_tasks)"
+        )
+        connection.execute("DELETE FROM entity_states WHERE entity_id NOT IN (SELECT entity_id FROM manual_tasks)")
+        connection.execute("DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM manual_tasks)")
 
 
 def upsert_source_records(database_path: str, records: Iterable[StoredSourceRecord]) -> None:
@@ -161,9 +232,12 @@ def upsert_source_records(database_path: str, records: Iterable[StoredSourceReco
         for record in records:
             connection.execute(
                 """
-                INSERT INTO source_records (id, source, thread_id, subject, sender, timestamp, raw_payload, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO source_records (
+                  id, user_id, source, thread_id, subject, sender, timestamp, raw_payload, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
+                  user_id = excluded.user_id,
                   source = excluded.source,
                   thread_id = excluded.thread_id,
                   subject = excluded.subject,
@@ -173,6 +247,7 @@ def upsert_source_records(database_path: str, records: Iterable[StoredSourceReco
                 """,
                 (
                     record.id,
+                    record.raw_payload.get("user_id") if isinstance(record.raw_payload.get("user_id"), str) else DEFAULT_USER_ID,
                     record.source,
                     record.thread_id,
                     record.subject,
@@ -234,12 +309,12 @@ def upsert_gmail_sync_state(
         )
 
 
-def create_entity(database_path: str, canonical_key: str) -> StoredEntity:
+def create_entity(database_path: str, canonical_key: str, user_id: str = DEFAULT_USER_ID) -> StoredEntity:
     """Create a new canonical entity row."""
     with connect(database_path) as connection:
         row = connection.execute(
-            "SELECT * FROM entities WHERE canonical_key = ? LIMIT 1",
-            (canonical_key,),
+            "SELECT * FROM entities WHERE canonical_key = ? AND user_id = ? LIMIT 1",
+            (canonical_key, user_id),
         ).fetchone()
 
         if row is not None:
@@ -253,8 +328,8 @@ def create_entity(database_path: str, canonical_key: str) -> StoredEntity:
         )
 
         connection.execute(
-            "INSERT INTO entities (id, canonical_key, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (entity.id, entity.canonical_key, entity.created_at, entity.updated_at),
+            "INSERT INTO entities (id, user_id, canonical_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (entity.id, user_id, entity.canonical_key, entity.created_at, entity.updated_at),
         )
 
     return entity
@@ -745,6 +820,314 @@ def list_trace_records_for_entity(database_path: str, entity_id: str) -> list[St
     return [_to_trace_record(row) for row in rows]
 
 
+def create_manual_task(
+    database_path: str,
+    *,
+    user_id: str,
+    title: str,
+    notes: str | None = None,
+    section: str = "today",
+    due_at: str | None = None,
+) -> StoredManualTask:
+    """Create a backend-owned task and its feed entity projection."""
+    now = utc_now_iso()
+    task_id = str(uuid4())
+    entity = create_entity(database_path, f"manual-task:{task_id}", user_id=user_id)
+    task = StoredManualTask(
+        id=task_id,
+        user_id=user_id,
+        entity_id=entity.id,
+        title=title,
+        notes=notes,
+        section=section,
+        due_at=due_at,
+        status="open",
+        created_at=now,
+        updated_at=now,
+    )
+
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO manual_tasks (
+              id, user_id, entity_id, title, notes, section, due_at, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task.id,
+                task.user_id,
+                task.entity_id,
+                task.title,
+                task.notes,
+                task.section,
+                task.due_at,
+                task.status,
+                task.created_at,
+                task.updated_at,
+            ),
+        )
+
+    _write_manual_task_projection(database_path, task)
+    return task
+
+
+def update_manual_task(
+    database_path: str,
+    task_id: str,
+    *,
+    user_id: str,
+    title: str | None = None,
+    notes: str | None = None,
+    section: str | None = None,
+    due_at: str | None = None,
+    status: str | None = None,
+) -> StoredManualTask | None:
+    """Patch a backend-owned task and refresh its feed projection."""
+    existing = get_manual_task(database_path, task_id, user_id=user_id)
+    if existing is None:
+        return None
+
+    task = StoredManualTask(
+        id=existing.id,
+        user_id=existing.user_id,
+        entity_id=existing.entity_id,
+        title=title if title is not None else existing.title,
+        notes=notes if notes is not None else existing.notes,
+        section=section if section is not None else existing.section,
+        due_at=due_at if due_at is not None else existing.due_at,
+        status=status if status is not None else existing.status,
+        created_at=existing.created_at,
+        updated_at=utc_now_iso(),
+    )
+
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE manual_tasks
+            SET title = ?, notes = ?, section = ?, due_at = ?, status = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (
+                task.title,
+                task.notes,
+                task.section,
+                task.due_at,
+                task.status,
+                task.updated_at,
+                task.id,
+                task.user_id,
+            ),
+        )
+
+    _write_manual_task_projection(database_path, task)
+    return task
+
+
+def delete_manual_task(database_path: str, task_id: str, *, user_id: str) -> bool:
+    """Delete a backend-owned task and suppress its entity through cascade cleanup."""
+    task = get_manual_task(database_path, task_id, user_id=user_id)
+    if task is None:
+        return False
+
+    with connect(database_path) as connection:
+        connection.execute("DELETE FROM manual_tasks WHERE id = ? AND user_id = ?", (task_id, user_id))
+        connection.execute("DELETE FROM entities WHERE id = ?", (task.entity_id,))
+    return True
+
+
+def get_manual_task(database_path: str, task_id: str, *, user_id: str) -> StoredManualTask | None:
+    """Load a backend-owned task by id."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM manual_tasks WHERE id = ? AND user_id = ?",
+            (task_id, user_id),
+        ).fetchone()
+    return _to_manual_task(row) if row is not None else None
+
+
+def get_manual_task_by_entity_id(database_path: str, entity_id: str, *, user_id: str) -> StoredManualTask | None:
+    """Load a backend-owned task by entity id."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM manual_tasks WHERE entity_id = ? AND user_id = ?",
+            (entity_id, user_id),
+        ).fetchone()
+    return _to_manual_task(row) if row is not None else None
+
+
+def append_entity_outcome(
+    database_path: str,
+    *,
+    user_id: str,
+    entity_id: str,
+    outcome_type: str,
+    snooze_until: str | None = None,
+    note: str | None = None,
+) -> StoredEntityOutcome:
+    """Persist one explicit user outcome against an entity."""
+    outcome = StoredEntityOutcome(
+        id=str(uuid4()),
+        user_id=user_id,
+        entity_id=entity_id,
+        outcome_type=outcome_type,
+        snooze_until=snooze_until,
+        note=note,
+        created_at=utc_now_iso(),
+    )
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO entity_outcomes (id, user_id, entity_id, outcome_type, snooze_until, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                outcome.id,
+                outcome.user_id,
+                outcome.entity_id,
+                outcome.outcome_type,
+                outcome.snooze_until,
+                outcome.note,
+                outcome.created_at,
+            ),
+        )
+    return outcome
+
+
+def get_latest_entity_outcomes(
+    database_path: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> dict[str, StoredEntityOutcome]:
+    """Return the latest outcome per entity for feed suppression."""
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM entity_outcomes
+            WHERE user_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (user_id,),
+        ).fetchall()
+    latest: dict[str, StoredEntityOutcome] = {}
+    for row in rows:
+        outcome = _to_entity_outcome(row)
+        latest[outcome.entity_id] = outcome
+    return latest
+
+
+def upsert_gmail_draft(database_path: str, draft: StoredGmailDraft) -> StoredGmailDraft:
+    """Persist the local mapping for an explicitly-created Gmail draft."""
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO gmail_drafts (
+              id, user_id, entity_id, gmail_draft_id, gmail_message_id, thread_id, to_recipients,
+              cc_recipients, bcc_recipients, subject, body, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(gmail_draft_id) DO UPDATE SET
+              entity_id = excluded.entity_id,
+              gmail_message_id = excluded.gmail_message_id,
+              thread_id = excluded.thread_id,
+              to_recipients = excluded.to_recipients,
+              cc_recipients = excluded.cc_recipients,
+              bcc_recipients = excluded.bcc_recipients,
+              subject = excluded.subject,
+              body = excluded.body,
+              status = excluded.status,
+              updated_at = excluded.updated_at
+            """,
+            (
+                draft.id,
+                draft.user_id,
+                draft.entity_id,
+                draft.gmail_draft_id,
+                draft.gmail_message_id,
+                draft.thread_id,
+                draft.to_recipients,
+                draft.cc_recipients,
+                draft.bcc_recipients,
+                draft.subject,
+                draft.body,
+                draft.status,
+                draft.created_at,
+                draft.updated_at,
+            ),
+        )
+    return draft
+
+
+def get_gmail_draft(database_path: str, draft_id: str, *, user_id: str) -> StoredGmailDraft | None:
+    """Load a Gmail draft mapping by local id or Gmail draft id."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM gmail_drafts
+            WHERE user_id = ? AND (id = ? OR gmail_draft_id = ?)
+            LIMIT 1
+            """,
+            (user_id, draft_id, draft_id),
+        ).fetchone()
+    return _to_gmail_draft(row) if row is not None else None
+
+
+def list_source_records_for_entity(database_path: str, entity_id: str) -> list[StoredSourceRecord]:
+    """Return source records for one entity in chronological order."""
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT source_records.*
+            FROM entity_members
+            JOIN source_records ON source_records.id = entity_members.source_record_id
+            WHERE entity_members.entity_id = ?
+            ORDER BY source_records.timestamp ASC, source_records.id ASC
+            """,
+            (entity_id,),
+        ).fetchall()
+    return [_to_source_record(row) for row in rows]
+
+
+def _write_manual_task_projection(database_path: str, task: StoredManualTask) -> None:
+    """Keep manual tasks visible through the same entity/feed machinery as email work."""
+    status_state = "done" if task.status == "done" else "open"
+    source_record = StoredSourceRecord(
+        id=f"manual-task:{task.id}",
+        source="manual",
+        thread_id=task.id,
+        subject=task.title,
+        sender="manual",
+        timestamp=task.updated_at,
+        raw_payload={
+            "user_id": task.user_id,
+            "task_id": task.id,
+            "subject": task.title,
+            "body": task.notes or "",
+            "section": task.section,
+            "due_at": task.due_at,
+            "status": task.status,
+        },
+        created_at=task.created_at,
+    )
+    upsert_source_records(database_path, [source_record])
+    attach_record_to_entity(database_path, task.entity_id, source_record.id)
+    upsert_entity_state(database_path, task.entity_id, status_state, task.due_at)
+    upsert_ai_suggestion(
+        database_path,
+        entity_id=task.entity_id,
+        title=task.title,
+        explanation=task.notes or "This is a task you added directly.",
+        action="none",
+        suggested_timing=task.section,
+        suggested_priority=70 if task.section == "now" else 50,
+        suggested_visibility=task.status != "done",
+        model="manual-task",
+        generated_from_updated_at=utc_now_iso(),
+    )
+
+
 def _to_source_record(row: sqlite3.Row) -> StoredSourceRecord:
     return StoredSourceRecord(
         id=str(row["id"]),
@@ -755,6 +1138,52 @@ def _to_source_record(row: sqlite3.Row) -> StoredSourceRecord:
         timestamp=str(row["timestamp"]),
         raw_payload=json.loads(row["raw_payload"]),
         created_at=str(row["created_at"]),
+    )
+
+
+def _to_manual_task(row: sqlite3.Row) -> StoredManualTask:
+    return StoredManualTask(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        entity_id=str(row["entity_id"]),
+        title=str(row["title"]),
+        notes=str(row["notes"]) if row["notes"] is not None else None,
+        section=str(row["section"]),
+        due_at=str(row["due_at"]) if row["due_at"] is not None else None,
+        status=str(row["status"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _to_entity_outcome(row: sqlite3.Row) -> StoredEntityOutcome:
+    return StoredEntityOutcome(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        entity_id=str(row["entity_id"]),
+        outcome_type=str(row["outcome_type"]),
+        snooze_until=str(row["snooze_until"]) if row["snooze_until"] is not None else None,
+        note=str(row["note"]) if row["note"] is not None else None,
+        created_at=str(row["created_at"]),
+    )
+
+
+def _to_gmail_draft(row: sqlite3.Row) -> StoredGmailDraft:
+    return StoredGmailDraft(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        entity_id=str(row["entity_id"]) if row["entity_id"] is not None else None,
+        gmail_draft_id=str(row["gmail_draft_id"]),
+        gmail_message_id=str(row["gmail_message_id"]) if row["gmail_message_id"] is not None else None,
+        thread_id=str(row["thread_id"]) if row["thread_id"] is not None else None,
+        to_recipients=str(row["to_recipients"]),
+        cc_recipients=str(row["cc_recipients"]) if row["cc_recipients"] is not None else None,
+        bcc_recipients=str(row["bcc_recipients"]) if row["bcc_recipients"] is not None else None,
+        subject=str(row["subject"]),
+        body=str(row["body"]),
+        status=str(row["status"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
     )
 
 

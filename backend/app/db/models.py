@@ -102,3 +102,52 @@ class StoredGmailSyncState:
     user_id: str
     last_history_id: str | None
     last_full_sync_at: str | None
+
+
+@dataclass
+class StoredManualTask:
+    """Backend-owned task that is not backed by Gmail."""
+
+    id: str
+    user_id: str
+    entity_id: str
+    title: str
+    notes: str | None
+    section: str
+    due_at: str | None
+    status: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class StoredEntityOutcome:
+    """Durable user action applied to one entity."""
+
+    id: str
+    user_id: str
+    entity_id: str
+    outcome_type: str
+    snooze_until: str | None
+    note: str | None
+    created_at: str
+
+
+@dataclass
+class StoredGmailDraft:
+    """Local mapping for an explicit Gmail draft action."""
+
+    id: str
+    user_id: str
+    entity_id: str | None
+    gmail_draft_id: str
+    gmail_message_id: str | None
+    thread_id: str | None
+    to_recipients: str
+    cc_recipients: str | None
+    bcc_recipients: str | None
+    subject: str
+    body: str
+    status: str
+    created_at: str
+    updated_at: str

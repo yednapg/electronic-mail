@@ -80,6 +80,8 @@ public final class DashboardStore: ObservableObject {
                 _ = try await apiClient.archiveThread(threadID)
             case .unarchive:
                 _ = try await apiClient.unarchiveThread(threadID)
+            case .markRead:
+                _ = try await apiClient.markThreadRead(threadID)
             }
 
             actionStates[item.id] = .done
