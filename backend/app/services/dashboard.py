@@ -46,7 +46,11 @@ def build_dashboard_response(settings: Settings) -> DashboardResponse:
     if not auth.connected:
         return DashboardResponse(auth=auth, feed=FeedResponse())
 
-    feed = build_feed_from_entities(str(settings.database_path), datetime.now(timezone.utc).isoformat())
+    feed = build_feed_from_entities(
+        str(settings.database_path),
+        datetime.now(timezone.utc).isoformat(),
+        record_trace=False,
+    )
     profile = load_google_account_profile()
     briefing = load_dashboard_briefing_cache(settings) or generate_dashboard_briefing(feed, profile)
 
