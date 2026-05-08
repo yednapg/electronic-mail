@@ -145,6 +145,17 @@ def initialize_database(database_path: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_trace_records_source_record
               ON trace_records(source_record_id);
 
+            CREATE TABLE IF NOT EXISTS feed_projections (
+              entity_id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              pipeline_output TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_feed_projections_user_updated
+              ON feed_projections(user_id, updated_at DESC, entity_id);
+
             CREATE TABLE IF NOT EXISTS gmail_sync_state (
               user_id TEXT PRIMARY KEY,
               last_history_id TEXT,
@@ -300,6 +311,7 @@ def clear_all_data(database_path: str) -> None:
         connection.execute("DELETE FROM gmail_drafts")
         connection.execute("DELETE FROM entity_outcomes")
         connection.execute("DELETE FROM manual_tasks")
+        connection.execute("DELETE FROM feed_projections")
         connection.execute("DELETE FROM trace_records")
         connection.execute("DELETE FROM entity_ai_suggestions")
         connection.execute("DELETE FROM entity_members")
@@ -315,6 +327,7 @@ def clear_derived_memory(database_path: str) -> None:
     """Remove derived source memory while preserving synced records and manual tasks."""
     with connect(database_path) as connection:
         connection.execute("DELETE FROM trace_records")
+        connection.execute("DELETE FROM feed_projections WHERE entity_id NOT IN (SELECT entity_id FROM manual_tasks)")
         connection.execute(
             "DELETE FROM entity_ai_suggestions WHERE entity_id NOT IN (SELECT entity_id FROM manual_tasks)"
         )
@@ -982,6 +995,76 @@ def append_trace_record(
         )
 
 
+def upsert_feed_projection(
+    database_path: str,
+    *,
+    user_id: str,
+    entity_id: str,
+    pipeline_output: dict[str, object],
+) -> None:
+    """Persist one backend-owned feed projection for a canonical entity."""
+    updated_at = utc_now_iso()
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO feed_projections (entity_id, user_id, pipeline_output, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(entity_id) DO UPDATE SET
+              user_id = excluded.user_id,
+              pipeline_output = excluded.pipeline_output,
+              updated_at = excluded.updated_at
+            """,
+            (
+                entity_id,
+                user_id,
+                json.dumps(pipeline_output, ensure_ascii=True),
+                updated_at,
+            ),
+        )
+
+
+def delete_feed_projection(database_path: str, entity_id: str) -> None:
+    """Remove one cached feed projection when its entity is deleted or hidden."""
+    with connect(database_path) as connection:
+        connection.execute("DELETE FROM feed_projections WHERE entity_id = ?", (entity_id,))
+
+
+def list_feed_projection_payloads(
+    database_path: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> list[dict[str, object]]:
+    """Return persisted feed projection payloads for sectioning into a feed."""
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT pipeline_output
+            FROM feed_projections
+            WHERE user_id = ?
+            ORDER BY updated_at DESC, entity_id ASC
+            """,
+            (user_id,),
+        ).fetchall()
+
+    payloads: list[dict[str, object]] = []
+    for row in rows:
+        payload = json.loads(row["pipeline_output"])
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
+def get_feed_projection_count(database_path: str, *, user_id: str = DEFAULT_USER_ID) -> int:
+    """Return how many cached feed projections are available for the user."""
+    with connect(database_path) as connection:
+        return int(
+            connection.execute(
+                "SELECT COUNT(*) FROM feed_projections WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()[0]
+        )
+
+
 def get_source_record_count(database_path: str) -> int:
     """Return the total number of persisted source records."""
     with connect(database_path) as connection:
@@ -1475,6 +1558,7 @@ def delete_manual_task(database_path: str, task_id: str, *, user_id: str) -> boo
 
     with connect(database_path) as connection:
         connection.execute("DELETE FROM manual_tasks WHERE id = ? AND user_id = ?", (task_id, user_id))
+        connection.execute("DELETE FROM feed_projections WHERE entity_id = ?", (task.entity_id,))
         connection.execute("DELETE FROM entities WHERE id = ?", (task.entity_id,))
     return True
 
