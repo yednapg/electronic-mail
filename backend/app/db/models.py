@@ -105,6 +105,24 @@ class StoredGmailSyncState:
 
 
 @dataclass
+class StoredDashboardImportJob:
+    """Durable backend-owned dashboard import/preparation job status."""
+
+    id: str
+    user_id: str
+    status: str
+    source_records: int
+    changed_entities: int
+    refreshed_entities: int
+    result_status: str | None
+    error_message: str | None
+    created_at: str
+    started_at: str | None
+    completed_at: str | None
+    updated_at: str
+
+
+@dataclass
 class StoredManualTask:
     """Backend-owned task that is not backed by Gmail."""
 

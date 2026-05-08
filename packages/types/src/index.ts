@@ -14,6 +14,7 @@ export type EntityCurrentState = 'open' | 'waiting' | 'done';
 
 export type SourceType = 'gmail' | 'calendar' | 'manual';
 export type GmailThreadAction = 'archive' | 'unarchive' | 'mark_read';
+export type DashboardImportJobStatus = 'queued' | 'running' | 'succeeded' | 'failed';
 
 export type FeedbackType = 'acted' | 'ignored' | 'snoozed' | 'dismissed';
 
@@ -143,6 +144,21 @@ export interface DashboardResponse {
   readonly profile?: DashboardProfile | null;
   readonly briefing?: DashboardBriefing | null;
   readonly feed: FeedResponse;
+}
+
+export interface DashboardImportJobResponse {
+  readonly id: string;
+  readonly user_id: string;
+  readonly status: DashboardImportJobStatus;
+  readonly source_records: number;
+  readonly changed_entities: number;
+  readonly refreshed_entities: number;
+  readonly result_status?: string | null;
+  readonly error_message?: string | null;
+  readonly created_at: string;
+  readonly started_at?: string | null;
+  readonly completed_at?: string | null;
+  readonly updated_at: string;
 }
 
 /**

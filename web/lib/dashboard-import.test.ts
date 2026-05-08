@@ -1,0 +1,104 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+  DashboardImportError,
+  createDashboardImportJob,
+  waitForDashboardImportJob,
+} from './dashboard-import';
+
+function response(body: object, init?: ResponseInit): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    ...init,
+  });
+}
+
+function job(status: 'queued' | 'running' | 'succeeded' | 'failed', errorMessage: string | null = null) {
+  return {
+    id: 'job-1',
+    user_id: 'google-dev-user',
+    status,
+    source_records: status === 'succeeded' ? 11 : 0,
+    changed_entities: status === 'succeeded' ? 4 : 0,
+    refreshed_entities: status === 'succeeded' ? 4 : 0,
+    result_status: status === 'succeeded' ? 'ready' : status === 'failed' ? 'failed' : null,
+    error_message: errorMessage,
+    created_at: '2026-05-08T00:00:00+00:00',
+    started_at: status === 'queued' ? null : '2026-05-08T00:00:01+00:00',
+    completed_at: status === 'succeeded' || status === 'failed' ? '2026-05-08T00:00:02+00:00' : null,
+    updated_at: '2026-05-08T00:00:02+00:00',
+  };
+}
+
+test('dashboard import job starts through the local proxy route', async () => {
+  const calls: string[] = [];
+  const fetcher = ((input: RequestInfo | URL) => {
+    calls.push(String(input));
+    return Promise.resolve(response(job('queued'), { status: 202 }));
+  }) as typeof fetch;
+
+  const created = await createDashboardImportJob(fetcher);
+
+  assert.equal(created.id, 'job-1');
+  assert.equal(created.status, 'queued');
+  assert.deepEqual(calls, ['/api/dashboard/import-jobs']);
+});
+
+test('dashboard import polling waits until the backend job succeeds', async () => {
+  const calls: string[] = [];
+  const responses = [
+    response(job('queued'), { status: 202 }),
+    response(job('running')),
+    response(job('succeeded')),
+  ];
+  const fetcher = ((input: RequestInfo | URL) => {
+    calls.push(String(input));
+    const next = responses.shift();
+    if (next === undefined) {
+      throw new Error('Unexpected fetch');
+    }
+    return Promise.resolve(next);
+  }) as typeof fetch;
+
+  const completed = await waitForDashboardImportJob({ fetcher, timeoutMs: 1000, pollMs: 0 });
+
+  assert.equal(completed.status, 'succeeded');
+  assert.equal(completed.source_records, 11);
+  assert.deepEqual(calls, [
+    '/api/dashboard/import-jobs',
+    '/api/dashboard/import-jobs/job-1',
+    '/api/dashboard/import-jobs/job-1',
+  ]);
+});
+
+test('dashboard import polling surfaces backend failure state', async () => {
+  const responses = [
+    response(job('queued'), { status: 202 }),
+    response(job('failed', 'sync exploded')),
+  ];
+  const fetcher = (() => {
+    const next = responses.shift();
+    if (next === undefined) {
+      throw new Error('Unexpected fetch');
+    }
+    return Promise.resolve(next);
+  }) as typeof fetch;
+
+  await assert.rejects(
+    () => waitForDashboardImportJob({ fetcher, timeoutMs: 1000, pollMs: 0 }),
+    (error) => error instanceof DashboardImportError && error.message === 'sync exploded',
+  );
+});
+
+test('dashboard import polling times out without pretending dashboard is ready', async () => {
+  const fetcher = (() => Promise.resolve(response(job('queued'), { status: 202 }))) as typeof fetch;
+
+  await assert.rejects(
+    () => waitForDashboardImportJob({ fetcher, timeoutMs: -1, pollMs: 0 }),
+    (error) => error instanceof DashboardImportError && error.message === 'Dashboard import job timed out.',
+  );
+});
