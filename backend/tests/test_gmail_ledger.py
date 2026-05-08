@@ -323,6 +323,44 @@ class GmailLedgerTests(unittest.TestCase):
         self.assertIn(("gmail_persisted", 1, 2), progress)
         self.assertIn(("gmail_persisted", 2, 2), progress)
 
+    def test_full_sync_fetches_thread_once_when_message_ids_span_pages(self) -> None:
+        first = build_message(message_id="message-1", thread_id="thread-1", history_id="200")
+        second = build_message(message_id="message-2", thread_id="thread-1", history_id="201")
+        third = build_message(message_id="message-3", thread_id="thread-1", history_id="202")
+        service = FakeGmailService(
+            database_path=self.database_path,
+            list_pages={
+                None: {
+                    "messages": [{"id": "message-1"}],
+                    "nextPageToken": "page-2",
+                    "resultSizeEstimate": 3,
+                },
+                "page-2": {
+                    "messages": [{"id": "message-2"}],
+                    "nextPageToken": "page-3",
+                    "resultSizeEstimate": 3,
+                },
+                "page-3": {
+                    "messages": [{"id": "message-3"}],
+                    "resultSizeEstimate": 3,
+                },
+            },
+            messages={"message-1": first, "message-2": second, "message-3": third},
+            threads={"thread-1": [first, second, third]},
+        )
+
+        records = sync_gmail_source_records(self.settings, service)
+
+        self.assertEqual(service.list_calls, [None, "page-2", "page-3"])
+        self.assertEqual(service.message_gets, ["message-1", "message-2", "message-3"])
+        self.assertEqual(service.thread_gets, ["thread-1"])
+        self.assertEqual([record.id for record in records], ["message-1", "message-2", "message-3"])
+        self.assertEqual(
+            [snapshot.message_id for snapshot in list_gmail_message_snapshots(self.database_path)],
+            ["message-1", "message-2", "message-3"],
+        )
+        self.assertEqual(get_gmail_sync_state(self.database_path, DEFAULT_USER_ID).last_history_id, "202")
+
     def test_batch_persistence_is_idempotent(self) -> None:
         message = build_message(message_id="message-1", thread_id="thread-1", history_id="200")
         service = FakeGmailService(
@@ -444,6 +482,46 @@ class GmailLedgerTests(unittest.TestCase):
         self.assertTrue(snapshots["message-deleted"].tombstoned)
         self.assertEqual(snapshots["message-deleted"].fetch_status, "deleted")
         self.assertEqual(get_gmail_sync_state(self.database_path, DEFAULT_USER_ID).last_history_id, "107")
+
+    def test_incremental_sync_keeps_cursor_when_changed_message_fetch_fails(self) -> None:
+        upsert_gmail_sync_state(
+            self.database_path,
+            user_id=DEFAULT_USER_ID,
+            last_history_id="100",
+            last_full_sync_at="2024-04-05T09:00:00+00:00",
+        )
+        service = FakeGmailService(
+            database_path=self.database_path,
+            history_response={
+                "historyId": "107",
+                "history": [
+                    {
+                        "id": "105",
+                        "messagesAdded": [
+                            {
+                                "message": {
+                                    "id": "message-transient-failure",
+                                    "threadId": "thread-transient-failure",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            message_errors={"message-transient-failure": "temporary fetch failure"},
+        )
+
+        records = sync_gmail_source_records(self.settings, service)
+
+        self.assertEqual(records, [])
+        self.assertEqual(service.message_gets, ["message-transient-failure"])
+        self.assertEqual(list_gmail_message_snapshots(self.database_path), [])
+        self.assertEqual(list_unlinked_source_records(self.database_path), [])
+        [event] = list_gmail_history_events(self.database_path)
+        self.assertEqual((event.event_type, event.message_id), ("messagesAdded", "message-transient-failure"))
+        sync_state = get_gmail_sync_state(self.database_path, DEFAULT_USER_ID)
+        self.assertEqual(sync_state.last_history_id, "100")
+        self.assertEqual(sync_state.last_full_sync_at, "2024-04-05T09:00:00+00:00")
 
     def test_gmail_sync_does_not_mutate_gmail(self) -> None:
         message = build_message(message_id="message-1", thread_id="thread-1")
