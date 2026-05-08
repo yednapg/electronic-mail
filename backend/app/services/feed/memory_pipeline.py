@@ -14,6 +14,7 @@ from app.db.repository import (
     get_loaded_entity,
     get_source_record_count,
     list_all_loaded_entities,
+    list_loaded_entities,
     list_entities_missing_state_ids,
     list_unlinked_source_records,
     upsert_ai_suggestion,
@@ -126,7 +127,7 @@ def refresh_ai_suggestions_for_entities(database_path: str, entity_ids: list[str
     if not unique_entity_ids:
         return
 
-    entities = [entity for entity in list_all_loaded_entities(database_path) if entity.entity.id in unique_entity_ids]
+    entities = list_loaded_entities(database_path, unique_entity_ids)
     entities_needing_refresh = [entity for entity in entities if get_usable_suggestion(entity) is None]
     contexts = [context for entity in entities_needing_refresh if (context := to_feed_entity_context(entity)) is not None]
 
