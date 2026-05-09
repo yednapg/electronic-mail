@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
+from app.schemas.domain import SourceRecord
 from app.services.integrations.google import (
     extract_participants,
+    fetch_google_source_records,
     normalize_gmail_messages,
     resolve_gmail_sync_scope,
 )
@@ -117,6 +123,45 @@ class GmailSyncNormalizationTests(unittest.TestCase):
 
     def test_invalid_scope_defaults_to_full(self) -> None:
         self.assertEqual(resolve_gmail_sync_scope("unknown"), "full")
+
+    @patch("app.services.integrations.google.fetch_upcoming_calendar_records")
+    @patch("app.services.integrations.google.sync_gmail_source_records")
+    @patch("app.services.integrations.google.build")
+    @patch("app.services.integrations.google.create_authorized_credentials")
+    def test_collect_records_false_still_returns_changed_gmail_records(
+        self,
+        mock_credentials: Mock,
+        mock_build: Mock,
+        mock_sync: Mock,
+        mock_calendar: Mock,
+    ) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = SimpleNamespace(database_path=Path(tmp_dir) / "gmail.db")
+            gmail_record = SourceRecord(
+                id="gmail-1",
+                user_id="google-dev-user",
+                source="gmail",
+                thread_id="thread-1",
+                raw_payload={"subject": "Reply needed"},
+                received_at="2026-05-06T10:00:00+00:00",
+            )
+            calendar_record = SourceRecord(
+                id="calendar-1",
+                user_id="google-dev-user",
+                source="calendar",
+                thread_id="calendar-1",
+                raw_payload={"summary": "Meeting"},
+                received_at="2026-05-06T09:00:00+00:00",
+            )
+            mock_credentials.return_value = object()
+            mock_build.side_effect = [object(), object()]
+            mock_sync.return_value = [gmail_record]
+            mock_calendar.return_value = [calendar_record]
+
+            records = fetch_google_source_records(settings, collect_records=False)
+
+            self.assertEqual([record.id for record in records], ["gmail-1", "calendar-1"])
+            self.assertFalse(mock_sync.call_args.kwargs["collect_records"])
 
 
 if __name__ == "__main__":

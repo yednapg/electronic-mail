@@ -201,9 +201,6 @@ def fetch_google_source_records(
     if calendar_records:
         persist_source_records(settings, calendar_records)
 
-    if not collect_records:
-        return calendar_records
-
     return sorted(gmail_records + calendar_records, key=lambda record: record.received_at, reverse=True)
 
 
