@@ -354,12 +354,8 @@ export function toSectionDetail(item: FeedItem): DashboardSectionItem['detail'] 
   }
 
   return withDetailLinks(item, {
-    facts: toDetailFacts(item, toCurrentStateLabel(item), toNextMoveLabel(item)),
-    body: [
-      item.why_this_is_here.trim() || `This ${sourceLabelForItem(item)} item is still open.`,
-      toNextMoveSentence(item),
-    ],
-    evidence: [`Thread: ${item.gmail_thread_id ?? item.entity_id}`, `Pipeline trace: ${item.trace_id}`],
+    body: [toDetailDescription(item)],
+    actionLabel: toDetailActionLabel(item),
     confirmLabel: primaryActionDoneLabel(item.primary_action),
     dismissLabel: 'Not needed',
     sourceLabel: sourceLabelForItem(item),
@@ -606,15 +602,12 @@ function withDetailLinks(
   item: FeedItem,
   detail: NonNullable<DashboardSectionItem['detail']>,
 ): NonNullable<DashboardSectionItem['detail']> {
-  const itemId = encodeURIComponent(item.id);
   const entityId = encodeURIComponent(item.entity_id);
 
   return {
     ...detail,
     links: {
       threadHref: `/entities/${entityId}/thread`,
-      rawHref: `/raw-feed?item=${itemId}`,
-      traceHref: `/trace/${entityId}`,
     },
   };
 }
@@ -632,6 +625,10 @@ function toCurrentStateLabel(item: FeedItem): string {
 }
 
 function toNextMoveLabel(item: FeedItem): string {
+  if (item.current_state === 'waiting' && (item.primary_action === 'none' || item.primary_action === 'open')) {
+    return 'Wait for the reply';
+  }
+
   switch (item.primary_action) {
     case 'reply':
       return 'Reply in the thread';
@@ -652,12 +649,26 @@ function toNextMoveLabel(item: FeedItem): string {
     case 'open':
       return 'Open and read';
     default:
-      return 'Decide whether this matters';
+      return 'Read the latest email';
   }
 }
 
-function toNextMoveSentence(item: FeedItem): string {
-  return `Next move: ${toNextMoveLabel(item).toLowerCase()}.`;
+function toDetailDescription(item: FeedItem): string {
+  const explanation = item.why_this_is_here.trim();
+  if (explanation.length > 0) {
+    return explanation;
+  }
+
+  const title = item.title.trim();
+  if (title.length > 0) {
+    return `${title} is still part of your mailbox work.`;
+  }
+
+  return 'This email needs attention.';
+}
+
+function toDetailActionLabel(item: FeedItem): string {
+  return toNextMoveLabel(item);
 }
 
 function primaryActionDoneLabel(action: string): string {
@@ -687,12 +698,10 @@ function primaryActionDoneLabel(action: string): string {
 
 function sourceLabelForItem(item: FeedItem): string {
   if (item.source === 'calendar') {
-    return 'Source: Calendar';
+    return 'Calendar';
   }
 
-  return item.gmail_thread_id !== null && item.gmail_thread_id !== undefined
-    ? `Source: Gmail thread ${item.gmail_thread_id}`
-    : 'Source: Gmail';
+  return 'Gmail';
 }
 
 function sortSectionFeedItems(items: FeedItem[]): FeedItem[] {

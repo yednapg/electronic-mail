@@ -1812,11 +1812,12 @@ a {
 
 .attention-detail-body {
   display: grid;
-  gap: 7px;
+  gap: 8px;
 }
 
 .attention-detail-body p,
-.attention-detail-source {
+.attention-detail-source,
+.attention-detail-next-copy {
   margin: 0;
   font-size: var(--type-detail);
   font-weight: 400;
@@ -1824,53 +1825,53 @@ a {
   letter-spacing: 0;
 }
 
-.attention-detail-actions {
-  display: flex;
-  align-items: baseline;
-  gap: 18px;
-  margin-top: 17px;
+.attention-detail-next,
+.attention-detail-source {
+  display: grid;
+  gap: 4px;
+  margin-top: 16px;
 }
 
-.attention-detail-action {
+.attention-detail-label {
+  color: var(--page-text-subtle);
+  font-size: var(--type-detail-source);
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.attention-detail-next-copy {
   padding: 0;
   border: 0;
   background: transparent;
-  color: var(--page-text-subtle);
-  font-size: var(--type-detail);
   font-weight: 700;
-  line-height: 1.25;
-  letter-spacing: 0;
-  cursor: pointer;
-  text-decoration: none;
-}
-
-.attention-detail-action-primary {
   color: var(--detail-primary);
+  text-align: left;
 }
 
-.attention-detail-action.is-selected {
-  color: var(--page-text);
-}
-
-.attention-detail-action:disabled {
-  cursor: default;
-}
-
-.attention-detail-action:focus-visible {
+.attention-detail-source-link:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 3px;
 }
 
-.attention-detail-divider {
-  color: var(--page-text-subtle);
-  font-size: var(--type-detail);
-  font-weight: 400;
-}
-
 .attention-detail-source {
-  margin-top: 18px;
   color: var(--detail-source);
   font-size: var(--type-detail-source);
+}
+
+.attention-detail-source-link {
+  width: fit-content;
+  color: var(--page-text-subtle);
+  font-size: var(--type-detail-source);
+  font-weight: 700;
+  line-height: 1.2;
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.attention-detail-source-link:hover {
+  color: var(--copy-hover);
 }
 
 .thread-reader-shell {
@@ -2432,19 +2433,19 @@ a {
   }
 
   .attention-detail-body p,
-  .attention-detail-action,
-  .attention-detail-divider {
+  .attention-detail-next-copy {
     font-size: var(--type-mobile-detail);
     line-height: 1.34;
   }
 
-  .attention-detail-actions {
-    gap: 16px;
-    margin-top: 16px;
+  .attention-detail-next,
+  .attention-detail-source {
+    margin-top: 15px;
   }
 
-  .attention-detail-source {
-    margin-top: 17px;
+  .attention-detail-label,
+  .attention-detail-source,
+  .attention-detail-source-link {
     font-size: var(--type-mobile-detail-source);
   }
 

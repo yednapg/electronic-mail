@@ -453,50 +453,45 @@ function DashboardItemDetail({
   if (!item.detail) {
     return null;
   }
+  const actionCopy = item.detail.actionLabel ?? getDetailFactValue(item.detail.facts, 'Next') ?? item.detail.confirmLabel;
 
   return (
     <div id={id} className="attention-detail">
       <div className="attention-detail-clip">
         <div className="attention-detail-panel">
           <div className="attention-detail-body">
-            {item.detail.facts?.map((fact) => (
-              <p key={`${fact.label}-${fact.value}`}>
-                <strong>{fact.label}:</strong> {fact.value}
-              </p>
-            ))}
             {item.detail.body.map((line) => (
               <p key={line}>{line}</p>
             ))}
-            {item.detail.evidence?.map((line) => (
-              <p key={line}>{line}</p>
-            ))}
           </div>
-          <div className="attention-detail-actions" aria-label={`Actions for ${item.title}`}>
-            <label htmlFor={checkboxId} className="attention-detail-action attention-detail-action-primary">
-              {item.detail.confirmLabel}
-            </label>
-            <span className="attention-detail-divider" aria-hidden="true">
-              |
-            </span>
-            <span className="attention-detail-action attention-detail-action-secondary">
-              {item.detail.dismissLabel}
-            </span>
+          <div className="attention-detail-next" aria-label={`Action for ${item.title}`}>
+            <span className="attention-detail-label">Action</span>
+            <span className="attention-detail-next-copy">{actionCopy}</span>
+          </div>
+          <div className="attention-detail-source">
+            <span className="attention-detail-label">Sources</span>
+            <span>{formatDetailSourceLabel(item.detail.sourceLabel)}</span>
             {item.detail.links?.threadHref ? (
-              <>
-                <span className="attention-detail-divider" aria-hidden="true">
-                  |
-                </span>
-                <a className="attention-detail-action" href={item.detail.links.threadHref}>
-                  Read email
-                </a>
-              </>
+              <a className="attention-detail-source-link" href={item.detail.links.threadHref}>
+                Read email
+              </a>
             ) : null}
           </div>
-          <p className="attention-detail-source">{item.detail.sourceLabel}</p>
         </div>
       </div>
     </div>
   );
+}
+
+function formatDetailSourceLabel(sourceLabel: string): string {
+  return sourceLabel.replace(/^\s*Sources?:\s*/i, '').trim();
+}
+
+function getDetailFactValue(
+  facts: NonNullable<DashboardSectionItem['detail']>['facts'],
+  label: string,
+): string | undefined {
+  return facts?.find((fact) => fact.label.toLowerCase() === label.toLowerCase())?.value;
 }
 
 function SectionCta({
