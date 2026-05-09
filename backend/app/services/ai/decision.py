@@ -101,9 +101,9 @@ Rules:
   - done: completed, closed, or finished
 - Repeated reminders and lifecycle updates should collapse into one meaningful item.
 - Read the whole timeline together, not just the latest subject line.
-- Title must be concise, human-readable, and useful in a personal feed.
+- Title must be a natural descriptive sentence, not a scraped subject line and not a 4-word task label.
 - Title must summarize the full entity from the user's perspective in natural language.
-- Titile should be descriptive, should be summarising instead of being to vauge or no context to the user. Like explanation but bit short.
+- Title should usually be 10-22 words when the context supports it, with enough detail that the user understands the work without opening Gmail.
 - Prefer titles like "HDFC Bank registered your credit card upgrade and limit increase request."
 - Avoid generic titles like "HDFC request acknowledged", "Bank update", or a bare copied subject line when the timeline provides richer context.
 - When several emails are about the same request, synthesize them into one natural title that reflects the latest meaningful state.
@@ -113,7 +113,8 @@ Rules:
 - Do not force verbs like review, track, join, or open when the timeline does not imply a concrete user action.
 - If the timeline shows the bank/vendor has acknowledged the request, registered it, taken it up for review, or promised a response within a few working days, prefer action = none unless the user is explicitly asked to do something.
 - If the provider has already completed the work from their side, prefer action = none and summarize the completed status accurately.
-- explanation should explain why this matters now.
+- explanation should read like a short human brief: what happened, why it matters, and what is still open.
+- explanation should not repeat fields like "Current", "Next", "pipeline", "trace", "thread id", or internal identifiers.
 - action must be one of or could be something else: reply, confirm, pay, join, review, send, approve, open, register, track, none.
 - suggested_timing must be one of: now, today, later, hidden.
 - suggested_priority must be an integer from 0 to 100.
@@ -157,7 +158,8 @@ Rules:
 - Preserve concrete facts: request, status, document, order, amount, deadline, or sender action.
 - If the message is a routine receipt or status update, say what happened plainly.
 - Do not invent missing context.
-- Keep each summary under 160 characters.
+- Keep each summary under 220 characters.
+- Use natural conversation-style wording, not a pasted subject line.
 - Do not mention prompts, JSON, models, or system behavior.
 
 Return strict JSON only:
@@ -231,6 +233,7 @@ MAX_SUMMARY_CHARS = 280
 MAX_SENDER_CHARS = 120
 MAX_PARTICIPANTS = 8
 MAX_BATCH_JSON_CHARS = 18000
+MAX_SOURCE_RECORD_SUMMARY_CHARS = 220
 
 
 @dataclass(frozen=True)
@@ -271,7 +274,7 @@ def decide_entities(entities: list[EntityInput]) -> list[DecisionOutput]:
     if not entities:
         return []
 
-    if _has_llm_config():
+    if _should_use_llm():
         return _decide_with_llm(entities)
 
     return _decide_with_heuristics(entities)
@@ -285,6 +288,17 @@ def _has_llm_config() -> bool:
 def _llm_required() -> bool:
     """Allow runtime to fail fast instead of silently falling back when OpenAI is mandatory."""
     return os.getenv("OPENAI_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_use_llm() -> bool:
+    """Return whether the LLM path should run, honoring explicit required mode."""
+    if _has_llm_config():
+        return True
+
+    if _llm_required():
+        _raise_missing_llm()
+
+    return False
 
 
 def _openai_model() -> str:
@@ -384,7 +398,7 @@ def describe_calendar_context(
     if not items:
         return []
 
-    if _has_llm_config():
+    if _should_use_llm():
         return _describe_calendar_context_with_llm(items)
 
     return [_describe_calendar_context_heuristically(item) for item in items]
@@ -397,7 +411,7 @@ def judge_feed_entities(
     if not entities:
         return []
 
-    if _has_llm_config():
+    if _should_use_llm():
         return _judge_feed_entities_with_llm(entities)
 
     return [_judge_feed_entity_heuristically(entity) for entity in entities]
@@ -408,10 +422,12 @@ def classify_entity_state(records: list[StoredSourceRecord]) -> str:
     if not records:
         return "open"
 
-    if _has_llm_config():
+    if _should_use_llm():
         try:
             return _classify_entity_state_with_llm(records)
         except Exception:
+            if _llm_required():
+                raise
             return _classify_entity_state_heuristically(records)
 
     return _classify_entity_state_heuristically(records)
@@ -422,7 +438,7 @@ def summarize_source_records(records: list[StoredSourceRecord]) -> SourceRecordS
     if not records:
         return SourceRecordSummaryBatch(model="none", summaries={})
 
-    if _has_llm_config():
+    if _should_use_llm():
         return _summarize_source_records_with_llm(records)
 
     return SourceRecordSummaryBatch(
@@ -464,7 +480,7 @@ def resolve_entity_group(request: EntityGroupingRequest) -> EntityGroupingRespon
     if not request.candidates:
         return EntityGroupingResponse(entity_id=None, confidence=0.0)
 
-    if _has_llm_config():
+    if _should_use_llm():
         return _resolve_entity_group_with_llm(request)
 
     return _resolve_entity_group_heuristically(request)
@@ -477,7 +493,7 @@ def generate_dashboard_briefing(
     """Return the generated dashboard headline and summary paragraph."""
     briefing_input = _build_dashboard_briefing_input(feed, profile)
 
-    if _has_llm_config():
+    if _should_use_llm():
         return _generate_dashboard_briefing_with_llm(briefing_input)
 
     return _generate_dashboard_briefing_heuristically(briefing_input)
@@ -784,7 +800,7 @@ def _summarize_source_records_with_llm(records: list[StoredSourceRecord]) -> Sou
         )
         parsed = SourceRecordSummaryResponse.model_validate(json.loads(content))
         for item in parsed.items:
-            summary = _truncate_text(item.summary, 160)
+            summary = _truncate_text(item.summary, MAX_SOURCE_RECORD_SUMMARY_CHARS)
             if summary:
                 summaries[item.id] = summary
 
@@ -885,12 +901,12 @@ def _summarize_source_record_heuristically(record: StoredSourceRecord) -> str:
     )
 
     if record.source == "calendar":
-        return _truncate_text(f"{subject} is on your calendar.", 160)
+        return _truncate_text(f"{subject} is on your calendar.", MAX_SOURCE_RECORD_SUMMARY_CHARS)
 
     if detail and detail.lower() not in subject.lower():
-        return _truncate_text(f"{subject}: {detail}", 160)
+        return _truncate_text(f"{subject}: {detail}", MAX_SOURCE_RECORD_SUMMARY_CHARS)
 
-    return _truncate_text(subject, 160)
+    return _truncate_text(subject, MAX_SOURCE_RECORD_SUMMARY_CHARS)
 
 
 def _first_sentence(value: str) -> str:

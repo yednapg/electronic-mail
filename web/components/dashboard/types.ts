@@ -26,13 +26,12 @@ export type DashboardSectionItem = {
     }>;
     body: string[];
     evidence?: string[];
+    actionLabel?: string;
     confirmLabel: string;
     dismissLabel: string;
     sourceLabel: string;
     links?: {
-      threadHref: string;
-      rawHref: string;
-      traceHref: string;
+      threadHref?: string;
     };
   };
   cta?: {

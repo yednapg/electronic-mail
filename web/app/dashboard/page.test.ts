@@ -240,13 +240,11 @@ test('YC RSVP items expose expandable detail instead of an inline CTA', () => {
     sourceLabel: 'Sources: 3 emails from YC',
     links: {
       threadHref: '/entities/entity-1/thread',
-      rawHref: '/raw-feed?item=item-1',
-      traceHref: '/trace/entity-1',
     },
   });
 });
 
-test('demo inbox items expose current state, next move, and source evidence', () => {
+test('demo inbox items expose natural detail, one action, and source link', () => {
   const detail = toSectionDetail(
     createFeedItem({
       id: 'hdfc-card-bill',
@@ -258,8 +256,8 @@ test('demo inbox items expose current state, next move, and source evidence', ()
     }),
   );
 
-  assert.equal(detail?.facts?.[0].value, 'Autopay is off');
-  assert.match(detail?.body.join(' ') ?? '', /Next move: pay the card/);
+  assert.match(detail?.body.join(' ') ?? '', /latest HDFC statement says autopay/);
+  assert.equal(detail?.actionLabel ?? detail?.confirmLabel, 'Paid');
   assert.deepEqual(detail?.evidence, [
     'HDFC statement email',
     'Payment reminder from alerts@hdfcbank.net',
@@ -267,7 +265,32 @@ test('demo inbox items expose current state, next move, and source evidence', ()
   ]);
   assert.deepEqual(detail?.links, {
     threadHref: '/entities/entity-hdfc-card-bill/thread',
-    rawHref: '/raw-feed?item=hdfc-card-bill',
-    traceHref: '/trace/entity-hdfc-card-bill',
+  });
+});
+
+test('generic Gmail detail hides internal Gmail thread and pipeline trace ids', () => {
+  const detail = toSectionDetail(
+    createFeedItem({
+      id: 'hsbc-query',
+      entity_id: 'entity-hsbc-query',
+      source: 'gmail',
+      gmail_thread_id: '19d82390812fb384',
+      trace_id: '695df90d-4122-4ac5-94bc-6aa30d11f9dd',
+      current_state: 'waiting',
+      primary_action: 'open',
+      title: 'HSBC is reviewing your savings account query after you corrected the account number.',
+      why_this_is_here:
+        'You corrected the account number, explained that the phone calls did not resolve your issue, and asked HSBC to follow up by email.',
+    }),
+  );
+
+  assert.equal(detail?.body.length, 1);
+  assert.match(detail?.body[0] ?? '', /asked HSBC to follow up by email/);
+  assert.equal(detail?.actionLabel, 'Wait for the reply');
+  assert.equal(detail?.sourceLabel, 'Gmail');
+  assert.doesNotMatch(detail?.sourceLabel ?? '', /19d82390812fb384/);
+  assert.doesNotMatch(JSON.stringify({ body: detail?.body, evidence: detail?.evidence }), /695df90d|19d823/);
+  assert.deepEqual(detail?.links, {
+    threadHref: '/entities/entity-hsbc-query/thread',
   });
 });

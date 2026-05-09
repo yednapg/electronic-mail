@@ -53,7 +53,7 @@ class MemoryHydrationTests(unittest.TestCase):
         upsert_source_records(self.database_path, [stored_record_from_source(record)])
 
         with (
-            patch.dict("os.environ", {"OPENAI_API_KEY": ""}, clear=False),
+            patch.dict("os.environ", {"OPENAI_API_KEY": "", "OPENAI_REQUIRED": ""}, clear=False),
             patch(
                 "app.services.feed.memory_pipeline.list_unlinked_source_records",
                 side_effect=AssertionError("normal import should not scan all unlinked records"),
