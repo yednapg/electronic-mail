@@ -268,6 +268,35 @@ test('demo inbox items expose natural detail, one action, and source link', () =
   });
 });
 
+test('backend-provided Gmail detail copy wins over frontend fallback shaping', () => {
+  const detail = toSectionDetail(
+    createFeedItem({
+      entity_id: 'entity-clean-detail',
+      source: 'gmail',
+      current_state: 'waiting',
+      primary_action: 'open',
+      title: 'Short backend title',
+      why_this_is_here: 'Old fallback copy.',
+      detail: {
+        body: ['HSBC is still reviewing your savings account query after you sent the corrected account number.'],
+        action_label: 'Wait for the reply',
+        source_label: 'Gmail',
+      },
+    }),
+  );
+
+  assert.deepEqual(detail, {
+    body: ['HSBC is still reviewing your savings account query after you sent the corrected account number.'],
+    actionLabel: 'Wait for the reply',
+    confirmLabel: 'Read',
+    dismissLabel: 'Not needed',
+    sourceLabel: 'Gmail',
+    links: {
+      threadHref: '/entities/entity-clean-detail/thread',
+    },
+  });
+});
+
 test('generic Gmail detail hides internal Gmail thread and pipeline trace ids', () => {
   const detail = toSectionDetail(
     createFeedItem({

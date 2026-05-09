@@ -42,6 +42,14 @@ class SourceRecord(BaseModel):
     received_at: str
 
 
+class AttentionItemDetail(BaseModel):
+    """Human-facing detail copy shared by web and iOS clients."""
+
+    body: list[str] = Field(default_factory=list)
+    action_label: str
+    source_label: str
+
+
 class AttentionItem(BaseModel):
     """User-facing feed item returned to the frontend."""
 
@@ -57,6 +65,7 @@ class AttentionItem(BaseModel):
     fallback_action: str
     title: str
     why_this_is_here: str
+    detail: AttentionItemDetail | None = None
     due_at: str | None = None
     importance_level: Literal["high", "medium", "low"] | None = None
     lifecycle_state: str | None = None

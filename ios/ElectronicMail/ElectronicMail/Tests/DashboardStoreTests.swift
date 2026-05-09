@@ -147,6 +147,7 @@ extension AttentionItem {
             fallbackAction: "open",
             title: "A useful status title.",
             whyThisIsHere: "This item matters.",
+            detail: nil,
             dueAt: nil,
             importanceLevel: "high",
             lifecycleState: "active",

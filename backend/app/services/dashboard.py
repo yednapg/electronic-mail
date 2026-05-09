@@ -32,6 +32,8 @@ from app.services.feed.memory_pipeline import (
     build_feed_from_projection_cache,
     build_feed_from_entities,
     hydrate_persistent_memory,
+    list_entity_ids_needing_ai_refresh,
+    list_stale_feed_projection_entity_ids,
     refresh_feed_projections_for_entities,
     refresh_ai_suggestions_for_entities,
 )
@@ -244,8 +246,10 @@ def _prepare_dashboard_state(settings: Settings, *, job_id: str | None = None) -
     refresh_source_record_summaries(database_path, [record.id for record in source_records])
     update_progress("memory_hydration", imported_count=imported_count, source_records=imported_count)
     changed_entity_ids = hydrate_persistent_memory(database_path, source_records)
+    stale_ai_entity_ids = list_entity_ids_needing_ai_refresh(database_path)
+    stale_projection_entity_ids = list_stale_feed_projection_entity_ids(database_path)
     update_progress("ai_refresh", changed_entities=len(changed_entity_ids))
-    refresh_entity_ids = sorted(set(changed_entity_ids))
+    refresh_entity_ids = sorted(set(changed_entity_ids) | set(stale_ai_entity_ids) | set(stale_projection_entity_ids))
     refresh_ai_suggestions_for_entities(database_path, refresh_entity_ids)
     update_progress("feed_build", refreshed_entities=len(refresh_entity_ids))
     current_time = datetime.now(timezone.utc).isoformat()

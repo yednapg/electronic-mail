@@ -332,6 +332,16 @@ export function toSectionDetail(item: FeedItem): DashboardSectionItem['detail'] 
     return undefined;
   }
 
+  if (item.detail !== undefined && item.detail !== null) {
+    return withDetailLinks(item, {
+      body: item.detail.body.length > 0 ? [...item.detail.body] : [toDetailDescription(item)],
+      actionLabel: item.detail.action_label,
+      confirmLabel: primaryActionDoneLabel(item.primary_action),
+      dismissLabel: 'Not needed',
+      sourceLabel: item.detail.source_label,
+    });
+  }
+
   const demoDetail = DEMO_DETAIL_BY_ITEM_ID[item.id];
 
   if (demoDetail !== undefined) {
