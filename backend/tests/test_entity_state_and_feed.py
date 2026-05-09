@@ -93,7 +93,7 @@ def make_output(
 
 class EntityStateAndFeedTests(unittest.TestCase):
     def test_classify_entity_state_heuristic_fallbacks(self) -> None:
-        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "", "OPENAI_REQUIRED": ""}, clear=False):
             self.assertEqual(
                 classify_entity_state(
                     [
@@ -135,7 +135,7 @@ class EntityStateAndFeedTests(unittest.TestCase):
             )
 
     def test_derive_state_uses_fallback_classifier_and_due_dates(self) -> None:
-        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "", "OPENAI_REQUIRED": ""}, clear=False):
             state, due_at = derive_state(
                 [
                     make_record(
