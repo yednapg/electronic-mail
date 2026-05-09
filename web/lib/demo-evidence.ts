@@ -125,7 +125,12 @@ export function getDemoSourceRecords(itemId?: string): SourceRecord[] {
   });
 }
 
-export function getDemoThread(entityId: string): ThreadReaderResponse | null {
+type DemoThreadOptions = {
+  limit?: number;
+  offset?: number;
+};
+
+export function getDemoThread(entityId: string, options: DemoThreadOptions = {}): ThreadReaderResponse | null {
   const item = getDemoFeedItems().find((candidate) => candidate.entity_id === entityId || candidate.id === entityId);
 
   if (item === undefined) {
@@ -136,6 +141,10 @@ export function getDemoThread(entityId: string): ThreadReaderResponse | null {
   const gmailThreadIds = Array.from(
     new Set(records.filter((record) => record.source === 'gmail').map((record) => record.thread_id)),
   );
+  const totalMessages = records.length;
+  const resolvedLimit = normalizeLimit(options.limit, totalMessages);
+  const resolvedOffset = normalizeOffset(options.offset);
+  const pageRecords = records.slice(resolvedOffset, resolvedOffset + resolvedLimit);
 
   return {
     entity_id: item.entity_id,
@@ -143,7 +152,11 @@ export function getDemoThread(entityId: string): ThreadReaderResponse | null {
     source: records.at(-1)?.source ?? item.source ?? null,
     gmail_thread_id: gmailThreadIds.length === 1 ? gmailThreadIds[0] : null,
     subject: stringPayload(records.at(-1)?.raw_payload, 'subject') ?? item.title,
-    messages: records.map((record) => ({
+    total_messages: totalMessages,
+    limit: resolvedLimit,
+    offset: resolvedOffset,
+    has_more: resolvedOffset + pageRecords.length < totalMessages,
+    messages: pageRecords.map((record) => ({
       id: record.id,
       source: record.source,
       thread_id: record.thread_id,
@@ -160,6 +173,26 @@ export function getDemoThread(entityId: string): ThreadReaderResponse | null {
       received_at: record.received_at,
     })),
   };
+}
+
+function normalizeLimit(limit: number | undefined, totalMessages: number): number {
+  if (limit === undefined) {
+    return Math.max(1, totalMessages);
+  }
+
+  if (!Number.isInteger(limit) || limit < 1) {
+    return 25;
+  }
+
+  return Math.min(limit, 100);
+}
+
+function normalizeOffset(offset: number | undefined): number {
+  if (offset === undefined || !Number.isInteger(offset) || offset < 0) {
+    return 0;
+  }
+
+  return offset;
 }
 
 export function getDemoTrace(entityId: string): TraceReplayResponse | null {

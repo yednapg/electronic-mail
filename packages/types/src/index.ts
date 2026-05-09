@@ -306,6 +306,10 @@ export interface ThreadReaderResponse {
   readonly source?: SourceType | null;
   readonly gmail_thread_id?: string | null;
   readonly subject?: string | null;
+  readonly total_messages: number;
+  readonly limit: number;
+  readonly offset: number;
+  readonly has_more: boolean;
   readonly messages: ThreadMessage[];
 }
 

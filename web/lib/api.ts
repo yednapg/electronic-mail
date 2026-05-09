@@ -13,12 +13,17 @@ import { demoHistory } from './demo-history';
 
 const DEFAULT_BACKEND_URL = 'http://localhost:3001';
 
+export type EntityThreadOptions = {
+  limit?: number;
+  offset?: number;
+};
+
 export function getBackendURL(): string {
   return (process.env.ELECTRONIC_MAIL_BACKEND_URL ?? DEFAULT_BACKEND_URL).replace(/\/+$/, '');
 }
 
 export function isDemoMode(): boolean {
-  return process.env.NEXT_PUBLIC_DEMO_MODE !== 'false';
+  return process.env.NEXT_PUBLIC_DEMO_MODE === 'true';
 }
 
 export async function getDashboard(): Promise<DashboardResponse> {
@@ -49,16 +54,29 @@ export async function getHistory({ limit = 60, offset = 0 } = {}): Promise<Histo
   return res.json();
 }
 
-export async function getEntityThread(entityId: string): Promise<ThreadReaderResponse> {
+export async function getEntityThread(
+  entityId: string,
+  { limit, offset }: EntityThreadOptions = {},
+): Promise<ThreadReaderResponse> {
   if (isDemoMode()) {
-    const thread = getDemoThread(entityId);
+    const thread = getDemoThread(entityId, { limit, offset });
     if (thread === null) {
       throw new Error('Thread not found');
     }
     return thread;
   }
 
-  const res = await fetch(`${getBackendURL()}/v1/entities/${encodeURIComponent(entityId)}/thread`, {
+  const params = new URLSearchParams();
+  if (limit !== undefined) {
+    params.set('limit', String(limit));
+  }
+  if (offset !== undefined) {
+    params.set('offset', String(offset));
+  }
+  const query = params.toString();
+  const url = `${getBackendURL()}/v1/entities/${encodeURIComponent(entityId)}/thread${query ? `?${query}` : ''}`;
+
+  const res = await fetch(url, {
     cache: 'no-store',
   });
   if (!res.ok) throw new Error('Failed to fetch entity thread');

@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 
 from app.core.config import load_settings
 from app.db.repository import (
     DEFAULT_USER_ID,
     append_entity_outcome,
+    get_entity,
+    get_latest_source_record_for_entity,
+    get_source_record_count_for_entity,
     get_loaded_entity,
     get_manual_task_by_entity_id,
+    list_gmail_thread_ids_for_entity,
     list_source_records_for_entity,
     update_manual_task,
     upsert_entity_state,
@@ -81,19 +85,29 @@ def dismiss_entity(entity_id: str, request: EntityOutcomeRequest | None = None) 
 
 
 @router.get("/v1/entities/{entity_id}/thread", response_model=ThreadReaderResponse)
-def entity_thread(entity_id: str) -> ThreadReaderResponse:
+def entity_thread(
+    entity_id: str,
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> ThreadReaderResponse:
     """Return the email-underneath/manual-task thread reader payload."""
-    loaded = ensure_entity(entity_id)
-    records = list_source_records_for_entity(str(settings.database_path), entity_id)
-    source = records[-1].source if records else None
-    gmail_thread_ids = sorted({record.thread_id for record in records if record.source == "gmail" and record.thread_id})
-    subject = records[-1].subject if records else None
+    entity = ensure_thread_entity(entity_id)
+    total_messages = get_source_record_count_for_entity(str(settings.database_path), entity_id)
+    records = list_source_records_for_entity(str(settings.database_path), entity_id, limit=limit, offset=offset)
+    latest_record = get_latest_source_record_for_entity(str(settings.database_path), entity_id)
+    source = latest_record.source if latest_record is not None else None
+    gmail_thread_ids = list_gmail_thread_ids_for_entity(str(settings.database_path), entity_id)
+    subject = latest_record.subject if latest_record is not None else None
     return ThreadReaderResponse(
         entity_id=entity_id,
         user_id=DEFAULT_USER_ID,
         source=source,
         gmail_thread_id=gmail_thread_ids[0] if len(gmail_thread_ids) == 1 else None,
-        subject=subject or loaded.entity.canonical_key,
+        subject=subject or entity.canonical_key,
+        total_messages=total_messages,
+        limit=limit,
+        offset=offset,
+        has_more=offset + len(records) < total_messages,
         messages=[to_thread_message(record) for record in records],
     )
 
@@ -103,6 +117,13 @@ def ensure_entity(entity_id: str):
     if loaded is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entity not found")
     return loaded
+
+
+def ensure_thread_entity(entity_id: str):
+    entity = get_entity(str(settings.database_path), entity_id, user_id=DEFAULT_USER_ID)
+    if entity is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entity not found")
+    return entity
 
 
 def to_outcome_response(outcome) -> EntityOutcomeResponse:

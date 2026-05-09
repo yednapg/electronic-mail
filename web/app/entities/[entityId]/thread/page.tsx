@@ -4,36 +4,48 @@ import React from 'react';
 
 import { getEntityThread } from '../../../../lib/api';
 
+const DEFAULT_THREAD_LIMIT = 25;
+
 type EntityThreadPageProps = {
   params: Promise<{
     entityId: string;
   }>;
+  searchParams?: Promise<Record<string, string | string[] | undefined>>;
 };
 
-export default async function EntityThreadPage({ params }: EntityThreadPageProps) {
-  const { entityId } = await params;
+type ThreadPageRequest = {
+  limit: number;
+  offset: number;
+};
+
+export default async function EntityThreadPage({ params, searchParams }: EntityThreadPageProps) {
+  const [{ entityId }, query] = await Promise.all([params, searchParams ?? Promise.resolve({})]);
+  const page = parseThreadPageRequest(query);
   let thread: ThreadReaderResponse | null = null;
   let errorMessage: string | null = null;
 
   try {
-    thread = await getEntityThread(entityId);
+    thread = await getEntityThread(entityId, page);
   } catch (error) {
     errorMessage = error instanceof Error ? error.message : 'Thread is unavailable.';
   }
 
-  return <ThreadDetail entityId={entityId} thread={thread} errorMessage={errorMessage} />;
+  return <ThreadDetail entityId={entityId} page={page} thread={thread} errorMessage={errorMessage} />;
 }
 
 export function ThreadDetail({
   entityId,
+  page = { limit: DEFAULT_THREAD_LIMIT, offset: 0 },
   thread,
   errorMessage,
 }: {
   entityId: string;
+  page?: ThreadPageRequest;
   thread: ThreadReaderResponse | null;
   errorMessage: string | null;
 }) {
   const title = thread?.subject?.trim() || 'Thread';
+  const pageState = thread ? getThreadPageState(thread, page) : null;
 
   return (
     <main className="digest-page">
@@ -45,7 +57,7 @@ export function ThreadDetail({
           <h1 className="thread-reader-title">{title}</h1>
           {thread ? (
             <div className="thread-reader-meta" aria-label="Thread metadata">
-              {buildThreadMeta(thread).map((part) => (
+              {buildThreadMeta(thread, pageState).map((part) => (
                 <span key={part}>{part}</span>
               ))}
             </div>
@@ -59,6 +71,21 @@ export function ThreadDetail({
               <ThreadMessageCard key={message.id} message={message} />
             ))}
           </ol>
+        ) : null}
+
+        {thread && pageState && (pageState.hasPrevious || pageState.hasMore) ? (
+          <nav className="thread-reader-pagination" aria-label="Thread pages">
+            {pageState.hasPrevious ? (
+              <Link className="thread-reader-page-link" href={buildThreadPageHref(entityId, pageState.limit, pageState.previousOffset)}>
+                Previous
+              </Link>
+            ) : null}
+            {pageState.hasMore ? (
+              <Link className="thread-reader-page-link" href={buildThreadPageHref(entityId, pageState.limit, pageState.nextOffset)}>
+                More
+              </Link>
+            ) : null}
+          </nav>
         ) : null}
 
         {thread && thread.messages.length === 0 ? (
@@ -114,8 +141,14 @@ function ThreadMessageCard({ message }: { message: ThreadMessage }) {
   );
 }
 
-function buildThreadMeta(thread: ThreadReaderResponse): string[] {
-  const parts = [`${thread.messages.length} ${thread.messages.length === 1 ? 'email' : 'emails'}`];
+function buildThreadMeta(thread: ThreadReaderResponse, pageState: ReturnType<typeof getThreadPageState> | null): string[] {
+  const messageCount = thread.messages.length;
+  const totalMessages = pageState?.totalMessages ?? messageCount;
+  const emailLabel = totalMessages === 1 ? 'email' : 'emails';
+  const parts =
+    totalMessages > messageCount
+      ? [`${messageCount} of ${totalMessages} ${emailLabel}`]
+      : [`${messageCount} ${messageCount === 1 ? 'email' : 'emails'}`];
   const source = thread.source ? formatSource(thread.source) : null;
   if (source) {
     parts.push(source);
@@ -129,6 +162,64 @@ function buildThreadMeta(thread: ThreadReaderResponse): string[] {
   }
 
   return parts;
+}
+
+function getThreadPageState(thread: ThreadReaderResponse, requestedPage: ThreadPageRequest) {
+  const messageCount = thread.messages.length;
+  const limit = positiveNumber(thread.limit) ?? requestedPage.limit;
+  const offset = nonNegativeNumber(thread.offset) ?? requestedPage.offset;
+  const totalMessages = Math.max(nonNegativeNumber(thread.total_messages) ?? messageCount, messageCount);
+  const hasMore = typeof thread.has_more === 'boolean' ? thread.has_more : offset + messageCount < totalMessages;
+
+  return {
+    limit,
+    offset,
+    totalMessages,
+    hasMore,
+    hasPrevious: offset > 0,
+    previousOffset: Math.max(0, offset - limit),
+    nextOffset: offset + limit,
+  };
+}
+
+function buildThreadPageHref(entityId: string, limit: number, offset: number): string {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  });
+  return `/entities/${encodeURIComponent(entityId)}/thread?${params.toString()}`;
+}
+
+function parseThreadPageRequest(searchParams: Record<string, string | string[] | undefined>): ThreadPageRequest {
+  return {
+    limit: parseBoundedInteger(firstValue(searchParams.limit), DEFAULT_THREAD_LIMIT, 1, 100),
+    offset: parseBoundedInteger(firstValue(searchParams.offset), 0, 0, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+function firstValue(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function parseBoundedInteger(value: string | undefined, fallback: number, min: number, max: number): number {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < min) {
+    return fallback;
+  }
+
+  return Math.min(parsed, max);
+}
+
+function positiveNumber(value: number | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function nonNegativeNumber(value: number | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 function formatSource(source: ThreadMessage['source']): string {
