@@ -1,4 +1,5 @@
 /** Root web layout that applies fonts and global dashboard styles. */
+import type { Metadata } from 'next';
 import type { ReactNode } from 'react';
 import localFont from 'next/font/local';
 
@@ -19,6 +20,10 @@ const sfProRounded = localFont({
     { path: '../font/SF-Pro-Rounded-Black.otf', weight: '900', style: 'normal' },
   ],
 });
+
+export const metadata: Metadata = {
+  icons: [{ rel: 'icon', url: '/icon.svg', type: 'image/svg+xml' }],
+};
 
 const interactionScript = `
 (() => {

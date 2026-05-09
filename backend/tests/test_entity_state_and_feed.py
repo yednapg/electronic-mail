@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import os
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from app.db.models import LoadedEntity, StoredEntity, StoredEntityAiSuggestion, StoredEntityState
 from app.db.models import StoredSourceRecord
 from app.db.repository import (
+    DEFAULT_USER_ID,
     attach_record_to_entity,
     create_entity,
     initialize_database,
     list_loaded_entities,
+    upsert_feed_projection,
     upsert_entity_state,
     upsert_source_records,
 )
@@ -22,10 +25,13 @@ from app.services.entities.derive_entity_state import derive_state
 from app.services.feed.build_feed import build_feed
 from app.services.feed.memory_pipeline import (
     AI_JUDGMENT_MODEL,
+    FEED_PROJECTION_VERSION,
+    build_feed_from_projection_cache,
     get_usable_suggestion,
     normalize_judgment,
     refresh_ai_suggestions_for_entities,
     to_pipeline_output,
+    versioned_feed_projection_payload,
 )
 
 
@@ -140,6 +146,35 @@ class EntityStateAndFeedTests(unittest.TestCase):
                 "done",
             )
 
+    @patch("app.services.ai.decision.OpenAI")
+    @patch("app.services.ai.decision._create_chat_completion")
+    def test_classify_entity_state_llm_path_uses_compact_timeline(
+        self,
+        mock_completion,
+        _mock_openai,
+    ) -> None:
+        mock_completion.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"current_state":"waiting"}'))]
+        )
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "OPENAI_REQUIRED": "true"}, clear=False):
+            state = classify_entity_state(
+                [
+                    make_record(
+                        record_id="state-llm-1",
+                        source="gmail",
+                        subject="HSBC acknowledged your corrected account number",
+                        body="We have taken your query up for review and will respond by email.",
+                        timestamp="2026-04-17T10:00:00+00:00",
+                    )
+                ]
+            )
+
+        self.assertEqual(state, "waiting")
+        message = mock_completion.call_args.kwargs["messages"][1]["content"]
+        self.assertIn('"timeline"', message)
+        self.assertIn("HSBC acknowledged", message)
+
     def test_derive_state_uses_fallback_classifier_and_due_dates(self) -> None:
         with patch.dict(os.environ, {"OPENAI_API_KEY": "", "OPENAI_REQUIRED": ""}, clear=False):
             state, due_at = derive_state(
@@ -193,6 +228,63 @@ class EntityStateAndFeedTests(unittest.TestCase):
         )
         self.assertEqual(feed.now, [])
         self.assertEqual(feed.worth_knowing, [])
+
+    def test_build_feed_backfills_backend_owned_detail_copy_without_internal_ids(self) -> None:
+        feed = build_feed(
+            [
+                make_output(
+                    entity_id="waiting-thread",
+                    current_state="waiting",
+                    importance_level="medium",
+                    created_at="2026-04-17T11:00:00+00:00",
+                )
+            ]
+        )
+
+        item = feed.today[0]
+
+        self.assertIsNotNone(item.detail)
+        assert item.detail is not None
+        self.assertEqual(item.detail.body, ["test"])
+        self.assertEqual(item.detail.action_label, "Wait for the reply")
+        self.assertEqual(item.detail.source_label, "Gmail")
+        self.assertNotIn("thread-1", item.detail.model_dump_json())
+        self.assertNotIn("trace", item.detail.model_dump_json())
+
+    def test_feed_projection_cache_requires_current_copy_version(self) -> None:
+        output = make_output(
+            entity_id="versioned-projection",
+            current_state="open",
+            importance_level="medium",
+            created_at="2026-04-17T11:00:00+00:00",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = f"{directory}/app.db"
+            initialize_database(database_path)
+            upsert_feed_projection(
+                database_path,
+                user_id=DEFAULT_USER_ID,
+                entity_id="versioned-projection",
+                pipeline_output=output.model_dump(),
+            )
+
+            self.assertIsNone(build_feed_from_projection_cache(database_path))
+
+            payload = versioned_feed_projection_payload(output)
+            self.assertEqual(payload["projection_version"], FEED_PROJECTION_VERSION)
+            upsert_feed_projection(
+                database_path,
+                user_id=DEFAULT_USER_ID,
+                entity_id="versioned-projection",
+                pipeline_output=payload,
+            )
+
+            feed = build_feed_from_projection_cache(database_path)
+
+        self.assertIsNotNone(feed)
+        assert feed is not None
+        self.assertEqual(feed.today[0].entity_id, "versioned-projection")
 
     def test_hidden_ai_judgment_suppresses_done_item(self) -> None:
         loaded_entity = LoadedEntity(

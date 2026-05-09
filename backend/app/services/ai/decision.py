@@ -889,6 +889,28 @@ def _compact_source_record_for_summary(record: StoredSourceRecord) -> dict[str, 
     }
 
 
+def _compact_state_timeline(records: list[StoredSourceRecord]) -> list[dict[str, object]]:
+    return [
+        {
+            "id": record.id,
+            "source": record.source,
+            "subject": _truncate_text(record.subject or _payload_string(record.raw_payload, "subject") or "", 180),
+            "sender": _truncate_text(
+                record.sender
+                or _payload_string(record.raw_payload, "from")
+                or _payload_string(record.raw_payload, "sender")
+                or "",
+                MAX_SENDER_CHARS,
+            )
+            or None,
+            "timestamp": record.timestamp,
+            "snippet": _truncate_text(_payload_string(record.raw_payload, "snippet") or "", 240) or None,
+            "body_snippet": _truncate_text(_payload_string(record.raw_payload, "body") or "", 700) or None,
+        }
+        for record in sorted(records, key=lambda item: item.timestamp)
+    ]
+
+
 def _summarize_source_record_heuristically(record: StoredSourceRecord) -> str:
     """Fallback single-record summary for history rows when no LLM is configured."""
     payload = record.raw_payload

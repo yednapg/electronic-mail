@@ -27,6 +27,13 @@
         "fallback_action": "open",
         "title": "Groww confirmed your demat account has been closed and sent the client master report.",
         "why_this_is_here": "This is a completed account-closure record with the related report attached.",
+        "detail": {
+          "body": [
+            "This is a completed account-closure record with the related report attached."
+          ],
+          "action_label": "Read the latest email",
+          "source_label": "Gmail"
+        },
         "due_at": null,
         "importance_level": "high",
         "lifecycle_state": "resolved",
@@ -53,6 +60,13 @@
         "fallback_action": "open",
         "title": "Zerodha asked for a callback about your email ID modification rejection.",
         "why_this_is_here": "This is waiting on your availability for a support callback.",
+        "detail": {
+          "body": [
+            "This is waiting on your availability for a support callback."
+          ],
+          "action_label": "Wait for the reply",
+          "source_label": "Gmail"
+        },
         "due_at": null,
         "importance_level": "medium",
         "lifecycle_state": "active",

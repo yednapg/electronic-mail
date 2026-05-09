@@ -80,6 +80,18 @@ public struct FeedResponse: Codable, Equatable {
     }
 }
 
+public struct AttentionItemDetail: Codable, Equatable, Hashable {
+    let body: [String]
+    let actionLabel: String
+    let sourceLabel: String
+
+    enum CodingKeys: String, CodingKey {
+        case body
+        case actionLabel = "action_label"
+        case sourceLabel = "source_label"
+    }
+}
+
 public struct AttentionItem: Codable, Equatable, Identifiable, Hashable {
     public let id: String
     let entityID: String
@@ -93,6 +105,7 @@ public struct AttentionItem: Codable, Equatable, Identifiable, Hashable {
     let fallbackAction: String
     let title: String
     let whyThisIsHere: String
+    let detail: AttentionItemDetail?
     let dueAt: String?
     let importanceLevel: String?
     let lifecycleState: String?
@@ -120,6 +133,7 @@ public struct AttentionItem: Codable, Equatable, Identifiable, Hashable {
         case fallbackAction = "fallback_action"
         case title
         case whyThisIsHere = "why_this_is_here"
+        case detail
         case dueAt = "due_at"
         case importanceLevel = "importance_level"
         case lifecycleState = "lifecycle_state"

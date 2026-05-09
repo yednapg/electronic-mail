@@ -264,6 +264,49 @@ class DashboardImportJobRouteTests(unittest.TestCase):
         self.assertEqual(refresh_args[0], str(self.database_path))
         self.assertEqual(set(refresh_args[1]), changed_entity_ids)
 
+    @patch("app.services.dashboard.fetch_google_account_profile")
+    @patch("app.services.dashboard.generate_dashboard_briefing")
+    @patch("app.services.dashboard.build_feed_from_entities")
+    @patch("app.services.dashboard.refresh_feed_projections_for_entities")
+    @patch("app.services.dashboard.refresh_ai_suggestions_for_entities")
+    @patch("app.services.dashboard.list_stale_feed_projection_entity_ids")
+    @patch("app.services.dashboard.list_entity_ids_needing_ai_refresh")
+    @patch("app.services.dashboard.hydrate_persistent_memory")
+    @patch("app.services.dashboard.fetch_google_source_records")
+    @patch("app.services.dashboard.get_google_auth_state")
+    def test_import_job_refreshes_changed_entities_and_stale_copy_caches(
+        self,
+        mock_auth: Mock,
+        mock_fetch_source_records: Mock,
+        mock_hydrate: Mock,
+        mock_stale_ai: Mock,
+        mock_stale_projection: Mock,
+        mock_refresh_ai: Mock,
+        mock_refresh_projection: Mock,
+        mock_build_feed: Mock,
+        mock_briefing: Mock,
+        mock_fetch_profile: Mock,
+    ) -> None:
+        mock_auth.return_value = GoogleAuthState(available=True, connected=True)
+        mock_fetch_source_records.return_value = []
+        mock_hydrate.return_value = {"changed-entity"}
+        mock_stale_ai.return_value = ["stale-ai-entity"]
+        mock_stale_projection.return_value = ["stale-projection-entity", "changed-entity"]
+        mock_build_feed.return_value = FeedResponse()
+        mock_fetch_profile.return_value = DashboardProfile(email="person@example.com")
+        mock_briefing.return_value = DashboardBriefing(headline="Morning", brief="Ready.")
+
+        create_response = self.client.post("/v1/dashboard/import-jobs")
+
+        self.assertEqual(create_response.status_code, 202)
+        persisted = self.client.get(f"/v1/dashboard/import-jobs/{create_response.json()['id']}").json()
+        self.assertEqual(persisted["status"], "succeeded")
+        self.assertEqual(persisted["changed_entities"], 1)
+        self.assertEqual(persisted["refreshed_entities"], 3)
+        expected = {"changed-entity", "stale-ai-entity", "stale-projection-entity"}
+        self.assertEqual(set(mock_refresh_ai.call_args.args[1]), expected)
+        self.assertEqual(set(mock_refresh_projection.call_args.args[1]), expected)
+
     @patch("app.services.dashboard.fetch_google_source_records", side_effect=RuntimeError("sync exploded"))
     @patch("app.services.dashboard.get_google_auth_state")
     def test_job_failure_is_persisted(self, mock_auth: Mock, _mock_fetch_source_records: Mock) -> None:

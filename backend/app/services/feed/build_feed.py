@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from app.db.repository import append_trace_record
-from app.schemas.domain import AttentionItem, FeedResponse, PipelineOutput
+from app.schemas.domain import AttentionItem, AttentionItemDetail, FeedResponse, PipelineOutput
 from app.services.ai.decision import normalize_entity_state
 
 
@@ -118,8 +118,78 @@ def enrich_attention_item(output: PipelineOutput, attention_item: AttentionItem)
         data["lifecycle_state"] = output.entity.lifecycle_state
     if attention_item.current_state is None:
         data["current_state"] = normalize_entity_state(output.entity.current_state)
+    if attention_item.detail is None:
+        detail_source = data.get("source")
+        data["detail"] = build_attention_item_detail(
+            title=str(data.get("title") or ""),
+            why_this_is_here=str(data.get("why_this_is_here") or ""),
+            primary_action=str(data.get("primary_action") or ""),
+            current_state=str(data.get("current_state") or output.entity.current_state),
+            source=detail_source if isinstance(detail_source, str) else None,
+        ).model_dump()
 
     return AttentionItem.model_validate(data)
+
+
+def build_attention_item_detail(
+    *,
+    title: str,
+    why_this_is_here: str,
+    primary_action: str,
+    current_state: str,
+    source: str | None,
+) -> AttentionItemDetail:
+    return AttentionItemDetail(
+        body=[detail_description(title, why_this_is_here)],
+        action_label=detail_action_label(primary_action, current_state),
+        source_label=detail_source_label(source),
+    )
+
+
+def detail_description(title: str, why_this_is_here: str) -> str:
+    explanation = " ".join(why_this_is_here.split()).strip()
+    if explanation:
+        return explanation
+
+    clean_title = " ".join(title.split()).strip()
+    if clean_title:
+        return f"{clean_title} is still part of your mailbox work."
+
+    return "This email needs attention."
+
+
+def detail_action_label(primary_action: str, current_state: str) -> str:
+    if normalize_entity_state(current_state) == "waiting" and primary_action in {"none", "open"}:
+        return "Wait for the reply"
+
+    if primary_action == "reply":
+        return "Reply in the thread"
+    if primary_action == "confirm":
+        return "Confirm or decline"
+    if primary_action == "pay":
+        return "Make the payment"
+    if primary_action == "track":
+        return "Check latest status"
+    if primary_action == "review":
+        return "Review and decide"
+    if primary_action == "send":
+        return "Send the missing item"
+    if primary_action == "approve":
+        return "Approve or deny"
+    if primary_action == "register":
+        return "Register if useful"
+    if primary_action == "open":
+        return "Open and read"
+
+    return "Read the latest email"
+
+
+def detail_source_label(source: str | None) -> str:
+    if source == "calendar":
+        return "Calendar"
+    if source == "manual":
+        return "Manual"
+    return "Gmail"
 
 
 def log_feed_ranking(
