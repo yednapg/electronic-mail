@@ -1930,6 +1930,27 @@ a {
   list-style: none;
 }
 
+.thread-reader-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin-top: 18px;
+}
+
+.thread-reader-page-link {
+  color: var(--page-text);
+  font-size: var(--type-detail-source);
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0;
+  text-decoration: none;
+}
+
+.thread-reader-page-link:hover,
+.thread-reader-page-link:focus-visible {
+  color: var(--page-text-muted);
+}
+
 .thread-message-card {
   padding: 16px 18px;
   border: 1px solid var(--dashboard-surface-border);

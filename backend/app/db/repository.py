@@ -436,11 +436,26 @@ def mark_source_records_deleted(
             unique_ids,
         )
 
-        if entity_ids:
-            entity_placeholders = ", ".join("?" for _ in entity_ids)
+        empty_entity_ids: list[str] = []
+        for entity_id in entity_ids:
+            active_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM entity_members
+                JOIN source_records ON source_records.id = entity_members.source_record_id
+                WHERE entity_members.entity_id = ?
+                  AND source_records.deleted_at IS NULL
+                """,
+                (entity_id,),
+            ).fetchone()[0]
+            if int(active_count) == 0:
+                empty_entity_ids.append(entity_id)
+
+        if empty_entity_ids:
+            entity_placeholders = ", ".join("?" for _ in empty_entity_ids)
             connection.execute(
                 f"DELETE FROM feed_projections WHERE entity_id IN ({entity_placeholders})",
-                entity_ids,
+                empty_entity_ids,
             )
 
     return entity_ids
@@ -983,6 +998,21 @@ def create_entity(database_path: str, canonical_key: str, user_id: str = DEFAULT
         )
 
     return entity
+
+
+def get_entity(database_path: str, entity_id: str, *, user_id: str = DEFAULT_USER_ID) -> StoredEntity | None:
+    """Load one entity row without hydrating source-record members."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM entities
+            WHERE id = ? AND user_id = ?
+            LIMIT 1
+            """,
+            (entity_id, user_id),
+        ).fetchone()
+    return _to_entity(row) if row is not None else None
 
 
 def attach_thread_to_entity(database_path: str, entity_id: str, source: str, thread_id: str) -> None:
@@ -1917,19 +1947,87 @@ def get_gmail_draft(database_path: str, draft_id: str, *, user_id: str) -> Store
     return _to_gmail_draft(row) if row is not None else None
 
 
-def list_source_records_for_entity(database_path: str, entity_id: str) -> list[StoredSourceRecord]:
-    """Return source records for one entity in chronological order."""
+def get_source_record_count_for_entity(database_path: str, entity_id: str) -> int:
+    """Return the active source-record count for one entity."""
     with connect(database_path) as connection:
-        rows = connection.execute(
+        row = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM entity_members
+            JOIN source_records ON source_records.id = entity_members.source_record_id
+            WHERE entity_members.entity_id = ?
+              AND source_records.deleted_at IS NULL
+            """,
+            (entity_id,),
+        ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def get_latest_source_record_for_entity(database_path: str, entity_id: str) -> StoredSourceRecord | None:
+    """Return the newest active source record for one entity."""
+    with connect(database_path) as connection:
+        row = connection.execute(
             """
             SELECT source_records.*
             FROM entity_members
             JOIN source_records ON source_records.id = entity_members.source_record_id
             WHERE entity_members.entity_id = ?
               AND source_records.deleted_at IS NULL
-            ORDER BY source_records.timestamp ASC, source_records.id ASC
+            ORDER BY source_records.timestamp DESC, source_records.id DESC
+            LIMIT 1
             """,
             (entity_id,),
+        ).fetchone()
+    return _to_source_record(row) if row is not None else None
+
+
+def list_gmail_thread_ids_for_entity(database_path: str, entity_id: str) -> list[str]:
+    """Return distinct active Gmail thread ids attached to one entity."""
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT source_records.thread_id
+            FROM entity_members
+            JOIN source_records ON source_records.id = entity_members.source_record_id
+            WHERE entity_members.entity_id = ?
+              AND source_records.source = 'gmail'
+              AND source_records.thread_id IS NOT NULL
+              AND source_records.deleted_at IS NULL
+            ORDER BY source_records.thread_id ASC
+            """,
+            (entity_id,),
+        ).fetchall()
+    return [str(row["thread_id"]) for row in rows if row["thread_id"] is not None]
+
+
+def list_source_records_for_entity(
+    database_path: str,
+    entity_id: str,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[StoredSourceRecord]:
+    """Return active source records for one entity in chronological order."""
+    bounded_offset = max(0, int(offset))
+    bounded_limit = None if limit is None else max(0, int(limit))
+    pagination_clause = ""
+    params: tuple[object, ...] = (entity_id,)
+    if bounded_limit is not None:
+        pagination_clause = "LIMIT ? OFFSET ?"
+        params = (entity_id, bounded_limit, bounded_offset)
+
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT source_records.*
+            FROM entity_members
+            JOIN source_records ON source_records.id = entity_members.source_record_id
+            WHERE entity_members.entity_id = ?
+              AND source_records.deleted_at IS NULL
+            ORDER BY source_records.timestamp ASC, source_records.id ASC
+            {pagination_clause}
+            """,
+            params,
         ).fetchall()
     return [_to_source_record(row) for row in rows]
 

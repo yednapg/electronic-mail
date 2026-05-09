@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { getDemoSourceRecords, getDemoTrace } from './demo-evidence';
+import { getDemoSourceRecords, getDemoThread, getDemoTrace } from './demo-evidence';
 
 test('demo evidence returns item-scoped raw Gmail records', () => {
   const records = getDemoSourceRecords('northstar-card-bill');
@@ -21,4 +21,18 @@ test('demo trace replays the frontend evidence pipeline for one entity', () => {
     ['ingestion', 'grouping', 'state_derivation', 'decision', 'action_selection', 'output'],
   );
   assert.equal(trace?.items[2].output.current_state, 'open');
+});
+
+test('demo thread honors the same pagination contract as the backend', () => {
+  const firstPage = getDemoThread('entity-northstar-card-bill', { limit: 1, offset: 0 });
+  const secondPage = getDemoThread('entity-northstar-card-bill', { limit: 1, offset: 1 });
+
+  assert.equal(firstPage?.total_messages, 2);
+  assert.equal(firstPage?.limit, 1);
+  assert.equal(firstPage?.offset, 0);
+  assert.equal(firstPage?.has_more, true);
+  assert.equal(firstPage?.messages.length, 1);
+  assert.equal(secondPage?.offset, 1);
+  assert.equal(secondPage?.has_more, false);
+  assert.equal(secondPage?.messages.length, 1);
 });

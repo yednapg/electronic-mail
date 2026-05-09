@@ -295,6 +295,10 @@ class ThreadReaderResponse(BaseModel):
     source: SourceType | None = None
     gmail_thread_id: str | None = None
     subject: str | None = None
+    total_messages: int
+    limit: int
+    offset: int
+    has_more: bool
     messages: list[ThreadMessage] = Field(default_factory=list)
 
 
