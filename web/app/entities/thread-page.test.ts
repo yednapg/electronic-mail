@@ -12,6 +12,10 @@ const thread: ThreadReaderResponse = {
   source: 'gmail',
   gmail_thread_id: 'thread-1',
   subject: 'HDFC credit card statement due today',
+  total_messages: 1,
+  limit: 25,
+  offset: 0,
+  has_more: false,
   messages: [
     {
       id: 'source-1',
@@ -46,4 +50,58 @@ test('thread detail does not expose Gmail mutation actions or backend ids', () =
   assert.doesNotMatch(html, /Mark read/);
   assert.doesNotMatch(html, /Entity:/);
   assert.doesNotMatch(html, /thread-1/);
+});
+
+test('thread detail renders pagination metadata and more link', () => {
+  const pageThread = {
+    ...thread,
+    total_messages: 100,
+    limit: 25,
+    offset: 0,
+    has_more: true,
+    messages: Array.from({ length: 25 }, (_, index) => ({
+      ...thread.messages[0],
+      id: `source-${index + 1}`,
+      received_at: `2026-04-24T10:${String(index).padStart(2, '0')}:00+00:00`,
+    })),
+  };
+
+  const html = renderToStaticMarkup(
+    React.createElement(ThreadDetail, {
+      entityId: 'entity-1',
+      page: { limit: 25, offset: 0 },
+      thread: pageThread,
+      errorMessage: null,
+    }),
+  );
+
+  assert.match(html, /25 of 100 emails/);
+  assert.match(html, /href="\/entities\/entity-1\/thread\?limit=25&amp;offset=25"/);
+  assert.match(html, />More</);
+  assert.doesNotMatch(html, />Previous</);
+});
+
+test('thread detail renders previous and more links for middle pages', () => {
+  const pageThread = {
+    ...thread,
+    total_messages: 100,
+    limit: 25,
+    offset: 25,
+    has_more: true,
+  };
+
+  const html = renderToStaticMarkup(
+    React.createElement(ThreadDetail, {
+      entityId: 'entity-1',
+      page: { limit: 25, offset: 25 },
+      thread: pageThread,
+      errorMessage: null,
+    }),
+  );
+
+  assert.match(html, /1 of 100 emails/);
+  assert.match(html, /href="\/entities\/entity-1\/thread\?limit=25&amp;offset=0"/);
+  assert.match(html, /href="\/entities\/entity-1\/thread\?limit=25&amp;offset=50"/);
+  assert.match(html, />Previous</);
+  assert.match(html, />More</);
 });

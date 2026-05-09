@@ -26,7 +26,7 @@ function wait(ms: number): Promise<void> {
 }
 
 async function waitForDashboardReady(onStatus?: (message: string) => void): Promise<void> {
-  if (process.env.NEXT_PUBLIC_DEMO_MODE === 'false') {
+  if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'true') {
     await waitForDashboardImportJob({
       timeoutMs: POST_LOGIN_READY_TIMEOUT_MS,
       onUpdate: (job) => onStatus?.(formatDashboardImportStatus(job)),
@@ -82,7 +82,7 @@ export function RotatingStatus() {
     }, POST_LOGIN_READY_TIMEOUT_MS);
 
     async function redirectWhenReady() {
-      if (process.env.NEXT_PUBLIC_DEMO_MODE === 'false') {
+      if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'true') {
         await Promise.all([
           wait(POST_LOGIN_MINIMUM_MS),
           waitForDashboardReady(setLiveStatus),

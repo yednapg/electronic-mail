@@ -4,6 +4,10 @@
   "source": "gmail",
   "gmail_thread_id": "thread-1",
   "subject": "HDFC credit card statement due today",
+  "total_messages": 1,
+  "limit": 25,
+  "offset": 0,
+  "has_more": false,
   "messages": [
     {
       "id": "source-1",

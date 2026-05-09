@@ -71,7 +71,7 @@ export function DashboardSection({
       return;
     }
 
-    if (process.env.NEXT_PUBLIC_DEMO_MODE === 'false') {
+    if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'true') {
       try {
         if (composeMode === 'email') {
           const draft = await createGmailDraft({
@@ -333,7 +333,7 @@ function DashboardSectionItemRow({
       return;
     }
 
-    if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'false') {
+    if (process.env.NEXT_PUBLIC_DEMO_MODE === 'true') {
       setCtaState('done');
       return;
     }
@@ -357,7 +357,7 @@ function DashboardSectionItemRow({
   }
 
   async function completeItem() {
-    if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'false') {
+    if (process.env.NEXT_PUBLIC_DEMO_MODE === 'true') {
       onComplete();
       return;
     }

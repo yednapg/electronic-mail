@@ -74,9 +74,59 @@ class EntityThreadReaderRouteTests(unittest.TestCase):
         self.assertEqual(payload["entity_id"], entity.id)
         self.assertEqual(payload["gmail_thread_id"], "thread-1")
         self.assertEqual(payload["subject"], "Apple order delivered")
+        self.assertEqual(payload["total_messages"], 2)
+        self.assertEqual(payload["limit"], 25)
+        self.assertEqual(payload["offset"], 0)
+        self.assertFalse(payload["has_more"])
         self.assertEqual([message["id"] for message in payload["messages"]], ["message-older", "message-newer"])
         self.assertEqual(payload["messages"][0]["body"], "Your iPhone order was placed.")
         self.assertEqual(payload["messages"][1]["label_ids"], ["INBOX", "CATEGORY_UPDATES"])
+
+    def test_thread_reader_paginates_large_threads_without_fetching_every_message(self) -> None:
+        records = [
+            StoredSourceRecord(
+                id=f"message-{index}",
+                source="gmail",
+                thread_id="thread-1",
+                subject=f"Message {index}",
+                sender="orders@apple.com",
+                timestamp=f"2023-05-{index + 1:02d}T09:00:00+00:00",
+                raw_payload={
+                    "user_id": "local-user",
+                    "from": "orders@apple.com",
+                    "to": "gaurav@example.com",
+                    "subject": f"Message {index}",
+                    "body": f"Body {index}",
+                    "snippet": f"Snippet {index}",
+                    "label_ids": ["INBOX"],
+                },
+                created_at=f"2023-05-{index + 1:02d}T09:00:00+00:00",
+            )
+            for index in range(4)
+        ]
+
+        upsert_source_records(self.db_file.name, records)
+        entity = create_entity(self.db_file.name, "gmail-thread:thread-1")
+        for record in records:
+            attach_record_to_entity(self.db_file.name, entity.id, record.id)
+
+        response = self.client.get(f"/v1/entities/{entity.id}/thread?limit=2&offset=1")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total_messages"], 4)
+        self.assertEqual(payload["limit"], 2)
+        self.assertEqual(payload["offset"], 1)
+        self.assertTrue(payload["has_more"])
+        self.assertEqual(payload["subject"], "Message 3")
+        self.assertEqual([message["id"] for message in payload["messages"]], ["message-1", "message-2"])
+
+    def test_thread_reader_rejects_unbounded_page_size(self) -> None:
+        entity = create_entity(self.db_file.name, "gmail-thread:thread-1")
+
+        response = self.client.get(f"/v1/entities/{entity.id}/thread?limit=500")
+
+        self.assertEqual(response.status_code, 422)
 
     def test_unknown_entity_returns_404(self) -> None:
         response = self.client.get("/v1/entities/missing/thread")
