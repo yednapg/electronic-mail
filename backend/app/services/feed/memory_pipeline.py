@@ -69,6 +69,8 @@ TITLE_CONTEXT_PATTERNS = [
     re.compile(r"\b(?:and|after|but)\b[^.;]{12,120}", re.IGNORECASE),
 ]
 MAX_SUGGESTED_TITLE_CHARS = 120
+AI_JUDGMENT_MODEL = "ai-judgment-v2"
+PERSISTENT_SUGGESTION_MODELS = {AI_JUDGMENT_MODEL, "manual-task"}
 
 
 def hydrate_persistent_memory(
@@ -572,7 +574,7 @@ def normalize_judgment(entity: LoadedEntity, judgment: FeedEntityJudgmentOutput)
         ),
         "suggested_priority": clamp_priority(judgment.suggested_priority),
         "suggested_visibility": judgment.suggested_visibility,
-        "model": "ai-judgment",
+        "model": AI_JUDGMENT_MODEL,
         "generated_from_updated_at": get_entity_context_updated_at(entity),
     }
 
@@ -580,6 +582,9 @@ def normalize_judgment(entity: LoadedEntity, judgment: FeedEntityJudgmentOutput)
 def get_usable_suggestion(entity: LoadedEntity):
     """Ignore cached AI suggestions once entity context has moved past them."""
     if entity.ai_suggestion is None:
+        return None
+
+    if entity.ai_suggestion.model not in PERSISTENT_SUGGESTION_MODELS:
         return None
 
     if entity.ai_suggestion.generated_from_updated_at < get_entity_context_updated_at(entity):

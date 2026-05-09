@@ -14,6 +14,8 @@ from app.db.repository import (
 )
 from app.services.ai.decision import summarize_source_records
 
+SOURCE_RECORD_SUMMARY_HASH_VERSION = "source-record-summary-v2"
+
 
 def refresh_source_record_summaries(database_path: str, source_record_ids: list[str]) -> int:
     """Refresh compact summaries for missing or changed source records."""
@@ -56,6 +58,7 @@ def refresh_source_record_summaries(database_path: str, source_record_ids: list[
 def source_record_summary_hash(record: StoredSourceRecord) -> str:
     """Hash the stable fields that determine one source-record summary."""
     payload = {
+        "version": SOURCE_RECORD_SUMMARY_HASH_VERSION,
         "id": record.id,
         "source": record.source,
         "thread_id": record.thread_id,
