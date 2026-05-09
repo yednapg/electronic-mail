@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
+import json
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -23,7 +25,7 @@ from app.db.repository import (
 )
 from app.main import app
 from app.services.ai.decision import SourceRecordSummaryBatch
-from app.services.source_record_summaries import refresh_source_record_summaries
+from app.services.source_record_summaries import refresh_source_record_summaries, source_record_summary_hash
 
 
 def make_record(
@@ -161,6 +163,30 @@ class HistoryRouteTests(unittest.TestCase):
         self.assertEqual(row["title"], "Apple shipped your iPhone order.")
         self.assertEqual(row["summary"], "Apple shipped your iPhone order.")
         mock_summarize.assert_called_once()
+
+    def test_source_record_summary_hash_includes_copy_prompt_version(self) -> None:
+        record = make_record(
+            record_id="message-1",
+            thread_id="thread-1",
+            received_at="2026-05-08T09:00:00+00:00",
+            subject="Order update",
+            snippet="Apple says your iPhone has shipped.",
+        )
+        legacy_payload = {
+            "id": record.id,
+            "source": record.source,
+            "thread_id": record.thread_id,
+            "subject": record.subject,
+            "sender": record.sender,
+            "timestamp": record.timestamp,
+            "summary_fields": {
+                key: record.raw_payload.get(key)
+                for key in ("subject", "from", "sender", "snippet", "summary", "body", "start", "end")
+            },
+        }
+        legacy_hash = hashlib.sha256(json.dumps(legacy_payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+        self.assertNotEqual(source_record_summary_hash(record), legacy_hash)
 
     @patch("app.services.integrations.google.fetch_google_source_records")
     @patch("app.api.routes.gmail.archive_gmail_thread_service")
