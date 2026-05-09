@@ -91,12 +91,14 @@ export function formatDashboardImportStatus(job: DashboardImportJobResponse): st
       return progress ? `Fetching Gmail threads ${progress}...` : 'Fetching Gmail threads...';
     case 'gmail_persisted':
       return progress ? `Saving Gmail evidence ${progress}...` : 'Saving Gmail evidence...';
+    case 'source_summary':
+      return formatCountedStatus('Summarizing email evidence', job.source_records || job.imported_count);
     case 'memory_hydration':
-      return 'Grouping related emails into work...';
+      return formatCountedStatus('Grouping related emails into work', job.source_records || job.imported_count);
     case 'ai_refresh':
-      return 'Finding current state and next move...';
+      return formatCountedStatus('Finding current state and next move', job.changed_entities);
     case 'feed_build':
-      return 'Preparing your dashboard...';
+      return formatCountedStatus('Preparing refreshed dashboard items', job.refreshed_entities || job.changed_entities);
     case 'briefing':
       return 'Writing your morning brief...';
     case 'completed':
@@ -114,6 +116,10 @@ function formatImportProgress(job: DashboardImportJobResponse): string | null {
   }
 
   return `${Math.min(job.imported_count, job.total_count)}/${job.total_count}`;
+}
+
+function formatCountedStatus(message: string, count: number): string {
+  return count > 0 ? `${message} for ${count} items...` : `${message}...`;
 }
 
 function wait(ms: number): Promise<void> {

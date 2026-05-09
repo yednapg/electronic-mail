@@ -90,6 +90,22 @@ test('dashboard import status formats backend-owned progress stages', () => {
   const running = job('running');
 
   assert.equal(formatDashboardImportStatus(running), 'Fetching Gmail threads 4/11...');
+  assert.equal(
+    formatDashboardImportStatus({ ...running, stage: 'source_summary', source_records: 256, imported_count: 256 }),
+    'Summarizing email evidence for 256 items...',
+  );
+  assert.equal(
+    formatDashboardImportStatus({ ...running, stage: 'memory_hydration', source_records: 256, imported_count: 256 }),
+    'Grouping related emails into work for 256 items...',
+  );
+  assert.equal(
+    formatDashboardImportStatus({ ...running, stage: 'ai_refresh', changed_entities: 103 }),
+    'Finding current state and next move for 103 items...',
+  );
+  assert.equal(
+    formatDashboardImportStatus({ ...running, stage: 'feed_build', changed_entities: 103, refreshed_entities: 110 }),
+    'Preparing refreshed dashboard items for 110 items...',
+  );
   assert.equal(formatDashboardImportStatus(job('succeeded')), 'Dashboard is ready.');
 });
 
