@@ -71,6 +71,7 @@ TITLE_CONTEXT_PATTERNS = [
 MAX_SUGGESTED_TITLE_CHARS = 120
 AI_JUDGMENT_MODEL = "ai-judgment-v2"
 PERSISTENT_SUGGESTION_MODELS = {AI_JUDGMENT_MODEL, "manual-task"}
+FEED_PROJECTION_VERSION = "feed-projection-v2"
 
 
 def hydrate_persistent_memory(
@@ -201,7 +202,7 @@ def refresh_feed_projections_for_entities(
             database_path,
             user_id=DEFAULT_USER_ID,
             entity_id=entity.entity.id,
-            pipeline_output=output.model_dump(),
+            pipeline_output=versioned_feed_projection_payload(output),
         )
 
 
@@ -210,11 +211,55 @@ def build_feed_from_projection_cache(database_path: str) -> FeedResponse | None:
     if get_feed_projection_count(database_path, user_id=DEFAULT_USER_ID) == 0:
         return None
 
-    outputs = [
-        PipelineOutput.model_validate(payload)
-        for payload in list_feed_projection_payloads(database_path, user_id=DEFAULT_USER_ID)
-    ]
+    payloads = list_feed_projection_payloads(database_path, user_id=DEFAULT_USER_ID)
+    if not payloads or any(not is_current_feed_projection_payload(payload) for payload in payloads):
+        return None
+
+    outputs = [PipelineOutput.model_validate(payload) for payload in payloads]
     return build_feed(outputs)
+
+
+def versioned_feed_projection_payload(output: PipelineOutput) -> dict[str, object]:
+    payload = output.model_dump()
+    payload["projection_version"] = FEED_PROJECTION_VERSION
+    return payload
+
+
+def is_current_feed_projection_payload(payload: dict[str, object]) -> bool:
+    return payload.get("projection_version") == FEED_PROJECTION_VERSION
+
+
+def list_stale_feed_projection_entity_ids(database_path: str) -> list[str]:
+    """Return entities whose cached feed projection predates the current user-facing copy contract."""
+    stale_entity_ids: set[str] = set()
+
+    for payload in list_feed_projection_payloads(database_path, user_id=DEFAULT_USER_ID):
+        if is_current_feed_projection_payload(payload):
+            continue
+
+        entity = payload.get("entity")
+        if isinstance(entity, dict):
+            entity_id = entity.get("id")
+            if isinstance(entity_id, str) and entity_id:
+                stale_entity_ids.add(entity_id)
+                continue
+
+        attention_item = payload.get("attention_item")
+        if isinstance(attention_item, dict):
+            entity_id = attention_item.get("entity_id")
+            if isinstance(entity_id, str) and entity_id:
+                stale_entity_ids.add(entity_id)
+
+    return sorted(stale_entity_ids)
+
+
+def list_entity_ids_needing_ai_refresh(database_path: str) -> list[str]:
+    """Return persisted entities whose AI judgment cache is missing or from an old copy model."""
+    return sorted(
+        entity.entity.id
+        for entity in list_all_loaded_entities(database_path)
+        if entity.state is not None and get_usable_suggestion(entity) is None
+    )
 
 
 def build_feed_from_entities(

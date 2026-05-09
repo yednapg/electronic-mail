@@ -74,6 +74,12 @@ export type Entity = (EntityThreadIdentity | EntityGroupIdentity) & {
 /**
  * User-facing actionable item derived from Entity
  */
+export interface AttentionItemDetail {
+  readonly body: readonly string[];
+  readonly action_label: string;
+  readonly source_label: string;
+}
+
 export interface AttentionItem {
   readonly id: string;
   readonly entity_id: string;
@@ -91,6 +97,7 @@ export interface AttentionItem {
 
   readonly title: string;
   readonly why_this_is_here: string;
+  readonly detail?: AttentionItemDetail | null;
   readonly due_at?: string | null;
   readonly importance_level?: 'high' | 'medium' | 'low';
   readonly lifecycle_state?: string;
