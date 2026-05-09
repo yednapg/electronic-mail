@@ -20,7 +20,13 @@ from app.schemas.domain import AttentionItem, PipelineEntity, PipelineOutput
 from app.services.ai.decision import classify_entity_state
 from app.services.entities.derive_entity_state import derive_state
 from app.services.feed.build_feed import build_feed
-from app.services.feed.memory_pipeline import normalize_judgment, refresh_ai_suggestions_for_entities, to_pipeline_output
+from app.services.feed.memory_pipeline import (
+    AI_JUDGMENT_MODEL,
+    get_usable_suggestion,
+    normalize_judgment,
+    refresh_ai_suggestions_for_entities,
+    to_pipeline_output,
+)
 
 
 def make_record(
@@ -338,6 +344,7 @@ class EntityStateAndFeedTests(unittest.TestCase):
             normalized["title"],
             "Groww confirmed your demat account has been closed and sent the client master report.",
         )
+        self.assertEqual(normalized["model"], AI_JUDGMENT_MODEL)
 
     def test_normalize_judgment_keeps_title_when_explanation_adds_no_high_value_clause(self) -> None:
         entity = LoadedEntity(
@@ -436,6 +443,47 @@ class EntityStateAndFeedTests(unittest.TestCase):
             loaded = {entity.entity.id: entity for entity in list_loaded_entities(db_file.name, [target.id, untouched.id])}
             self.assertIsNotNone(loaded[target.id].ai_suggestion)
             self.assertIsNone(loaded[untouched.id].ai_suggestion)
+
+    def test_old_ai_judgment_cache_is_ignored_after_copy_prompt_version_change(self) -> None:
+        loaded_entity = LoadedEntity(
+            entity=StoredEntity(
+                id="entity-old-copy",
+                canonical_key="gmail-thread:thread-old-copy",
+                created_at="2026-04-17T09:00:00+00:00",
+                updated_at="2026-04-17T10:00:00+00:00",
+            ),
+            state=StoredEntityState(
+                id="state-old-copy",
+                entity_id="entity-old-copy",
+                current_state="open",
+                due_at=None,
+                updated_at="2026-04-17T10:00:00+00:00",
+            ),
+            ai_suggestion=StoredEntityAiSuggestion(
+                id="ai-old-copy",
+                entity_id="entity-old-copy",
+                title="Short scraped title",
+                explanation="Old brief.",
+                action="open",
+                suggested_timing="today",
+                suggested_priority=50,
+                suggested_visibility=True,
+                model="ai-judgment",
+                generated_at="2026-04-17T10:00:00+00:00",
+                generated_from_updated_at="2026-04-17T10:00:00+00:00",
+            ),
+            members=[
+                make_record(
+                    record_id="record-old-copy",
+                    source="gmail",
+                    subject="Please review this",
+                    body="Can you review this before launch?",
+                    timestamp="2026-04-17T10:00:00+00:00",
+                )
+            ],
+        )
+
+        self.assertIsNone(get_usable_suggestion(loaded_entity))
 
 
 if __name__ == "__main__":
