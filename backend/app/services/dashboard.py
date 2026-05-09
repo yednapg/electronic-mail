@@ -27,7 +27,7 @@ from app.schemas.domain import (
     DashboardResponse,
     FeedResponse,
 )
-from app.services.ai.decision import generate_dashboard_briefing
+from app.services.ai.decision import generate_dashboard_briefing, sanitize_dashboard_briefing
 from app.services.feed.memory_pipeline import (
     build_feed_from_projection_cache,
     build_feed_from_entities,
@@ -65,6 +65,7 @@ def build_dashboard_response(settings: Settings) -> DashboardResponse:
     )
     profile = load_google_account_profile()
     briefing = load_dashboard_briefing_cache(settings) or generate_dashboard_briefing(feed, profile)
+    briefing = sanitize_dashboard_briefing(briefing, feed, profile)
 
     resolved_profile = _merge_profile(profile, briefing)
     return DashboardResponse(auth=auth, profile=resolved_profile, briefing=briefing, feed=feed)

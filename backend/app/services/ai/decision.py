@@ -185,6 +185,8 @@ Rules:
 - brief must be one compact natural-language summary, ideally one sentence and never more than two short sentences.
 - brief must summarize meetings, tasks, replies, payments, and how free the rest of the day looks.
 - Use a count-first structure: meetings, tasks, replies, payments, then free time.
+- If meeting_count is 0, describe the calendar as open, clear, or fairly open; never say booked, busy, packed, tight, or full because of tasks alone.
+- Do not let task count make calendar availability sound booked.
 - Do not summarize individual inbox items, name specific threads, or mention examples such as visa documents or bank reminders.
 - Use relevant emojis inline before the category counts and the free-time phrase, chosen by you from the mailbox context.
 - Emojis must be generated as part of the brief text, not represented as placeholders or labels.
@@ -497,6 +499,15 @@ def generate_dashboard_briefing(
         return _generate_dashboard_briefing_with_llm(briefing_input)
 
     return _generate_dashboard_briefing_heuristically(briefing_input)
+
+
+def sanitize_dashboard_briefing(
+    briefing: DashboardBriefing,
+    feed: FeedResponse,
+    profile: DashboardProfile | None,
+) -> DashboardBriefing:
+    """Apply deterministic quality guardrails to cached or generated briefing copy."""
+    return _sanitize_dashboard_briefing_output(briefing, _build_dashboard_briefing_input(feed, profile))
 
 
 def _decide_with_heuristics(entities: list[EntityInput]) -> list[DecisionOutput]:
@@ -994,7 +1005,7 @@ def _generate_dashboard_briefing_with_llm(
 
     headline = generated.headline.strip() or _build_dashboard_briefing_fallback_output(briefing_input).headline
     brief = generated.brief.strip() or _build_dashboard_briefing_fallback_output(briefing_input).brief
-    return DashboardBriefing(headline=headline, brief=brief)
+    return _sanitize_dashboard_briefing_output(DashboardBriefing(headline=headline, brief=brief), briefing_input)
 
 
 def _generate_dashboard_briefing_heuristically(
@@ -1002,7 +1013,10 @@ def _generate_dashboard_briefing_heuristically(
 ) -> DashboardBriefing:
     """Fallback dashboard briefing when no LLM is configured."""
     output = _build_dashboard_briefing_fallback_output(briefing_input)
-    return DashboardBriefing(headline=output.headline, brief=output.brief)
+    return _sanitize_dashboard_briefing_output(
+        DashboardBriefing(headline=output.headline, brief=output.brief),
+        briefing_input,
+    )
 
 
 def _resolve_entity_group_with_llm(request: EntityGroupingRequest) -> EntityGroupingResponse:
@@ -1401,11 +1415,16 @@ def _build_dashboard_briefing_fallback_output(
     )
     headline = f"{greeting}, {display_name}." if display_name else f"{greeting}."
 
+    free_time_sentence = (
+        "Your calendar is open for the rest of the day."
+        if briefing_input.meeting_count == 0
+        else f"You're mostly free after {briefing_input.free_after_label}."
+    )
     brief = (
         f"You have {briefing_input.meeting_count} meetings, {briefing_input.task_count} tasks, "
         f"{briefing_input.reply_count} emails to reply to, and "
         f"{briefing_input.payment_count} card payments due today. "
-        f"You're mostly free after {briefing_input.free_after_label}."
+        f"{free_time_sentence}"
     )
 
     return DashboardBriefingOutput(
@@ -1413,6 +1432,48 @@ def _build_dashboard_briefing_fallback_output(
         headline=headline,
         brief=brief,
     )
+
+
+def _sanitize_dashboard_briefing_output(
+    briefing: DashboardBriefing,
+    briefing_input: DashboardBriefingInput,
+) -> DashboardBriefing:
+    """Remove contradictory availability language from the top briefing."""
+    brief = _ensure_dashboard_brief_has_subject(briefing.brief)
+
+    if briefing_input.meeting_count != 0:
+        return DashboardBriefing(headline=briefing.headline, brief=brief)
+
+    brief = re.sub(
+        r"\b(?:mostly\s+)?(?:booked|busy|packed|tight|full)\b",
+        "fairly open",
+        brief,
+        flags=re.IGNORECASE,
+    )
+    brief = re.sub(r"\bno free time\b", "an open calendar", brief, flags=re.IGNORECASE)
+    brief = re.sub(r"\bnot free\b", "fairly open", brief, flags=re.IGNORECASE)
+
+    return DashboardBriefing(headline=briefing.headline, brief=brief)
+
+
+def _ensure_dashboard_brief_has_subject(brief: str) -> str:
+    """Keep count-first model output readable as a sentence."""
+    stripped = brief.strip()
+    if not stripped:
+        return brief
+
+    lowered = stripped.lower()
+    if lowered.startswith(("you have", "you've", "there are", "there is")):
+        return stripped
+
+    if re.search(r"\b\d+\s+meetings?\b", stripped, flags=re.IGNORECASE) and re.search(
+        r"\b\d+\s+tasks?\b",
+        stripped,
+        flags=re.IGNORECASE,
+    ):
+        return f"You have {stripped}"
+
+    return stripped
 
 
 def _first_name(display_name: str | None) -> str | None:

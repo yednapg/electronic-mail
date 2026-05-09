@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from app.schemas.domain import DashboardProfile, FeedResponse
+from app.schemas.domain import DashboardBriefing, DashboardProfile, FeedResponse
 from app.services.ai.decision import (
     DASHBOARD_BRIEFING_PROMPT,
     FEED_JUDGMENT_PROMPT,
@@ -14,6 +14,7 @@ from app.services.ai.decision import (
     _build_dashboard_briefing_input,
     _infer_name_candidates_from_items,
     generate_dashboard_briefing,
+    sanitize_dashboard_briefing,
 )
 
 
@@ -22,6 +23,7 @@ class DashboardBriefingTests(unittest.TestCase):
         self.assertIn("Use relevant emojis inline", DASHBOARD_BRIEFING_PROMPT)
         self.assertIn("Do not summarize individual inbox items", DASHBOARD_BRIEFING_PROMPT)
         self.assertIn("profile_display_name", DASHBOARD_BRIEFING_PROMPT)
+        self.assertIn("If meeting_count is 0", DASHBOARD_BRIEFING_PROMPT)
 
     def test_feed_prompt_requires_natural_task_copy_without_internal_ids(self) -> None:
         self.assertIn("natural descriptive sentence", FEED_JUDGMENT_PROMPT)
@@ -62,6 +64,39 @@ class DashboardBriefingTests(unittest.TestCase):
 
         self.assertIn("Gaurav", output.headline)
         self.assertNotIn("Ramesh", output.headline)
+        self.assertIn("Your calendar is open for the rest of the day.", output.brief)
+
+    def test_cached_briefing_cannot_call_zero_meeting_day_booked(self) -> None:
+        briefing = sanitize_dashboard_briefing(
+            DashboardBriefing(
+                headline="Good morning.",
+                brief=(
+                    "You have 🗓️ 0 meetings, ✅ 8 tasks, 💬 0 replies, and 💳 0 payments, "
+                    "so 🔓 the rest of the day looks mostly booked."
+                ),
+            ),
+            FeedResponse(),
+            DashboardProfile(email="user@example.com", display_name=None),
+        )
+
+        self.assertIn("fairly open", briefing.brief)
+        self.assertNotIn("mostly booked", briefing.brief)
+        self.assertTrue(briefing.brief.startswith("You have 🗓️ 0 meetings"))
+
+    def test_cached_briefing_adds_subject_to_count_first_model_copy(self) -> None:
+        briefing = sanitize_dashboard_briefing(
+            DashboardBriefing(
+                headline="Good morning.",
+                brief="🗓️ 0 meetings, ✅ 8 tasks, 💬 0 replies, and 💳 0 payments.",
+            ),
+            FeedResponse(),
+            DashboardProfile(email="user@example.com", display_name=None),
+        )
+
+        self.assertEqual(
+            briefing.brief,
+            "You have 🗓️ 0 meetings, ✅ 8 tasks, 💬 0 replies, and 💳 0 payments.",
+        )
 
     def test_openai_required_without_key_fails_instead_of_using_briefing_fallback(self) -> None:
         with patch.dict(os.environ, {"OPENAI_API_KEY": "", "OPENAI_REQUIRED": "true"}, clear=False):
