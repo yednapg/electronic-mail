@@ -38,6 +38,7 @@ def make_record(
     sender: str | None = None,
     snippet: str | None = None,
     body: str | None = None,
+    labels: list[str] | None = None,
 ) -> StoredSourceRecord:
     raw_payload: dict[str, object] = {"user_id": DEFAULT_USER_ID}
     if subject is not None:
@@ -48,6 +49,8 @@ def make_record(
         raw_payload["snippet"] = snippet
     if body is not None:
         raw_payload["body"] = body
+    if labels is not None:
+        raw_payload["label_ids"] = labels
 
     return StoredSourceRecord(
         id=record_id,
@@ -163,6 +166,98 @@ class HistoryRouteTests(unittest.TestCase):
         self.assertEqual(row["title"], "Apple shipped your iPhone order.")
         self.assertEqual(row["summary"], "Apple shipped your iPhone order.")
         mock_summarize.assert_called_once()
+
+    @patch("app.services.source_record_summaries.summarize_source_records")
+    def test_source_record_summaries_are_humanized_before_persisting(self, mock_summarize: Mock) -> None:
+        record = make_record(
+            record_id="message-1",
+            thread_id="thread-1",
+            received_at="2026-05-08T09:00:00+00:00",
+            subject="Forwarded HSBC document",
+            sender="TestUser <demo@example.test>",
+            labels=["SENT"],
+        )
+        upsert_source_records(str(self.database_path), [record])
+        mock_summarize.return_value = SourceRecordSummaryBatch(
+            model="test-summary-model",
+            summaries={"message-1": "TestUser forwarded an HSBC email about sharing documents."},
+        )
+
+        refreshed = refresh_source_record_summaries(str(self.database_path), ["message-1"])
+        response = self.client.get("/v1/history")
+
+        self.assertEqual(refreshed, 1)
+        row = flatten_history_rows(response.json())[0]
+        self.assertEqual(row["title"], "You forwarded an HSBC email about sharing documents.")
+        self.assertEqual(row["summary"], "You forwarded an HSBC email about sharing documents.")
+
+    def test_history_humanizes_legacy_user_narrator_summaries(self) -> None:
+        record = make_record(
+            record_id="message-1",
+            thread_id="thread-1",
+            received_at="2026-05-08T09:00:00+00:00",
+            subject="Promo complaint",
+            snippet="Please stop sending promotional emails.",
+        )
+        upsert_source_records(str(self.database_path), [record])
+        upsert_source_record_summary(
+            str(self.database_path),
+            source_record_id=record.id,
+            user_id=DEFAULT_USER_ID,
+            summary="User says they keep getting promo emails after unsubscribing.",
+            model="legacy-summary-model",
+            generated_from_hash="legacy-hash",
+        )
+
+        response = self.client.get("/v1/history")
+
+        row = flatten_history_rows(response.json())[0]
+        self.assertEqual(row["title"], "You said you keep getting promo emails after unsubscribing.")
+        self.assertEqual(row["summary"], "You said you keep getting promo emails after unsubscribing.")
+
+    def test_history_cleans_legacy_account_owner_name_and_followup_verbs(self) -> None:
+        first = make_record(
+            record_id="message-1",
+            thread_id="thread-1",
+            received_at="2026-05-08T09:00:00+00:00",
+            subject="Forwarded HSBC document",
+            sender="TestUser <demo@example.test>",
+            snippet="Please find the attachment.",
+            labels=["SENT"],
+        )
+        second = make_record(
+            record_id="message-2",
+            thread_id="thread-2",
+            received_at="2026-05-07T09:00:00+00:00",
+            subject="Card request",
+            snippet="Please consider this request.",
+        )
+        upsert_source_records(str(self.database_path), [first, second])
+        upsert_source_record_summary(
+            str(self.database_path),
+            source_record_id=first.id,
+            user_id=DEFAULT_USER_ID,
+            summary="TestUser forwarded an HSBC email about sharing documents.",
+            model="legacy-summary-model",
+            generated_from_hash="legacy-hash-1",
+        )
+        upsert_source_record_summary(
+            str(self.database_path),
+            source_record_id=second.id,
+            user_id=DEFAULT_USER_ID,
+            summary="User says they only have last year’s ITR available and asks Northstar to consider a card upgrade.",
+            model="legacy-summary-model",
+            generated_from_hash="legacy-hash-2",
+        )
+
+        response = self.client.get("/v1/history")
+
+        rows = flatten_history_rows(response.json())
+        self.assertEqual(rows[0]["title"], "You forwarded an HSBC email about sharing documents.")
+        self.assertEqual(
+            rows[1]["title"],
+            "You said you only have last year’s ITR available and asked Northstar to consider a card upgrade.",
+        )
 
     def test_source_record_summary_hash_includes_copy_prompt_version(self) -> None:
         record = make_record(

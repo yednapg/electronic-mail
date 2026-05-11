@@ -196,34 +196,6 @@ def resolve_entity_for_record(
     existing_by_thread = (
         find_entity_by_thread_id(database_path, record.source, record.thread_id) if record.thread_id else None
     )
-    candidates = find_entity_candidates(database_path, record)
-
-    if existing_by_thread is not None and candidates:
-        ai_resolution = resolve_entity_with_ai(record, candidates)
-
-        if ai_resolution.entity_id is not None and ai_resolution.confidence > 0.8:
-            matched_candidate = next(
-                (candidate for candidate in candidates if candidate["entity"].id == ai_resolution.entity_id),
-                None,
-            )
-
-            if matched_candidate is not None and matched_candidate["entity"].id != existing_by_thread.id:
-                attach_record_with_thread_membership(database_path, matched_candidate["entity"].id, record)
-                append_trace_record(
-                    database_path,
-                    stage="grouping",
-                    user_id=record.user_id,
-                    entity_id=matched_candidate["entity"].id,
-                    source_record_id=record.id,
-                    trace_id=matched_candidate["entity"].id,
-                    input=trace_input,
-                    output={
-                        "entity_id": matched_candidate["entity"].id,
-                        "confidence": float(ai_resolution.confidence),
-                        "method": "ai_override",
-                    },
-                )
-                return matched_candidate["entity"], float(ai_resolution.confidence)
 
     if existing_by_thread is not None:
         attach_record_with_thread_membership(database_path, existing_by_thread.id, record)
@@ -238,6 +210,8 @@ def resolve_entity_for_record(
             output={"entity_id": existing_by_thread.id, "confidence": 1.0, "method": "thread_match"},
         )
         return existing_by_thread, 1.0
+
+    candidates = find_entity_candidates(database_path, record)
 
     if candidates:
         if is_reference_only_subject(normalized_subject):

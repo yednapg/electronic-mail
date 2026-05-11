@@ -13,6 +13,8 @@ import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
+import google_auth_httplib2
+import httplib2
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -47,14 +49,29 @@ TOKEN_FILE_PATH = BACKEND_DIR / ".google-oauth.json"
 OAUTH_SESSION_FILE_PATH = BACKEND_DIR / ".google-oauth-session.json"
 ACCOUNT_PROFILE_FILE_PATH = BACKEND_DIR / ".google-account.json"
 DEV_USER_ID = "google-dev-user"
-GMAIL_PAGE_SIZE = 100
+GMAIL_PAGE_SIZE = 500
 GMAIL_LOOKBACK_DAYS = 90
+GOOGLE_API_TIMEOUT_SECONDS = 20
 CALENDAR_MAX_RESULTS = 20
 CALENDAR_WINDOW_DAYS = 7
+GMAIL_BODY_CHAR_LIMIT = 4000
+GMAIL_MODEL_BODY_CHAR_LIMIT = 1800
 GMAIL_SYNC_SCOPES = {"full", "recent"}
 GMAIL_INBOX_LABEL = "INBOX"
 GMAIL_UNREAD_LABEL = "UNREAD"
 HTML_TAG_PATTERN = re.compile(r"(?is)<[^>]+>")
+BASE64_LIKE_PATTERN = re.compile(r"^[A-Za-z0-9+/_=-]{80,}$")
+QUOTE_BOUNDARY_PATTERNS = [
+    re.compile(r"(?i)^on .+ wrote:$"),
+    re.compile(r"(?i)^wrote:$"),
+    re.compile(r"(?i)^-+\s*original message\s*-+$"),
+    re.compile(r"(?i)^from:\s"),
+    re.compile(r"(?i)^sent:\s"),
+    re.compile(r"(?i)^to:\s"),
+    re.compile(r"(?i)^cc:\s"),
+    re.compile(r"(?i)^subject:\s"),
+]
+READABLE_GMAIL_MIME_TYPES = {"text/plain", "text/html"}
 GmailSyncProgressCallback = Callable[[str, int, int | None], None]
 
 
@@ -82,12 +99,23 @@ def _gmail_debug_enabled() -> bool:
     return os.getenv("GMAIL_DEBUG_LOGS", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _safe_print(*args: object, **kwargs: object) -> None:
+    """Keep terminal diagnostics from failing long-running sync work."""
+    try:
+        print(*args, **kwargs)
+    except BrokenPipeError:
+        return
+    except OSError as exc:
+        if exc.errno != 32:
+            raise
+
+
 def _log_gmail_debug(label: str, payload: dict[str, object]) -> None:
     """Print Gmail API inputs and raw outputs to the backend terminal."""
     if not _gmail_debug_enabled():
         return
 
-    print(
+    _safe_print(
         json.dumps(
             {
                 "gmail_debug": True,
@@ -102,7 +130,7 @@ def _log_gmail_debug(label: str, payload: dict[str, object]) -> None:
 
 def _log_gmail_error(label: str, payload: dict[str, object]) -> None:
     """Print sync errors even when verbose Gmail debugging is disabled."""
-    print(
+    _safe_print(
         json.dumps(
             {
                 "gmail_error": True,
@@ -113,6 +141,13 @@ def _log_gmail_error(label: str, payload: dict[str, object]) -> None:
             indent=2,
         )
     )
+
+
+def build_google_service(api: str, version: str, credentials: Credentials):
+    """Build a Google API service with a bounded request timeout."""
+    http = httplib2.Http(timeout=GOOGLE_API_TIMEOUT_SECONDS)
+    authorized_http = google_auth_httplib2.AuthorizedHttp(credentials, http=http)
+    return build(api, version, http=authorized_http, cache_discovery=False)
 
 
 def get_google_auth_url(settings: Settings, redirect_to: str | None = None) -> str:
@@ -180,6 +215,8 @@ def fetch_google_source_records(
     *,
     progress_callback: GmailSyncProgressCallback | None = None,
     collect_records: bool = True,
+    sync_scope: str | None = None,
+    force_full_sync: bool = False,
 ) -> list[SourceRecord]:
     """Sync Gmail incrementally, fetch calendar updates, and return changed records."""
     credentials = create_authorized_credentials(settings)
@@ -188,13 +225,15 @@ def fetch_google_source_records(
         return []
 
     initialize_database(str(settings.database_path))
-    gmail_service = build("gmail", "v1", credentials=credentials)
-    calendar_service = build("calendar", "v3", credentials=credentials)
+    gmail_service = build_google_service("gmail", "v1", credentials)
+    calendar_service = build_google_service("calendar", "v3", credentials)
     gmail_records = sync_gmail_source_records(
         settings,
         gmail_service,
         progress_callback=progress_callback,
         collect_records=collect_records,
+        sync_scope=sync_scope,
+        force_full_sync=force_full_sync,
     )
     calendar_records = fetch_upcoming_calendar_records(calendar_service)
 
@@ -204,6 +243,38 @@ def fetch_google_source_records(
     return sorted(gmail_records + calendar_records, key=lambda record: record.received_at, reverse=True)
 
 
+def should_run_gmail_full_history_backfill(settings: Settings) -> bool:
+    """Return whether a recent-first account still needs one non-blocking full Gmail pass."""
+    if resolve_gmail_sync_scope(getattr(settings, "gmail_sync_scope", "full")) != "recent":
+        return False
+
+    sync_state = get_gmail_sync_state(str(settings.database_path), DEV_USER_ID)
+    return sync_state is not None and bool(sync_state.last_history_id) and not sync_state.last_full_sync_at
+
+
+def backfill_full_gmail_source_records(
+    settings: Settings,
+    *,
+    progress_callback: GmailSyncProgressCallback | None = None,
+) -> list[SourceRecord]:
+    """Run the Gmail-only full-history pass after the first dashboard is already usable."""
+    credentials = create_authorized_credentials(settings)
+
+    if credentials is None:
+        return []
+
+    initialize_database(str(settings.database_path))
+    gmail_service = build_google_service("gmail", "v1", credentials)
+    return sync_gmail_source_records(
+        settings,
+        gmail_service,
+        progress_callback=progress_callback,
+        collect_records=False,
+        sync_scope="full",
+        force_full_sync=True,
+    )
+
+
 def fetch_raw_gmail_source_records(settings: Settings) -> list[SourceRecord]:
     """Fetch a full live Gmail snapshot for debugging, without persisting sync state."""
     credentials = create_authorized_credentials(settings)
@@ -211,7 +282,7 @@ def fetch_raw_gmail_source_records(settings: Settings) -> list[SourceRecord]:
     if credentials is None:
         return []
 
-    gmail_service = build("gmail", "v1", credentials=credentials)
+    gmail_service = build_google_service("gmail", "v1", credentials)
     message_ids = fetch_all_gmail_message_ids(
         gmail_service,
         scope=resolve_gmail_sync_scope(settings.gmail_sync_scope),
@@ -235,7 +306,7 @@ def fetch_raw_gmail_api_messages(settings: Settings) -> list[dict[str, object]]:
     if credentials is None:
         return []
 
-    gmail_service = build("gmail", "v1", credentials=credentials)
+    gmail_service = build_google_service("gmail", "v1", credentials)
     message_ids = fetch_all_gmail_message_ids(
         gmail_service,
         scope=resolve_gmail_sync_scope(settings.gmail_sync_scope),
@@ -496,7 +567,7 @@ def fetch_google_account_profile(settings: Settings) -> DashboardProfile | None:
 def fetch_google_account_profile_from_credentials(credentials: Credentials) -> DashboardProfile | None:
     """Fetch the mailbox profile using the current authorized credentials."""
     try:
-        gmail_service = build("gmail", "v1", credentials=credentials)
+        gmail_service = build_google_service("gmail", "v1", credentials)
         payload = gmail_service.users().getProfile(userId="me").execute()
     except HttpError:
         return None
@@ -612,12 +683,14 @@ def sync_gmail_source_records(
     *,
     progress_callback: GmailSyncProgressCallback | None = None,
     collect_records: bool = True,
+    sync_scope: str | None = None,
+    force_full_sync: bool = False,
 ) -> list[SourceRecord]:
     """Run resumable Gmail sync with full initial load and history-based incremental updates."""
     database_path = str(settings.database_path)
     sync_state = get_gmail_sync_state(database_path, DEV_USER_ID)
-    used_full_sync = sync_state is None or not sync_state.last_history_id
-    sync_scope = resolve_gmail_sync_scope(settings.gmail_sync_scope)
+    used_full_sync = force_full_sync or sync_state is None or not sync_state.last_history_id
+    sync_scope = resolve_gmail_sync_scope(sync_scope or settings.gmail_sync_scope)
     history_events: list[StoredGmailHistoryEvent] = []
     records_by_id: dict[str, SourceRecord] = {}
     changed_record_ids: set[str] = set()
@@ -741,7 +814,11 @@ def sync_gmail_source_records(
             database_path,
             user_id=DEV_USER_ID,
             last_history_id=resolved_history_id,
-            last_full_sync_at=utc_now_iso() if used_full_sync else (sync_state.last_full_sync_at if sync_state else None),
+            last_full_sync_at=(
+                utc_now_iso()
+                if used_full_sync and sync_scope == "full"
+                else (sync_state.last_full_sync_at if sync_state else None)
+            ),
         )
 
     total_source_records = get_source_record_count(database_path)
@@ -754,7 +831,7 @@ def sync_gmail_source_records(
         ]
     fetched_count = imported_count if not collect_records else len(records_by_id)
     if total_source_records < fetched_count:
-        print(
+        _safe_print(
             "GMAIL SYNC INVARIANT VIOLATION",
             {
                 "total_source_records": total_source_records,
@@ -762,7 +839,7 @@ def sync_gmail_source_records(
             },
         )
 
-    print(
+    _safe_print(
         {
             "messages_fetched": fetched_count,
             "new_messages": new_count,
@@ -1072,7 +1149,12 @@ def fetch_thread_messages_for_message_ids(
             full_message = (
                 gmail_service.users()
                 .messages()
-                .get(userId="me", id=message_id, format="full")
+                .get(
+                    userId="me",
+                    id=message_id,
+                    format="metadata",
+                    metadataHeaders=["Subject", "From", "To", "Cc", "Bcc", "Date"],
+                )
                 .execute()
             )
             _log_gmail_debug(
@@ -1098,11 +1180,6 @@ def fetch_thread_messages_for_message_ids(
             latest_history_id,
             str(full_message.get("historyId")) if full_message.get("historyId") is not None else None,
         )
-        full_message_id = full_message.get("id")
-        if full_message_id:
-            thread_messages[str(full_message_id)] = full_message
-            failed_message_ids.discard(str(full_message_id))
-
         thread_id = full_message.get("threadId")
         if not thread_id or str(thread_id) in fetched_threads:
             continue
@@ -1192,6 +1269,34 @@ def max_history_id(left: str | None, right: str | None) -> str | None:
     return left if int(left) >= int(right) else right
 
 
+def compact_gmail_message_payload(message: dict[str, object]) -> dict[str, object]:
+    """Persist a compact Gmail ledger payload without MIME bodies or raw blobs."""
+    payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+    headers = payload.get("headers") if isinstance(payload.get("headers"), list) else []
+    body = clean_gmail_body_text(
+        extract_gmail_body(payload).strip() or str(message.get("snippet") or "").strip(),
+        limit=GMAIL_BODY_CHAR_LIMIT,
+    )
+    label_ids = message.get("labelIds") if isinstance(message.get("labelIds"), list) else []
+    return {
+        "id": str(message.get("id") or ""),
+        "threadId": str(message.get("threadId") or ""),
+        "historyId": str(message.get("historyId") or ""),
+        "internalDate": str(message.get("internalDate") or ""),
+        "labelIds": [str(label_id) for label_id in label_ids],
+        "snippet": str(message.get("snippet") or ""),
+        "subject": get_header(headers, "subject") or "",
+        "from": get_header(headers, "from") or "",
+        "to": get_header(headers, "to") or "",
+        "cc": get_header(headers, "cc") or "",
+        "bcc": get_header(headers, "bcc") or "",
+        "date": get_header(headers, "date") or "",
+        "body": body,
+        "body_preview": clean_gmail_body_text(body, limit=GMAIL_MODEL_BODY_CHAR_LIMIT),
+        "attachments": extract_gmail_attachment_metadata(payload),
+    }
+
+
 def gmail_message_snapshot_from_payload(message: dict[str, object]) -> StoredGmailMessageSnapshot:
     """Build a local Gmail ledger snapshot from a full Gmail API message payload."""
     now = utc_now_iso()
@@ -1203,7 +1308,7 @@ def gmail_message_snapshot_from_payload(message: dict[str, object]) -> StoredGma
         history_id=str(message.get("historyId")) if message.get("historyId") is not None else None,
         internal_date=to_gmail_internal_date_iso(message.get("internalDate")),
         label_ids=[str(label_id) for label_id in label_ids],
-        raw_payload=message,
+        raw_payload=compact_gmail_message_payload(message),
         fetch_status="fetched",
         tombstoned=False,
         tombstoned_at=None,
@@ -1257,9 +1362,11 @@ def to_gmail_source_record(message: dict[str, object]) -> SourceRecord | None:
     received_at = to_valid_iso(date_header) or to_gmail_internal_date_iso(internal_date)
     received_at = received_at or utc_now_iso()
     body = extract_gmail_body(payload).strip() or str(message.get("snippet") or "").strip()
+    body = clean_gmail_body_text(body, limit=GMAIL_BODY_CHAR_LIMIT)
     message_id = message.get("id")
     thread_id = message.get("threadId")
     participants = extract_participants(sender, recipients, cc_recipients, bcc_recipients)
+    attachments = extract_gmail_attachment_metadata(payload)
 
     if not message_id or not thread_id:
         _log_gmail_debug(
@@ -1296,6 +1403,7 @@ def to_gmail_source_record(message: dict[str, object]) -> SourceRecord | None:
             "received_at": received_at,
             "snippet": str(message.get("snippet") or ""),
             "label_ids": message.get("labelIds") if isinstance(message.get("labelIds"), list) else [],
+            "attachments": attachments,
             "history_id": str(message.get("historyId") or ""),
         },
         received_at=received_at,
@@ -1382,7 +1490,7 @@ def modify_gmail_thread_labels(
     if credentials is None:
         raise RuntimeError("Google account is not connected")
 
-    gmail_service = build("gmail", "v1", credentials=credentials)
+    gmail_service = build_google_service("gmail", "v1", credentials)
     request_body: dict[str, list[str]] = {}
     if add_label_ids:
         request_body["addLabelIds"] = add_label_ids
@@ -1432,7 +1540,7 @@ def create_gmail_service(settings: Settings):
     credentials = create_authorized_credentials(settings)
     if credentials is None:
         raise RuntimeError("Google account is not connected")
-    return build("gmail", "v1", credentials=credentials)
+    return build_google_service("gmail", "v1", credentials)
 
 
 def build_raw_email(
@@ -1456,33 +1564,57 @@ def build_raw_email(
 
 
 def extract_gmail_body(payload: dict[str, object]) -> str:
-    """Walk the Gmail MIME payload tree until a readable text body is found."""
-    if payload.get("mimeType") == "text/plain":
-        body = payload.get("body") or {}
-
-        if isinstance(body, dict) and body.get("data"):
-            return decode_base64_url(str(body["data"]))
-
-    for part in payload.get("parts") or []:
-        if not isinstance(part, dict):
-            continue
-        extracted = extract_gmail_body(part)
-
-        if extracted:
-            return extracted
-
-    body = payload.get("body") or {}
-
-    if isinstance(body, dict) and body.get("data"):
-        return decode_base64_url(str(body["data"]))
-
-    return ""
+    """Extract only readable text bodies, never attachment or inline binary data."""
+    plain_body, html_body = extract_gmail_body_variants(payload)
+    return plain_body or html_to_text(html_body)
 
 
 def decode_base64_url(value: str) -> str:
     """Decode Gmail's URL-safe base64 body encoding."""
     padded = value + "=" * (-len(value) % 4)
     return urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8", errors="ignore")
+
+
+def clean_gmail_body_text(value: str, *, limit: int) -> str:
+    """Remove quote history and opaque blobs before storing or prompting on Gmail text."""
+    if not value:
+        return ""
+
+    text = html.unescape(value).replace("\r", "\n")
+    lines: list[str] = []
+    total_chars = 0
+
+    for raw_line in text.split("\n"):
+        line = " ".join(raw_line.split()).strip()
+
+        if not line:
+            continue
+        if line.startswith(">") or any(pattern.search(line) for pattern in QUOTE_BOUNDARY_PATTERNS):
+            break
+        if is_opaque_gmail_blob(line):
+            continue
+
+        lines.append(line)
+        total_chars += len(line)
+
+        if total_chars >= limit:
+            break
+
+    cleaned = "\n".join(lines).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rstrip()
+
+
+def is_opaque_gmail_blob(value: str) -> bool:
+    """Detect base64/hash-like runs that are not useful email text."""
+    compact = "".join(value.split())
+    if len(compact) < 80:
+        return False
+    if BASE64_LIKE_PATTERN.match(compact) is None:
+        return False
+    alpha_numeric_ratio = sum(character.isalnum() for character in compact) / max(len(compact), 1)
+    return alpha_numeric_ratio > 0.85
 
 
 def clean_gmail_api_message(message: dict[str, object]) -> dict[str, object]:
@@ -1522,6 +1654,8 @@ def extract_gmail_body_variants(payload: dict[str, object]) -> tuple[str, str]:
 
     def walk(part: dict[str, object]) -> None:
         mime_type = str(part.get("mimeType") or "")
+        if is_non_readable_gmail_part(part):
+            return
         body = part.get("body") or {}
         data = ""
 
@@ -1529,9 +1663,13 @@ def extract_gmail_body_variants(payload: dict[str, object]) -> tuple[str, str]:
             data = decode_base64_url(str(body["data"]))
 
         if mime_type == "text/plain" and data.strip():
-            plain_parts.append(data.strip())
+            cleaned = clean_gmail_body_text(data, limit=GMAIL_BODY_CHAR_LIMIT)
+            if cleaned:
+                plain_parts.append(cleaned)
         elif mime_type == "text/html" and data.strip():
-            html_parts.append(data.strip())
+            cleaned = clean_gmail_body_text(html_to_text(data), limit=GMAIL_BODY_CHAR_LIMIT)
+            if cleaned:
+                html_parts.append(cleaned)
 
         for child in part.get("parts") or []:
             if isinstance(child, dict):
@@ -1540,6 +1678,65 @@ def extract_gmail_body_variants(payload: dict[str, object]) -> tuple[str, str]:
     walk(payload)
 
     return ("\n\n".join(plain_parts).strip(), "\n\n".join(html_parts).strip())
+
+
+def is_non_readable_gmail_part(part: dict[str, object]) -> bool:
+    """Return whether a MIME part should be excluded from normal sync text."""
+    mime_type = str(part.get("mimeType") or "").lower()
+    filename = str(part.get("filename") or "").strip()
+    headers = part.get("headers") if isinstance(part.get("headers"), list) else []
+    header_values = {
+        str(header.get("name", "")).lower(): str(header.get("value", "")).lower()
+        for header in headers
+        if isinstance(header, dict)
+    }
+    disposition = header_values.get("content-disposition", "")
+
+    if mime_type in READABLE_GMAIL_MIME_TYPES:
+        return False
+    if mime_type.startswith("multipart/"):
+        return False
+    if filename:
+        return True
+    if "attachment" in disposition:
+        return True
+    if mime_type.startswith(("image/", "audio/", "video/", "application/")):
+        return True
+    return bool(mime_type and mime_type not in READABLE_GMAIL_MIME_TYPES)
+
+
+def extract_gmail_attachment_metadata(payload: dict[str, object]) -> list[dict[str, object]]:
+    """Return attachment metadata while excluding attachment bodies."""
+    attachments: list[dict[str, object]] = []
+
+    def walk(part: dict[str, object]) -> None:
+        body = part.get("body") or {}
+        filename = str(part.get("filename") or "").strip()
+        mime_type = str(part.get("mimeType") or "")
+        headers = part.get("headers") if isinstance(part.get("headers"), list) else []
+        disposition = ""
+        for header in headers:
+            if isinstance(header, dict) and str(header.get("name", "")).lower() == "content-disposition":
+                disposition = str(header.get("value") or "")
+                break
+
+        if filename or "attachment" in disposition.lower():
+            attachments.append(
+                {
+                    "part_id": str(part.get("partId") or ""),
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "size": body.get("size") if isinstance(body, dict) else None,
+                    "attachment_id": str(body.get("attachmentId") or "") if isinstance(body, dict) else "",
+                }
+            )
+
+        for child in part.get("parts") or []:
+            if isinstance(child, dict):
+                walk(child)
+
+    walk(payload)
+    return attachments
 
 
 def summarize_gmail_parts(payload: dict[str, object]) -> list[dict[str, object]]:

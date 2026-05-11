@@ -7,6 +7,7 @@ from datetime import datetime
 from app.db.models import StoredHistorySourceRecord
 from app.db.repository import DEFAULT_USER_ID, get_history_source_record_count, list_history_source_records
 from app.schemas.domain import HistoryDayGroup, HistoryMonthGroup, HistoryResponse, HistoryRow, HistoryYearGroup
+from app.services.copy_quality import humanize_account_copy, infer_account_emails_from_records
 
 
 STATE_ALIASES = {
@@ -42,11 +43,12 @@ def build_history_response(
 ) -> HistoryResponse:
     """Build a paginated year/month/day projection from local persisted records."""
     rows = list_history_source_records(database_path, user_id=user_id, limit=limit, offset=offset)
+    account_emails = infer_account_emails_from_records(row.source_record for row in rows)
     return HistoryResponse(
         limit=limit,
         offset=offset,
         total=get_history_source_record_count(database_path, user_id=user_id),
-        years=group_history_rows([to_history_row(row) for row in rows]),
+        years=group_history_rows([to_history_row(row, account_emails=account_emails) for row in rows]),
     )
 
 
@@ -85,11 +87,25 @@ def group_history_rows(rows: list[HistoryRow]) -> list[HistoryYearGroup]:
     return years
 
 
-def to_history_row(row: StoredHistorySourceRecord) -> HistoryRow:
+def to_history_row(row: StoredHistorySourceRecord, *, account_emails: set[str] | None = None) -> HistoryRow:
     """Convert a stored joined row into the API contract."""
     record = row.source_record
     payload = record.raw_payload
     current_state = normalize_current_state(row.current_state)
+    resolved_account_emails = account_emails or set()
+    source_summary = humanize_account_copy(row.source_summary, record=record, account_emails=resolved_account_emails)
+    suggestion_title = humanize_account_copy(row.suggestion_title, record=record, account_emails=resolved_account_emails)
+    suggestion_summary = humanize_account_copy(
+        row.suggestion_summary,
+        record=record,
+        account_emails=resolved_account_emails,
+    )
+    payload_title = humanize_account_copy(string_payload(payload, "title"), record=record, account_emails=resolved_account_emails)
+    payload_summary = humanize_account_copy(
+        string_payload(payload, "summary"),
+        record=record,
+        account_emails=resolved_account_emails,
+    )
     return HistoryRow(
         source_record_id=record.id,
         entity_id=row.entity_id,
@@ -97,15 +113,15 @@ def to_history_row(row: StoredHistorySourceRecord) -> HistoryRow:
         thread_id=record.thread_id,
         received_at=record.timestamp,
         subject=string_payload(payload, "subject") or record.subject,
-        title=row.source_summary or string_payload(payload, "title") or record.subject or row.suggestion_title,
+        title=source_summary or payload_title or record.subject or suggestion_title,
         sender=string_payload(payload, "from") or string_payload(payload, "sender") or record.sender,
         snippet=compact_text(
             string_payload(payload, "snippet")
-            or string_payload(payload, "summary")
+            or payload_summary
             or string_payload(payload, "notes")
             or string_payload(payload, "body")
         ),
-        summary=row.source_summary or row.suggestion_summary or string_payload(payload, "summary"),
+        summary=source_summary or suggestion_summary or payload_summary,
         current_state=current_state,  # type: ignore[arg-type]
         lifecycle_state=to_lifecycle_state(current_state),  # type: ignore[arg-type]
         outcome_type=normalize_outcome_type(row.outcome_type),  # type: ignore[arg-type]

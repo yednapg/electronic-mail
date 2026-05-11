@@ -102,10 +102,10 @@ class EntityResolutionTests(unittest.TestCase):
             ("gmail", "gmail-thread-1"),
         ])
 
-    def test_ai_can_override_a_thread_seed_with_high_confidence(self) -> None:
+    def test_exact_thread_match_skips_ai_override(self) -> None:
         seed_record = build_record(record_id="gmail-1", source="gmail", thread_id="gmail-thread-1")
         upsert_source_records(self.database_path, [stored_record_from_source(seed_record)])
-        resolve_entity_for_record(self.database_path, seed_record)
+        seed_entity, _ = resolve_entity_for_record(self.database_path, seed_record)
 
         candidate_entity = create_entity(self.database_path, "gmail-thread:gmail-thread-2")
 
@@ -118,11 +118,11 @@ class EntityResolutionTests(unittest.TestCase):
         ):
             entity, confidence = resolve_entity_for_record(self.database_path, incoming)
 
-        self.assertEqual(entity.id, candidate_entity.id)
-        self.assertEqual(confidence, 0.95)
-        self.assertEqual(find_entity_by_thread_id(self.database_path, "gmail", "gmail-thread-1").id, candidate_entity.id)
+        self.assertEqual(entity.id, seed_entity.id)
+        self.assertEqual(confidence, 1.0)
+        self.assertEqual(find_entity_by_thread_id(self.database_path, "gmail", "gmail-thread-1").id, seed_entity.id)
 
-        loaded = get_loaded_entity(self.database_path, candidate_entity.id)
+        loaded = get_loaded_entity(self.database_path, seed_entity.id)
         self.assertIsNotNone(loaded)
         assert loaded is not None
         self.assertEqual([(membership.source, membership.thread_id) for membership in loaded.thread_memberships], [

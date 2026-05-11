@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from base64 import urlsafe_b64encode
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -8,10 +9,13 @@ from unittest.mock import Mock, patch
 
 from app.schemas.domain import SourceRecord
 from app.services.integrations.google import (
+    GMAIL_PAGE_SIZE,
     extract_participants,
     fetch_google_source_records,
+    gmail_message_snapshot_from_payload,
     normalize_gmail_messages,
     resolve_gmail_sync_scope,
+    to_gmail_source_record,
 )
 
 
@@ -55,7 +59,14 @@ def build_message(
     }
 
 
+def encode_body(value: str) -> str:
+    return urlsafe_b64encode(value.encode("utf-8")).decode("utf-8").rstrip("=")
+
+
 class GmailSyncNormalizationTests(unittest.TestCase):
+    def test_page_size_uses_gmail_maximum_for_faster_listing(self) -> None:
+        self.assertEqual(GMAIL_PAGE_SIZE, 500)
+
     def test_full_scope_keeps_archived_messages(self) -> None:
         records = normalize_gmail_messages(
             [
@@ -111,6 +122,65 @@ class GmailSyncNormalizationTests(unittest.TestCase):
             record.raw_payload["participants"],
             ["sender@example.com", "alpha@example.com", "beta@example.com", "gamma@example.com"],
         )
+
+    def test_plain_text_body_is_decoded_and_capped_without_blob_lines(self) -> None:
+        blob = "A" * 120
+        message = build_message(message_id="message-plain", thread_id="thread-plain")
+        message["payload"]["body"] = {"data": encode_body(f"Please review this.\n{blob}\nThanks.")}
+
+        record = to_gmail_source_record(message)
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.raw_payload["body"], "Please review this.\nThanks.")
+
+    def test_html_body_is_converted_to_readable_text(self) -> None:
+        message = build_message(message_id="message-html", thread_id="thread-html")
+        message["payload"] = {
+            "headers": message["payload"]["headers"],
+            "mimeType": "text/html",
+            "body": {"data": encode_body("<div>Hello</div><div>Please reply today.</div>")},
+        }
+
+        record = to_gmail_source_record(message)
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertIn("Hello Please reply today.", record.raw_payload["body"])
+
+    def test_attachments_are_metadata_only_and_not_body_text(self) -> None:
+        message = build_message(message_id="message-attachment", thread_id="thread-attachment")
+        message["payload"] = {
+            "headers": message["payload"]["headers"],
+            "mimeType": "multipart/mixed",
+            "body": {},
+            "parts": [
+                {
+                    "partId": "0",
+                    "mimeType": "text/plain",
+                    "filename": "",
+                    "body": {"data": encode_body("Readable mail body.")},
+                },
+                {
+                    "partId": "1",
+                    "mimeType": "application/pdf",
+                    "filename": "statement.pdf",
+                    "body": {"data": encode_body("RAWPDFDATA" * 100), "size": 1200, "attachmentId": "att-1"},
+                    "headers": [{"name": "Content-Disposition", "value": "attachment; filename=statement.pdf"}],
+                },
+            ],
+        }
+
+        record = to_gmail_source_record(message)
+        snapshot = gmail_message_snapshot_from_payload(message)
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.raw_payload["body"], "Readable mail body.")
+        self.assertNotIn("RAWPDFDATA", record.raw_payload["body"])
+        self.assertEqual(record.raw_payload["attachments"][0]["filename"], "statement.pdf")
+        self.assertNotIn("payload", snapshot.raw_payload)
+        self.assertEqual(snapshot.raw_payload["attachments"][0]["attachment_id"], "att-1")
 
     def test_extract_participants_deduplicates_addresses(self) -> None:
         self.assertEqual(

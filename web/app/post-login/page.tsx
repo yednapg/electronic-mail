@@ -1,4 +1,5 @@
 import { AppMark } from '../../components/AppMark';
+import { RedirectToDashboard } from './redirect-to-dashboard';
 import { RotatingStatus } from './rotating-status';
 
 export default function PostLoginPage() {
@@ -12,6 +13,7 @@ export default function PostLoginPage() {
             <span className="post-login-title-line">Preparing your dashboard</span>
           </h1>
           <RotatingStatus />
+          <RedirectToDashboard />
           <a className="post-login-fallback-link" href="/dashboard">
             See dashboard
           </a>
