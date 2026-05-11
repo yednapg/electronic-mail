@@ -12,9 +12,10 @@ from app.db.repository import (
     list_source_records_by_ids,
     upsert_source_record_summary,
 )
+from app.services.copy_quality import humanize_account_copy
 from app.services.ai.decision import summarize_source_records
 
-SOURCE_RECORD_SUMMARY_HASH_VERSION = "source-record-summary-v2"
+SOURCE_RECORD_SUMMARY_HASH_VERSION = "source-record-summary-v3"
 
 
 def refresh_source_record_summaries(database_path: str, source_record_ids: list[str]) -> int:
@@ -42,11 +43,12 @@ def refresh_source_record_summaries(database_path: str, source_record_ids: list[
         summary = generated.summaries.get(record.id)
         if summary is None or not summary.strip():
             continue
+        polished_summary = humanize_account_copy(summary.strip(), record=record) or summary.strip()
         upsert_source_record_summary(
             database_path,
             source_record_id=record.id,
             user_id=DEFAULT_USER_ID,
-            summary=summary.strip(),
+            summary=polished_summary,
             model=generated.model,
             generated_from_hash=record_hashes[record.id],
         )
@@ -67,7 +69,7 @@ def source_record_summary_hash(record: StoredSourceRecord) -> str:
         "timestamp": record.timestamp,
         "summary_fields": {
             key: record.raw_payload.get(key)
-            for key in ("subject", "from", "sender", "snippet", "summary", "body", "start", "end")
+            for key in ("subject", "from", "sender", "label_ids", "labelIds", "snippet", "summary", "body", "start", "end")
         },
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()

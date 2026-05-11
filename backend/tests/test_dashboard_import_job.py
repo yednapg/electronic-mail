@@ -11,18 +11,21 @@ from fastapi.testclient import TestClient
 
 from app.api.routes import dashboard as dashboard_routes
 from app.db.repository import (
+    DEFAULT_USER_ID,
     create_dashboard_import_job,
     get_dashboard_import_job,
     initialize_database,
     mark_dashboard_import_job_running,
     mark_dashboard_import_job_succeeded,
     update_dashboard_import_job_progress,
+    upsert_gmail_sync_state,
 )
 from app.main import app
 from app.schemas.domain import DashboardBriefing, DashboardProfile, FeedResponse, GoogleAuthState, SourceRecord
 from app.services.dashboard import (
     STALE_IMPORT_JOB_MESSAGE,
     create_or_reuse_dashboard_import_job,
+    run_gmail_full_history_backfill,
 )
 
 
@@ -126,6 +129,24 @@ class DashboardImportJobRouteTests(unittest.TestCase):
         self.assertIsNotNone(failed_stale)
         self.assertEqual(failed_stale.status, "failed")
         self.assertEqual(failed_stale.error_message, STALE_IMPORT_JOB_MESSAGE)
+
+    @patch("app.services.dashboard.backfill_full_gmail_source_records")
+    def test_full_history_backfill_runs_only_after_recent_first_sync(self, mock_backfill: Mock) -> None:
+        settings = SimpleNamespace(
+            database_path=self.database_path,
+            google_configured=True,
+            gmail_sync_scope="recent",
+        )
+        upsert_gmail_sync_state(
+            str(self.database_path),
+            user_id=DEFAULT_USER_ID,
+            last_history_id="123",
+            last_full_sync_at=None,
+        )
+
+        run_gmail_full_history_backfill(settings)
+
+        mock_backfill.assert_called_once_with(settings)
 
     @patch("app.services.dashboard.fetch_google_account_profile")
     @patch("app.services.dashboard.fetch_google_source_records")

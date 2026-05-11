@@ -49,12 +49,18 @@ export function DashboardSection({
   const [emailDraft, setEmailDraft] = useState<EmailDraftState>(emptyEmailDraft);
   const [showCc, setShowCc] = useState(false);
   const [showBcc, setShowBcc] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [composeError, setComposeError] = useState<string | null>(null);
   const [hiddenItemIds, setHiddenItemIds] = useState<Set<string>>(new Set());
   const sectionItems = [...localItems, ...items].filter((item) => !hiddenItemIds.has(item.id));
   const hasOverflow = maxVisible !== undefined && sectionItems.length > maxVisible;
   const [expanded, setExpanded] = useState(!hasOverflow || !collapsedByDefault);
   const visibleItems = hasOverflow && !expanded ? sectionItems.slice(0, maxVisible) : sectionItems;
   const overflowCount = hasOverflow ? sectionItems.length - (maxVisible ?? sectionItems.length) : 0;
+  const canSubmit =
+    composeMode === 'email'
+      ? formatEmailDraftTitle(emailDraft).length > 0
+      : todoTitle.trim().length > 0;
 
   function updateEmailDraft(key: keyof EmailDraftState, value: string | boolean) {
     setEmailDraft((draft) => ({ ...draft, [key]: value }));
@@ -71,8 +77,15 @@ export function DashboardSection({
       return;
     }
 
-    if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'true') {
-      try {
+    if (isSubmitting) {
+      return;
+    }
+
+    setIsSubmitting(true);
+    setComposeError(null);
+
+    try {
+      if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'true') {
         if (composeMode === 'email') {
           const draft = await createGmailDraft({
             to: emailDraft.to,
@@ -104,27 +117,29 @@ export function DashboardSection({
             ...currentItems,
           ]);
         }
-      } catch (_error) {
-        return;
+      } else {
+        setLocalItems((currentItems) => [
+          {
+            id: `local-${Date.now()}`,
+            title: titleText,
+          },
+          ...currentItems,
+        ]);
       }
-    } else {
-      setLocalItems((currentItems) => [
-        {
-          id: `local-${Date.now()}`,
-          title: titleText,
-        },
-        ...currentItems,
-      ]);
-    }
 
-    setTodoTitle('');
-    setTodoNotes('');
-    setEmailDraft(emptyEmailDraft);
-    setShowCc(false);
-    setShowBcc(false);
-    setComposeMode('todo');
-    setComposeOpen(false);
-    setExpanded(true);
+      setTodoTitle('');
+      setTodoNotes('');
+      setEmailDraft(emptyEmailDraft);
+      setShowCc(false);
+      setShowBcc(false);
+      setComposeMode('todo');
+      setComposeOpen(false);
+      setExpanded(true);
+    } catch (_error) {
+      setComposeError(composeMode === 'email' ? 'Could not save this draft.' : 'Could not add this item.');
+    } finally {
+      setIsSubmitting(false);
+    }
   }
 
   return (
@@ -150,24 +165,38 @@ export function DashboardSection({
               <button
                 type="button"
                 className={`inline-compose-mode-button ${composeMode === 'todo' ? 'is-selected' : ''}`}
-                onClick={() => setComposeMode('todo')}
+                onClick={() => {
+                  setComposeMode('todo');
+                  setComposeError(null);
+                }}
                 aria-pressed={composeMode === 'todo'}
+                disabled={isSubmitting}
               >
                 To-do
               </button>
               <button
                 type="button"
                 className={`inline-compose-mode-button ${composeMode === 'email' ? 'is-selected' : ''}`}
-                onClick={() => setComposeMode('email')}
+                onClick={() => {
+                  setComposeMode('email');
+                  setComposeError(null);
+                }}
                 aria-pressed={composeMode === 'email'}
+                disabled={isSubmitting}
               >
                 Email
               </button>
             </div>
-            <button type="submit" className="inline-compose-submit">
-              {composeMode === 'email' ? 'Draft' : 'Add'}
+            <button type="submit" className="inline-compose-submit" disabled={!canSubmit || isSubmitting}>
+              {isSubmitting ? 'Saving...' : composeMode === 'email' ? 'Draft' : 'Add'}
             </button>
           </div>
+
+          {composeError ? (
+            <p className="inline-compose-error" role="alert">
+              {composeError}
+            </p>
+          ) : null}
 
           {composeMode === 'todo' ? (
             <div className="inline-compose-todo">
@@ -250,6 +279,7 @@ export function DashboardSection({
                   className={`inline-compose-tool ${emailDraft.hasAttachment ? 'is-selected' : ''}`}
                   aria-pressed={emailDraft.hasAttachment}
                   onClick={() => updateEmailDraft('hasAttachment', !emailDraft.hasAttachment)}
+                  disabled={isSubmitting}
                 >
                   <svg viewBox="0 0 24 24" className="inline-compose-tool-icon" aria-hidden="true">
                     <path d="M8 12.7 15.5 5.2a3.3 3.3 0 0 1 4.7 4.7l-9.4 9.4a5 5 0 0 1-7.1-7.1L13 2.9" />
@@ -318,6 +348,8 @@ function DashboardSectionItemRow({
   onComplete: () => void;
 }) {
   const [ctaState, setCtaState] = useState<'idle' | 'loading' | 'done'>('idle');
+  const [checked, setChecked] = useState(Boolean(item.checked));
+  const [isCompleting, setIsCompleting] = useState(false);
   const detailId = `attention-detail-${item.id}`;
   const checkboxId = `attention-check-${item.id}`;
   const copyClassName = [
@@ -357,6 +389,13 @@ function DashboardSectionItemRow({
   }
 
   async function completeItem() {
+    if (isCompleting || checked) {
+      return;
+    }
+
+    setChecked(true);
+    setIsCompleting(true);
+
     if (process.env.NEXT_PUBLIC_DEMO_MODE === 'true') {
       onComplete();
       return;
@@ -371,22 +410,30 @@ function DashboardSectionItemRow({
       await completeEntity(item.entityId);
       onComplete();
     } catch (_error) {
-      // Leave the checkbox state local when the backend rejects the action.
+      setChecked(false);
+    } finally {
+      setIsCompleting(false);
     }
   }
 
   const itemStyle = { '--attention-index': index } as CSSProperties;
 
   return (
-    <li className={`attention-item ${item.detail ? 'attention-item-expandable' : ''}`} style={itemStyle}>
+    <li
+      className={`attention-item ${item.detail ? 'attention-item-expandable' : ''} ${isCompleting ? 'attention-item-pending' : ''}`}
+      style={itemStyle}
+    >
       <input
         id={checkboxId}
         type="checkbox"
         className="attention-checkbox-input"
-        defaultChecked={item.checked ?? false}
+        checked={checked}
+        disabled={isCompleting}
         onChange={(event) => {
           if (event.currentTarget.checked) {
             void completeItem();
+          } else {
+            setChecked(false);
           }
         }}
       />

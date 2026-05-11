@@ -20,7 +20,12 @@ from app.db.repository import (
 )
 from app.schemas.ai import FeedEntityJudgmentOutput
 from app.schemas.domain import AttentionItem, PipelineEntity, PipelineOutput
-from app.services.ai.decision import classify_entity_state
+from app.services.ai.decision import (
+    OPENAI_TIMEOUT_SECONDS,
+    _create_json_response,
+    _create_json_response_content,
+    classify_entity_state,
+)
 from app.services.entities.derive_entity_state import derive_state
 from app.services.feed.build_feed import build_feed
 from app.services.feed.memory_pipeline import (
@@ -104,6 +109,53 @@ def make_output(
 
 
 class EntityStateAndFeedTests(unittest.TestCase):
+    def test_responses_api_helper_uses_private_medium_reasoning_defaults(self) -> None:
+        calls: list[dict[str, object]] = []
+        client = SimpleNamespace(
+            responses=SimpleNamespace(
+                create=lambda **kwargs: calls.append(kwargs) or SimpleNamespace(output_text='{"ok":true}')
+            )
+        )
+
+        with patch.dict(os.environ, {"OPENAI_REASONING_EFFORT": ""}, clear=False):
+            response = _create_json_response(
+                client,
+                model="gpt-5.4-mini",
+                instructions="Return JSON.",
+                input_text='{"hello":"world"}',
+            )
+
+        self.assertEqual(response.output_text, '{"ok":true}')
+        self.assertEqual(calls[0]["reasoning"], {"effort": "medium"})
+        self.assertEqual(calls[0]["text"], {"format": {"type": "json_object"}, "verbosity": "low"})
+        self.assertEqual(calls[0]["max_output_tokens"], 1800)
+        self.assertFalse(calls[0]["store"])
+        self.assertEqual(calls[0]["timeout"], OPENAI_TIMEOUT_SECONDS)
+
+    @patch("app.services.ai.decision._create_json_response")
+    def test_json_response_content_retries_high_effort_after_malformed_json(self, mock_response) -> None:
+        mock_response.side_effect = [
+            SimpleNamespace(output_text="{not-json"),
+            SimpleNamespace(output_text='{"ok":true}'),
+        ]
+
+        with patch.dict(os.environ, {"OPENAI_REASONING_EFFORT": ""}, clear=False):
+            content = _create_json_response_content(
+                SimpleNamespace(),
+                model="gpt-5.4-mini",
+                instructions="Return JSON.",
+                input_text='{"hello":"world"}',
+                label="test",
+                payload={"hello": "world"},
+                fallback_content='{"ok":false}',
+            )
+
+        self.assertEqual(content, '{"ok":true}')
+        self.assertEqual(
+            [call.kwargs["reasoning_effort"] for call in mock_response.call_args_list],
+            ["medium", "high"],
+        )
+
     def test_classify_entity_state_heuristic_fallbacks(self) -> None:
         with patch.dict(os.environ, {"OPENAI_API_KEY": "", "OPENAI_REQUIRED": ""}, clear=False):
             self.assertEqual(
@@ -147,17 +199,19 @@ class EntityStateAndFeedTests(unittest.TestCase):
             )
 
     @patch("app.services.ai.decision.OpenAI")
-    @patch("app.services.ai.decision._create_chat_completion")
+    @patch("app.services.ai.decision._create_json_response")
     def test_classify_entity_state_llm_path_uses_compact_timeline(
         self,
-        mock_completion,
+        mock_response,
         _mock_openai,
     ) -> None:
-        mock_completion.return_value = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content='{"current_state":"waiting"}'))]
-        )
+        mock_response.return_value = SimpleNamespace(output_text='{"current_state":"waiting"}')
 
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "OPENAI_REQUIRED": "true"}, clear=False):
+        with patch.dict(
+            os.environ,
+            {"OPENAI_API_KEY": "test-key", "OPENAI_REQUIRED": "true", "OPENAI_REASONING_EFFORT": ""},
+            clear=False,
+        ):
             state = classify_entity_state(
                 [
                     make_record(
@@ -171,7 +225,9 @@ class EntityStateAndFeedTests(unittest.TestCase):
             )
 
         self.assertEqual(state, "waiting")
-        message = mock_completion.call_args.kwargs["messages"][1]["content"]
+        self.assertEqual(mock_response.call_args.kwargs["reasoning_effort"], "medium")
+        self.assertEqual(mock_response.call_args.kwargs["verbosity"], "low")
+        message = mock_response.call_args.kwargs["input_text"]
         self.assertIn('"timeline"', message)
         self.assertIn("HSBC acknowledged", message)
 

@@ -26,6 +26,7 @@ from app.db.repository import (
 from app.schemas.ai import FeedEntityContextInput, FeedEntityJudgmentOutput
 from app.schemas.domain import AttentionItem, FeedResponse, PipelineEntity, PipelineOutput, SourceRecord
 from app.services.ai.decision import judge_feed_entities, normalize_entity_state
+from app.services.copy_quality import humanize_account_copy, infer_account_emails_from_records
 from app.services.entities.entity_reconciler import reconcile_entities
 from app.services.entities.derive_entity_state import derive_and_store_entity_state
 from app.services.entities.entity_resolver import get_sender_domain, resolve_entity_for_record
@@ -71,7 +72,7 @@ TITLE_CONTEXT_PATTERNS = [
 MAX_SUGGESTED_TITLE_CHARS = 120
 AI_JUDGMENT_MODEL = "ai-judgment-v2"
 PERSISTENT_SUGGESTION_MODELS = {AI_JUDGMENT_MODEL, "manual-task"}
-FEED_PROJECTION_VERSION = "feed-projection-v2"
+FEED_PROJECTION_VERSION = "feed-projection-v3"
 
 
 def hydrate_persistent_memory(
@@ -652,6 +653,7 @@ def to_suggested_attention_item(
     assert suggestion is not None
     normalized_state = normalize_entity_state(state.current_state)
     primary_action = normalize_action(suggestion.action, normalized_state)
+    account_emails = infer_account_emails_from_records(entity.members)
     timing_band = (
         "later"
         if force_worth_knowing
@@ -677,8 +679,14 @@ def to_suggested_attention_item(
         action_confidence=action_confidence,
         primary_action=primary_action,
         fallback_action="open",
-        title=suggestion.title,
-        why_this_is_here=suggestion.explanation,
+        title=humanize_account_copy(suggestion.title, record=latest_record, account_emails=account_emails)
+        or suggestion.title,
+        why_this_is_here=humanize_account_copy(
+            suggestion.explanation,
+            record=latest_record,
+            account_emails=account_emails,
+        )
+        or suggestion.explanation,
         due_at=state.due_at,
         importance_level=importance_level,
         lifecycle_state=to_lifecycle_state(normalized_state),
@@ -698,6 +706,14 @@ def to_fallback_attention_item(entity: LoadedEntity, latest_record, current_time
     normalized_state = normalize_entity_state(state.current_state)
     primary_action = to_fallback_action(normalized_state)
     latest_title = payload_string(latest_record.raw_payload, "subject") or latest_record.subject or "Untitled"
+    latest_title = (
+        humanize_account_copy(
+            latest_title,
+            record=latest_record,
+            account_emails=infer_account_emails_from_records(entity.members),
+        )
+        or latest_title
+    )
 
     return AttentionItem(
         id=entity.entity.id,
