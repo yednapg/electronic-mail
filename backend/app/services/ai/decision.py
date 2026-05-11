@@ -160,6 +160,7 @@ Rules:
 - Do not invent missing context.
 - Keep each summary under 220 characters.
 - Use natural conversation-style wording, not a pasted subject line.
+- For records sent by the account owner, write from the user's point of view with "you"; do not write "User says" or narrate with the account owner's name.
 - Do not mention prompts, JSON, models, or system behavior.
 
 Return strict JSON only:
@@ -236,6 +237,10 @@ MAX_SENDER_CHARS = 120
 MAX_PARTICIPANTS = 8
 MAX_BATCH_JSON_CHARS = 18000
 MAX_SOURCE_RECORD_SUMMARY_CHARS = 220
+OPENAI_TIMEOUT_SECONDS = 30.0
+
+JSON_TASK_OUTPUT_TOKENS = 1800
+BRIEFING_OUTPUT_TOKENS = 900
 
 
 @dataclass(frozen=True)
@@ -251,12 +256,23 @@ def _openai_debug_enabled() -> bool:
     return os.getenv("OPENAI_DEBUG_LOGS", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _safe_print(*args: object, **kwargs: object) -> None:
+    """Keep debug logging from failing the work it is observing."""
+    try:
+        print(*args, **kwargs)
+    except BrokenPipeError:
+        return
+    except OSError as exc:
+        if exc.errno != 32:
+            raise
+
+
 def _log_openai_exchange(*, label: str, model: str, payload: dict[str, object], content: str) -> None:
     """Print the compact request payload and raw model JSON to the backend terminal."""
     if not _openai_debug_enabled():
         return
 
-    print(
+    _safe_print(
         json.dumps(
             {
                 "openai_debug": True,
@@ -318,26 +334,87 @@ def _openai_reasoning_effort() -> str:
     return "medium"
 
 
-def _create_chat_completion(
+def _create_json_response(
     client: OpenAI,
     *,
     model: str,
-    temperature: float,
-    response_format: dict[str, str],
-    messages: list[dict[str, str]],
+    instructions: str,
+    input_text: str,
+    verbosity: str = "low",
+    max_output_tokens: int = JSON_TASK_OUTPUT_TOKENS,
+    reasoning_effort: str | None = None,
 ):
-    """Create a chat completion while respecting model-specific parameter limits."""
-    kwargs = {
-        "model": model,
-        "reasoning_effort": _openai_reasoning_effort(),
-        "response_format": response_format,
-        "messages": messages,
-    }
+    """Create a JSON Responses API call with privacy and fast-quality defaults."""
+    return client.responses.create(
+        model=model,
+        instructions=instructions,
+        input=input_text,
+        reasoning={"effort": reasoning_effort or _openai_reasoning_effort()},
+        text={"format": {"type": "json_object"}, "verbosity": verbosity},
+        max_output_tokens=max_output_tokens,
+        store=False,
+        timeout=OPENAI_TIMEOUT_SECONDS,
+    )
 
-    if model != "gpt-5.4-mini":
-        kwargs["temperature"] = temperature
 
-    return client.chat.completions.create(**kwargs)
+def _create_json_response_content(
+    client: OpenAI,
+    *,
+    model: str,
+    instructions: str,
+    input_text: str,
+    label: str,
+    payload: dict[str, object],
+    fallback_content: str,
+    verbosity: str = "low",
+    max_output_tokens: int = JSON_TASK_OUTPUT_TOKENS,
+    response_model: object | None = None,
+) -> str:
+    """Create and validate JSON text, retrying once with high reasoning on malformed output."""
+    efforts = [_openai_reasoning_effort()]
+    if efforts[0] != "high":
+        efforts.append("high")
+
+    last_content = fallback_content
+    for effort in efforts:
+        response = _create_json_response(
+            client,
+            model=model,
+            instructions=instructions,
+            input_text=input_text,
+            verbosity=verbosity,
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=effort,
+        )
+        content = _response_output_text(response) or fallback_content
+        last_content = content
+        _log_openai_exchange(label=label, model=model, payload=payload, content=content)
+        try:
+            parsed_json = json.loads(content)
+            if response_model is not None:
+                response_model.model_validate(parsed_json)  # type: ignore[attr-defined]
+            return content
+        except Exception:
+            if effort == "high":
+                return content
+
+    return last_content
+
+
+def _response_output_text(response) -> str:
+    """Read text from a Responses API object, including simple test doubles."""
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str):
+        return output_text
+
+    choices = getattr(response, "choices", None)
+    if choices:
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content
+
+    return ""
 
 
 def _raise_missing_llm() -> None:
@@ -358,31 +435,24 @@ def _decide_with_llm(entities: list[EntityInput]) -> list[DecisionOutput]:
         user_payload = {
             "entities": batch["entities"],
         }
-        completion = _create_chat_completion(
+        input_text = (
+            "Generate decision-ready items for these entities. "
+            "Only include entities that require action.\n\n"
+            f"{json.dumps(user_payload, ensure_ascii=True)}"
+        )
+        content = _create_json_response_content(
             client,
             model=model,
-            temperature=0.3,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        "Generate decision-ready items for these entities. "
-                        "Only include entities that require action.\n\n"
-                        f"{json.dumps(user_payload, ensure_ascii=True)}"
-                    ),
-                },
-            ],
+            instructions=SYSTEM_PROMPT,
+            input_text=input_text,
+            label="decide_entities",
+            payload=user_payload,
+            fallback_content='{"items":[]}',
+            verbosity="low",
+            max_output_tokens=JSON_TASK_OUTPUT_TOKENS,
+            response_model=DecideResponse,
         )
 
-        content = completion.choices[0].message.content or '{"items":[]}'
-        _log_openai_exchange(
-            label="decide_entities",
-            model=model,
-            payload=user_payload,
-            content=content,
-        )
         parsed = DecideResponse.model_validate(json.loads(content))
         items.extend(
             item
@@ -598,30 +668,23 @@ def _describe_calendar_context_with_llm(
         user_payload = {
             "items": batch["items"],
         }
-        completion = _create_chat_completion(
+        input_text = (
+            "Write one dashboard sentence for each calendar item.\n\n"
+            f"{json.dumps(user_payload, ensure_ascii=True)}"
+        )
+        content = _create_json_response_content(
             client,
             model=model,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": CALENDAR_CONTEXT_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        "Write one dashboard sentence for each calendar item.\n\n"
-                        f"{json.dumps(user_payload, ensure_ascii=True)}"
-                    ),
-                },
-            ],
+            instructions=CALENDAR_CONTEXT_PROMPT,
+            input_text=input_text,
+            label="calendar_context",
+            payload=user_payload,
+            fallback_content='{"items":[]}',
+            verbosity="low",
+            max_output_tokens=JSON_TASK_OUTPUT_TOKENS,
+            response_model=CalendarContextResponse,
         )
 
-        content = completion.choices[0].message.content or '{"items":[]}'
-        _log_openai_exchange(
-            label="calendar_context",
-            model=model,
-            payload=user_payload,
-            content=content,
-        )
         parsed = CalendarContextResponse.model_validate(json.loads(content))
         outputs.extend(parsed.items)
 
@@ -686,32 +749,25 @@ def _judge_feed_entities_with_llm(
         user_payload = {
             "entities": batch["entities"],
         }
-        completion = _create_chat_completion(
+        input_text = (
+            "Judge these feed entities from memory context. "
+            "Read each timeline from oldest to newest and write the title as one natural summary of the full thread from the user's point of view. "
+            "Return judgment signals only; the API will validate, override if needed, and compute final ranking.\n\n"
+            f"{json.dumps(user_payload, ensure_ascii=True)}"
+        )
+        content = _create_json_response_content(
             client,
             model=model,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": FEED_JUDGMENT_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        "Judge these feed entities from memory context. "
-                        "Read each timeline from oldest to newest and write the title as one natural summary of the full thread from the user's point of view. "
-                        "Return judgment signals only; the API will validate, override if needed, and compute final ranking.\n\n"
-                        f"{json.dumps(user_payload, ensure_ascii=True)}"
-                    ),
-                },
-            ],
+            instructions=FEED_JUDGMENT_PROMPT,
+            input_text=input_text,
+            label="judge_feed_entities",
+            payload=user_payload,
+            fallback_content='{"items":[]}',
+            verbosity="low",
+            max_output_tokens=JSON_TASK_OUTPUT_TOKENS,
+            response_model=FeedEntityJudgmentResponse,
         )
 
-        content = completion.choices[0].message.content or '{"items":[]}'
-        _log_openai_exchange(
-            label="judge_feed_entities",
-            model=model,
-            payload=user_payload,
-            content=content,
-        )
         parsed = FeedEntityJudgmentResponse.model_validate(json.loads(content))
         outputs.extend(parsed.items)
 
@@ -747,25 +803,21 @@ def _classify_entity_state_with_llm(records: list[StoredSourceRecord]) -> str:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     model = _openai_model()
     user_payload = {"timeline": _compact_state_timeline(records)}
-    completion = _create_chat_completion(
+    input_text = (
+        "Classify this entity timeline into one current_state value.\n\n"
+        f"{json.dumps(user_payload, ensure_ascii=True)}"
+    )
+    content = _create_json_response_content(
         client,
         model=model,
-        temperature=0.0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": ENTITY_STATE_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Classify this entity timeline into one current_state value.\n\n"
-                    f"{json.dumps(user_payload, ensure_ascii=True)}"
-                ),
-            },
-        ],
+        instructions=ENTITY_STATE_PROMPT,
+        input_text=input_text,
+        label="classify_entity_state",
+        payload=user_payload,
+        fallback_content='{"current_state":"open"}',
+        verbosity="low",
+        max_output_tokens=600,
     )
-
-    content = completion.choices[0].message.content or '{"current_state":"open"}'
-    _log_openai_exchange(label="classify_entity_state", model=model, payload=user_payload, content=content)
 
     try:
         parsed = json.loads(content)
@@ -786,28 +838,21 @@ def _summarize_source_records_with_llm(records: list[StoredSourceRecord]) -> Sou
 
     for batch in _chunk_json_payloads(compact_records, key="records"):
         user_payload = {"records": batch["records"]}
-        completion = _create_chat_completion(
+        input_text = (
+            "Write compact summaries for these individual records.\n\n"
+            f"{json.dumps(user_payload, ensure_ascii=True)}"
+        )
+        content = _create_json_response_content(
             client,
             model=model,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": SOURCE_RECORD_SUMMARY_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        "Write compact summaries for these individual records.\n\n"
-                        f"{json.dumps(user_payload, ensure_ascii=True)}"
-                    ),
-                },
-            ],
-        )
-        content = completion.choices[0].message.content or '{"items":[]}'
-        _log_openai_exchange(
+            instructions=SOURCE_RECORD_SUMMARY_PROMPT,
+            input_text=input_text,
             label="source_record_summaries",
-            model=model,
             payload=user_payload,
-            content=content,
+            fallback_content='{"items":[]}',
+            verbosity="low",
+            max_output_tokens=JSON_TASK_OUTPUT_TOKENS,
+            response_model=SourceRecordSummaryResponse,
         )
         parsed = SourceRecordSummaryResponse.model_validate(json.loads(content))
         for item in parsed.items:
@@ -895,6 +940,7 @@ def _compact_source_record_for_summary(record: StoredSourceRecord) -> dict[str, 
         )
         or None,
         "timestamp": record.timestamp,
+        "labels": _payload_string_list(payload, "label_ids") or _payload_string_list(payload, "labelIds"),
         "snippet": _truncate_text(_payload_string(payload, "snippet") or "", 240) or None,
         "body": _truncate_text(_payload_string(payload, "body") or "", 700) or None,
     }
@@ -969,6 +1015,15 @@ def _payload_string(payload: dict[str, object], key: str) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def _payload_string_list(payload: dict[str, object], key: str) -> list[str]:
+    value = payload.get(key)
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
 def _generate_dashboard_briefing_with_llm(
     briefing_input: DashboardBriefingInput,
 ) -> DashboardBriefing:
@@ -976,30 +1031,23 @@ def _generate_dashboard_briefing_with_llm(
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     model = _openai_model()
     user_payload = briefing_input.model_dump()
-    completion = _create_chat_completion(
+    input_text = (
+        "Write the dashboard greeting and summary from this mailbox context.\n\n"
+        f"{json.dumps(user_payload, ensure_ascii=True)}"
+    )
+    content = _create_json_response_content(
         client,
         model=model,
-        temperature=0.2,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": DASHBOARD_BRIEFING_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Write the dashboard greeting and summary from this mailbox context.\n\n"
-                    f"{json.dumps(user_payload, ensure_ascii=True)}"
-                ),
-            },
-        ],
+        instructions=DASHBOARD_BRIEFING_PROMPT,
+        input_text=input_text,
+        label="dashboard_briefing",
+        payload=user_payload,
+        fallback_content='{"items":[]}',
+        verbosity="medium",
+        max_output_tokens=BRIEFING_OUTPUT_TOKENS,
+        response_model=DashboardBriefingResponse,
     )
 
-    content = completion.choices[0].message.content or '{"items":[]}'
-    _log_openai_exchange(
-        label="dashboard_briefing",
-        model=model,
-        payload=user_payload,
-        content=content,
-    )
     parsed = DashboardBriefingResponse.model_validate(json.loads(content))
     generated = parsed.items[0] if parsed.items else _build_dashboard_briefing_fallback_output(briefing_input)
 
@@ -1042,27 +1090,20 @@ def _resolve_entity_group_with_llm(request: EntityGroupingRequest) -> EntityGrou
             for candidate in request.candidates[:5]
         ],
     }
-    completion = _create_chat_completion(
+    input_text = json.dumps(user_payload, ensure_ascii=True)
+    content = _create_json_response_content(
         client,
         model=model,
-        temperature=0.1,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": ENTITY_GROUPING_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(user_payload, ensure_ascii=True),
-            },
-        ],
+        instructions=ENTITY_GROUPING_PROMPT,
+        input_text=input_text,
+        label="resolve_entity_group",
+        payload=user_payload,
+        fallback_content='{"entity_id": null, "confidence": 0.0}',
+        verbosity="low",
+        max_output_tokens=600,
+        response_model=EntityGroupingResponse,
     )
 
-    content = completion.choices[0].message.content or '{"entity_id": null, "confidence": 0.0}'
-    _log_openai_exchange(
-        label="resolve_entity_group",
-        model=model,
-        payload=user_payload,
-        content=content,
-    )
     return EntityGroupingResponse.model_validate(json.loads(content))
 
 

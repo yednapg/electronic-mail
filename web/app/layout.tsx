@@ -3,6 +3,7 @@ import type { Metadata } from 'next';
 import type { ReactNode } from 'react';
 import localFont from 'next/font/local';
 
+import { CommandPaletteMount } from '../components/command-palette/CommandPaletteMount';
 import './globals.css';
 
 const sfProRounded = localFont({
@@ -181,6 +182,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       <body className={`${sfProRounded.variable} ${sfProRounded.className}`}>
         <script dangerouslySetInnerHTML={{ __html: interactionScript }} />
         {children}
+        <CommandPaletteMount />
         <ThemeToggleButton />
       </body>
     </html>

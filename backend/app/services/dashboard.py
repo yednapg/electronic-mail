@@ -38,10 +38,12 @@ from app.services.feed.memory_pipeline import (
     refresh_ai_suggestions_for_entities,
 )
 from app.services.integrations.google import (
+    backfill_full_gmail_source_records,
     fetch_google_account_profile,
     fetch_google_source_records,
     get_google_auth_state,
     load_google_account_profile,
+    should_run_gmail_full_history_backfill,
 )
 from app.services.source_record_summaries import refresh_source_record_summaries
 
@@ -116,10 +118,15 @@ def create_new_dashboard_import_job(
 def start_dashboard_import_job(settings: Settings, *, user_id: str = DEFAULT_USER_ID) -> DashboardImportJobResponse:
     """Create and run a backend-owned dashboard import/preparation job inline."""
     job = create_new_dashboard_import_job(settings, user_id=user_id)
-    return to_dashboard_import_job_response(run_dashboard_import_job(settings, job.id))
+    return to_dashboard_import_job_response(run_dashboard_import_job(settings, job.id, run_backfill=False))
 
 
-def run_dashboard_import_job(settings: Settings, job_id: str) -> StoredDashboardImportJob:
+def run_dashboard_import_job(
+    settings: Settings,
+    job_id: str,
+    *,
+    run_backfill: bool = True,
+) -> StoredDashboardImportJob:
     """Run a queued dashboard import/preparation job and persist the final status."""
     mark_dashboard_import_job_running(str(settings.database_path), job_id)
 
@@ -128,7 +135,7 @@ def run_dashboard_import_job(settings: Settings, job_id: str) -> StoredDashboard
     except Exception as exc:
         return mark_dashboard_import_job_failed(str(settings.database_path), job_id, error_message=str(exc))
 
-    return mark_dashboard_import_job_succeeded(
+    succeeded = mark_dashboard_import_job_succeeded(
         str(settings.database_path),
         job_id,
         result_status=str(result["status"]),
@@ -136,6 +143,9 @@ def run_dashboard_import_job(settings: Settings, job_id: str) -> StoredDashboard
         changed_entities=int(result["changed_entities"]),
         refreshed_entities=int(result.get("refreshed_entities", 0)),
     )
+    if run_backfill and result["status"] == "ready":
+        run_gmail_full_history_backfill(settings)
+    return succeeded
 
 
 def get_dashboard_import_job_status(settings: Settings, job_id: str) -> DashboardImportJobResponse | None:
@@ -171,6 +181,14 @@ def prepare_dashboard_state(settings: Settings) -> dict[str, object]:
     if job.error_message:
         response["error_message"] = job.error_message
     return response
+
+
+def run_gmail_full_history_backfill(settings: Settings) -> None:
+    """Import older Gmail records after the first recent dashboard has been marked ready."""
+    if not should_run_gmail_full_history_backfill(settings):
+        return
+
+    backfill_full_gmail_source_records(settings)
 
 
 def to_dashboard_import_job_response(job: StoredDashboardImportJob) -> DashboardImportJobResponse:

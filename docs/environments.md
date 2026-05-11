@@ -10,7 +10,7 @@ This pass keeps SQLite as the runtime database and makes configuration environme
 | `PORT` | `3001` | Backend HTTP port. |
 | `DATABASE_URL` | `file:./dev.db` | SQLite file URL for this pass. |
 | `CORS_ORIGIN` | `http://localhost:5173` | Web origin allowed by CORS. Must be HTTPS outside local development. |
-| `GMAIL_SYNC_SCOPE` | `full` | Supported values: `full`, `recent`. |
+| `GMAIL_SYNC_SCOPE` | `recent` | Supported values: `full`, `recent`. |
 | `GMAIL_RECENT_DAYS` | `90` | Used when recent sync is enabled. |
 | `GOOGLE_CLIENT_ID` | empty | Required for Google OAuth. |
 | `GOOGLE_CLIENT_SECRET` | empty | Required for Google OAuth. |

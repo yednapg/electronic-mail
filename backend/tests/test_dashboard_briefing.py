@@ -33,6 +33,7 @@ class DashboardBriefingTests(unittest.TestCase):
     def test_source_summary_prompt_allows_human_readable_detail(self) -> None:
         self.assertIn("under 220 characters", SOURCE_RECORD_SUMMARY_PROMPT)
         self.assertIn("natural conversation-style wording", SOURCE_RECORD_SUMMARY_PROMPT)
+        self.assertIn('do not write "User says"', SOURCE_RECORD_SUMMARY_PROMPT)
 
     def test_briefing_input_passes_profile_display_name_to_model(self) -> None:
         briefing_input = _build_dashboard_briefing_input(

@@ -10,9 +10,9 @@ import {
   isTimedIsoTimestamp,
   toAgendaSortValue,
 } from '../../lib/formatting';
-import type { FeedItem, FeedResponse, GoogleAuthState, TimingBand } from '../../lib/types';
+import { redirect } from 'next/navigation';
+import type { FeedItem, FeedResponse, TimingBand } from '../../lib/types';
 import { DashboardView } from '../../components/dashboard/DashboardView';
-import { DashboardMeta } from '../../components/dashboard/DashboardMeta';
 import type {
   DashboardAgendaItem,
   DashboardSectionData,
@@ -27,7 +27,7 @@ export default async function DashboardPage() {
   const now = demoMode ? new Date('2023-02-01T09:00:00') : new Date();
 
   if (!dashboard.auth.connected) {
-    return <SignedOutDashboard now={now} auth={dashboard.auth} liveMeta={!demoMode} />;
+    redirect('/');
   }
 
   const agenda = buildAgenda(dashboard.feed);
@@ -43,31 +43,6 @@ export default async function DashboardPage() {
       agenda={agenda}
       sections={sections}
     />
-  );
-}
-
-function SignedOutDashboard({ now, auth, liveMeta }: { now: Date; auth: GoogleAuthState; liveMeta: boolean }) {
-  return (
-    <main className="digest-page">
-      <div className="digest-shell">
-        <DashboardMeta dateLabel={formatDate(now)} timeLabel={formatClockTime(now)} live={liveMeta} />
-        <section className="digest-auth-state" aria-label="Connect Google">
-          <p className="digest-summary">
-            <span className="digest-summary-medium">Connect your Google account.</span>{' '}
-            <span className="digest-summary-light">
-              {auth.available
-                ? 'The dashboard needs live Gmail and Calendar access before it can build your brief.'
-                : 'Google OAuth is not configured in the backend yet.'}
-            </span>
-          </p>
-          {auth.connect_url ? (
-            <a className="digest-connect-link" href={auth.connect_url}>
-              Continue with Google
-            </a>
-          ) : null}
-        </section>
-      </div>
-    </main>
   );
 }
 

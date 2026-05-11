@@ -108,7 +108,7 @@ def load_settings() -> Settings:
         database_url=database_url,
         database_path=_resolve_database_path(database_url),
         cors_origin=os.getenv("CORS_ORIGIN", "http://localhost:5173"),
-        gmail_sync_scope=os.getenv("GMAIL_SYNC_SCOPE", "full").strip().lower() or "full",
+        gmail_sync_scope=os.getenv("GMAIL_SYNC_SCOPE", "recent").strip().lower() or "recent",
         gmail_recent_days=int(os.getenv("GMAIL_RECENT_DAYS", "90")),
         google_client_id=os.getenv("GOOGLE_CLIENT_ID", "").strip().strip("\"'"),
         google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET", "").strip().strip("\"'"),

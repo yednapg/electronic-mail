@@ -70,6 +70,7 @@ class FakeMessagesResource:
         def execute():
             page_token = kwargs.get("pageToken")
             self.service.list_calls.append(page_token)
+            self.service.list_kwargs.append(kwargs)
             if page_token in self.service.list_errors:
                 raise RuntimeError(self.service.list_errors[page_token])
             if self.service.list_pages is not None:
@@ -81,6 +82,7 @@ class FakeMessagesResource:
     def get(self, *, id: str, **_kwargs):
         def execute():
             self.service.message_gets.append(id)
+            self.service.message_get_kwargs.append(_kwargs)
             if self.service.assert_history_persisted_before_hydration:
                 events = list_gmail_history_events(self.service.database_path)
                 if not events:
@@ -158,8 +160,10 @@ class FakeGmailService:
         self.message_errors = message_errors or {}
         self.assert_history_persisted_before_hydration = assert_history_persisted_before_hydration
         self.message_gets: list[str] = []
+        self.message_get_kwargs: list[dict[str, object]] = []
         self.thread_gets: list[str] = []
         self.list_calls: list[str | None] = []
+        self.list_kwargs: list[dict[str, object]] = []
         self.mutations: list[str] = []
 
     def users(self):
@@ -293,10 +297,33 @@ class GmailLedgerTests(unittest.TestCase):
 
         self.assertEqual([record.id for record in records], ["message-1", "message-2", "message-3"])
         self.assertEqual(service.list_calls, [None, "page-2"])
+        self.assertTrue(all(call["maxResults"] == 500 for call in service.list_kwargs))
         self.assertEqual([snapshot.message_id for snapshot in list_gmail_message_snapshots(self.database_path)], ["message-1", "message-2", "message-3"])
         self.assertIn(("gmail_persisted", 2, 3), progress)
         self.assertIn(("gmail_persisted", 3, 3), progress)
         self.assertEqual(get_gmail_sync_state(self.database_path, DEFAULT_USER_ID).last_history_id, "202")
+
+    def test_recent_first_sync_does_not_mark_full_backfill_complete(self) -> None:
+        message = build_message(message_id="message-1", thread_id="thread-1", history_id="200")
+        settings = SimpleNamespace(
+            database_path=self.database_path,
+            gmail_sync_scope="recent",
+            gmail_recent_days=30,
+        )
+        service = FakeGmailService(
+            database_path=self.database_path,
+            list_ids=["message-1"],
+            messages={"message-1": message},
+            threads={"thread-1": [message]},
+        )
+
+        sync_gmail_source_records(settings, service)
+
+        sync_state = get_gmail_sync_state(self.database_path, DEFAULT_USER_ID)
+        self.assertIsNotNone(sync_state)
+        assert sync_state is not None
+        self.assertEqual(sync_state.last_history_id, "200")
+        self.assertIsNone(sync_state.last_full_sync_at)
 
     def test_full_sync_deduplicates_thread_messages_across_pages(self) -> None:
         first = build_message(message_id="message-1", thread_id="thread-1", history_id="200")
@@ -360,6 +387,7 @@ class GmailLedgerTests(unittest.TestCase):
 
         self.assertEqual(service.list_calls, [None, "page-2", "page-3"])
         self.assertEqual(service.message_gets, ["message-1", "message-2", "message-3"])
+        self.assertTrue(all(call["format"] == "metadata" for call in service.message_get_kwargs))
         self.assertEqual(service.thread_gets, ["thread-1"])
         self.assertEqual([record.id for record in records], ["message-1", "message-2", "message-3"])
         self.assertEqual(
