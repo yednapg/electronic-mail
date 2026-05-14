@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { getDashboard, getHistory, isDemoMode } from './api';
+import { getDashboard, getGmailView, getHistory, isDemoMode } from './api';
 
 test('demo mode is opt-in so the app uses the real backend by default', () => {
   const previousMode = process.env.NEXT_PUBLIC_DEMO_MODE;
@@ -69,6 +69,64 @@ test('history fetcher calls backend when demo mode is not enabled', async () => 
 
     assert.equal(history.total, 0);
     assert.equal(calls[0], 'http://localhost:3001/v1/history?limit=60&offset=0');
+  } finally {
+    if (previousMode === undefined) {
+      delete process.env.NEXT_PUBLIC_DEMO_MODE;
+    } else {
+      process.env.NEXT_PUBLIC_DEMO_MODE = previousMode;
+    }
+
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('gmail view fetcher returns hardcoded demo Gmail threads without fetching backend', async () => {
+  const previousMode = process.env.NEXT_PUBLIC_DEMO_MODE;
+  const previousFetch = globalThis.fetch;
+
+  process.env.NEXT_PUBLIC_DEMO_MODE = 'true';
+  globalThis.fetch = (() => {
+    throw new Error('Demo Gmail view should not fetch the backend');
+  }) as typeof fetch;
+
+  try {
+    const gmail = await getGmailView();
+
+    assert.equal(gmail.total_threads, 3);
+    assert.equal(gmail.sections[0].title, 'Today');
+    assert.equal(gmail.sections[0].rows[0].thread_id, 'pycon-us-2026');
+  } finally {
+    if (previousMode === undefined) {
+      delete process.env.NEXT_PUBLIC_DEMO_MODE;
+    } else {
+      process.env.NEXT_PUBLIC_DEMO_MODE = previousMode;
+    }
+
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('gmail view fetcher calls backend when demo mode is not enabled', async () => {
+  const previousMode = process.env.NEXT_PUBLIC_DEMO_MODE;
+  const previousFetch = globalThis.fetch;
+  const calls: string[] = [];
+
+  delete process.env.NEXT_PUBLIC_DEMO_MODE;
+  globalThis.fetch = ((input: RequestInfo | URL) => {
+    calls.push(String(input));
+    return Promise.resolve(
+      new Response(JSON.stringify({ total_threads: 0, sections: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+  }) as typeof fetch;
+
+  try {
+    const gmail = await getGmailView();
+
+    assert.equal(gmail.total_threads, 0);
+    assert.equal(calls[0], 'http://localhost:3001/v1/gmail-view');
   } finally {
     if (previousMode === undefined) {
       delete process.env.NEXT_PUBLIC_DEMO_MODE;

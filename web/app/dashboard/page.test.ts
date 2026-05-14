@@ -188,6 +188,19 @@ test('dashboard renders all work buckets when inbox items exist in each one', ()
   );
 });
 
+test('dashboard keeps work buckets available when the inbox is empty', () => {
+  const sections = buildSections(createFeed());
+
+  assert.deepEqual(
+    sections.map((section) => ({ id: section.id, title: section.title, itemCount: section.items.length })),
+    [
+      { id: 'now', title: 'Now', itemCount: 0 },
+      { id: 'today', title: 'Today', itemCount: 0 },
+      { id: 'worth-knowing', title: 'Worth Knowing', itemCount: 0 },
+    ],
+  );
+});
+
 test('dashboard summary renders backend-generated briefing copy without rewriting it', () => {
   const summary = buildSummary({
     briefing: {
@@ -214,57 +227,45 @@ test('gmail archive actions stay out of compact feed rows', () => {
   assert.equal(cta, undefined);
 });
 
-test('YC RSVP items expose expandable detail instead of an inline CTA', () => {
+test('confirmation items use generic expandable detail instead of hardcoded vendor copy', () => {
   const item = createFeedItem({
     source: 'gmail',
-    title: 'RSVP for YC Startup School India',
+    title: 'RSVP for the founder event',
     primary_action: 'confirm',
-    why_this_is_here: 'YC has accepted your application to attend Startup School India.',
+    why_this_is_here: 'The organizer accepted your application and needs your RSVP.',
   });
 
-  assert.equal(toActionSentence(item), 'RSVP for YC Startup School India');
+  assert.equal(toActionSentence(item), 'RSVP for the founder event');
   assert.equal(toSectionCta(item), undefined);
   assert.deepEqual(toSectionDetail(item), {
-    facts: [
-      { label: 'Current', value: 'Waiting on you' },
-      { label: 'Next', value: 'RSVP before the attendee list closes' },
-    ],
-    body: [
-      'YC has accepted your application to attend Startup School India.',
-      'The talk is in Bangalore. Only confirm if you can attend.',
-      'YC will send a calendar invite after you RSVP.',
-    ],
-    evidence: ['YC acceptance email', 'Follow-up RSVP reminder', 'Event details from the same thread'],
-    confirmLabel: 'Yes, I can attend',
-    dismissLabel: 'No',
-    sourceLabel: 'Sources: 3 emails from YC',
+    body: ['The organizer accepted your application and needs your RSVP.'],
+    actionLabel: 'Confirm or decline',
+    confirmLabel: 'Confirmed',
+    dismissLabel: 'Not needed',
+    sourceLabel: 'Gmail',
     links: {
       threadHref: '/entities/entity-1/thread',
     },
   });
 });
 
-test('demo inbox items expose natural detail, one action, and source link', () => {
+test('gmail items without backend detail use generic fallback copy and source link', () => {
   const detail = toSectionDetail(
     createFeedItem({
-      id: 'northstar-card-bill',
-      entity_id: 'entity-northstar-card-bill',
+      id: 'card-bill',
+      entity_id: 'entity-card-bill',
       source: 'gmail',
-      title: 'Northstar credit card bill due today',
+      title: 'Credit card bill due today',
       primary_action: 'pay',
       why_this_is_here: 'The statement says autopay is off and the bill is due by 5 PM.',
     }),
   );
 
-  assert.match(detail?.body.join(' ') ?? '', /latest Northstar statement says autopay/);
-  assert.equal(detail?.actionLabel ?? detail?.confirmLabel, 'Paid');
-  assert.deepEqual(detail?.evidence, [
-    'Northstar statement email',
-    'Payment reminder from alerts@northstarbank.example',
-    'No matching payment receipt found today',
-  ]);
+  assert.deepEqual(detail?.body, ['The statement says autopay is off and the bill is due by 5 PM.']);
+  assert.equal(detail?.actionLabel, 'Make the payment');
+  assert.equal(detail?.sourceLabel, 'Gmail');
   assert.deepEqual(detail?.links, {
-    threadHref: '/entities/entity-northstar-card-bill/thread',
+    threadHref: '/entities/entity-card-bill/thread',
   });
 });
 

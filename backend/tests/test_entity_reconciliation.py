@@ -94,7 +94,7 @@ class EntityReconciliationTests(unittest.TestCase):
         registered_entity = self.seed_entity(registered)
         self.seed_entity(compensation)
 
-        with patch(
+        with patch.dict("os.environ", {"OPENAI_ENTITY_GROUPING": "true"}, clear=False), patch(
             "app.services.entities.entity_reconciler.resolve_entity_group",
             return_value=EntityGroupingResponse(entity_id=registered_entity.id, confidence=0.97),
         ):
@@ -135,7 +135,7 @@ class EntityReconciliationTests(unittest.TestCase):
         self.seed_entity(compensation)
         case_entity = self.seed_entity(case_thread)
 
-        with patch(
+        with patch.dict("os.environ", {"OPENAI_ENTITY_GROUPING": "true"}, clear=False), patch(
             "app.services.entities.entity_reconciler.resolve_entity_group",
             return_value=EntityGroupingResponse(entity_id=registered_entity.id, confidence=0.96),
         ):
@@ -171,7 +171,7 @@ class EntityReconciliationTests(unittest.TestCase):
         self.seed_entity(hsbc_chain)
         self.seed_entity(cibil_case)
 
-        with patch(
+        with patch.dict("os.environ", {"OPENAI_ENTITY_GROUPING": "true"}, clear=False), patch(
             "app.services.entities.entity_reconciler.resolve_entity_group",
             return_value=EntityGroupingResponse(entity_id="should-not-merge", confidence=0.99),
         ) as mock_grouping:
@@ -203,7 +203,7 @@ class EntityReconciliationTests(unittest.TestCase):
         self.seed_entity(groww_closure)
         self.seed_entity(groww_issue)
 
-        with patch(
+        with patch.dict("os.environ", {"OPENAI_ENTITY_GROUPING": "true"}, clear=False), patch(
             "app.services.entities.entity_reconciler.resolve_entity_group",
             return_value=EntityGroupingResponse(entity_id="should-not-merge", confidence=0.99),
         ) as mock_grouping:
@@ -239,7 +239,7 @@ class EntityReconciliationTests(unittest.TestCase):
         seed_entity = self.seed_entity(screenshot_seed)
         self.seed_entity(screenshot_followup)
 
-        with patch(
+        with patch.dict("os.environ", {"OPENAI_ENTITY_GROUPING": "true"}, clear=False), patch(
             "app.services.entities.entity_reconciler.resolve_entity_group",
             return_value=EntityGroupingResponse(entity_id=seed_entity.id, confidence=0.84),
         ):

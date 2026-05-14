@@ -209,7 +209,7 @@ class GmailSyncNormalizationTests(unittest.TestCase):
             settings = SimpleNamespace(database_path=Path(tmp_dir) / "gmail.db")
             gmail_record = SourceRecord(
                 id="gmail-1",
-                user_id="google-dev-user",
+                user_id="local-user",
                 source="gmail",
                 thread_id="thread-1",
                 raw_payload={"subject": "Reply needed"},
@@ -217,7 +217,7 @@ class GmailSyncNormalizationTests(unittest.TestCase):
             )
             calendar_record = SourceRecord(
                 id="calendar-1",
-                user_id="google-dev-user",
+                user_id="local-user",
                 source="calendar",
                 thread_id="calendar-1",
                 raw_payload={"summary": "Meeting"},

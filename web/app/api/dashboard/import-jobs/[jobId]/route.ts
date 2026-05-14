@@ -45,6 +45,8 @@ function createDemoImportJob(jobId: string) {
     error_message: null,
     created_at: now,
     started_at: now,
+    stage_started_at: now,
+    stage_durations: { gmail_fetching: 1.2 },
     completed_at: now,
     updated_at: now,
   };

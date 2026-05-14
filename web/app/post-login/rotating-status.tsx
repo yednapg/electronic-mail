@@ -28,7 +28,7 @@ function wait(ms: number): Promise<void> {
 async function waitForDashboardReady(onStatus?: (message: string) => void): Promise<void> {
   if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'true') {
     await waitForDashboardImportJob({
-      timeoutMs: POST_LOGIN_READY_TIMEOUT_MS,
+      timeoutMs: null,
       onUpdate: (job) => onStatus?.(formatDashboardImportStatus(job)),
     });
     return;
@@ -50,12 +50,17 @@ async function waitForDashboardReady(onStatus?: (message: string) => void): Prom
 export function RotatingStatus() {
   const [activeIndex, setActiveIndex] = useState(0);
   const [liveStatus, setLiveStatus] = useState<string | null>(null);
+  const [stopped, setStopped] = useState(false);
   const [visible, setVisible] = useState(true);
   const swapTimeoutRef = useRef<number | null>(null);
   const activeMessage = liveStatus ?? statusMessages[activeIndex];
 
   useEffect(() => {
     const interval = window.setInterval(() => {
+      if (stopped) {
+        return;
+      }
+
       setVisible(false);
 
       swapTimeoutRef.current = window.setTimeout(() => {
@@ -70,16 +75,14 @@ export function RotatingStatus() {
         window.clearTimeout(swapTimeoutRef.current);
       }
     };
-  }, []);
+  }, [stopped]);
 
   useEffect(() => {
+    let cancelled = false;
+
     function redirectToDashboard() {
       window.location.assign(DEMO_DASHBOARD_ROUTE);
     }
-
-    const fallbackTimer = window.setTimeout(() => {
-      redirectToDashboard();
-    }, POST_LOGIN_READY_TIMEOUT_MS);
 
     async function redirectWhenReady() {
       if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'true') {
@@ -88,9 +91,15 @@ export function RotatingStatus() {
           waitForDashboardReady(setLiveStatus),
         ]);
 
-        redirectToDashboard();
+        if (!cancelled) {
+          redirectToDashboard();
+        }
         return;
       }
+
+      const fallbackTimer = window.setTimeout(() => {
+        redirectToDashboard();
+      }, POST_LOGIN_READY_TIMEOUT_MS);
 
       await Promise.all([
         wait(POST_LOGIN_MINIMUM_MS),
@@ -100,16 +109,21 @@ export function RotatingStatus() {
         ]),
       ]);
 
+      window.clearTimeout(fallbackTimer);
       redirectToDashboard();
     }
 
-    void redirectWhenReady().catch(async () => {
+    void redirectWhenReady().catch(async (error) => {
       await wait(POST_LOGIN_MINIMUM_MS);
-      redirectToDashboard();
+      if (!cancelled) {
+        setStopped(true);
+        setVisible(true);
+        setLiveStatus(error instanceof Error ? error.message : 'Dashboard preparation failed. Please try again.');
+      }
     });
 
     return () => {
-      window.clearTimeout(fallbackTimer);
+      cancelled = true;
     };
   }, []);
 

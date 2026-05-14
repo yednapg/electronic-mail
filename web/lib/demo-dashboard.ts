@@ -51,7 +51,7 @@ export const demoDashboard: DashboardResponse = {
     connect_url: null,
   },
   profile: {
-    email: 'demo@example.test',
+    email: 'demo@example.com',
     display_name: 'TestUser',
   },
   briefing: {

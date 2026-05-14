@@ -25,6 +25,7 @@ from app.db.repository import (
 )
 from app.main import app
 from app.services.ai.decision import SourceRecordSummaryBatch
+from app.services.gmail_view import build_gmail_view_response
 from app.services.source_record_summaries import refresh_source_record_summaries, source_record_summary_hash
 
 
@@ -123,6 +124,70 @@ class HistoryRouteTests(unittest.TestCase):
         self.assertEqual(payload["years"][0]["months"][0]["days"][0]["date"], "2026-05-08")
         self.assertEqual(payload["years"][0]["months"][0]["days"][0]["rows"][0]["source_record_id"], "gmail-2026-may")
         self.assertEqual(payload["years"][1]["months"][0]["days"][0]["date"], "2025-12-31")
+
+    def test_gmail_view_buckets_raw_threads_without_overlapping_dates(self) -> None:
+        upsert_source_records(
+            str(self.database_path),
+            [
+                make_record(
+                    record_id="today-old",
+                    thread_id="thread-today",
+                    received_at="2026-05-11T08:00:00+00:00",
+                    subject="Order confirmed",
+                    sender="store@example.com",
+                    snippet="Your order is confirmed.",
+                ),
+                make_record(
+                    record_id="today-latest",
+                    thread_id="thread-today",
+                    received_at="2026-05-11T10:00:00+00:00",
+                    subject="Order shipped",
+                    sender="store@example.com",
+                    snippet="Your order shipped.",
+                ),
+                make_record(
+                    record_id="yesterday",
+                    thread_id="thread-yesterday",
+                    received_at="2026-05-10T09:00:00+00:00",
+                    subject="Yesterday",
+                ),
+                make_record(
+                    record_id="previous-six",
+                    thread_id="thread-previous-six",
+                    received_at="2026-05-06T09:00:00+00:00",
+                    subject="Last seven days",
+                ),
+                make_record(
+                    record_id="earlier-month",
+                    thread_id="thread-earlier-month",
+                    received_at="2026-05-02T09:00:00+00:00",
+                    subject="Earlier this month",
+                ),
+                make_record(
+                    record_id="older-month",
+                    thread_id="thread-older-month",
+                    received_at="2026-04-30T09:00:00+00:00",
+                    subject="Older month",
+                ),
+            ],
+        )
+
+        response = build_gmail_view_response(
+            str(self.database_path),
+            current_time="2026-05-11T12:00:00+00:00",
+        )
+
+        self.assertEqual(response.total_threads, 5)
+        self.assertEqual(
+            [section.title for section in response.sections],
+            ["Today", "Yesterday", "Last seven days", "Earlier this month", "April 2026"],
+        )
+        today_row = response.sections[0].rows[0]
+        self.assertEqual(today_row.thread_id, "thread-today")
+        self.assertEqual(today_row.latest_source_record_id, "today-latest")
+        self.assertEqual(today_row.latest_subject, "Order shipped")
+        self.assertEqual(today_row.message_count, 2)
+        self.assertEqual([update.subject for update in today_row.lifecycle_updates], ["Order confirmed", "Order shipped"])
 
     def test_history_paginates_source_records_without_losing_total(self) -> None:
         upsert_source_records(

@@ -78,6 +78,8 @@ FEED_PROJECTION_VERSION = "feed-projection-v3"
 def hydrate_persistent_memory(
     database_path: str,
     source_records: list[SourceRecord] | None = None,
+    *,
+    include_unlinked: bool = False,
 ) -> list[str]:
     """Resolve records to entities, backfill missing links, and derive state."""
     touched_entity_ids: set[str] = set()
@@ -88,11 +90,11 @@ def hydrate_persistent_memory(
         entity, _ = resolve_entity_for_record(database_path, record)
         touched_entity_ids.add(entity.id)
 
-    if not explicit_source_records:
+    if include_unlinked or not explicit_source_records:
         for record in list_unlinked_source_records(database_path):
             source_record = SourceRecord(
                 id=record.id,
-                user_id="local-user",
+                user_id=DEFAULT_USER_ID,
                 source=record.source,
                 thread_id=record.thread_id or "",
                 raw_payload=record.raw_payload,
@@ -164,7 +166,7 @@ def refresh_ai_suggestions_for_entities(database_path: str, entity_ids: list[str
             append_trace_record(
                 database_path,
                 stage="decision",
-                user_id="local-user",
+                user_id=DEFAULT_USER_ID,
                 entity_id=entity.entity.id,
                 source_record_id=entity.members[-1].id if entity.members else None,
                 trace_id=entity.entity.id,
@@ -271,7 +273,7 @@ def build_feed_from_entities(
 ) -> FeedResponse:
     """Convert all loaded entities into pipeline outputs and then section them into a feed."""
     entities = list_all_loaded_entities(database_path)
-    outcomes = get_latest_entity_outcomes(database_path, user_id="google-dev-user")
+    outcomes = get_latest_entity_outcomes(database_path, user_id=DEFAULT_USER_ID)
     outputs = [
         to_pipeline_output(
             database_path,
@@ -326,7 +328,7 @@ def to_pipeline_output(
             append_trace_record(
                 database_path,
                 stage="output",
-                user_id="local-user",
+                user_id=DEFAULT_USER_ID,
                 entity_id=pipeline_entity.id,
                 source_record_id=source_record_id,
                 trace_id=pipeline_entity.id,
@@ -342,7 +344,7 @@ def to_pipeline_output(
             append_trace_record(
                 database_path,
                 stage="action_selection",
-                user_id="local-user",
+                user_id=DEFAULT_USER_ID,
                 entity_id=pipeline_entity.id,
                 source_record_id=source_record_id,
                 trace_id=pipeline_entity.id,
@@ -363,7 +365,7 @@ def to_pipeline_output(
             append_trace_record(
                 database_path,
                 stage="timing",
-                user_id="local-user",
+                user_id=DEFAULT_USER_ID,
                 entity_id=pipeline_entity.id,
                 source_record_id=source_record_id,
                 trace_id=pipeline_entity.id,
@@ -414,7 +416,7 @@ def to_pipeline_output(
         append_trace_record(
             database_path,
             stage="lifecycle_transition",
-            user_id="local-user",
+            user_id=DEFAULT_USER_ID,
             entity_id=pipeline_entity.id,
             source_record_id=source_record_id,
             trace_id=pipeline_entity.id,
@@ -436,7 +438,7 @@ def to_pipeline_output(
         append_trace_record(
             database_path,
             stage="action_selection",
-            user_id="local-user",
+            user_id=DEFAULT_USER_ID,
             entity_id=pipeline_entity.id,
             source_record_id=source_record_id,
             trace_id=pipeline_entity.id,
@@ -456,7 +458,7 @@ def to_pipeline_output(
         append_trace_record(
             database_path,
             stage="timing",
-            user_id="local-user",
+            user_id=DEFAULT_USER_ID,
             entity_id=pipeline_entity.id,
             source_record_id=source_record_id,
             trace_id=pipeline_entity.id,
@@ -491,7 +493,7 @@ def create_missing_state_attention_item(entity: LoadedEntity, latest_record) -> 
     return AttentionItem(
         id=entity.entity.id,
         entity_id=entity.entity.id,
-        user_id="local-user",
+        user_id=DEFAULT_USER_ID,
         need_type="awareness",
         action_type="external",
         effort_level="quick",
@@ -521,7 +523,7 @@ def to_pipeline_entity(entity: LoadedEntity, source: str | None) -> PipelineEnti
     return PipelineEntity(
         id=entity.entity.id,
         group_id=entity.entity.id,
-        user_id="local-user",
+        user_id=DEFAULT_USER_ID,
         source=source or "gmail",
         current_state=current_state,
         due_at=due_at,
@@ -671,7 +673,7 @@ def to_suggested_attention_item(
     return AttentionItem(
         id=entity.entity.id,
         entity_id=entity.entity.id,
-        user_id="local-user",
+        user_id=DEFAULT_USER_ID,
         need_type="awareness" if primary_action == "none" else "decision",
         action_type=to_action_type(primary_action),
         effort_level=to_effort_level(primary_action),
@@ -718,7 +720,7 @@ def to_fallback_attention_item(entity: LoadedEntity, latest_record, current_time
     return AttentionItem(
         id=entity.entity.id,
         entity_id=entity.entity.id,
-        user_id="local-user",
+        user_id=DEFAULT_USER_ID,
         need_type="awareness" if primary_action == "none" else "decision",
         action_type=to_action_type(primary_action),
         effort_level=to_effort_level(primary_action),

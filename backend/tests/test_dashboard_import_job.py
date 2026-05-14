@@ -41,6 +41,8 @@ class DashboardImportJobRepositoryTests(unittest.TestCase):
             self.assertEqual(queued.imported_count, 0)
             self.assertIsNone(queued.total_count)
             self.assertIsNone(queued.started_at)
+            self.assertIsNotNone(queued.stage_started_at)
+            self.assertEqual(queued.stage_durations, {})
             self.assertIsNone(queued.completed_at)
 
             running = mark_dashboard_import_job_running(database_path, queued.id)
@@ -61,6 +63,7 @@ class DashboardImportJobRepositoryTests(unittest.TestCase):
             self.assertEqual(progress.imported_count, 2)
             self.assertEqual(progress.total_count, 5)
             self.assertEqual(progress.source_records, 2)
+            self.assertIn("starting", progress.stage_durations)
 
             succeeded = mark_dashboard_import_job_succeeded(
                 database_path,
@@ -78,6 +81,8 @@ class DashboardImportJobRepositoryTests(unittest.TestCase):
             self.assertEqual(succeeded.source_records, 3)
             self.assertEqual(succeeded.changed_entities, 2)
             self.assertEqual(succeeded.refreshed_entities, 4)
+            self.assertIn("gmail_persisted", succeeded.stage_durations)
+            self.assertIsNotNone(succeeded.stage_started_at)
             self.assertIsNotNone(succeeded.completed_at)
 
             reloaded = get_dashboard_import_job(database_path, queued.id)
@@ -129,6 +134,33 @@ class DashboardImportJobRouteTests(unittest.TestCase):
         self.assertIsNotNone(failed_stale)
         self.assertEqual(failed_stale.status, "failed")
         self.assertEqual(failed_stale.error_message, STALE_IMPORT_JOB_MESSAGE)
+
+    def test_import_job_status_marks_stale_running_job_failed(self) -> None:
+        stale = mark_dashboard_import_job_running(
+            str(self.database_path),
+            create_dashboard_import_job(str(self.database_path)).id,
+        )
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                """
+                UPDATE dashboard_import_jobs
+                SET updated_at = ?, started_at = ?, stage_started_at = ?
+                WHERE id = ?
+                """,
+                (
+                    "2000-01-01T00:00:00+00:00",
+                    "2000-01-01T00:00:00+00:00",
+                    "2000-01-01T00:00:00+00:00",
+                    stale.id,
+                ),
+            )
+
+        response = self.client.get(f"/v1/dashboard/import-jobs/{stale.id}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["error_message"], STALE_IMPORT_JOB_MESSAGE)
 
     @patch("app.services.dashboard.backfill_full_gmail_source_records")
     def test_full_history_backfill_runs_only_after_recent_first_sync(self, mock_backfill: Mock) -> None:
@@ -198,7 +230,7 @@ class DashboardImportJobRouteTests(unittest.TestCase):
             return [
                 SourceRecord(
                     id="gmail-1",
-                    user_id="google-dev-user",
+                    user_id="local-user",
                     source="gmail",
                     thread_id="thread-1",
                     raw_payload={"subject": "One"},
@@ -206,7 +238,7 @@ class DashboardImportJobRouteTests(unittest.TestCase):
                 ),
                 SourceRecord(
                     id="gmail-2",
-                    user_id="google-dev-user",
+                    user_id="local-user",
                     source="gmail",
                     thread_id="thread-2",
                     raw_payload={"subject": "Two"},
@@ -233,10 +265,12 @@ class DashboardImportJobRouteTests(unittest.TestCase):
         self.assertEqual(payload["total_count"], 2)
         self.assertEqual(payload["changed_entities"], len(changed_entity_ids))
         self.assertEqual(payload["refreshed_entities"], len(changed_entity_ids))
+        self.assertIn("stage_durations", payload)
         mock_fetch_source_records.assert_called_once()
         mock_hydrate.assert_called_once()
         hydrated_records = mock_hydrate.call_args.args[1]
         self.assertEqual([record.id for record in hydrated_records], ["gmail-1", "gmail-2"])
+        self.assertTrue(mock_hydrate.call_args.kwargs["include_unlinked"])
         mock_refresh.assert_called_once()
         refresh_args = mock_refresh.call_args.args
         self.assertEqual(refresh_args[0], str(self.database_path))
@@ -280,6 +314,7 @@ class DashboardImportJobRouteTests(unittest.TestCase):
         self.assertEqual(persisted["refreshed_entities"], len(changed_entity_ids))
         mock_hydrate.assert_called_once()
         self.assertEqual(mock_hydrate.call_args.args[1], [])
+        self.assertTrue(mock_hydrate.call_args.kwargs["include_unlinked"])
         mock_refresh.assert_called_once()
         refresh_args = mock_refresh.call_args.args
         self.assertEqual(refresh_args[0], str(self.database_path))

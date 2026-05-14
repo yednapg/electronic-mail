@@ -3,7 +3,7 @@ import Link from 'next/link';
 import { redirect } from 'next/navigation';
 
 import { AppMark } from '../components/AppMark';
-import { getBackendURL, getDashboard, isDemoMode } from '../lib/api';
+import { getBackendURL, getDashboard, getLatestDashboardImportJob, isDemoMode } from '../lib/api';
 import { DEMO_SIGN_IN_ROUTE } from '../lib/demo-flow';
 import type { DashboardResponse } from '../lib/types';
 
@@ -21,7 +21,8 @@ export default async function HomePage() {
   }
 
   if (dashboard?.auth.connected) {
-    redirect('/dashboard');
+    const latestImportJob = await getLatestDashboardImportJob();
+    redirect(latestImportJob?.status === 'succeeded' ? '/dashboard' : '/post-login');
   }
 
   signInHref = dashboard?.auth.connect_url ?? signInHref;

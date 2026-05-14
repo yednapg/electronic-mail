@@ -1,7 +1,7 @@
 'use client';
 
 /** Render one checklist-style dashboard section and manage local checked state. */
-import { useState, type CSSProperties, type FormEvent } from 'react';
+import React, { useState, type CSSProperties, type FormEvent } from 'react';
 
 import { completeEntity, createGmailDraft, createTask } from '../../lib/api';
 import type { DashboardSectionItem } from './types';
@@ -59,7 +59,7 @@ export function DashboardSection({
   const overflowCount = hasOverflow ? sectionItems.length - (maxVisible ?? sectionItems.length) : 0;
   const canSubmit =
     composeMode === 'email'
-      ? formatEmailDraftTitle(emailDraft).length > 0
+      ? emailDraft.to.trim().length > 0 && formatEmailDraftTitle(emailDraft).length > 0
       : todoTitle.trim().length > 0;
 
   function updateEmailDraft(key: keyof EmailDraftState, value: string | boolean) {
@@ -88,11 +88,11 @@ export function DashboardSection({
       if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'true') {
         if (composeMode === 'email') {
           const draft = await createGmailDraft({
-            to: emailDraft.to,
-            cc: emailDraft.cc || null,
-            bcc: emailDraft.bcc || null,
-            subject: emailDraft.subject,
-            body: emailDraft.body,
+            to: emailDraft.to.trim(),
+            cc: emailDraft.cc.trim() || null,
+            bcc: emailDraft.bcc.trim() || null,
+            subject: emailDraft.subject.trim(),
+            body: emailDraft.body.trim(),
           });
           setLocalItems((currentItems) => [
             {
@@ -292,16 +292,20 @@ export function DashboardSection({
         </form>
       ) : null}
 
-      <ul className="attention-list">
-        {visibleItems.map((item, index) => (
-          <DashboardSectionItemRow
-            key={item.id}
-            item={item}
-            index={index}
-            onComplete={() => setHiddenItemIds((current) => new Set(current).add(item.id))}
-          />
-        ))}
-      </ul>
+      {visibleItems.length > 0 ? (
+        <ul className="attention-list">
+          {visibleItems.map((item, index) => (
+            <DashboardSectionItemRow
+              key={item.id}
+              item={item}
+              index={index}
+              onComplete={() => setHiddenItemIds((current) => new Set(current).add(item.id))}
+            />
+          ))}
+        </ul>
+      ) : (
+        <p className="attention-empty">Nothing here yet.</p>
+      )}
 
       {hasOverflow ? (
         <button
@@ -374,7 +378,7 @@ function DashboardSectionItemRow({
 
     try {
       const { threadId, operation } = item.cta.action;
-      const response = await fetch(`http://localhost:3001/gmail/threads/${threadId}/${operation}`, {
+      const response = await fetch(`/api/gmail/threads/${encodeURIComponent(threadId)}/${operation}`, {
         method: 'POST',
       });
 

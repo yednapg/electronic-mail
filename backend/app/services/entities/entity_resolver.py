@@ -3,6 +3,7 @@ from __future__ import annotations
 """Resolve new source records onto existing entities or create fallback entities."""
 
 import html
+import os
 import re
 
 from app.db.models import StoredEntity
@@ -241,31 +242,53 @@ def resolve_entity_for_record(
             )
             return entity, 0.0
 
-        ai_resolution = resolve_entity_with_ai(record, candidates)
+        deterministic_candidate = choose_deterministic_candidate(candidates)
 
-        if ai_resolution.entity_id is not None and ai_resolution.confidence > 0.8:
-            matched_candidate = next(
-                (candidate for candidate in candidates if candidate["entity"].id == ai_resolution.entity_id),
-                None,
+        if deterministic_candidate is not None:
+            matched_entity = deterministic_candidate["entity"]
+            attach_record_with_thread_membership(database_path, matched_entity.id, record)
+            append_trace_record(
+                database_path,
+                stage="grouping",
+                user_id=record.user_id,
+                entity_id=matched_entity.id,
+                source_record_id=record.id,
+                trace_id=matched_entity.id,
+                input=trace_input,
+                output={
+                    "entity_id": matched_entity.id,
+                    "confidence": float(deterministic_candidate["confidence"]),
+                    "method": "heuristic_match",
+                },
             )
+            return matched_entity, float(deterministic_candidate["confidence"])
 
-            if matched_candidate is not None:
-                attach_record_with_thread_membership(database_path, matched_candidate["entity"].id, record)
-                append_trace_record(
-                    database_path,
-                    stage="grouping",
-                    user_id=record.user_id,
-                    entity_id=matched_candidate["entity"].id,
-                    source_record_id=record.id,
-                    trace_id=matched_candidate["entity"].id,
-                    input=trace_input,
-                    output={
-                        "entity_id": matched_candidate["entity"].id,
-                        "confidence": float(ai_resolution.confidence),
-                        "method": "ai_match",
-                    },
+        if should_use_ai_grouping():
+            ai_resolution = resolve_entity_with_ai(record, candidates)
+
+            if ai_resolution.entity_id is not None and ai_resolution.confidence > 0.8:
+                matched_candidate = next(
+                    (candidate for candidate in candidates if candidate["entity"].id == ai_resolution.entity_id),
+                    None,
                 )
-                return matched_candidate["entity"], float(ai_resolution.confidence)
+
+                if matched_candidate is not None:
+                    attach_record_with_thread_membership(database_path, matched_candidate["entity"].id, record)
+                    append_trace_record(
+                        database_path,
+                        stage="grouping",
+                        user_id=record.user_id,
+                        entity_id=matched_candidate["entity"].id,
+                        source_record_id=record.id,
+                        trace_id=matched_candidate["entity"].id,
+                        input=trace_input,
+                        output={
+                            "entity_id": matched_candidate["entity"].id,
+                            "confidence": float(ai_resolution.confidence),
+                            "method": "ai_match",
+                        },
+                    )
+                    return matched_candidate["entity"], float(ai_resolution.confidence)
 
     entity = create_entity(database_path, build_entity_seed_key(record))
     attach_record_with_thread_membership(database_path, entity.id, record)
@@ -484,10 +507,41 @@ def find_entity_candidates(database_path: str, record: SourceRecord) -> list[dic
                 "shared_reference_ids": sorted(
                     set(candidate.get("shared_reference_ids", [])) | shared_summary_reference_ids
                 ),
+                "shared_named_markers": sorted(candidate.get("shared_named_markers", [])),
+                "candidate_named_markers": sorted(candidate.get("candidate_named_markers", [])),
             }
         )
 
     return sorted(candidates, key=lambda item: item["confidence"], reverse=True)[:5]
+
+
+def choose_deterministic_candidate(candidates: list[dict[str, object]]) -> dict[str, object] | None:
+    """Pick only high-confidence cross-thread matches without blocking on AI."""
+    if not candidates:
+        return None
+
+    top = candidates[0]
+    top_confidence = float(top.get("confidence") or 0.0)
+    second_confidence = float(candidates[1].get("confidence") or 0.0) if len(candidates) > 1 else 0.0
+    margin = top_confidence - second_confidence
+    has_shared_reference = bool(top.get("shared_reference_ids"))
+    has_shared_named_marker = bool(top.get("shared_named_markers"))
+
+    if has_shared_reference and top_confidence >= 0.86 and (len(candidates) == 1 or margin >= 0.05):
+        return top
+
+    if has_shared_named_marker and top_confidence >= 0.9 and (len(candidates) == 1 or margin >= 0.1):
+        return top
+
+    if top_confidence >= 0.94 and (len(candidates) == 1 or margin >= 0.12):
+        return top
+
+    return None
+
+
+def should_use_ai_grouping() -> bool:
+    """Keep first-run hydration fast unless AI grouping is explicitly enabled."""
+    return os.getenv("OPENAI_ENTITY_GROUPING", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def get_subject_confidence(left: str, right: str) -> float:
