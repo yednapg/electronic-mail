@@ -1,10 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import type { ThreadReaderResponse } from '../../lib/types';
 import { ThreadDetail } from './[entityId]/thread/page';
+
+const threadPageSource = readFileSync(new URL('./[entityId]/thread/page.tsx', import.meta.url), 'utf8');
 
 const thread: ThreadReaderResponse = {
   entity_id: 'entity-1',
@@ -42,6 +45,11 @@ test('thread detail renders persisted subject body snippet and source', () => {
   assert.match(html, /alerts@hdfcbank.net/);
 });
 
+test('thread page auth check does not fetch the full dashboard', () => {
+  assert.doesNotMatch(threadPageSource, /\bgetDashboard\b/);
+  assert.match(threadPageSource, /\bgetGoogleAuthState\b/);
+});
+
 test('thread detail does not expose Gmail mutation actions or backend ids', () => {
   const html = renderToStaticMarkup(React.createElement(ThreadDetail, { entityId: 'entity-1', thread, errorMessage: null }));
 
@@ -52,7 +60,7 @@ test('thread detail does not expose Gmail mutation actions or backend ids', () =
   assert.doesNotMatch(html, /thread-1/);
 });
 
-test('thread detail renders pagination metadata and more link', () => {
+test('thread detail renders focused page with more link', () => {
   const pageThread = {
     ...thread,
     total_messages: 100,
@@ -75,7 +83,6 @@ test('thread detail renders pagination metadata and more link', () => {
     }),
   );
 
-  assert.match(html, /25 of 100 emails/);
   assert.match(html, /href="\/entities\/entity-1\/thread\?limit=25&amp;offset=25"/);
   assert.match(html, />More</);
   assert.doesNotMatch(html, />Previous</);
@@ -99,7 +106,6 @@ test('thread detail renders previous and more links for middle pages', () => {
     }),
   );
 
-  assert.match(html, /1 of 100 emails/);
   assert.match(html, /href="\/entities\/entity-1\/thread\?limit=25&amp;offset=0"/);
   assert.match(html, /href="\/entities\/entity-1\/thread\?limit=25&amp;offset=50"/);
   assert.match(html, />Previous</);

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import React from 'react';
@@ -6,6 +7,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import { GmailView, formatGmailReceivedAt } from './page';
 import type { GmailViewResponse } from '../../lib/types';
+
+const gmailThreadPageSource = readFileSync(new URL('./threads/[threadId]/page.tsx', import.meta.url), 'utf8');
 
 test('gmail received time stays compact', () => {
   assert.match(formatGmailReceivedAt('2026-05-11T09:30:00'), /9:30/);
@@ -87,13 +90,20 @@ test('gmail view renders raw thread buckets before lifecycle grouping', () => {
 
   const markup = renderToStaticMarkup(React.createElement(GmailView, { gmail }));
 
-  assert.match(markup, /Gmail/);
+  assert.match(markup, /Inbox/);
   assert.match(markup, /Today/);
   assert.match(markup, /Last seven days/);
   assert.match(markup, /Order shipped/);
-  assert.match(markup, /3 emails/);
   assert.match(markup, /Apple shipped your order/);
-  assert.match(markup, /Apple confirmed the order/);
+  assert.match(markup, /href="\/gmail\/threads\/thread-order"/);
+  assert.match(markup, /href="\/gmail\/threads\/thread-bank"/);
   assert.match(markup, /Statement ready/);
   assert.doesNotMatch(markup, /Archive|Unarchive/);
+  assert.doesNotMatch(markup, /Apple confirmed the order/);
+});
+
+test('gmail thread route uses the mounted mailbox client instead of server thread fetching', () => {
+  assert.match(gmailThreadPageSource, /\bGmailInboxClient\b/);
+  assert.doesNotMatch(gmailThreadPageSource, /\bgetMailboxThread\b/);
+  assert.doesNotMatch(gmailThreadPageSource, /\bThreadDetail\b/);
 });

@@ -1,117 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { getDashboard, getGmailView, getHistory, isDemoMode } from './api';
+import {
+  getDashboard,
+  getEntityThread,
+  getGmailView,
+  getGoogleAuthState,
+  getMailbox,
+  getMailboxSyncState,
+  getMailboxThread,
+  triggerMailboxSync,
+} from './api';
 
-test('demo mode is opt-in so the app uses the real backend by default', () => {
-  const previousMode = process.env.NEXT_PUBLIC_DEMO_MODE;
-
-  delete process.env.NEXT_PUBLIC_DEMO_MODE;
-
-  try {
-    assert.equal(isDemoMode(), false);
-    process.env.NEXT_PUBLIC_DEMO_MODE = 'true';
-    assert.equal(isDemoMode(), true);
-  } finally {
-    if (previousMode === undefined) {
-      delete process.env.NEXT_PUBLIC_DEMO_MODE;
-    } else {
-      process.env.NEXT_PUBLIC_DEMO_MODE = previousMode;
-    }
-  }
-});
-
-test('history fetcher returns hardcoded demo history without fetching backend', async () => {
-  const previousMode = process.env.NEXT_PUBLIC_DEMO_MODE;
-  const previousFetch = globalThis.fetch;
-
-  process.env.NEXT_PUBLIC_DEMO_MODE = 'true';
-  globalThis.fetch = (() => {
-    throw new Error('Demo history should not fetch the backend');
-  }) as typeof fetch;
-
-  try {
-    const history = await getHistory();
-
-    assert.equal(history.total, 15);
-    assert.equal(history.years[0].year, '2026');
-    assert.equal(history.years[0].months[0].month, '2026-05');
-    assert.equal(history.years[0].months[0].days[0].rows[0].source_record_id, 'gmail:pycon-us-invite-2026');
-  } finally {
-    if (previousMode === undefined) {
-      delete process.env.NEXT_PUBLIC_DEMO_MODE;
-    } else {
-      process.env.NEXT_PUBLIC_DEMO_MODE = previousMode;
-    }
-
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('history fetcher calls backend when demo mode is not enabled', async () => {
-  const previousMode = process.env.NEXT_PUBLIC_DEMO_MODE;
+test('gmail view fetcher always calls backend', async () => {
   const previousFetch = globalThis.fetch;
   const calls: string[] = [];
 
-  delete process.env.NEXT_PUBLIC_DEMO_MODE;
-  globalThis.fetch = ((input: RequestInfo | URL) => {
-    calls.push(String(input));
-    return Promise.resolve(
-      new Response(JSON.stringify({ total: 0, limit: 60, offset: 0, years: [] }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    );
-  }) as typeof fetch;
-
-  try {
-    const history = await getHistory();
-
-    assert.equal(history.total, 0);
-    assert.equal(calls[0], 'http://localhost:3001/v1/history?limit=60&offset=0');
-  } finally {
-    if (previousMode === undefined) {
-      delete process.env.NEXT_PUBLIC_DEMO_MODE;
-    } else {
-      process.env.NEXT_PUBLIC_DEMO_MODE = previousMode;
-    }
-
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('gmail view fetcher returns hardcoded demo Gmail threads without fetching backend', async () => {
-  const previousMode = process.env.NEXT_PUBLIC_DEMO_MODE;
-  const previousFetch = globalThis.fetch;
-
-  process.env.NEXT_PUBLIC_DEMO_MODE = 'true';
-  globalThis.fetch = (() => {
-    throw new Error('Demo Gmail view should not fetch the backend');
-  }) as typeof fetch;
-
-  try {
-    const gmail = await getGmailView();
-
-    assert.equal(gmail.total_threads, 3);
-    assert.equal(gmail.sections[0].title, 'Today');
-    assert.equal(gmail.sections[0].rows[0].thread_id, 'pycon-us-2026');
-  } finally {
-    if (previousMode === undefined) {
-      delete process.env.NEXT_PUBLIC_DEMO_MODE;
-    } else {
-      process.env.NEXT_PUBLIC_DEMO_MODE = previousMode;
-    }
-
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('gmail view fetcher calls backend when demo mode is not enabled', async () => {
-  const previousMode = process.env.NEXT_PUBLIC_DEMO_MODE;
-  const previousFetch = globalThis.fetch;
-  const calls: string[] = [];
-
-  delete process.env.NEXT_PUBLIC_DEMO_MODE;
   globalThis.fetch = ((input: RequestInfo | URL) => {
     calls.push(String(input));
     return Promise.resolve(
@@ -128,53 +32,14 @@ test('gmail view fetcher calls backend when demo mode is not enabled', async () 
     assert.equal(gmail.total_threads, 0);
     assert.equal(calls[0], 'http://localhost:3001/v1/gmail-view');
   } finally {
-    if (previousMode === undefined) {
-      delete process.env.NEXT_PUBLIC_DEMO_MODE;
-    } else {
-      process.env.NEXT_PUBLIC_DEMO_MODE = previousMode;
-    }
-
     globalThis.fetch = previousFetch;
   }
 });
 
-test('dashboard fetcher returns hardcoded demo data without fetching backend', async () => {
-  const previousMode = process.env.NEXT_PUBLIC_DEMO_MODE;
-  const previousFetch = globalThis.fetch;
-
-  process.env.NEXT_PUBLIC_DEMO_MODE = 'true';
-  globalThis.fetch = (() => {
-    throw new Error('Demo dashboard should not fetch the backend');
-  }) as typeof fetch;
-
-  try {
-    const dashboard = await getDashboard();
-
-    assert.equal(dashboard.auth.connected, true);
-    assert.equal(dashboard.profile?.display_name, 'Demo User');
-    assert.match(dashboard.briefing?.brief ?? '', /📆 5 meetings/);
-    assert.ok(dashboard.feed.now.length > 0);
-    assert.ok(dashboard.feed.today.length > 0);
-    assert.ok(dashboard.feed.worth_knowing.length > 0);
-    assert.ok(dashboard.feed.now.some((item) => item.id === 'hdfc-card-bill'));
-    assert.ok(dashboard.feed.today.some((item) => item.id === 'apple-replacement'));
-  } finally {
-    if (previousMode === undefined) {
-      delete process.env.NEXT_PUBLIC_DEMO_MODE;
-    } else {
-      process.env.NEXT_PUBLIC_DEMO_MODE = previousMode;
-    }
-
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('dashboard fetcher calls backend when demo mode is not enabled', async () => {
-  const previousMode = process.env.NEXT_PUBLIC_DEMO_MODE;
+test('dashboard fetcher always calls backend', async () => {
   const previousFetch = globalThis.fetch;
   const calls: string[] = [];
 
-  delete process.env.NEXT_PUBLIC_DEMO_MODE;
   globalThis.fetch = ((input: RequestInfo | URL) => {
     calls.push(String(input));
     return Promise.resolve(
@@ -199,12 +64,159 @@ test('dashboard fetcher calls backend when demo mode is not enabled', async () =
     assert.equal(dashboard.auth.connected, false);
     assert.equal(calls[0], 'http://localhost:3001/dashboard');
   } finally {
-    if (previousMode === undefined) {
-      delete process.env.NEXT_PUBLIC_DEMO_MODE;
-    } else {
-      process.env.NEXT_PUBLIC_DEMO_MODE = previousMode;
-    }
+    globalThis.fetch = previousFetch;
+  }
+});
 
+test('Google auth state fetcher uses the lightweight backend endpoint', async () => {
+  const previousFetch = globalThis.fetch;
+  const calls: string[] = [];
+
+  globalThis.fetch = ((input: RequestInfo | URL) => {
+    calls.push(String(input));
+    return Promise.resolve(
+      new Response(JSON.stringify({ available: true, connected: true, connect_url: null }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+  }) as typeof fetch;
+
+  try {
+    const auth = await getGoogleAuthState();
+
+    assert.equal(auth.connected, true);
+    assert.equal(calls[0], 'http://localhost:3001/v1/auth/google/state');
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('entity thread fetcher always calls backend with pagination', async () => {
+  const previousFetch = globalThis.fetch;
+  const calls: string[] = [];
+
+  globalThis.fetch = ((input: RequestInfo | URL) => {
+    calls.push(String(input));
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          entity_id: 'entity-123',
+          total_records: 0,
+          records: [],
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      ),
+    );
+  }) as typeof fetch;
+
+  try {
+    const thread = await getEntityThread('entity-123', { limit: 10, offset: 20, threadId: 'gmail-thread-1' });
+
+    assert.equal(thread.entity_id, 'entity-123');
+    assert.equal(
+      calls[0],
+      'http://localhost:3001/v1/entities/entity-123/thread?limit=10&offset=20&threadId=gmail-thread-1',
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('mailbox fetcher calls backend with label pagination', async () => {
+  const previousFetch = globalThis.fetch;
+  const calls: string[] = [];
+
+  globalThis.fetch = ((input: RequestInfo | URL) => {
+    calls.push(String(input));
+    return Promise.resolve(
+      new Response(JSON.stringify({ label: 'inbox', total_threads: 0, next_cursor: null, sections: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+  }) as typeof fetch;
+
+  try {
+    const mailbox = await getMailbox({ label: 'trash', limit: 50, cursor: '100' });
+
+    assert.equal(mailbox.total_threads, 0);
+    assert.equal(calls[0], 'http://localhost:3001/v1/mailbox?label=trash&limit=50&cursor=100');
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('mailbox thread fetcher opens by Gmail thread id without entity id', async () => {
+  const previousFetch = globalThis.fetch;
+  const calls: string[] = [];
+
+  globalThis.fetch = ((input: RequestInfo | URL) => {
+    calls.push(String(input));
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          entity_id: 'gmail-thread:thread-1',
+          user_id: 'local-user',
+          source: 'gmail',
+          gmail_thread_id: 'thread-1',
+          subject: 'Thread subject',
+          total_messages: 0,
+          limit: 25,
+          offset: 0,
+          has_more: false,
+          messages: [],
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      ),
+    );
+  }) as typeof fetch;
+
+  try {
+    const thread = await getMailboxThread('thread-1', { limit: 25, offset: 0 });
+
+    assert.equal(thread.gmail_thread_id, 'thread-1');
+    assert.equal(calls[0], 'http://localhost:3001/v1/mailbox/threads/thread-1?limit=25&offset=0');
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('mailbox sync helpers use backend sync endpoints', async () => {
+  const previousFetch = globalThis.fetch;
+  const calls: string[] = [];
+
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push(`${init?.method ?? 'GET'} ${String(input)}`);
+    const payload =
+      init?.method === 'POST'
+        ? { status: 'queued', state: { connected: true, total_threads: 0 } }
+        : { connected: true, total_threads: 0 };
+    return Promise.resolve(
+      new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+  }) as typeof fetch;
+
+  try {
+    const state = await getMailboxSyncState();
+    const triggered = await triggerMailboxSync();
+
+    assert.equal(state.connected, true);
+    assert.equal(triggered.status, 'queued');
+    assert.deepEqual(calls, [
+      'GET http://localhost:3001/v1/mailbox/sync-state',
+      'POST http://localhost:3001/v1/mailbox/sync',
+    ]);
+  } finally {
     globalThis.fetch = previousFetch;
   }
 });

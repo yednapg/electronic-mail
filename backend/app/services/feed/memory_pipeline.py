@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Persisted-memory pipeline that hydrates entities and produces the feed."""
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 import re
 
@@ -13,8 +14,8 @@ from app.db.repository import (
     get_feed_projection_count,
     get_entity_member_count,
     get_latest_entity_outcomes,
-    get_loaded_entity,
     get_source_record_count,
+    list_entity_member_source_records_lightweight,
     list_feed_projection_payloads,
     list_all_loaded_entities,
     list_loaded_entities,
@@ -24,7 +25,7 @@ from app.db.repository import (
     upsert_feed_projection,
 )
 from app.schemas.ai import FeedEntityContextInput, FeedEntityJudgmentOutput
-from app.schemas.domain import AttentionItem, FeedResponse, PipelineEntity, PipelineOutput, SourceRecord
+from app.schemas.domain import AttentionItem, AttentionItemDetail, FeedResponse, PipelineEntity, PipelineOutput, SourceRecord
 from app.services.ai.decision import judge_feed_entities, normalize_entity_state
 from app.services.copy_quality import humanize_account_copy, infer_account_emails_from_records
 from app.services.entities.entity_reconciler import reconcile_entities
@@ -70,9 +71,58 @@ TITLE_CONTEXT_PATTERNS = [
     re.compile(r"\b(?:and|after|but)\b[^.;]{12,120}", re.IGNORECASE),
 ]
 MAX_SUGGESTED_TITLE_CHARS = 120
-AI_JUDGMENT_MODEL = "ai-judgment-v2"
+AI_JUDGMENT_MODEL = "ai-judgment-v3"
 PERSISTENT_SUGGESTION_MODELS = {AI_JUDGMENT_MODEL, "manual-task"}
-FEED_PROJECTION_VERSION = "feed-projection-v3"
+FEED_PROJECTION_VERSION = "feed-projection-v4"
+RECENT_ACTION_WINDOW_DAYS = 90
+CONCRETE_ACTIONS = {"reply", "confirm", "pay", "join", "review", "send", "approve", "register", "track"}
+URL_PATTERN = re.compile(r"https?://[^\s<>)\"']+", re.IGNORECASE)
+ACTION_LANGUAGE_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in [
+        r"\bplease\s+(?:reply|respond|review|confirm|approve|send|share|upload|pay|complete|submit)\b",
+        r"\b(?:reply|respond|review|confirm|approve|send|share|upload|pay|complete|submit)\s+(?:by|before|today|within)\b",
+        r"\b(?:can|could|would)\s+you\s+(?:reply|respond|review|confirm|approve|send|share|upload|pay|complete|submit|provide)\b",
+        r"\b(?:need|needs|needed|requires|requesting)\s+(?:your\s+)?(?:reply|response|review|confirmation|approval|payment|documents?|details?|input)\b",
+        r"\b(?:action required|required action|payment due|bill due|due today|overdue|expires today)\b",
+        r"\b(?:kindly|please)\s+(?:provide|submit|send|share|confirm|make payment)\b",
+    ]
+]
+ACTION_INFERENCE_PATTERNS = [
+    ("pay", re.compile(r"\b(?:pay|payment due|bill due|invoice due|make payment|autopay)\b", re.IGNORECASE)),
+    ("reply", re.compile(r"\b(?:reply|respond|response needed|get back to us)\b", re.IGNORECASE)),
+    ("confirm", re.compile(r"\b(?:confirm|rsvp|accept or decline|accept|decline)\b", re.IGNORECASE)),
+    ("approve", re.compile(r"\b(?:approve|approval required|approval needed)\b", re.IGNORECASE)),
+    ("send", re.compile(r"\b(?:send|share|upload|submit|provide)\s+(?:the\s+)?(?:document|documents|file|files|details|information|screenshot|form)\b", re.IGNORECASE)),
+    ("review", re.compile(r"\b(?:review|check|verify)\b", re.IGNORECASE)),
+    ("register", re.compile(r"\b(?:register|sign up|complete registration)\b", re.IGNORECASE)),
+    ("join", re.compile(r"\b(?:join|attend)\b", re.IGNORECASE)),
+    ("track", re.compile(r"\b(?:track|check status|view status)\b", re.IGNORECASE)),
+]
+PASSIVE_STATUS_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in [
+        r"\b(?:processed|processed successfully|completed|closed|resolved|delivered|shipped)\b",
+        r"\b(?:confirmed|accepted|approved|registered|acknowledged|received)\b",
+        r"\b(?:receipt|statement|intimation|confirmation|notification|update)\b",
+        r"\b(?:no action required|no further action|for your information|fyi)\b",
+    ]
+]
+IMPORTANT_STATUS_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in [
+        r"\b(?:itr|income tax|tax return|intimation)\b",
+        r"\b(?:refund|payment|bill|statement|approval|approved|processed|completed|closed)\b",
+        r"\b(?:account|card|bank|rbi|zerodha|demat|application)\b",
+    ]
+]
+URGENT_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in [
+        r"\b(?:urgent|immediately|asap|overdue|expires today|due today|by today|within 24 hours)\b",
+        r"\bsecurity\b",
+    ]
+]
 
 
 def hydrate_persistent_memory(
@@ -80,21 +130,33 @@ def hydrate_persistent_memory(
     source_records: list[SourceRecord] | None = None,
     *,
     include_unlinked: bool = False,
+    user_id: str = DEFAULT_USER_ID,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[str]:
     """Resolve records to entities, backfill missing links, and derive state."""
     touched_entity_ids: set[str] = set()
     explicit_source_records = source_records is not None
     ordered_records = sorted(source_records or [], key=lambda record: record.received_at)
+    unlinked_records = list(list_unlinked_source_records(database_path, user_id=user_id)) if include_unlinked or not explicit_source_records else []
+    total_records_to_link = len(ordered_records) + len(unlinked_records)
+    linked_records = 0
+
+    def report_progress() -> None:
+        if progress_callback is not None:
+            progress_callback(linked_records, total_records_to_link)
 
     for record in ordered_records:
         entity, _ = resolve_entity_for_record(database_path, record)
         touched_entity_ids.add(entity.id)
+        linked_records += 1
+        if linked_records % 5 == 0 or linked_records == total_records_to_link:
+            report_progress()
 
     if include_unlinked or not explicit_source_records:
-        for record in list_unlinked_source_records(database_path):
+        for record in unlinked_records:
             source_record = SourceRecord(
                 id=record.id,
-                user_id=DEFAULT_USER_ID,
+                user_id=user_id,
                 source=record.source,
                 thread_id=record.thread_id or "",
                 raw_payload=record.raw_payload,
@@ -102,21 +164,30 @@ def hydrate_persistent_memory(
             )
             entity, _ = resolve_entity_for_record(database_path, source_record)
             touched_entity_ids.add(entity.id)
+            linked_records += 1
+            if linked_records % 5 == 0 or linked_records == total_records_to_link:
+                report_progress()
 
-        for entity_id in list_entities_missing_state_ids(database_path):
+        for entity_id in list_entities_missing_state_ids(database_path, user_id=user_id):
             touched_entity_ids.add(entity_id)
 
-        touched_entity_ids.update(reconcile_entities(database_path))
+        touched_entity_ids.update(reconcile_entities(database_path, user_id=user_id))
 
-    for entity_id in touched_entity_ids:
-        loaded = get_loaded_entity(database_path, entity_id)
+    state_entity_ids = sorted(touched_entity_ids)
+    total_state_work = total_records_to_link + len(state_entity_ids)
+    for index, entity_id in enumerate(state_entity_ids, start=1):
+        members = list_entity_member_source_records_lightweight(database_path, entity_id, user_id=user_id)
 
-        if loaded is None:
+        if not members:
             continue
 
-        derive_and_store_entity_state(database_path, entity_id, loaded.members)
+        derive_and_store_entity_state(database_path, entity_id, members, user_id=user_id)
+        if progress_callback is not None and (index % 5 == 0 or index == len(state_entity_ids)):
+            progress_callback(linked_records + index, total_state_work)
 
-    total_records = get_source_record_count(database_path)
+    report_progress()
+
+    total_records = get_source_record_count(database_path, user_id=user_id)
     total_members = get_entity_member_count(database_path)
 
     # Every source record should belong to exactly one entity member row.
@@ -126,20 +197,25 @@ def hydrate_persistent_memory(
     return sorted(touched_entity_ids)
 
 
-def rebuild_persistent_memory(database_path: str) -> list[str]:
+def rebuild_persistent_memory(database_path: str, *, user_id: str = DEFAULT_USER_ID) -> list[str]:
     """Recompute entity memory from already-synced source records."""
-    clear_derived_memory(database_path)
-    return hydrate_persistent_memory(database_path)
+    clear_derived_memory(database_path, user_id=user_id)
+    return hydrate_persistent_memory(database_path, user_id=user_id)
 
 
-def refresh_ai_suggestions_for_entities(database_path: str, entity_ids: list[str]) -> None:
+def refresh_ai_suggestions_for_entities(
+    database_path: str,
+    entity_ids: list[str],
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> None:
     """Refresh cached AI judgments only for entities changed by the current sync cycle."""
     unique_entity_ids = sorted(set(entity_ids))
 
     if not unique_entity_ids:
         return
 
-    entities = list_loaded_entities(database_path, unique_entity_ids)
+    entities = list_loaded_entities(database_path, unique_entity_ids, user_id=user_id)
     entities_needing_refresh = [entity for entity in entities if get_usable_suggestion(entity) is None]
     contexts = [context for entity in entities_needing_refresh if (context := to_feed_entity_context(entity)) is not None]
 
@@ -166,7 +242,7 @@ def refresh_ai_suggestions_for_entities(database_path: str, entity_ids: list[str
             append_trace_record(
                 database_path,
                 stage="decision",
-                user_id=DEFAULT_USER_ID,
+                user_id=user_id,
                 entity_id=entity.entity.id,
                 source_record_id=entity.members[-1].id if entity.members else None,
                 trace_id=entity.entity.id,
@@ -182,6 +258,7 @@ def refresh_feed_projections_for_entities(
     entity_ids: list[str],
     current_time: str,
     *,
+    user_id: str = DEFAULT_USER_ID,
     record_trace: bool = True,
 ) -> None:
     """Refresh cached feed projections only for entities touched by the current change."""
@@ -190,8 +267,8 @@ def refresh_feed_projections_for_entities(
     if not unique_entity_ids:
         return
 
-    entities = list_loaded_entities(database_path, unique_entity_ids)
-    outcomes = get_latest_entity_outcomes(database_path, user_id=DEFAULT_USER_ID)
+    entities = list_loaded_entities(database_path, unique_entity_ids, user_id=user_id)
+    outcomes = get_latest_entity_outcomes(database_path, user_id=user_id)
 
     for entity in entities:
         output = to_pipeline_output(
@@ -199,22 +276,23 @@ def refresh_feed_projections_for_entities(
             entity,
             current_time,
             latest_outcome=outcomes.get(entity.entity.id),
+            user_id=user_id,
             record_trace=record_trace,
         )
         upsert_feed_projection(
             database_path,
-            user_id=DEFAULT_USER_ID,
+            user_id=user_id,
             entity_id=entity.entity.id,
             pipeline_output=versioned_feed_projection_payload(output),
         )
 
 
-def build_feed_from_projection_cache(database_path: str) -> FeedResponse | None:
+def build_feed_from_projection_cache(database_path: str, *, user_id: str = DEFAULT_USER_ID) -> FeedResponse | None:
     """Build the feed from persisted per-entity projections when the cache is populated."""
-    if get_feed_projection_count(database_path, user_id=DEFAULT_USER_ID) == 0:
+    if get_feed_projection_count(database_path, user_id=user_id) == 0:
         return None
 
-    payloads = list_feed_projection_payloads(database_path, user_id=DEFAULT_USER_ID)
+    payloads = list_feed_projection_payloads(database_path, user_id=user_id)
     if not payloads or any(not is_current_feed_projection_payload(payload) for payload in payloads):
         return None
 
@@ -232,11 +310,11 @@ def is_current_feed_projection_payload(payload: dict[str, object]) -> bool:
     return payload.get("projection_version") == FEED_PROJECTION_VERSION
 
 
-def list_stale_feed_projection_entity_ids(database_path: str) -> list[str]:
+def list_stale_feed_projection_entity_ids(database_path: str, *, user_id: str = DEFAULT_USER_ID) -> list[str]:
     """Return entities whose cached feed projection predates the current user-facing copy contract."""
     stale_entity_ids: set[str] = set()
 
-    for payload in list_feed_projection_payloads(database_path, user_id=DEFAULT_USER_ID):
+    for payload in list_feed_projection_payloads(database_path, user_id=user_id):
         if is_current_feed_projection_payload(payload):
             continue
 
@@ -256,11 +334,11 @@ def list_stale_feed_projection_entity_ids(database_path: str) -> list[str]:
     return sorted(stale_entity_ids)
 
 
-def list_entity_ids_needing_ai_refresh(database_path: str) -> list[str]:
+def list_entity_ids_needing_ai_refresh(database_path: str, *, user_id: str = DEFAULT_USER_ID) -> list[str]:
     """Return persisted entities whose AI judgment cache is missing or from an old copy model."""
     return sorted(
         entity.entity.id
-        for entity in list_all_loaded_entities(database_path)
+        for entity in list_all_loaded_entities(database_path, user_id=user_id)
         if entity.state is not None and get_usable_suggestion(entity) is None
     )
 
@@ -269,23 +347,25 @@ def build_feed_from_entities(
     database_path: str,
     current_time: str,
     *,
+    user_id: str = DEFAULT_USER_ID,
     record_trace: bool = True,
 ) -> FeedResponse:
     """Convert all loaded entities into pipeline outputs and then section them into a feed."""
-    entities = list_all_loaded_entities(database_path)
-    outcomes = get_latest_entity_outcomes(database_path, user_id=DEFAULT_USER_ID)
+    entities = list_all_loaded_entities(database_path, user_id=user_id)
+    outcomes = get_latest_entity_outcomes(database_path, user_id=user_id)
     outputs = [
         to_pipeline_output(
             database_path,
             entity,
             current_time,
             latest_outcome=outcomes.get(entity.entity.id),
+            user_id=user_id,
             record_trace=record_trace,
         )
         for entity in entities
     ]
     feed = build_feed(outputs, database_path if record_trace else None)
-    source_records = get_source_record_count(database_path)
+    source_records = get_source_record_count(database_path, user_id=user_id)
     feed_items = len(feed.now) + len(feed.today) + len(feed.worth_knowing)
 
     # Feed projection should never create more visible items than underlying entities.
@@ -315,6 +395,7 @@ def to_pipeline_output(
     current_time: str,
     latest_outcome=None,
     *,
+    user_id: str = DEFAULT_USER_ID,
     record_trace: bool = True,
 ) -> PipelineOutput:
     """Turn one loaded entity into a visible feed item whenever enough context exists."""
@@ -323,12 +404,12 @@ def to_pipeline_output(
     source_record_id = latest_record.id if latest_record is not None else None
 
     if latest_record is None:
-        pipeline_entity = to_pipeline_entity(entity, None)
+        pipeline_entity = to_pipeline_entity(entity, None, user_id=user_id)
         if record_trace:
             append_trace_record(
                 database_path,
                 stage="output",
-                user_id=DEFAULT_USER_ID,
+                user_id=user_id,
                 entity_id=pipeline_entity.id,
                 source_record_id=source_record_id,
                 trace_id=pipeline_entity.id,
@@ -338,13 +419,15 @@ def to_pipeline_output(
         return create_suppressed_output(pipeline_entity, "missing_state")
 
     if state is None:
-        pipeline_entity = to_pipeline_entity(entity, latest_record.source)
-        attention_item = create_missing_state_attention_item(entity, latest_record)
+        pipeline_entity = to_pipeline_entity(entity, latest_record.source, user_id=user_id)
+        attention_item = create_missing_state_attention_item(entity, latest_record, current_time, user_id=user_id)
+        if should_suppress_attention_item(entity, latest_record, attention_item, current_time):
+            return create_suppressed_output(pipeline_entity, "missing_state_not_actionable")
         if record_trace:
             append_trace_record(
                 database_path,
                 stage="action_selection",
-                user_id=DEFAULT_USER_ID,
+                user_id=user_id,
                 entity_id=pipeline_entity.id,
                 source_record_id=source_record_id,
                 trace_id=pipeline_entity.id,
@@ -365,7 +448,7 @@ def to_pipeline_output(
             append_trace_record(
                 database_path,
                 stage="timing",
-                user_id=DEFAULT_USER_ID,
+                user_id=user_id,
                 entity_id=pipeline_entity.id,
                 source_record_id=source_record_id,
                 trace_id=pipeline_entity.id,
@@ -386,7 +469,7 @@ def to_pipeline_output(
             suppression_reason=None,
         )
 
-    pipeline_entity = to_pipeline_entity(entity, latest_record.source)
+    pipeline_entity = to_pipeline_entity(entity, latest_record.source, user_id=user_id)
     normalized_state = normalize_entity_state(state.current_state)
     if latest_outcome is not None:
         if latest_outcome.outcome_type == "complete":
@@ -404,19 +487,32 @@ def to_pipeline_output(
 
     if normalized_state == "done":
         pipeline_entity = pipeline_entity.model_copy(update={"lifecycle_state": "resolved"})
+        if should_surface_worth_knowing_status(entity, latest_record, current_time):
+            return PipelineOutput(
+                entity=pipeline_entity,
+                attention_item=create_status_attention_item(entity, latest_record, normalized_state, user_id=user_id),
+                suppressed=False,
+                suppression_reason=None,
+            )
         return create_suppressed_output(pipeline_entity, "resolved_state")
 
     suggestion = get_usable_suggestion(entity)
-    force_worth_knowing = normalized_state == "done" or (
-        suggestion is not None and (
-        not suggestion.suggested_visibility or suggestion.suggested_timing == "hidden"
-        )
-    )
+    if suggestion is not None and (not suggestion.suggested_visibility or suggestion.suggested_timing == "hidden"):
+        if should_surface_worth_knowing_status(entity, latest_record, current_time):
+            return PipelineOutput(
+                entity=pipeline_entity,
+                attention_item=create_status_attention_item(entity, latest_record, normalized_state, user_id=user_id),
+                suppressed=False,
+                suppression_reason=None,
+            )
+        return create_suppressed_output(pipeline_entity, "hidden_by_feed_judgment")
+
+    force_worth_knowing = False
     if record_trace:
         append_trace_record(
             database_path,
             stage="lifecycle_transition",
-            user_id=DEFAULT_USER_ID,
+            user_id=user_id,
             entity_id=pipeline_entity.id,
             source_record_id=source_record_id,
             trace_id=pipeline_entity.id,
@@ -425,20 +521,24 @@ def to_pipeline_output(
         )
 
     attention_item = (
-        to_fallback_attention_item(entity, latest_record, current_time)
+        to_fallback_attention_item(entity, latest_record, current_time, user_id=user_id)
         if suggestion is None
         else to_suggested_attention_item(
             entity,
             latest_record,
             current_time,
+            user_id=user_id,
             force_worth_knowing=force_worth_knowing,
         )
     )
+    if should_suppress_attention_item(entity, latest_record, attention_item, current_time):
+        return create_suppressed_output(pipeline_entity, "not_actionable_or_worth_knowing")
+
     if record_trace:
         append_trace_record(
             database_path,
             stage="action_selection",
-            user_id=DEFAULT_USER_ID,
+            user_id=user_id,
             entity_id=pipeline_entity.id,
             source_record_id=source_record_id,
             trace_id=pipeline_entity.id,
@@ -458,7 +558,7 @@ def to_pipeline_output(
         append_trace_record(
             database_path,
             stage="timing",
-            user_id=DEFAULT_USER_ID,
+            user_id=user_id,
             entity_id=pipeline_entity.id,
             source_record_id=source_record_id,
             trace_id=pipeline_entity.id,
@@ -486,23 +586,70 @@ def create_suppressed_output(entity: PipelineEntity, reason: str) -> PipelineOut
     return PipelineOutput(entity=entity, attention_item=None, suppressed=True, suppression_reason=reason)
 
 
-def create_missing_state_attention_item(entity: LoadedEntity, latest_record) -> AttentionItem:
-    """Surface entities even when state derivation has not completed yet."""
-    latest_title = payload_string(latest_record.raw_payload, "subject") or latest_record.subject or "Untitled"
+def create_status_attention_item(
+    entity: LoadedEntity,
+    latest_record,
+    current_state: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> AttentionItem:
+    """Surface important passive status as Worth Knowing instead of a to-do."""
+    title = compact_dashboard_title(status_title(entity, latest_record), "none", latest_record)
+    detail = build_attention_detail_for_entity(entity, latest_record, "none", current_state)
 
     return AttentionItem(
         id=entity.entity.id,
         entity_id=entity.entity.id,
-        user_id=DEFAULT_USER_ID,
+        user_id=user_id,
         need_type="awareness",
-        action_type="external",
+        action_type="none",
         effort_level="quick",
         timing_band="later",
         action_confidence="low",
-        primary_action="open",
+        primary_action="none",
         fallback_action="open",
-        title=latest_title,
-        why_this_is_here="This item was synced but its state is still being derived, so it is surfaced to avoid hiding it.",
+        title=title,
+        why_this_is_here=detail.body[0] if detail.body else title,
+        detail=detail,
+        due_at=None,
+        importance_level="low",
+        lifecycle_state="active",
+        current_state=normalize_entity_state(current_state),
+        source=latest_record.source,
+        gmail_thread_id=resolve_gmail_thread_id(entity, latest_record.source),
+        gmail_thread_action=None,
+        trace_id=entity.entity.id,
+        created_at=latest_record.timestamp,
+    )
+
+
+def create_missing_state_attention_item(
+    entity: LoadedEntity,
+    latest_record,
+    current_time: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> AttentionItem:
+    """Surface entities even when state derivation has not completed yet."""
+    latest_title = payload_string(latest_record.raw_payload, "subject") or latest_record.subject or "Untitled"
+    primary_action = refine_primary_action(entity, latest_record, "open", current_time)
+    timing_band = enforce_dashboard_timing(entity, latest_record, primary_action, "later", current_time)
+    detail = build_attention_detail_for_entity(entity, latest_record, primary_action, "open")
+
+    return AttentionItem(
+        id=entity.entity.id,
+        entity_id=entity.entity.id,
+        user_id=user_id,
+        need_type="awareness" if primary_action == "none" else "decision",
+        action_type=to_action_type(primary_action),
+        effort_level=to_effort_level(primary_action),
+        timing_band=timing_band,
+        action_confidence="low" if primary_action == "none" else "medium",
+        primary_action=primary_action,
+        fallback_action="open",
+        title=compact_dashboard_title(latest_title, primary_action, latest_record),
+        why_this_is_here=detail.body[0] if detail.body else record_detail_sentence(latest_record),
+        detail=detail,
         due_at=None,
         importance_level="low",
         lifecycle_state="active",
@@ -515,7 +662,7 @@ def create_missing_state_attention_item(entity: LoadedEntity, latest_record) -> 
     )
 
 
-def to_pipeline_entity(entity: LoadedEntity, source: str | None) -> PipelineEntity:
+def to_pipeline_entity(entity: LoadedEntity, source: str | None, *, user_id: str = DEFAULT_USER_ID) -> PipelineEntity:
     """Adapt the persistence-layer entity into the pipeline entity schema."""
     current_state = normalize_entity_state(entity.state.current_state if entity.state is not None else None)
     due_at = entity.state.due_at if entity.state is not None else None
@@ -523,7 +670,7 @@ def to_pipeline_entity(entity: LoadedEntity, source: str | None) -> PipelineEnti
     return PipelineEntity(
         id=entity.entity.id,
         group_id=entity.entity.id,
-        user_id=DEFAULT_USER_ID,
+        user_id=user_id,
         source=source or "gmail",
         current_state=current_state,
         due_at=due_at,
@@ -646,6 +793,7 @@ def to_suggested_attention_item(
     latest_record,
     current_time: str,
     *,
+    user_id: str = DEFAULT_USER_ID,
     force_worth_knowing: bool = False,
 ) -> AttentionItem:
     """Build a feed item from the cached AI suggestion when it is still valid."""
@@ -655,25 +803,47 @@ def to_suggested_attention_item(
     assert suggestion is not None
     normalized_state = normalize_entity_state(state.current_state)
     primary_action = normalize_action(suggestion.action, normalized_state)
+    primary_action = refine_primary_action(entity, latest_record, primary_action, current_time)
     account_emails = infer_account_emails_from_records(entity.members)
     timing_band = (
         "later"
         if force_worth_knowing
         else normalize_timing_band(suggestion.suggested_timing, entity, current_time, latest_record.source)
     )
+    timing_band = enforce_dashboard_timing(
+        entity,
+        latest_record,
+        primary_action,
+        timing_band,
+        current_time,
+    )
     importance_level = (
         "low" if force_worth_knowing else to_importance_level(suggestion.suggested_priority, normalized_state)
     )
+    if primary_action == "none" or timing_band == "later":
+        importance_level = "low" if primary_action == "none" else importance_level
     action_confidence = (
         "low"
         if force_worth_knowing and primary_action == "none"
         else to_action_confidence(normalized_state, primary_action, suggestion.suggested_priority)
     )
+    title = humanize_account_copy(suggestion.title, record=latest_record, account_emails=account_emails) or suggestion.title
+    explanation = (
+        humanize_account_copy(
+            suggestion.explanation,
+            record=latest_record,
+            account_emails=account_emails,
+        )
+        or suggestion.explanation
+    )
+    if is_synthetic_explanation(explanation):
+        explanation = record_detail_sentence(latest_record)
+    detail = build_attention_detail_for_entity(entity, latest_record, primary_action, normalized_state, explanation)
 
     return AttentionItem(
         id=entity.entity.id,
         entity_id=entity.entity.id,
-        user_id=DEFAULT_USER_ID,
+        user_id=user_id,
         need_type="awareness" if primary_action == "none" else "decision",
         action_type=to_action_type(primary_action),
         effort_level=to_effort_level(primary_action),
@@ -681,14 +851,9 @@ def to_suggested_attention_item(
         action_confidence=action_confidence,
         primary_action=primary_action,
         fallback_action="open",
-        title=humanize_account_copy(suggestion.title, record=latest_record, account_emails=account_emails)
-        or suggestion.title,
-        why_this_is_here=humanize_account_copy(
-            suggestion.explanation,
-            record=latest_record,
-            account_emails=account_emails,
-        )
-        or suggestion.explanation,
+        title=compact_dashboard_title(title, primary_action, latest_record),
+        why_this_is_here=detail.body[0] if detail.body else explanation,
+        detail=detail,
         due_at=state.due_at,
         importance_level=importance_level,
         lifecycle_state=to_lifecycle_state(normalized_state),
@@ -701,12 +866,19 @@ def to_suggested_attention_item(
     )
 
 
-def to_fallback_attention_item(entity: LoadedEntity, latest_record, current_time: str) -> AttentionItem:
+def to_fallback_attention_item(
+    entity: LoadedEntity,
+    latest_record,
+    current_time: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> AttentionItem:
     """Produce a deterministic fallback item when AI judgment is missing or stale."""
     state = entity.state
     assert state is not None
     normalized_state = normalize_entity_state(state.current_state)
     primary_action = to_fallback_action(normalized_state)
+    primary_action = refine_primary_action(entity, latest_record, primary_action, current_time)
     latest_title = payload_string(latest_record.raw_payload, "subject") or latest_record.subject or "Untitled"
     latest_title = (
         humanize_account_copy(
@@ -717,19 +889,24 @@ def to_fallback_attention_item(entity: LoadedEntity, latest_record, current_time
         or latest_title
     )
 
+    timing_band = derive_fallback_timing_band(normalized_state, state.due_at, current_time, latest_record.source)
+    timing_band = enforce_dashboard_timing(entity, latest_record, primary_action, timing_band, current_time)
+    detail = build_attention_detail_for_entity(entity, latest_record, primary_action, normalized_state)
+
     return AttentionItem(
         id=entity.entity.id,
         entity_id=entity.entity.id,
-        user_id=DEFAULT_USER_ID,
+        user_id=user_id,
         need_type="awareness" if primary_action == "none" else "decision",
         action_type=to_action_type(primary_action),
         effort_level=to_effort_level(primary_action),
-        timing_band=derive_fallback_timing_band(normalized_state, state.due_at, current_time, latest_record.source),
+        timing_band=timing_band,
         action_confidence=to_action_confidence(normalized_state, primary_action, 50),
         primary_action=primary_action,
         fallback_action="open",
-        title=latest_title if normalized_state == "waiting" else f"Open: {latest_title}",
-        why_this_is_here=to_fallback_explanation(normalized_state, latest_title),
+        title=compact_dashboard_title(latest_title, primary_action, latest_record),
+        why_this_is_here=detail.body[0] if detail.body else to_fallback_explanation(normalized_state, latest_title),
+        detail=detail,
         due_at=state.due_at,
         importance_level=to_importance_level(50, normalized_state),
         lifecycle_state=to_lifecycle_state(normalized_state),
@@ -835,6 +1012,356 @@ def derive_lifecycle_hints(records) -> list[str]:
     return sorted(set(hints))
 
 
+def refine_primary_action(entity: LoadedEntity, latest_record, primary_action: str, current_time: str) -> str:
+    """Keep only concrete email actions in the to-do sections."""
+    if latest_record.source != "gmail":
+        return primary_action
+
+    text = entity_text(entity)
+
+    if is_passive_status_text(text):
+        return "none"
+
+    if not is_recent_record(latest_record.timestamp, current_time):
+        return "none"
+
+    inferred_action = infer_concrete_action(text)
+    if inferred_action is not None:
+        return inferred_action
+
+    if primary_action == "pay" and ("pay" in text or "payment" in text or "bill" in text or extract_action_url(entity, "pay")):
+        return "pay"
+
+    if primary_action in CONCRETE_ACTIONS and has_action_required_language(text):
+        return primary_action
+
+    if primary_action == "reply" and re.search(r"\b(?:reply|respond|response needed)\b", text, re.IGNORECASE):
+        return "reply"
+
+    if primary_action == "confirm" and re.search(r"\b(?:confirm|rsvp|accept|decline)\b", text, re.IGNORECASE):
+        return "confirm"
+
+    return "none"
+
+
+def infer_concrete_action(text: str) -> str | None:
+    """Infer the action the user must perform from actual email wording."""
+    if not has_action_required_language(text):
+        return None
+
+    for action, pattern in ACTION_INFERENCE_PATTERNS:
+        if pattern.search(text):
+            return action
+
+    return "review"
+
+
+def enforce_dashboard_timing(
+    entity: LoadedEntity,
+    latest_record,
+    primary_action: str,
+    timing_band: str,
+    current_time: str,
+) -> str:
+    """Apply product-level bucket semantics after action selection."""
+    if latest_record.source != "gmail":
+        return timing_band
+
+    if primary_action == "none":
+        return "later"
+
+    if not is_recent_record(latest_record.timestamp, current_time):
+        return "later"
+
+    text = entity_text(entity)
+    due_at = entity.state.due_at if entity.state is not None else None
+    due_delta = seconds_until(due_at, current_time)
+
+    if due_delta is not None:
+        if due_delta <= 4 * 60 * 60:
+            return "now"
+        if due_delta <= 24 * 60 * 60:
+            return "today"
+        return "later"
+
+    if any(pattern.search(text) for pattern in URGENT_PATTERNS):
+        return "now"
+
+    return "today" if timing_band in {"now", "today"} else "later"
+
+
+def should_surface_worth_knowing_status(entity: LoadedEntity, latest_record, current_time: str) -> bool:
+    """Keep recent important passive statuses visible without turning them into work."""
+    if latest_record.source != "gmail" or not is_recent_record(latest_record.timestamp, current_time):
+        return False
+
+    text = entity_text(entity)
+    return is_passive_status_text(text) and any(pattern.search(text) for pattern in IMPORTANT_STATUS_PATTERNS)
+
+
+def should_suppress_attention_item(
+    entity: LoadedEntity,
+    latest_record,
+    attention_item: AttentionItem,
+    current_time: str,
+) -> bool:
+    """Drop Gmail rows that are neither a concrete task nor important context."""
+    if latest_record.source != "gmail":
+        return False
+
+    if attention_item.primary_action != "none":
+        return False
+
+    return not should_surface_worth_knowing_status(entity, latest_record, current_time)
+
+
+def is_recent_record(timestamp: str, current_time: str, *, days: int = RECENT_ACTION_WINDOW_DAYS) -> bool:
+    record_time = parse_datetime(timestamp)
+    reference = parse_datetime(current_time)
+
+    if record_time is None or reference is None:
+        return False
+
+    return 0 <= (reference - record_time).total_seconds() <= days * 24 * 60 * 60
+
+
+def seconds_until(due_at: str | None, current_time: str) -> float | None:
+    if due_at is None:
+        return None
+
+    due_time = parse_datetime(due_at)
+    reference = parse_datetime(current_time)
+
+    if due_time is None or reference is None:
+        return None
+
+    return (due_time - reference).total_seconds()
+
+
+def parse_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+
+    return parsed
+
+
+def entity_text(entity: LoadedEntity) -> str:
+    return " ".join(
+        f"{payload_string(record.raw_payload, 'subject') or record.subject or ''} {payload_string(record.raw_payload, 'body') or ''}"
+        for record in entity.members
+    ).lower()
+
+
+def is_passive_status_text(text: str) -> bool:
+    if has_action_required_language(text):
+        return False
+
+    return any(pattern.search(text) for pattern in PASSIVE_STATUS_PATTERNS)
+
+
+def has_action_required_language(text: str) -> bool:
+    return any(pattern.search(text) for pattern in ACTION_LANGUAGE_PATTERNS)
+
+
+def build_attention_detail_for_entity(
+    entity: LoadedEntity,
+    latest_record,
+    primary_action: str,
+    current_state: str,
+    explanation: str | None = None,
+) -> AttentionItemDetail:
+    """Build task details from actual email content and source coverage."""
+    action_url = extract_action_url(entity, primary_action)
+    body = detail_body_lines(entity, latest_record, explanation)
+
+    return AttentionItemDetail(
+        body=body,
+        action_label=detail_action_label(primary_action, current_state, action_url),
+        action_url=action_url,
+        source_label=detail_source_label(entity, latest_record.source),
+    )
+
+
+def detail_body_lines(entity: LoadedEntity, latest_record, explanation: str | None) -> list[str]:
+    lines: list[str] = []
+    clean_explanation = normalize_detail_sentence(explanation or "")
+
+    if clean_explanation and not is_synthetic_explanation(clean_explanation):
+        lines.append(clean_explanation)
+
+    latest_sentence = record_detail_sentence(latest_record)
+    if latest_sentence and latest_sentence not in lines:
+        lines.append(latest_sentence)
+
+    if len(entity.members) > 1:
+        previous = record_detail_sentence(entity.members[-2])
+        if previous and previous not in lines:
+            lines.append(previous)
+
+    return lines[:2] or ["Open the source email for the full context."]
+
+
+def record_detail_sentence(record) -> str:
+    subject = payload_string(record.raw_payload, "subject") or record.subject or "Email"
+    body = payload_string(record.raw_payload, "body") or payload_string(record.raw_payload, "snippet") or ""
+    text = normalize_detail_sentence(first_meaningful_sentence(body))
+
+    if text:
+        return text
+
+    return normalize_detail_sentence(subject)
+
+
+def first_meaningful_sentence(value: str) -> str:
+    cleaned = " ".join(value.split()).strip()
+    if not cleaned:
+        return ""
+
+    parts = re.split(r"(?<=[.!?])\s+", cleaned)
+    for part in parts:
+        candidate = part.strip()
+        if len(candidate) >= 20 and not candidate.lower().startswith(("dear ", "hello ", "hi ")):
+            return candidate
+
+    return parts[0].strip() if parts else cleaned
+
+
+def normalize_detail_sentence(value: str) -> str:
+    cleaned = " ".join(value.split()).strip()
+    cleaned = cleaned.replace("This is still waiting on the other side for ", "")
+    cleaned = cleaned.replace("This still needs attention for ", "")
+    cleaned = cleaned.replace("This still needs a decision for ", "")
+    cleaned = cleaned.rstrip(" .")
+
+    if len(cleaned) > 220:
+        cleaned = f"{cleaned[:217].rstrip()}..."
+
+    if cleaned and cleaned[-1] not in ".!?":
+        cleaned = f"{cleaned}."
+
+    return cleaned
+
+
+def is_synthetic_explanation(value: str) -> bool:
+    lowered = value.lower()
+    return any(
+        phrase in lowered
+        for phrase in [
+            "waiting on the other side",
+            "still needs attention",
+            "still needs a decision",
+            "part of your mailbox work",
+        ]
+    )
+
+
+def detail_action_label(primary_action: str, current_state: str, action_url: str | None) -> str:
+    if primary_action == "pay":
+        return "Pay bill" if action_url else "Pay"
+    if primary_action == "reply":
+        return "Reply"
+    if primary_action == "confirm":
+        return "Confirm"
+    if primary_action == "track":
+        return "Track status"
+    if primary_action == "review":
+        return "Review"
+    if primary_action == "send":
+        return "Send"
+    if primary_action == "approve":
+        return "Approve"
+    if primary_action == "register":
+        return "Register"
+    if primary_action == "join":
+        return "Join"
+    if primary_action == "open":
+        return "Read"
+    if normalize_entity_state(current_state) == "waiting":
+        return "No action needed right now"
+    return "No action needed"
+
+
+def detail_source_label(entity: LoadedEntity, source: str | None) -> str:
+    if source == "calendar":
+        return "Calendar"
+    if source == "manual":
+        return "Manual"
+
+    count = sum(1 for record in entity.members if record.source == "gmail")
+    return f"Gmail · {count} {'email' if count == 1 else 'emails'}"
+
+
+def extract_action_url(entity: LoadedEntity, primary_action: str) -> str | None:
+    urls: list[str] = []
+    for record in reversed(entity.members):
+        body = payload_string(record.raw_payload, "body") or ""
+        subject = payload_string(record.raw_payload, "subject") or record.subject or ""
+        urls.extend(extract_urls(f"{subject} {body}"))
+
+    if not urls:
+        return None
+
+    if primary_action == "pay":
+        for url in urls:
+            if any(token in url.lower() for token in ["pay", "payment", "bill", "invoice"]):
+                return url
+
+    return urls[0]
+
+
+def extract_urls(value: str) -> list[str]:
+    urls: list[str] = []
+    for match in URL_PATTERN.finditer(value):
+        url = match.group(0).rstrip(".,;:!?)\"]}'")
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+def compact_dashboard_title(title: str, primary_action: str, latest_record) -> str:
+    subject = payload_string(latest_record.raw_payload, "subject") or latest_record.subject or title
+    candidate = normalize_text_field(title or subject)
+    candidate = re.sub(r"^(?:open|review|track)\s*[:\-]?\s+", "", candidate, flags=re.IGNORECASE)
+
+    if len(candidate) > 96 or candidate.lower().startswith(("re:", "fw:", "fwd:")):
+        candidate = normalize_text_field(subject)
+
+    if primary_action == "pay" and not re.match(r"^pay\b", candidate, flags=re.IGNORECASE):
+        candidate = f"Pay {candidate}"
+    elif primary_action == "reply" and not re.match(r"^reply\b", candidate, flags=re.IGNORECASE):
+        candidate = f"Reply to {candidate}"
+
+    if len(candidate) > 96:
+        candidate = f"{candidate[:93].rstrip()}..."
+
+    return candidate.rstrip(" .")
+
+
+def status_title(entity: LoadedEntity, latest_record) -> str:
+    subject = payload_string(latest_record.raw_payload, "subject") or latest_record.subject or "Mailbox update"
+    body = payload_string(latest_record.raw_payload, "body") or ""
+    text = f"{subject} {body}".lower()
+
+    if "itr" in text or "income tax" in text:
+        return "Your ITR intimation was processed"
+    if "refund" in text:
+        return "Refund update received"
+    if "approved" in text or "approval" in text:
+        return "Approval update received"
+    if "closed" in text or "completed" in text:
+        return "Request completion update received"
+
+    return subject
+
+
 def normalize_action(action: str, current_state: str) -> str:
     """Clamp AI actions to the supported action vocabulary."""
     normalized = action.strip().lower()
@@ -901,9 +1428,9 @@ def normalize_timing_band(
     if normalized not in {"now", "today", "later", "hidden"}:
         return fallback
     if normalized == "hidden":
-        return fallback
-    if current_state == "waiting" and normalized == "later":
-        return "today"
+        return "hidden"
+    if current_state == "waiting":
+        return "later"
     if state.due_at is not None:
         due_at = parse_iso(state.due_at)
         reference = parse_iso(current_time or datetime.now(timezone.utc).isoformat())
@@ -928,7 +1455,7 @@ def derive_fallback_timing_band(current_state: str, due_at: str | None, current_
         return "later"
 
     if due_at is None:
-        return "today" if source == "calendar" or normalized_state == "waiting" else "later"
+        return "today" if source == "calendar" else "later"
 
     due_timestamp = parse_iso(due_at)
     current_timestamp = parse_iso(current_time)
@@ -938,9 +1465,9 @@ def derive_fallback_timing_band(current_state: str, due_at: str | None, current_
 
     delta_seconds = due_timestamp - current_timestamp
 
-    if delta_seconds <= 24 * 60 * 60:
+    if delta_seconds <= 4 * 60 * 60:
         return "now"
-    if delta_seconds <= 3 * 24 * 60 * 60:
+    if delta_seconds <= 24 * 60 * 60:
         return "today"
     return "later"
 
@@ -950,10 +1477,10 @@ def to_fallback_explanation(current_state: str, title: str) -> str:
     normalized_state = normalize_entity_state(current_state)
 
     if normalized_state == "waiting":
-        return f"This is still waiting on the other side for {title}."
+        return f"Latest email says no action is needed yet for {title}."
     if normalized_state == "done":
-        return f"This was already completed for {title}."
-    return f"This still needs attention for {title}."
+        return f"Latest email says {title} is complete."
+    return f"Latest email asks you to act on {title}."
 
 
 def to_action_type(primary_action: str) -> str:
@@ -973,7 +1500,7 @@ def to_effort_level(primary_action: str) -> str:
 def to_importance_level(priority: int, current_state: str) -> str:
     normalized_state = normalize_entity_state(current_state)
 
-    if normalized_state == "waiting" or priority >= 80:
+    if priority >= 80:
         return "high"
     if normalized_state == "open" or priority >= 50:
         return "medium"
@@ -983,6 +1510,8 @@ def to_importance_level(priority: int, current_state: str) -> str:
 def to_action_confidence(current_state: str, primary_action: str, priority: int) -> str:
     normalized_state = normalize_entity_state(current_state)
 
+    if primary_action == "none":
+        return "low"
     if normalized_state == "waiting" or primary_action == "reply":
         return "high"
     if priority >= 60:

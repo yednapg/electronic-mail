@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 
-import { getBackendURL, isDemoMode } from '../../../../../../lib/api';
+import { getBackendURL } from '../../../../../../lib/api';
+import { backendProxyHeaders, requireConnectedGoogleAccount } from '../../../../../../lib/api-auth';
 
 const ALLOWED_OPERATIONS = new Set(['archive', 'unarchive', 'mark-read']);
 
@@ -11,15 +12,16 @@ type RouteContext = {
   }>;
 };
 
-export async function POST(_request: Request, { params }: RouteContext) {
+export async function POST(request: Request, { params }: RouteContext) {
+  const unauthorized = await requireConnectedGoogleAccount(request);
+  if (unauthorized) {
+    return unauthorized;
+  }
+
   const { threadId, operation } = await params;
 
   if (!ALLOWED_OPERATIONS.has(operation)) {
     return NextResponse.json({ detail: 'Unsupported Gmail thread operation' }, { status: 400 });
-  }
-
-  if (isDemoMode()) {
-    return NextResponse.json({ thread_id: threadId, action: operation });
   }
 
   const response = await fetch(
@@ -27,11 +29,20 @@ export async function POST(_request: Request, { params }: RouteContext) {
     {
       method: 'POST',
       cache: 'no-store',
-      headers: {
+      headers: backendProxyHeaders(request, {
         Accept: 'application/json',
-      },
+      }),
     },
   );
+  if (response.ok) {
+    await fetch(`${getBackendURL()}/v1/mailbox/sync`, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: backendProxyHeaders(request, {
+        Accept: 'application/json',
+      }),
+    }).catch(() => null);
+  }
 
   const body = await response.text();
   return new NextResponse(body, {

@@ -6,7 +6,7 @@ final class DashboardStoreTests: XCTestCase {
     func testRefreshLoadsDashboard() async {
         let client = MockDashboardAPIClient()
         client.dashboardResponse = .fixture(connected: true)
-        let store = DashboardStore(apiClient: client, oauthService: MockOAuthService())
+        let store = DashboardStore(apiClient: client, oauthService: MockOAuthService(), sessionTokenStore: InMemorySessionTokenStore())
 
         await store.refresh()
 
@@ -18,11 +18,14 @@ final class DashboardStoreTests: XCTestCase {
         let client = MockDashboardAPIClient()
         client.dashboardResponse = .fixture(connected: true)
         let oauth = MockOAuthService()
-        let store = DashboardStore(apiClient: client, oauthService: oauth)
+        let tokenStore = InMemorySessionTokenStore()
+        let store = DashboardStore(apiClient: client, oauthService: oauth, sessionTokenStore: tokenStore)
 
         await store.connectGoogle()
 
         XCTAssertTrue(oauth.didStart)
+        XCTAssertEqual(client.sessionToken, "ios-session-token")
+        XCTAssertEqual(tokenStore.token, "ios-session-token")
         XCTAssertEqual(store.dashboard?.auth.connected, true)
     }
 
@@ -30,7 +33,7 @@ final class DashboardStoreTests: XCTestCase {
         let item = AttentionItem.fixture(gmailThreadAction: .archive)
         let client = MockDashboardAPIClient()
         client.dashboardResponse = .fixture(connected: true)
-        let store = DashboardStore(apiClient: client, oauthService: MockOAuthService())
+        let store = DashboardStore(apiClient: client, oauthService: MockOAuthService(), sessionTokenStore: InMemorySessionTokenStore())
 
         await store.runGmailAction(for: item)
 
@@ -42,12 +45,21 @@ final class DashboardStoreTests: XCTestCase {
 
 final class MockDashboardAPIClient: DashboardAPIProviding {
     var baseURL = URL(string: "http://localhost:3001")!
+    var sessionToken: String?
     var dashboardResponse = DashboardResponse.fixture(connected: false)
     var dashboardCallCount = 0
     var archivedThreadID: String?
     var unarchivedThreadID: String?
 
     func health() async throws {}
+
+    func exchangeMobileLoginCode(_ loginCode: String) async throws -> MobileSessionExchangeResponse {
+        MobileSessionExchangeResponse(
+            sessionToken: "ios-session-token",
+            expiresAt: "2026-05-14T00:00:00+00:00",
+            user: AuthUserResponse(id: "user-1", email: "person@example.com", displayName: "Person", betaEnabled: true)
+        )
+    }
 
     func dashboard() async throws -> DashboardResponse {
         dashboardCallCount += 1
@@ -116,8 +128,25 @@ final class MockDashboardAPIClient: DashboardAPIProviding {
 final class MockOAuthService: OAuthServicing {
     var didStart = false
 
-    func startGoogleAuthentication(baseURL: URL, mobileRedirectURI: String) async throws {
+    func startGoogleAuthentication(baseURL: URL, mobileRedirectURI: String) async throws -> String {
         didStart = true
+        return "mobile-login-code"
+    }
+}
+
+final class InMemorySessionTokenStore: SessionTokenStoring {
+    var token: String?
+
+    func load() -> String? {
+        token
+    }
+
+    func save(_ token: String) throws {
+        self.token = token
+    }
+
+    func clear() {
+        token = nil
     }
 }
 

@@ -3,12 +3,13 @@ import Foundation
 import UIKit
 
 public protocol OAuthServicing: AnyObject {
-    func startGoogleAuthentication(baseURL: URL, mobileRedirectURI: String) async throws
+    func startGoogleAuthentication(baseURL: URL, mobileRedirectURI: String) async throws -> String
 }
 
 public enum OAuthError: Error, Equatable {
     case invalidURL
     case missingPresentationAnchor
+    case missingLoginCode
 }
 
 @MainActor
@@ -19,7 +20,7 @@ public final class GoogleOAuthService: NSObject, OAuthServicing, ASWebAuthentica
         super.init()
     }
 
-    public func startGoogleAuthentication(baseURL: URL, mobileRedirectURI: String) async throws {
+    public func startGoogleAuthentication(baseURL: URL, mobileRedirectURI: String) async throws -> String {
         guard var components = URLComponents(url: baseURL.appendingPathComponent("auth/google"), resolvingAgainstBaseURL: false) else {
             throw OAuthError.invalidURL
         }
@@ -36,9 +37,9 @@ public final class GoogleOAuthService: NSObject, OAuthServicing, ASWebAuthentica
             throw OAuthError.invalidURL
         }
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
             var didResume = false
-            func resumeOnce(_ result: Result<Void, Error>) {
+            func resumeOnce(_ result: Result<String, Error>) {
                 guard !didResume else {
                     return
                 }
@@ -49,8 +50,8 @@ public final class GoogleOAuthService: NSObject, OAuthServicing, ASWebAuthentica
                     self.session = nil
 
                     switch result {
-                    case .success:
-                        continuation.resume()
+                    case .success(let loginCode):
+                        continuation.resume(returning: loginCode)
                     case .failure(let error):
                         continuation.resume(throwing: error)
                     }
@@ -60,11 +61,13 @@ public final class GoogleOAuthService: NSObject, OAuthServicing, ASWebAuthentica
             let authSession = ASWebAuthenticationSession(
                 url: url,
                 callbackURLScheme: callbackScheme
-            ) { _, error in
+            ) { callbackURL, error in
                 if let error {
                     resumeOnce(.failure(error))
+                } else if let callbackURL, let loginCode = Self.loginCode(from: callbackURL) {
+                    resumeOnce(.success(loginCode))
                 } else {
-                    resumeOnce(.success(()))
+                    resumeOnce(.failure(OAuthError.missingLoginCode))
                 }
             }
 
@@ -82,5 +85,12 @@ public final class GoogleOAuthService: NSObject, OAuthServicing, ASWebAuthentica
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let window = scenes.flatMap(\.windows).first { $0.isKeyWindow }
         return window ?? ASPresentationAnchor()
+    }
+
+    private static func loginCode(from url: URL) -> String? {
+        URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first { $0.name == "login_code" }?
+            .value
     }
 }

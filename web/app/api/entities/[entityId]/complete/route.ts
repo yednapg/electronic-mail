@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 
-import { getBackendURL, isDemoMode } from '../../../../../lib/api';
+import { getBackendURL } from '../../../../../lib/api';
+import { backendProxyHeaders, requireConnectedGoogleAccount } from '../../../../../lib/api-auth';
 
 type CompleteRouteContext = {
   params: Promise<{
@@ -8,29 +9,21 @@ type CompleteRouteContext = {
   }>;
 };
 
-export async function POST(_request: Request, { params }: CompleteRouteContext) {
-  const { entityId } = await params;
-
-  if (isDemoMode()) {
-    const now = new Date().toISOString();
-    return NextResponse.json({
-      id: `demo-complete-${entityId}`,
-      user_id: 'demo-user',
-      entity_id: entityId,
-      outcome_type: 'complete',
-      snooze_until: null,
-      note: null,
-      created_at: now,
-    });
+export async function POST(request: Request, { params }: CompleteRouteContext) {
+  const unauthorized = await requireConnectedGoogleAccount(request);
+  if (unauthorized) {
+    return unauthorized;
   }
+
+  const { entityId } = await params;
 
   const response = await fetch(`${getBackendURL()}/v1/entities/${encodeURIComponent(entityId)}/complete`, {
     method: 'POST',
     cache: 'no-store',
-    headers: {
+    headers: backendProxyHeaders(request, {
       Accept: 'application/json',
       'Content-Type': 'application/json',
-    },
+    }),
     body: '{}',
   });
 

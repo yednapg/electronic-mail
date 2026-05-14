@@ -4,6 +4,8 @@ import { useEffect } from 'react';
 
 const themeStorageKey = 'decision-pipeline-theme';
 const dashboardViewStorageKey = 'decision-pipeline-dashboard-view';
+const themeTransitionMs = 220;
+let themeTransitionTimeout: number | undefined;
 
 const defaultViewSettings = {
   brief: true,
@@ -38,7 +40,18 @@ function getStoredTheme(): ThemeMode | null {
   return isThemeMode(storedTheme) ? storedTheme : null;
 }
 
-function applyTheme(theme: ThemeMode) {
+function applyTheme(theme: ThemeMode, options: { animate?: boolean } = {}) {
+  if (options.animate) {
+    document.documentElement.dataset.themeTransition = 'true';
+    window.clearTimeout(themeTransitionTimeout);
+    themeTransitionTimeout = window.setTimeout(() => {
+      delete document.documentElement.dataset.themeTransition;
+    }, themeTransitionMs);
+  } else {
+    window.clearTimeout(themeTransitionTimeout);
+    delete document.documentElement.dataset.themeTransition;
+  }
+
   document.documentElement.dataset.theme = theme;
   document.documentElement.style.colorScheme = theme;
   updateThemeControls(theme);
@@ -132,7 +145,7 @@ export function LayoutInteractions() {
         try {
           window.localStorage.setItem(themeStorageKey, nextTheme);
         } catch (_error) {}
-        applyTheme(nextTheme);
+        applyTheme(nextTheme, { animate: true });
         return;
       }
 

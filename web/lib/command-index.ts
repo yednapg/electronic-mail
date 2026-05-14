@@ -1,6 +1,6 @@
-import type { DashboardResponse, FeedItem, FeedResponse } from './types';
+import type { DashboardResponse, FeedItem, FeedResponse, GmailThreadRow, GmailViewResponse } from './types';
 
-export type CommandKind = 'navigation' | 'work' | 'action';
+export type CommandKind = 'navigation' | 'work' | 'email' | 'action';
 
 export type CommandAction = {
   kind: 'complete-entity';
@@ -39,29 +39,11 @@ const STATIC_COMMANDS: Array<Omit<CommandItem, 'searchText'>> = [
   {
     id: 'nav:gmail',
     kind: 'navigation',
-    title: 'Gmail',
-    subtitle: 'Review raw Gmail threads',
+    title: 'Inbox',
+    subtitle: 'Open Gmail-style thread list',
     keywords: ['gmail', 'mail', 'inbox', 'threads'],
     priority: 24,
     href: '/gmail',
-  },
-  {
-    id: 'nav:history',
-    kind: 'navigation',
-    title: 'History',
-    subtitle: 'Review imported records',
-    keywords: ['archive', 'past', 'done', 'records'],
-    priority: 25,
-    href: '/history',
-  },
-  {
-    id: 'nav:raw-feed',
-    kind: 'navigation',
-    title: 'Raw Gmail Feed',
-    subtitle: 'Inspect persisted Gmail evidence',
-    keywords: ['gmail', 'debug', 'feed', 'source', 'records'],
-    priority: 30,
-    href: '/raw-feed',
   },
 ];
 
@@ -74,8 +56,9 @@ const SECTION_CONFIGS = [
 export function buildCommandIndex(
   dashboard: DashboardResponse | null,
   generatedAt: Date | string = new Date(),
+  gmail: GmailViewResponse | null = null,
 ): CommandIndexResponse {
-  const commands = [...getStaticCommands(), ...buildDashboardCommands(dashboard)];
+  const commands = [...getStaticCommands(), ...buildDashboardCommands(dashboard), ...buildGmailCommands(gmail)];
   return {
     generatedAt: typeof generatedAt === 'string' ? generatedAt : generatedAt.toISOString(),
     commands,
@@ -112,6 +95,26 @@ export function buildDashboardCommands(dashboard: DashboardResponse | null): Com
   return commands;
 }
 
+export function buildGmailCommands(gmail: GmailViewResponse | null): CommandItem[] {
+  if (gmail === null) {
+    return [];
+  }
+
+  const commands: CommandItem[] = [];
+  const indexedThreadIds = new Set<string>();
+
+  gmail.sections.forEach((section, sectionIndex) => {
+    section.rows.forEach((row, rowIndex) => {
+      const command = toGmailThreadCommand(row, section.title, 18 + sectionIndex * 20 + rowIndex, indexedThreadIds);
+      if (command !== null) {
+        commands.push(command);
+      }
+    });
+  });
+
+  return commands;
+}
+
 export function filterCommands(
   commands: CommandItem[],
   query: string,
@@ -120,7 +123,10 @@ export function filterCommands(
   const normalizedQuery = normalizeSearchText(query);
 
   if (normalizedQuery.length === 0) {
-    return [...commands].sort(compareCommands).slice(0, limit);
+    return commands
+      .filter((command) => command.kind === 'navigation')
+      .sort(compareCommands)
+      .slice(0, limit);
   }
 
   const tokens = normalizedQuery.split(' ').filter(Boolean);
@@ -157,7 +163,12 @@ function toWorkCommand(
 
   const title = titleForItem(item);
   const entityId = cleanOptionalText(item.entity_id);
-  const href = entityId ? `/entities/${encodeURIComponent(entityId)}/thread` : '/dashboard';
+  const gmailThreadId = cleanOptionalText(item.gmail_thread_id);
+  const href = gmailThreadId
+    ? `/gmail/threads/${encodeURIComponent(gmailThreadId)}`
+    : entityId
+      ? `/entities/${encodeURIComponent(entityId)}/thread`
+      : '/dashboard';
 
   return withSearchText({
     id: `work:${item.id}`,
@@ -197,6 +208,47 @@ function toCompleteCommand(
       kind: 'complete-entity',
       entityId,
     },
+  });
+}
+
+function toGmailThreadCommand(
+  row: GmailThreadRow,
+  sectionTitle: string,
+  priority: number,
+  indexedThreadIds: Set<string>,
+): CommandItem | null {
+  const entityId = cleanOptionalText(row.entity_id);
+  const threadId = cleanOptionalText(row.thread_id);
+  if (!threadId || indexedThreadIds.has(threadId)) {
+    return null;
+  }
+
+  indexedThreadIds.add(threadId);
+  const subject = compactText(row.latest_subject || row.summary || row.snippet || 'Untitled email', 92);
+  const sender = compactText(formatSender(row.latest_sender), 56);
+  const preview = compactText(row.summary || row.snippet || '', 120);
+
+  return withSearchText({
+    id: `email:${threadId}`,
+    kind: 'email',
+    title: `${sender}: ${subject}`,
+    subtitle: preview ? `${sectionTitle} - ${preview}` : `${sectionTitle} - Open email`,
+    keywords: [
+      'gmail',
+      'mail',
+      'inbox',
+      'email',
+      sectionTitle,
+      threadId,
+      row.latest_subject ?? '',
+      row.latest_sender ?? '',
+      row.summary ?? '',
+      row.snippet ?? '',
+      ...row.participants,
+    ],
+    priority,
+    href: `/gmail/threads/${encodeURIComponent(threadId)}`,
+    entityId: entityId || undefined,
   });
 }
 
@@ -291,6 +343,20 @@ function compactText(value: string, maxLength: number): string {
     return normalized;
   }
   return `${normalized.slice(0, maxLength - 1)}...`;
+}
+
+function formatSender(value: string | null | undefined): string {
+  const sender = cleanOptionalText(value);
+  if (!sender) {
+    return 'Unknown sender';
+  }
+
+  const match = sender.match(/^"?([^"<]+?)"?\s*<([^>]+)>$/);
+  if (match?.[1]) {
+    return match[1].trim();
+  }
+
+  return sender;
 }
 
 export function flattenFeed(feed: FeedResponse): FeedItem[] {

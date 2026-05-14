@@ -62,7 +62,7 @@ def _subject_root(subject: str) -> str:
     return " ".join(tokens)
 
 
-def reconcile_entities(database_path: str) -> list[str]:
+def reconcile_entities(database_path: str, *, user_id: str = DEFAULT_USER_ID) -> list[str]:
     """Merge entities that later evidence proves belong to one real-world task."""
     if not should_use_ai_grouping():
         return []
@@ -70,7 +70,7 @@ def reconcile_entities(database_path: str) -> list[str]:
     changed_entity_ids: set[str] = set()
 
     while True:
-        profiles = [build_merge_profile(entity) for entity in list_all_loaded_entities(database_path)]
+        profiles = [build_merge_profile(entity) for entity in list_all_loaded_entities(database_path, user_id=user_id)]
         merge_plan = find_ai_merge(profiles)
 
         if merge_plan is None:
@@ -81,7 +81,7 @@ def reconcile_entities(database_path: str) -> list[str]:
         append_trace_record(
             database_path,
             stage="grouping",
-            user_id=DEFAULT_USER_ID,
+            user_id=user_id,
             entity_id=target.loaded.entity.id,
             trace_id=target.loaded.entity.id,
             input={

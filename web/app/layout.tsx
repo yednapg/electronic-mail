@@ -9,7 +9,7 @@ import './globals.css';
 
 const sfProRounded = localFont({
   variable: '--font-sf-pro-rounded',
-  display: 'swap',
+  display: 'block',
   src: [
     { path: '../font/SF-Pro-Rounded-Thin.otf', weight: '100', style: 'normal' },
     { path: '../font/SF-Pro-Rounded-Ultralight.otf', weight: '200', style: 'normal' },
@@ -29,7 +29,7 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" className={`${sfProRounded.variable} ${sfProRounded.className}`} suppressHydrationWarning>
       <body className={`${sfProRounded.variable} ${sfProRounded.className}`}>
         <LayoutInteractions />
         {children}

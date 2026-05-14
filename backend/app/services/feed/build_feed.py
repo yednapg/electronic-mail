@@ -160,7 +160,7 @@ def detail_description(title: str, why_this_is_here: str) -> str:
 
 def detail_action_label(primary_action: str, current_state: str) -> str:
     if normalize_entity_state(current_state) == "waiting" and primary_action in {"none", "open"}:
-        return "Wait for the reply"
+        return "No action needed right now"
 
     if primary_action == "reply":
         return "Reply in the thread"

@@ -10,6 +10,8 @@ backend/.env.local
 web/.env
 web/.env.local
 backend/.google-oauth.json
+backend/.google-oauth-session.json
+backend/.google-account.json
 backend/.dashboard-briefing.json
 *.pyc
 __pycache__

@@ -27,6 +27,7 @@ export type DashboardSectionItem = {
     body: string[];
     evidence?: string[];
     actionLabel?: string;
+    actionUrl?: string | null;
     confirmLabel: string;
     dismissLabel: string;
     sourceLabel: string;

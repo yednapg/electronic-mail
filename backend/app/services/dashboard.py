@@ -3,8 +3,6 @@ from __future__ import annotations
 """Backend dashboard assembly for auth, feed, and natural-language briefing."""
 
 from datetime import datetime, timedelta, timezone
-import json
-from pathlib import Path
 
 from app.core.config import Settings
 from app.db.models import StoredDashboardImportJob
@@ -12,13 +10,16 @@ from app.db.repository import (
     DEFAULT_USER_ID,
     create_dashboard_import_job,
     get_active_dashboard_import_job,
+    get_dashboard_briefing,
     get_dashboard_import_job,
     get_latest_dashboard_import_job,
+    get_user,
     mark_stale_dashboard_import_jobs_failed,
     mark_dashboard_import_job_failed,
     mark_dashboard_import_job_running,
     mark_dashboard_import_job_succeeded,
     update_dashboard_import_job_progress,
+    upsert_dashboard_briefing,
 )
 from app.schemas.domain import (
     DashboardBriefing,
@@ -37,6 +38,7 @@ from app.services.feed.memory_pipeline import (
     refresh_feed_projections_for_entities,
     refresh_ai_suggestions_for_entities,
 )
+from app.services.fast_dashboard import build_fast_dashboard_feed_from_gmail_threads
 from app.services.integrations.google import (
     backfill_full_gmail_source_records,
     fetch_google_account_profile,
@@ -52,21 +54,30 @@ IMPORT_JOB_STALE_AFTER_SECONDS = 30 * 60
 STALE_IMPORT_JOB_MESSAGE = "Dashboard import job became stale before completing."
 
 
-def build_dashboard_response(settings: Settings) -> DashboardResponse:
+def build_dashboard_response(
+    settings: Settings,
+    *,
+    user_id: str | None = DEFAULT_USER_ID,
+    auth=None,
+    profile: DashboardProfile | None = None,
+) -> DashboardResponse:
     """Return the full dashboard payload for the current local user."""
-    auth = get_google_auth_state(settings)
+    auth = auth or get_google_auth_state(settings)
 
-    if not auth.connected:
+    if not auth.connected or user_id is None:
         return DashboardResponse(auth=auth, feed=FeedResponse())
 
     current_time = datetime.now(timezone.utc).isoformat()
-    feed = build_feed_from_projection_cache(str(settings.database_path)) or build_feed_from_entities(
-        str(settings.database_path),
-        current_time,
-        record_trace=False,
+    feed = (
+        build_feed_from_projection_cache(str(settings.database_path), user_id=user_id)
+        or build_fast_dashboard_feed_from_gmail_threads(str(settings.database_path), user_id=user_id)
+        or FeedResponse()
     )
-    profile = load_google_account_profile()
-    briefing = load_dashboard_briefing_cache(settings) or generate_dashboard_briefing(feed, profile)
+    profile = profile or load_google_account_profile()
+    briefing = load_dashboard_briefing_cache(settings, user_id=user_id) or DashboardBriefing(
+        headline="Your dashboard is ready.",
+        brief="Mailbox sync and work extraction run in the background.",
+    )
     briefing = sanitize_dashboard_briefing(briefing, feed, profile)
 
     resolved_profile = _merge_profile(profile, briefing)
@@ -112,20 +123,21 @@ def create_new_dashboard_import_job(
 def start_dashboard_import_job(settings: Settings, *, user_id: str = DEFAULT_USER_ID) -> DashboardImportJobResponse:
     """Create and run a backend-owned dashboard import/preparation job inline."""
     job = create_new_dashboard_import_job(settings, user_id=user_id)
-    return to_dashboard_import_job_response(run_dashboard_import_job(settings, job.id, run_backfill=False))
+    return to_dashboard_import_job_response(run_dashboard_import_job(settings, job.id, user_id=user_id, run_backfill=False))
 
 
 def run_dashboard_import_job(
     settings: Settings,
     job_id: str,
     *,
+    user_id: str = DEFAULT_USER_ID,
     run_backfill: bool = True,
 ) -> StoredDashboardImportJob:
     """Run a queued dashboard import/preparation job and persist the final status."""
     mark_dashboard_import_job_running(str(settings.database_path), job_id)
 
     try:
-        result = _prepare_dashboard_state(settings, job_id=job_id)
+        result = _prepare_dashboard_state(settings, job_id=job_id, user_id=user_id)
     except Exception as exc:
         return mark_dashboard_import_job_failed(str(settings.database_path), job_id, error_message=str(exc))
 
@@ -138,14 +150,21 @@ def run_dashboard_import_job(
         refreshed_entities=int(result.get("refreshed_entities", 0)),
     )
     if run_backfill and result["status"] == "ready":
-        run_gmail_full_history_backfill(settings)
+        run_gmail_full_history_backfill(settings, user_id=user_id)
     return succeeded
 
 
-def get_dashboard_import_job_status(settings: Settings, job_id: str) -> DashboardImportJobResponse | None:
+def get_dashboard_import_job_status(
+    settings: Settings,
+    job_id: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> DashboardImportJobResponse | None:
     """Return persisted status for one dashboard import/preparation job."""
     database_path = str(settings.database_path)
     job = get_dashboard_import_job(database_path, job_id)
+    if job is not None and job.user_id != user_id:
+        return None
     if job is not None and job.status in {"queued", "running"}:
         fail_stale_dashboard_import_jobs(settings, user_id=job.user_id)
         job = get_dashboard_import_job(database_path, job_id)
@@ -174,9 +193,9 @@ def fail_stale_dashboard_import_jobs(settings: Settings, *, user_id: str = DEFAU
     )
 
 
-def prepare_dashboard_state(settings: Settings) -> dict[str, object]:
+def prepare_dashboard_state(settings: Settings, *, user_id: str = DEFAULT_USER_ID) -> dict[str, object]:
     """Compatibility wrapper for explicit dashboard preparation."""
-    job = start_dashboard_import_job(settings)
+    job = start_dashboard_import_job(settings, user_id=user_id)
     response: dict[str, object] = {
         "status": job.result_status or job.status,
         "source_records": job.source_records,
@@ -195,12 +214,13 @@ def prepare_dashboard_state(settings: Settings) -> dict[str, object]:
     return response
 
 
-def run_gmail_full_history_backfill(settings: Settings) -> None:
+def run_gmail_full_history_backfill(settings: Settings, *, user_id: str = DEFAULT_USER_ID) -> None:
     """Import older Gmail records after the first recent dashboard has been marked ready."""
-    if not should_run_gmail_full_history_backfill(settings):
+    if not should_run_gmail_full_history_backfill(settings, user_id=user_id):
         return
 
-    backfill_full_gmail_source_records(settings)
+    effective_user_id = None if is_legacy_local_default_user(settings, user_id) else user_id
+    backfill_full_gmail_source_records(settings, user_id=effective_user_id)
 
 
 def to_dashboard_import_job_response(job: StoredDashboardImportJob) -> DashboardImportJobResponse:
@@ -226,10 +246,17 @@ def to_dashboard_import_job_response(job: StoredDashboardImportJob) -> Dashboard
     )
 
 
-def _prepare_dashboard_state(settings: Settings, *, job_id: str | None = None) -> dict[str, object]:
+def _prepare_dashboard_state(
+    settings: Settings,
+    *,
+    job_id: str | None = None,
+    user_id: str = DEFAULT_USER_ID,
+) -> dict[str, object]:
     """Run the explicit Gmail/Calendar and AI prep before the dashboard is shown."""
     database_path = str(settings.database_path)
     latest_imported_count = 0
+    legacy_local_default = is_legacy_local_default_user(settings, user_id)
+    user_kwargs = {} if legacy_local_default else {"user_id": user_id}
 
     def update_progress(
         stage: str,
@@ -252,7 +279,7 @@ def _prepare_dashboard_state(settings: Settings, *, job_id: str | None = None) -
         )
 
     auth = get_google_auth_state(settings)
-    if not auth.connected:
+    if user_id == DEFAULT_USER_ID and not auth.connected:
         update_progress("not_connected", imported_count=0, total_count=0)
         return {
             "status": "not_connected",
@@ -271,30 +298,44 @@ def _prepare_dashboard_state(settings: Settings, *, job_id: str | None = None) -
             source_records=imported_count,
         ),
         collect_records=False,
+        **user_kwargs,
     )
     gmail_source_records = [record for record in source_records if record.source == "gmail"]
     non_gmail_source_records = [record for record in source_records if record.source != "gmail"]
     imported_count = max(latest_imported_count, len(gmail_source_records)) + len(non_gmail_source_records)
     update_progress("source_summary", imported_count=imported_count, source_records=imported_count)
-    refresh_source_record_summaries(database_path, [record.id for record in source_records])
+    refresh_source_record_summaries(database_path, [record.id for record in source_records], user_id=user_id)
     update_progress("memory_hydration", imported_count=imported_count, source_records=imported_count)
-    changed_entity_ids = hydrate_persistent_memory(database_path, source_records, include_unlinked=True)
-    stale_ai_entity_ids = list_entity_ids_needing_ai_refresh(database_path)
-    stale_projection_entity_ids = list_stale_feed_projection_entity_ids(database_path)
+    changed_entity_ids = hydrate_persistent_memory(
+        database_path,
+        source_records,
+        include_unlinked=True,
+        progress_callback=lambda processed, total: update_progress(
+            "memory_hydration",
+            imported_count=imported_count,
+            total_count=total,
+            source_records=processed,
+        ),
+        **user_kwargs,
+    )
+    stale_ai_entity_ids = list_entity_ids_needing_ai_refresh(database_path, **user_kwargs)
+    stale_projection_entity_ids = list_stale_feed_projection_entity_ids(database_path, **user_kwargs)
     update_progress("ai_refresh", changed_entities=len(changed_entity_ids))
     refresh_entity_ids = sorted(set(changed_entity_ids) | set(stale_ai_entity_ids) | set(stale_projection_entity_ids))
-    refresh_ai_suggestions_for_entities(database_path, refresh_entity_ids)
+    refresh_ai_suggestions_for_entities(database_path, refresh_entity_ids, **user_kwargs)
     update_progress("feed_build", refreshed_entities=len(refresh_entity_ids))
     current_time = datetime.now(timezone.utc).isoformat()
-    refresh_feed_projections_for_entities(database_path, refresh_entity_ids, current_time)
-    feed = build_feed_from_projection_cache(database_path) or build_feed_from_entities(
+    refresh_feed_projections_for_entities(database_path, refresh_entity_ids, current_time, user_id=user_id)
+    feed = build_feed_from_projection_cache(database_path, user_id=user_id) or build_feed_from_entities(
         database_path,
         current_time,
+        **user_kwargs,
         record_trace=False,
     )
-    profile = load_google_account_profile() or fetch_google_account_profile(settings)
+    profile = load_google_account_profile() if legacy_local_default else None
+    profile = profile or fetch_google_account_profile(settings, user_id=user_kwargs.get("user_id"))
     update_progress("briefing", refreshed_entities=len(refresh_entity_ids))
-    save_dashboard_briefing_cache(settings, generate_dashboard_briefing(feed, profile))
+    save_dashboard_briefing_cache(settings, generate_dashboard_briefing(feed, profile), user_id=user_id)
     return {
         "status": "ready",
         "source_records": imported_count,
@@ -303,27 +344,36 @@ def _prepare_dashboard_state(settings: Settings, *, job_id: str | None = None) -
     }
 
 
-def load_dashboard_briefing_cache(settings: Settings) -> DashboardBriefing | None:
+def load_dashboard_briefing_cache(settings: Settings, *, user_id: str = DEFAULT_USER_ID) -> DashboardBriefing | None:
     """Load the last prepared dashboard summary from backend-owned state."""
-    cache_path = _dashboard_briefing_cache_path(settings)
-    if not cache_path.exists():
-        return None
-
     try:
-        return DashboardBriefing.model_validate(json.loads(cache_path.read_text()))
+        row = get_dashboard_briefing(str(settings.database_path), user_id=user_id)
+        return DashboardBriefing.model_validate(row.payload) if row is not None else None
     except Exception:
         return None
 
 
-def save_dashboard_briefing_cache(settings: Settings, briefing: DashboardBriefing) -> None:
+def save_dashboard_briefing_cache(
+    settings: Settings,
+    briefing: DashboardBriefing,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> None:
     """Persist the prepared dashboard summary for fast dashboard rendering."""
-    cache_path = _dashboard_briefing_cache_path(settings)
-    cache_path.write_text(json.dumps(briefing.model_dump(), indent=2))
+    upsert_dashboard_briefing(str(settings.database_path), user_id=user_id, payload=briefing.model_dump())
 
 
-def _dashboard_briefing_cache_path(settings: Settings) -> Path:
-    """Return the dashboard briefing cache path next to the SQLite database."""
-    return Path(settings.database_path).with_name(".dashboard-briefing.json")
+def is_legacy_local_default_user(settings: Settings, user_id: str) -> bool:
+    """Return true only for the explicit local-file OAuth compatibility user."""
+    return getattr(settings, "app_env", "local") == "local" and user_id == DEFAULT_USER_ID
+
+
+def stored_user_profile(settings: Settings, *, user_id: str) -> DashboardProfile | None:
+    """Build a profile from app-owned user state without reading local profile files."""
+    user = get_user(str(settings.database_path), user_id)
+    if user is None:
+        return None
+    return DashboardProfile(email=user.email, display_name=user.display_name)
 
 
 def _merge_profile(

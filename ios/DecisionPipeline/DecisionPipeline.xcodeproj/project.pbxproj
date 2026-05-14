@@ -21,6 +21,7 @@
 		AF9D993B6EE075EE925132A3 /* DecisionPipelineCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A4FBD9D7C01AC9A8B8679913 /* DecisionPipelineCore.framework */; };
 		BEB7EDAD3CFC9FB39416388E /* DashboardStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A8780AFDC8F9FCB35EB7FD6 /* DashboardStoreTests.swift */; };
 		C9B4E05EFC42E1CB6F3827B1 /* OAuthService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A1FA3A2A477A3A1A0B98FC3 /* OAuthService.swift */; };
+		DB00625EB7D598B597E43E35 /* SessionTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29D3F2150A3001BB57B63D11 /* SessionTokenStore.swift */; };
 		E0D1F36C247EEC168AAAB53A /* DashboardAPIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8EEF23F145AA1D2FB8F188D /* DashboardAPIClient.swift */; };
 /* End PBXBuildFile section */
 
@@ -79,6 +80,7 @@
 		0C1EC9D18544942F09D05D3C /* APIClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClientTests.swift; sourceTree = "<group>"; };
 		1B06B34BFE8146684659F67B /* DecisionPipeline-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "DecisionPipeline-Info.plist"; sourceTree = "<group>"; };
 		23050E31D323B3A2F5ACDF34 /* DecisionPipelineApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DecisionPipelineApp.swift; sourceTree = "<group>"; };
+		29D3F2150A3001BB57B63D11 /* SessionTokenStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionTokenStore.swift; sourceTree = "<group>"; };
 		2FBDB75E82D71BA9D0AC111C /* DecisionPipelineTests-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "DecisionPipelineTests-Info.plist"; sourceTree = "<group>"; };
 		5033F24BDAF8ADE428CF4C7D /* TraceAndSettingsViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TraceAndSettingsViews.swift; sourceTree = "<group>"; };
 		548EF97A0A4B6BF4179362C9 /* DecisionPipelineTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DecisionPipelineTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -176,6 +178,7 @@
 				FD79630FCABAF14F24AE2048 /* Models.swift */,
 				6A1FA3A2A477A3A1A0B98FC3 /* OAuthService.swift */,
 				94147E6FDF2E0F0A41A5BFC3 /* RootView.swift */,
+				29D3F2150A3001BB57B63D11 /* SessionTokenStore.swift */,
 				5033F24BDAF8ADE428CF4C7D /* TraceAndSettingsViews.swift */,
 			);
 			path = Core;
@@ -342,6 +345,7 @@
 				2A92B933124EC3E09F21198A /* Models.swift in Sources */,
 				C9B4E05EFC42E1CB6F3827B1 /* OAuthService.swift in Sources */,
 				8D8917713AFDA82CC1C9CE39 /* RootView.swift in Sources */,
+				DB00625EB7D598B597E43E35 /* SessionTokenStore.swift in Sources */,
 				0F24911317DC2F083F7E0441 /* TraceAndSettingsViews.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

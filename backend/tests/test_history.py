@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from app.api.routes import history as history_routes
-from app.db.models import StoredSourceRecord
+from app.db.models import StoredGmailMessageSnapshot, StoredSourceRecord
 from app.db.repository import (
     DEFAULT_USER_ID,
     append_entity_outcome,
@@ -20,6 +20,7 @@ from app.db.repository import (
     initialize_database,
     upsert_ai_suggestion,
     upsert_entity_state,
+    upsert_gmail_message_snapshots,
     upsert_source_record_summary,
     upsert_source_records,
 )
@@ -62,6 +63,33 @@ def make_record(
         timestamp=received_at,
         raw_payload=raw_payload,
         created_at=received_at,
+    )
+
+
+def make_snapshot(record: StoredSourceRecord) -> StoredGmailMessageSnapshot:
+    return StoredGmailMessageSnapshot(
+        user_id=DEFAULT_USER_ID,
+        message_id=record.id,
+        thread_id=record.thread_id,
+        history_id="history-1",
+        internal_date=record.timestamp,
+        label_ids=["INBOX"],
+        raw_payload={
+            "id": record.id,
+            "threadId": record.thread_id or "",
+            "subject": record.raw_payload.get("subject", ""),
+            "from": record.raw_payload.get("from", ""),
+            "to": "receiver@example.com",
+            "snippet": record.raw_payload.get("snippet", ""),
+            "body": record.raw_payload.get("body", record.raw_payload.get("snippet", "")),
+            "labelIds": ["INBOX"],
+        },
+        fetch_status="fetched",
+        tombstoned=False,
+        tombstoned_at=None,
+        last_fetched_at=record.timestamp,
+        created_at=record.timestamp,
+        updated_at=record.timestamp,
     )
 
 
@@ -126,51 +154,53 @@ class HistoryRouteTests(unittest.TestCase):
         self.assertEqual(payload["years"][1]["months"][0]["days"][0]["date"], "2025-12-31")
 
     def test_gmail_view_buckets_raw_threads_without_overlapping_dates(self) -> None:
-        upsert_source_records(
-            str(self.database_path),
-            [
-                make_record(
-                    record_id="today-old",
-                    thread_id="thread-today",
-                    received_at="2026-05-11T08:00:00+00:00",
-                    subject="Order confirmed",
-                    sender="store@example.com",
-                    snippet="Your order is confirmed.",
-                ),
-                make_record(
-                    record_id="today-latest",
-                    thread_id="thread-today",
-                    received_at="2026-05-11T10:00:00+00:00",
-                    subject="Order shipped",
-                    sender="store@example.com",
-                    snippet="Your order shipped.",
-                ),
-                make_record(
-                    record_id="yesterday",
-                    thread_id="thread-yesterday",
-                    received_at="2026-05-10T09:00:00+00:00",
-                    subject="Yesterday",
-                ),
-                make_record(
-                    record_id="previous-six",
-                    thread_id="thread-previous-six",
-                    received_at="2026-05-06T09:00:00+00:00",
-                    subject="Last seven days",
-                ),
-                make_record(
-                    record_id="earlier-month",
-                    thread_id="thread-earlier-month",
-                    received_at="2026-05-02T09:00:00+00:00",
-                    subject="Earlier this month",
-                ),
-                make_record(
-                    record_id="older-month",
-                    thread_id="thread-older-month",
-                    received_at="2026-04-30T09:00:00+00:00",
-                    subject="Older month",
-                ),
-            ],
-        )
+        records = [
+            make_record(
+                record_id="today-old",
+                thread_id="thread-today",
+                received_at="2026-05-11T08:00:00+00:00",
+                subject="Order confirmed",
+                sender="store@example.com",
+                snippet="Your order is confirmed.",
+            ),
+            make_record(
+                record_id="today-latest",
+                thread_id="thread-today",
+                received_at="2026-05-11T10:00:00+00:00",
+                subject="Order shipped",
+                sender="store@example.com",
+                snippet="Your order shipped.",
+            ),
+            make_record(
+                record_id="yesterday",
+                thread_id="thread-yesterday",
+                received_at="2026-05-10T09:00:00+00:00",
+                subject="Yesterday",
+                snippet="Yesterday summary.",
+            ),
+            make_record(
+                record_id="previous-six",
+                thread_id="thread-previous-six",
+                received_at="2026-05-06T09:00:00+00:00",
+                subject="Last seven days",
+                snippet="Last seven days summary.",
+            ),
+            make_record(
+                record_id="earlier-month",
+                thread_id="thread-earlier-month",
+                received_at="2026-05-02T09:00:00+00:00",
+                subject="Earlier this month",
+                snippet="Earlier this month summary.",
+            ),
+            make_record(
+                record_id="older-month",
+                thread_id="thread-older-month",
+                received_at="2026-04-30T09:00:00+00:00",
+                subject="Older month",
+                snippet="Older month.",
+            ),
+        ]
+        upsert_gmail_message_snapshots(str(self.database_path), [make_snapshot(record) for record in records])
 
         response = build_gmail_view_response(
             str(self.database_path),
@@ -187,7 +217,9 @@ class HistoryRouteTests(unittest.TestCase):
         self.assertEqual(today_row.latest_source_record_id, "today-latest")
         self.assertEqual(today_row.latest_subject, "Order shipped")
         self.assertEqual(today_row.message_count, 2)
-        self.assertEqual([update.subject for update in today_row.lifecycle_updates], ["Order confirmed", "Order shipped"])
+        self.assertEqual(today_row.lifecycle_updates, [])
+        self.assertEqual(response.sections[-1].rows[0].summary, "Older month.")
+        self.assertNotIn("waiting on the other side", response.sections[-1].rows[0].summary or "")
 
     def test_history_paginates_source_records_without_losing_total(self) -> None:
         upsert_source_records(
@@ -223,7 +255,7 @@ class HistoryRouteTests(unittest.TestCase):
             summaries={"message-1": "Apple shipped your iPhone order."},
         )
 
-        refreshed = refresh_source_record_summaries(str(self.database_path), ["message-1"])
+        refreshed = refresh_source_record_summaries(str(self.database_path), ["message-1"], user_id=DEFAULT_USER_ID)
         response = self.client.get("/v1/history")
 
         self.assertEqual(refreshed, 1)
@@ -248,7 +280,7 @@ class HistoryRouteTests(unittest.TestCase):
             summaries={"message-1": "Gaurav Pandey forwarded an HSBC email about sharing documents."},
         )
 
-        refreshed = refresh_source_record_summaries(str(self.database_path), ["message-1"])
+        refreshed = refresh_source_record_summaries(str(self.database_path), ["message-1"], user_id=DEFAULT_USER_ID)
         response = self.client.get("/v1/history")
 
         self.assertEqual(refreshed, 1)

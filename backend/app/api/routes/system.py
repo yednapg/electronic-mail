@@ -7,6 +7,7 @@ import sqlite3
 from fastapi import APIRouter, HTTPException, status
 
 from app.core.config import load_settings
+from app.db.repository import ALEMBIC_BASELINE_REVISION, get_engine
 
 
 router = APIRouter()
@@ -21,10 +22,22 @@ def health() -> dict[str, str]:
 
 @router.get("/ready")
 def ready() -> dict[str, object]:
-    """Readiness probe for config and SQLite schema availability."""
+    """Readiness probe for config and database schema availability."""
     errors = settings.readiness_errors()
+    database_backend = settings.database_backend
 
-    if not settings.database_path.exists():
+    if database_backend == "postgres":
+        try:
+            with get_engine(str(settings.database_path)).connect() as connection:
+                revision = connection.exec_driver_sql("SELECT version_num FROM alembic_version LIMIT 1").scalar()
+                if revision != ALEMBIC_BASELINE_REVISION:
+                    errors.append(
+                        f"Database migration revision is {revision or 'missing'}, expected {ALEMBIC_BASELINE_REVISION}"
+                    )
+                connection.exec_driver_sql("SELECT 1 FROM source_records LIMIT 1")
+        except Exception as exc:
+            errors.append(f"Postgres readiness check failed: {exc}")
+    elif settings.sqlite_database_path is None or not settings.sqlite_database_path.exists():
         errors.append(f"Database file does not exist: {settings.database_path}")
     else:
         try:
@@ -50,7 +63,7 @@ def ready() -> dict[str, object]:
     return {
         "status": "ready",
         "environment": settings.app_env,
-        "database": "sqlite",
+        "database": database_backend,
         "google_configured": settings.google_configured,
         "openai_configured": settings.openai_configured,
         "openai_model": settings.openai_model,

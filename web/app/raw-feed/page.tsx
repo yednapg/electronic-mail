@@ -1,7 +1,8 @@
 import type { SourceRecord } from '@decision-pipeline/types';
+import { redirect } from 'next/navigation';
 
-import { getBackendURL, isDemoMode } from '../../lib/api';
-import { getDemoSourceRecords } from '../../lib/demo-evidence';
+import { getBackendURL, getDashboard } from '../../lib/api';
+import { getServerCookieHeader } from '../../lib/server-cookies';
 
 type RawFeedPageProps = {
   searchParams?: Promise<{
@@ -9,9 +10,10 @@ type RawFeedPageProps = {
   }>;
 };
 
-async function getRawFeed(): Promise<SourceRecord[]> {
+async function getRawFeed(cookie: string | null): Promise<SourceRecord[]> {
   const response = await fetch(`${getBackendURL()}/raw-feed`, {
     cache: 'no-store',
+    headers: cookie === null ? undefined : { Cookie: cookie },
   });
 
   if (!response.ok) {
@@ -22,19 +24,20 @@ async function getRawFeed(): Promise<SourceRecord[]> {
 }
 
 export default async function RawFeedPage({ searchParams }: RawFeedPageProps) {
-  const params = await searchParams;
+  const cookie = await getServerCookieHeader();
+  const [params, dashboard] = await Promise.all([searchParams, getDashboard({ cookie })]);
+  if (!dashboard.auth.connected) {
+    redirect('/');
+  }
+
   const itemId = params?.item;
   let records: SourceRecord[] = [];
   let errorMessage: string | null = null;
 
-  if (isDemoMode()) {
-    records = getDemoSourceRecords(itemId);
-  } else {
-    try {
-      records = await getRawFeed();
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : 'Raw feed is unavailable.';
-    }
+  try {
+    records = await getRawFeed(cookie);
+  } catch (error) {
+    errorMessage = error instanceof Error ? error.message : 'Raw feed is unavailable.';
   }
 
   return (
@@ -70,7 +73,7 @@ export default async function RawFeedPage({ searchParams }: RawFeedPageProps) {
         ) : null}
 
         {errorMessage === null && records.length === 0 ? (
-          <p className="debug-copy">No matching Gmail records for this demo item.</p>
+          <p className="debug-copy">No matching Gmail records.</p>
         ) : null}
       </div>
     </main>

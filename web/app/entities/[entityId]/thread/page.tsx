@@ -1,8 +1,11 @@
 import type { ThreadMessage, ThreadReaderResponse } from '@decision-pipeline/types';
 import Link from 'next/link';
+import { redirect } from 'next/navigation';
 import React from 'react';
 
-import { getEntityThread } from '../../../../lib/api';
+import { SignedInAppChrome } from '../../../../components/app/AppChrome';
+import { getEntityThread, getGoogleAuthState } from '../../../../lib/api';
+import { getServerCookieHeader } from '../../../../lib/server-cookies';
 
 const DEFAULT_THREAD_LIMIT = 25;
 
@@ -16,21 +19,47 @@ type EntityThreadPageProps = {
 type ThreadPageRequest = {
   limit: number;
   offset: number;
+  threadId?: string;
 };
 
 export default async function EntityThreadPage({ params, searchParams }: EntityThreadPageProps) {
-  const [{ entityId }, query] = await Promise.all([params, searchParams ?? Promise.resolve({})]);
+  const cookie = await getServerCookieHeader();
+  const [{ entityId }, query] = await Promise.all([
+    params,
+    searchParams ?? Promise.resolve({}),
+  ]);
   const page = parseThreadPageRequest(query);
-  let thread: ThreadReaderResponse | null = null;
-  let errorMessage: string | null = null;
+  const [auth, threadResult] = await Promise.all([
+    getGoogleAuthState({ cookie }),
+    loadThreadDetail(entityId, page, cookie),
+  ]);
 
-  try {
-    thread = await getEntityThread(entityId, page);
-  } catch (error) {
-    errorMessage = error instanceof Error ? error.message : 'Thread is unavailable.';
+  if (!auth.connected) {
+    redirect('/');
   }
 
-  return <ThreadDetail entityId={entityId} page={page} thread={thread} errorMessage={errorMessage} />;
+  return (
+    <ThreadDetail
+      entityId={entityId}
+      page={page}
+      thread={threadResult.thread}
+      errorMessage={threadResult.errorMessage}
+    />
+  );
+}
+
+async function loadThreadDetail(entityId: string, page: ThreadPageRequest, cookie: string | null) {
+  try {
+    return {
+      thread: await getEntityThread(entityId, page, { cookie }),
+      errorMessage: null,
+    };
+  } catch (error) {
+    return {
+      thread: null,
+      errorMessage: error instanceof Error ? error.message : 'Thread is unavailable.',
+    };
+  }
 }
 
 export function ThreadDetail({
@@ -38,61 +67,64 @@ export function ThreadDetail({
   page = { limit: DEFAULT_THREAD_LIMIT, offset: 0 },
   thread,
   errorMessage,
+  reader = 'entity',
 }: {
   entityId: string;
   page?: ThreadPageRequest;
   thread: ThreadReaderResponse | null;
   errorMessage: string | null;
+  reader?: 'entity' | 'gmail';
 }) {
   const title = thread?.subject?.trim() || 'Thread';
   const pageState = thread ? getThreadPageState(thread, page) : null;
 
   return (
-    <main className="digest-page">
-      <div className="digest-shell thread-reader-shell">
-        <header className="thread-reader-header">
-          <Link className="thread-reader-back" href="/dashboard">
-            Dashboard
-          </Link>
-          <h1 className="thread-reader-title">{title}</h1>
-          {thread ? (
-            <div className="thread-reader-meta" aria-label="Thread metadata">
-              {buildThreadMeta(thread, pageState).map((part) => (
-                <span key={part}>{part}</span>
+    <SignedInAppChrome active="gmail">
+      <main className="digest-page">
+        <div className="digest-shell thread-reader-shell">
+          <header className="thread-reader-header">
+            <Link className="thread-reader-back" href="/gmail" prefetch>
+              Back to Inbox
+            </Link>
+            <h1 className="thread-reader-title">{title}</h1>
+            {errorMessage ? <p className="thread-reader-empty">{errorMessage}</p> : null}
+          </header>
+
+          {thread && thread.messages.length > 0 ? (
+            <ol className="thread-message-list" aria-label="Persisted thread messages">
+              {thread.messages.map((message) => (
+                <ThreadMessageCard key={message.id} message={message} />
               ))}
-            </div>
+            </ol>
           ) : null}
-          {errorMessage ? <p className="thread-reader-empty">{errorMessage}</p> : null}
-        </header>
 
-        {thread && thread.messages.length > 0 ? (
-          <ol className="thread-message-list" aria-label="Persisted thread messages">
-            {thread.messages.map((message) => (
-              <ThreadMessageCard key={message.id} message={message} />
-            ))}
-          </ol>
-        ) : null}
+          {thread && pageState && (pageState.hasPrevious || pageState.hasMore) ? (
+            <nav className="thread-reader-pagination" aria-label="Thread pages">
+              {pageState.hasPrevious ? (
+                <Link
+                  className="thread-reader-page-link"
+                  href={buildThreadPageHref(entityId, pageState.limit, pageState.previousOffset, page.threadId, reader)}
+                >
+                  Previous
+                </Link>
+              ) : null}
+              {pageState.hasMore ? (
+                <Link
+                  className="thread-reader-page-link"
+                  href={buildThreadPageHref(entityId, pageState.limit, pageState.nextOffset, page.threadId, reader)}
+                >
+                  More
+                </Link>
+              ) : null}
+            </nav>
+          ) : null}
 
-        {thread && pageState && (pageState.hasPrevious || pageState.hasMore) ? (
-          <nav className="thread-reader-pagination" aria-label="Thread pages">
-            {pageState.hasPrevious ? (
-              <Link className="thread-reader-page-link" href={buildThreadPageHref(entityId, pageState.limit, pageState.previousOffset)}>
-                Previous
-              </Link>
-            ) : null}
-            {pageState.hasMore ? (
-              <Link className="thread-reader-page-link" href={buildThreadPageHref(entityId, pageState.limit, pageState.nextOffset)}>
-                More
-              </Link>
-            ) : null}
-          </nav>
-        ) : null}
-
-        {thread && thread.messages.length === 0 ? (
-          <p className="thread-reader-empty">No persisted messages are attached to this entity yet.</p>
-        ) : null}
-      </div>
-    </main>
+          {thread && thread.messages.length === 0 ? (
+            <p className="thread-reader-empty">No persisted messages are attached to this entity yet.</p>
+          ) : null}
+        </div>
+      </main>
+    </SignedInAppChrome>
   );
 }
 
@@ -141,29 +173,6 @@ function ThreadMessageCard({ message }: { message: ThreadMessage }) {
   );
 }
 
-function buildThreadMeta(thread: ThreadReaderResponse, pageState: ReturnType<typeof getThreadPageState> | null): string[] {
-  const messageCount = thread.messages.length;
-  const totalMessages = pageState?.totalMessages ?? messageCount;
-  const emailLabel = totalMessages === 1 ? 'email' : 'emails';
-  const parts =
-    totalMessages > messageCount
-      ? [`${messageCount} of ${totalMessages} ${emailLabel}`]
-      : [`${messageCount} ${messageCount === 1 ? 'email' : 'emails'}`];
-  const source = thread.source ? formatSource(thread.source) : null;
-  if (source) {
-    parts.push(source);
-  }
-
-  const received = thread.messages.map((message) => message.received_at).filter(Boolean);
-  if (received.length > 0) {
-    const first = received[0];
-    const last = received[received.length - 1];
-    parts.push(first === last ? formatReceivedAt(first) : `${formatReceivedAt(first)} to ${formatReceivedAt(last)}`);
-  }
-
-  return parts;
-}
-
 function getThreadPageState(thread: ThreadReaderResponse, requestedPage: ThreadPageRequest) {
   const messageCount = thread.messages.length;
   const limit = positiveNumber(thread.limit) ?? requestedPage.limit;
@@ -182,11 +191,23 @@ function getThreadPageState(thread: ThreadReaderResponse, requestedPage: ThreadP
   };
 }
 
-function buildThreadPageHref(entityId: string, limit: number, offset: number): string {
+function buildThreadPageHref(
+  entityId: string,
+  limit: number,
+  offset: number,
+  threadId: string | undefined,
+  reader: 'entity' | 'gmail',
+): string {
   const params = new URLSearchParams({
     limit: String(limit),
     offset: String(offset),
   });
+  if (threadId !== undefined) {
+    params.set('threadId', threadId);
+  }
+  if (reader === 'gmail') {
+    return `/gmail/threads/${encodeURIComponent(threadId ?? entityId)}?${params.toString()}`;
+  }
   return `/entities/${encodeURIComponent(entityId)}/thread?${params.toString()}`;
 }
 
@@ -194,6 +215,7 @@ function parseThreadPageRequest(searchParams: Record<string, string | string[] |
   return {
     limit: parseBoundedInteger(firstValue(searchParams.limit), DEFAULT_THREAD_LIMIT, 1, 100),
     offset: parseBoundedInteger(firstValue(searchParams.offset), 0, 0, Number.MAX_SAFE_INTEGER),
+    threadId: cleanOptionalText(firstValue(searchParams.threadId)) || undefined,
   };
 }
 
@@ -212,6 +234,10 @@ function parseBoundedInteger(value: string | undefined, fallback: number, min: n
   }
 
   return Math.min(parsed, max);
+}
+
+function cleanOptionalText(value: string | undefined): string {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
 function positiveNumber(value: number | undefined): number | null {

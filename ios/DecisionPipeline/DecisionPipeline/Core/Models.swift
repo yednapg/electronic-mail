@@ -64,6 +64,40 @@ public struct DashboardResponse: Codable, Equatable {
     let feed: FeedResponse
 }
 
+public struct AuthUserResponse: Codable, Equatable {
+    let id: String
+    let email: String
+    let displayName: String?
+    let betaEnabled: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case email
+        case displayName = "display_name"
+        case betaEnabled = "beta_enabled"
+    }
+}
+
+public struct MobileSessionExchangeRequest: Codable, Equatable {
+    let loginCode: String
+
+    enum CodingKeys: String, CodingKey {
+        case loginCode = "login_code"
+    }
+}
+
+public struct MobileSessionExchangeResponse: Codable, Equatable {
+    let sessionToken: String
+    let expiresAt: String
+    let user: AuthUserResponse
+
+    enum CodingKeys: String, CodingKey {
+        case sessionToken = "session_token"
+        case expiresAt = "expires_at"
+        case user
+    }
+}
+
 public struct FeedResponse: Codable, Equatable {
     let now: [AttentionItem]
     let today: [AttentionItem]

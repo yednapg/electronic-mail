@@ -82,6 +82,21 @@ class GmailSyncNormalizationTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].id, "message-1")
 
+    def test_provider_message_ids_are_scoped_for_beta_users(self) -> None:
+        message = build_message(message_id="message-1", thread_id="thread-1")
+
+        first = to_gmail_source_record(message, user_id="user-a")
+        second = to_gmail_source_record(message, user_id="user-b")
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None
+        assert second is not None
+        self.assertEqual(first.raw_payload["message_id"], "message-1")
+        self.assertEqual(second.raw_payload["message_id"], "message-1")
+        self.assertEqual(first.id, "user-a:gmail:message-1")
+        self.assertEqual(second.id, "user-b:gmail:message-1")
+
     def test_recent_scope_filters_by_time_but_not_by_label(self) -> None:
         records = normalize_gmail_messages(
             [

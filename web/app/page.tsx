@@ -1,28 +1,27 @@
-/** Demo landing screen that sends users into the dashboard flow. */
+/** Landing screen that starts the real Google connection flow. */
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
 
 import { AppMark } from '../components/AppMark';
-import { getBackendURL, getDashboard, getLatestDashboardImportJob, isDemoMode } from '../lib/api';
-import { DEMO_SIGN_IN_ROUTE } from '../lib/demo-flow';
+import { getBackendURL, getDashboard, getLatestFirstRunImportJob } from '../lib/api';
+import { getServerCookieHeader } from '../lib/server-cookies';
 import type { DashboardResponse } from '../lib/types';
 
 export default async function HomePage() {
-  const demoMode = isDemoMode();
-  let signInHref = demoMode ? DEMO_SIGN_IN_ROUTE : `${getBackendURL()}/auth/google`;
+  let signInHref = `${getBackendURL()}/auth/google`;
   let dashboard: DashboardResponse | null = null;
+  const cookie = await getServerCookieHeader();
 
-  if (!demoMode) {
-    try {
-      dashboard = await getDashboard();
-    } catch {
-      signInHref = `${getBackendURL()}/auth/google`;
-    }
+  try {
+    dashboard = await getDashboard({ cookie });
+  } catch {
+    signInHref = `${getBackendURL()}/auth/google`;
   }
 
   if (dashboard?.auth.connected) {
-    const latestImportJob = await getLatestDashboardImportJob();
-    redirect(latestImportJob?.status === 'succeeded' ? '/dashboard' : '/post-login');
+    const latestImportJob = await getLatestFirstRunImportJob({ cookie });
+    const firstRunReady = Boolean(latestImportJob?.inbox_ready_at && latestImportJob?.dashboard_ready_at);
+    redirect(firstRunReady ? '/dashboard' : '/post-login');
   }
 
   signInHref = dashboard?.auth.connect_url ?? signInHref;
