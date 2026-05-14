@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 
-import { getBackendURL, isDemoMode } from '../../../../../lib/api';
-import { getDemoThread } from '../../../../../lib/demo-evidence';
+import { getBackendURL } from '../../../../../lib/api';
+import { backendProxyHeaders, requireConnectedGoogleAccount } from '../../../../../lib/api-auth';
 
 type ThreadRouteContext = {
   params: Promise<{
@@ -10,22 +10,16 @@ type ThreadRouteContext = {
 };
 
 export async function GET(request: Request, { params }: ThreadRouteContext) {
+  const unauthorized = await requireConnectedGoogleAccount(request);
+  if (unauthorized) {
+    return unauthorized;
+  }
+
   const { entityId } = await params;
   const requestUrl = new URL(request.url);
 
-  if (isDemoMode()) {
-    const thread = getDemoThread(entityId, {
-      limit: parseIntegerSearchParam(requestUrl.searchParams.get('limit')),
-      offset: parseIntegerSearchParam(requestUrl.searchParams.get('offset')),
-    });
-    if (thread === null) {
-      return NextResponse.json({ detail: 'Entity not found' }, { status: 404 });
-    }
-    return NextResponse.json(thread);
-  }
-
   const backendParams = new URLSearchParams();
-  for (const key of ['limit', 'offset']) {
+  for (const key of ['limit', 'offset', 'threadId']) {
     const value = requestUrl.searchParams.get(key);
     if (value !== null) {
       backendParams.set(key, value);
@@ -34,9 +28,9 @@ export async function GET(request: Request, { params }: ThreadRouteContext) {
   const query = backendParams.toString();
   const response = await fetch(`${getBackendURL()}/v1/entities/${encodeURIComponent(entityId)}/thread${query ? `?${query}` : ''}`, {
     cache: 'no-store',
-    headers: {
+    headers: backendProxyHeaders(request, {
       Accept: 'application/json',
-    },
+    }),
   });
 
   const body = await response.text();
@@ -46,13 +40,4 @@ export async function GET(request: Request, { params }: ThreadRouteContext) {
       'Content-Type': response.headers.get('Content-Type') ?? 'application/json',
     },
   });
-}
-
-function parseIntegerSearchParam(value: string | null): number | undefined {
-  if (value === null) {
-    return undefined;
-  }
-
-  const parsed = Number(value);
-  return Number.isInteger(parsed) ? parsed : undefined;
 }

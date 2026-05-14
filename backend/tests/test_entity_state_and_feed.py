@@ -307,7 +307,7 @@ class EntityStateAndFeedTests(unittest.TestCase):
         self.assertIsNotNone(item.detail)
         assert item.detail is not None
         self.assertEqual(item.detail.body, ["test"])
-        self.assertEqual(item.detail.action_label, "Wait for the reply")
+        self.assertEqual(item.detail.action_label, "No action needed right now")
         self.assertEqual(item.detail.source_label, "Gmail")
         self.assertNotIn("thread-1", item.detail.model_dump_json())
         self.assertNotIn("trace", item.detail.model_dump_json())
@@ -365,7 +365,7 @@ class EntityStateAndFeedTests(unittest.TestCase):
             ai_suggestion=StoredEntityAiSuggestion(
                 id="ai-1",
                 entity_id="entity-hidden",
-                title="Your bank request was completed.",
+                title="Your parcel was delivered.",
                 explanation="This is worth keeping around as context.",
                 action="none",
                 suggested_timing="hidden",
@@ -379,8 +379,8 @@ class EntityStateAndFeedTests(unittest.TestCase):
                 make_record(
                     record_id="record-1",
                     source="gmail",
-                    subject="Your request has been completed",
-                    body="Processed successfully.",
+                    subject="Your parcel has been delivered",
+                    body="Delivery complete.",
                     timestamp="2026-04-17T10:00:00+00:00",
                 )
             ],
@@ -398,6 +398,127 @@ class EntityStateAndFeedTests(unittest.TestCase):
         self.assertEqual(feed.now, [])
         self.assertEqual(feed.today, [])
         self.assertEqual(feed.worth_knowing, [])
+
+    def test_itr_intimation_surfaces_as_worth_knowing_not_a_todo(self) -> None:
+        loaded_entity = LoadedEntity(
+            entity=StoredEntity(
+                id="entity-itr",
+                canonical_key="gmail-thread:thread-itr",
+                created_at="2026-05-12T09:00:00+00:00",
+                updated_at="2026-05-12T10:00:00+00:00",
+            ),
+            state=StoredEntityState(
+                id="state-itr",
+                entity_id="entity-itr",
+                current_state="done",
+                due_at=None,
+                updated_at="2026-05-12T10:00:00+00:00",
+            ),
+            ai_suggestion=None,
+            members=[
+                make_record(
+                    record_id="record-itr",
+                    source="gmail",
+                    subject="Your tax notice",
+                    body="Your income tax return has been processed successfully.",
+                    timestamp="2026-05-12T10:00:00+00:00",
+                )
+            ],
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".db") as db_file:
+            initialize_database(db_file.name)
+            output = to_pipeline_output(db_file.name, loaded_entity, "2026-05-13T12:00:00+00:00")
+
+        self.assertFalse(output.suppressed)
+        self.assertIsNotNone(output.attention_item)
+        assert output.attention_item is not None
+        self.assertEqual(output.attention_item.timing_band, "later")
+        self.assertEqual(output.attention_item.need_type, "awareness")
+        self.assertEqual(output.attention_item.primary_action, "none")
+        self.assertEqual(output.attention_item.title, "Your ITR intimation was processed")
+
+        feed = build_feed([output])
+
+        self.assertEqual(feed.now, [])
+        self.assertEqual(feed.today, [])
+        self.assertEqual([item.entity_id for item in feed.worth_knowing], ["entity-itr"])
+
+    def test_recent_bill_email_becomes_concrete_pay_action_with_link(self) -> None:
+        loaded_entity = LoadedEntity(
+            entity=StoredEntity(
+                id="entity-bill",
+                canonical_key="gmail-thread:thread-bill",
+                created_at="2026-05-13T09:00:00+00:00",
+                updated_at="2026-05-13T09:30:00+00:00",
+            ),
+            state=StoredEntityState(
+                id="state-bill",
+                entity_id="entity-bill",
+                current_state="open",
+                due_at=None,
+                updated_at="2026-05-13T09:30:00+00:00",
+            ),
+            ai_suggestion=None,
+            members=[
+                make_record(
+                    record_id="record-bill",
+                    source="gmail",
+                    subject="Credit card bill due today",
+                    body="Please pay your card bill at https://bank.example/pay before 5 PM to avoid late fees.",
+                    timestamp="2026-05-13T09:30:00+00:00",
+                )
+            ],
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".db") as db_file:
+            initialize_database(db_file.name)
+            output = to_pipeline_output(db_file.name, loaded_entity, "2026-05-13T12:00:00+00:00")
+
+        self.assertFalse(output.suppressed)
+        self.assertIsNotNone(output.attention_item)
+        assert output.attention_item is not None
+        self.assertEqual(output.attention_item.primary_action, "pay")
+        self.assertEqual(output.attention_item.timing_band, "now")
+        self.assertIsNotNone(output.attention_item.detail)
+        assert output.attention_item.detail is not None
+        self.assertEqual(output.attention_item.detail.action_label, "Pay bill")
+        self.assertEqual(output.attention_item.detail.action_url, "https://bank.example/pay")
+
+    def test_old_gmail_action_email_is_not_converted_to_todo(self) -> None:
+        loaded_entity = LoadedEntity(
+            entity=StoredEntity(
+                id="entity-old-bill",
+                canonical_key="gmail-thread:thread-old-bill",
+                created_at="2026-01-01T09:00:00+00:00",
+                updated_at="2026-01-01T09:30:00+00:00",
+            ),
+            state=StoredEntityState(
+                id="state-old-bill",
+                entity_id="entity-old-bill",
+                current_state="open",
+                due_at=None,
+                updated_at="2026-01-01T09:30:00+00:00",
+            ),
+            ai_suggestion=None,
+            members=[
+                make_record(
+                    record_id="record-old-bill",
+                    source="gmail",
+                    subject="Credit card bill due today",
+                    body="Please pay your card bill at https://bank.example/pay before 5 PM to avoid late fees.",
+                    timestamp="2026-01-01T09:30:00+00:00",
+                )
+            ],
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".db") as db_file:
+            initialize_database(db_file.name)
+            output = to_pipeline_output(db_file.name, loaded_entity, "2026-05-13T12:00:00+00:00")
+
+        self.assertTrue(output.suppressed)
+        self.assertEqual(output.suppression_reason, "not_actionable_or_worth_knowing")
+        self.assertIsNone(output.attention_item)
 
     def test_visible_done_item_is_suppressed_by_backend_state(self) -> None:
         loaded_entity = LoadedEntity(

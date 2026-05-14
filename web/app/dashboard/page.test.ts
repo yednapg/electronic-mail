@@ -1,9 +1,13 @@
 /** Unit tests for dashboard copy shaping and agenda extraction. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import type { FeedItem, FeedResponse } from '../../lib/types';
 import { buildAgenda, buildSections, buildSummary, toActionSentence, toSectionCta, toSectionDetail } from './page';
+
+const dashboardPageSource = readFileSync(new URL('./page.tsx', import.meta.url), 'utf8');
+const dashboardClientSource = readFileSync(new URL('./DashboardClient.tsx', import.meta.url), 'utf8');
 
 function createFeedItem(overrides: Partial<FeedItem> = {}): FeedItem {
   return {
@@ -33,6 +37,13 @@ function createFeed(overrides: Partial<FeedResponse> = {}): FeedResponse {
     ...overrides,
   };
 }
+
+test('dashboard route mounts the client cache instead of server-fetching dashboard data', () => {
+  assert.match(dashboardPageSource, /\bDashboardClient\b/);
+  assert.doesNotMatch(dashboardPageSource, /\bgetDashboard\b/);
+  assert.match(dashboardClientSource, /\bDASHBOARD_STORAGE_PREFIX\b/);
+  assert.match(dashboardClientSource, /\bfetchAuthMe\b/);
+});
 
 test('agenda sorts calendar items chronologically', () => {
   const earlyMeeting = createFeedItem({
@@ -204,13 +215,13 @@ test('dashboard keeps work buckets available when the inbox is empty', () => {
 test('dashboard summary renders backend-generated briefing copy without rewriting it', () => {
   const summary = buildSummary({
     briefing: {
-      headline: 'Good morning, TestUser.',
+      headline: 'Good morning, Jordan.',
       brief: 'You have 0 meetings and a mostly open afternoon.',
     },
   });
 
   assert.deepEqual(summary, {
-    headline: 'Good morning, TestUser.',
+    headline: 'Good morning, Jordan.',
     brief: 'You have 0 meetings and a mostly open afternoon.',
   });
 });

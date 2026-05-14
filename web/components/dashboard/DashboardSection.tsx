@@ -85,43 +85,33 @@ export function DashboardSection({
     setComposeError(null);
 
     try {
-      if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'true') {
-        if (composeMode === 'email') {
-          const draft = await createGmailDraft({
-            to: emailDraft.to.trim(),
-            cc: emailDraft.cc.trim() || null,
-            bcc: emailDraft.bcc.trim() || null,
-            subject: emailDraft.subject.trim(),
-            body: emailDraft.body.trim(),
-          });
-          setLocalItems((currentItems) => [
-            {
-              id: draft.id,
-              entityId: draft.entity_id ?? undefined,
-              title: titleText,
-            },
-            ...currentItems,
-          ]);
-        } else {
-          const task = await createTask({
-            title: todoTitle.trim(),
-            notes: todoNotes.trim() || null,
-            section: sectionId === 'worth-knowing' ? 'later' : sectionId,
-          });
-          setLocalItems((currentItems) => [
-            {
-              id: task.id,
-              entityId: task.entity_id,
-              title: task.title,
-            },
-            ...currentItems,
-          ]);
-        }
-      } else {
+      if (composeMode === 'email') {
+        const draft = await createGmailDraft({
+          to: emailDraft.to.trim(),
+          cc: emailDraft.cc.trim() || null,
+          bcc: emailDraft.bcc.trim() || null,
+          subject: emailDraft.subject.trim(),
+          body: emailDraft.body.trim(),
+        });
         setLocalItems((currentItems) => [
           {
-            id: `local-${Date.now()}`,
+            id: draft.id,
+            entityId: draft.entity_id ?? undefined,
             title: titleText,
+          },
+          ...currentItems,
+        ]);
+      } else {
+        const task = await createTask({
+          title: todoTitle.trim(),
+          notes: todoNotes.trim() || null,
+          section: sectionId === 'worth-knowing' ? 'later' : sectionId,
+        });
+        setLocalItems((currentItems) => [
+          {
+            id: task.id,
+            entityId: task.entity_id,
+            title: task.title,
           },
           ...currentItems,
         ]);
@@ -369,11 +359,6 @@ function DashboardSectionItemRow({
       return;
     }
 
-    if (process.env.NEXT_PUBLIC_DEMO_MODE === 'true') {
-      setCtaState('done');
-      return;
-    }
-
     setCtaState('loading');
 
     try {
@@ -399,11 +384,6 @@ function DashboardSectionItemRow({
 
     setChecked(true);
     setIsCompleting(true);
-
-    if (process.env.NEXT_PUBLIC_DEMO_MODE === 'true') {
-      onComplete();
-      return;
-    }
 
     if (!item.entityId) {
       onComplete();
@@ -433,6 +413,8 @@ function DashboardSectionItemRow({
         className="attention-checkbox-input"
         checked={checked}
         disabled={isCompleting}
+        style={{ caretColor: 'transparent' }}
+        suppressHydrationWarning
         onChange={(event) => {
           if (event.currentTarget.checked) {
             void completeItem();
@@ -517,16 +499,24 @@ function DashboardItemDetail({
           </div>
           <div className="attention-detail-next" aria-label={`Action for ${item.title}`}>
             <span className="attention-detail-label">Action</span>
-            <span className="attention-detail-next-copy">{actionCopy}</span>
+            {item.detail.actionUrl ? (
+              <a className="attention-detail-next-copy attention-detail-next-link" href={item.detail.actionUrl}>
+                {actionCopy}
+              </a>
+            ) : (
+              <span className="attention-detail-next-copy">{actionCopy}</span>
+            )}
           </div>
           <div className="attention-detail-source">
             <span className="attention-detail-label">Sources</span>
-            <span>{formatDetailSourceLabel(item.detail.sourceLabel)}</span>
-            {item.detail.links?.threadHref ? (
-              <a className="attention-detail-source-link" href={item.detail.links.threadHref}>
-                Read email
-              </a>
-            ) : null}
+            <span className="attention-detail-source-line">
+              <span>{formatDetailSourceLabel(item.detail.sourceLabel)}</span>
+              {item.detail.links?.threadHref ? (
+                <a className="attention-detail-source-link" href={item.detail.links.threadHref}>
+                  Read email
+                </a>
+              ) : null}
+            </span>
           </div>
         </div>
       </div>

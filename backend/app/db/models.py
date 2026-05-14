@@ -1,9 +1,76 @@
 from __future__ import annotations
 
-"""Small dataclass models representing persisted SQLite rows and joins."""
+"""Small dataclass models representing persisted backend rows and joins."""
 
 from dataclasses import dataclass, field
 from typing import Any
+
+
+@dataclass
+class StoredUser:
+    """Signed-in app user resolved from Google OAuth."""
+
+    id: str
+    email: str
+    display_name: str | None
+    google_sub: str
+    beta_enabled: bool
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class StoredAppSession:
+    """Opaque app session used by web cookies and iOS bearer auth."""
+
+    id: str
+    user_id: str
+    token_hash: str
+    platform: str
+    expires_at: str
+    revoked_at: str | None
+    last_seen_at: str | None
+    created_at: str
+
+
+@dataclass
+class StoredOAuthLoginSession:
+    """PKCE OAuth session keyed by Google state."""
+
+    state: str
+    code_verifier: str
+    redirect_to: str | None
+    expires_at: str
+    created_at: str
+
+
+@dataclass
+class StoredMobileLoginCode:
+    """One-time login code exchanged by iOS after OAuth callback."""
+
+    code_hash: str
+    user_id: str
+    expires_at: str
+    consumed_at: str | None
+    created_at: str
+
+
+@dataclass
+class StoredGoogleOAuthToken:
+    """Encrypted Google OAuth credentials for one app user."""
+
+    user_id: str
+    token_json_encrypted: str
+    updated_at: str
+
+
+@dataclass
+class StoredDashboardBriefing:
+    """Cached dashboard briefing payload for one app user."""
+
+    user_id: str
+    payload: dict[str, Any]
+    updated_at: str
 
 
 @dataclass
@@ -103,6 +170,10 @@ class StoredGmailSyncState:
     user_id: str
     last_history_id: str | None
     last_full_sync_at: str | None
+    watch_expiration_at: str | None = None
+    last_sync_started_at: str | None = None
+    last_sync_completed_at: str | None = None
+    last_sync_error: str | None = None
 
 
 @dataclass
@@ -140,6 +211,25 @@ class StoredGmailHistoryEvent:
 
 
 @dataclass
+class StoredGmailThreadProjection:
+    """Fast thread-level mailbox row derived from Gmail message snapshots."""
+
+    user_id: str
+    thread_id: str
+    latest_message_id: str
+    latest_received_at: str
+    latest_subject: str | None
+    latest_sender: str | None
+    snippet: str | None
+    participants: list[str]
+    label_ids: list[str]
+    message_count: int
+    unread: bool
+    tombstoned: bool
+    updated_at: str
+
+
+@dataclass
 class StoredSourceRecordSummary:
     """Generated compact summary for one persisted source record."""
 
@@ -170,6 +260,29 @@ class StoredDashboardImportJob:
     started_at: str | None
     stage_started_at: str | None
     stage_durations: dict[str, float]
+    completed_at: str | None
+    updated_at: str
+
+
+@dataclass
+class StoredFirstRunImportJob:
+    """Durable first-run Gmail plus fast-dashboard setup job status."""
+
+    id: str
+    user_id: str
+    status: str
+    stage: str
+    fetched_count: int
+    total_count: int | None
+    thread_count: int
+    dashboard_item_count: int
+    inbox_ready_at: str | None
+    dashboard_ready_at: str | None
+    full_import_started_at: str | None
+    full_import_completed_at: str | None
+    error_message: str | None
+    created_at: str
+    started_at: str | None
     completed_at: str | None
     updated_at: str
 

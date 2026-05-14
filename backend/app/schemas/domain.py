@@ -16,6 +16,7 @@ ActionConfidence = Literal["high", "medium", "low"]
 LifecycleState = Literal["active", "scheduled", "resolved", "suppressed"]
 EntityCurrentState = Literal["open", "waiting", "done"]
 GmailThreadAction = Literal["archive", "unarchive", "mark_read"]
+MailboxLabel = Literal["inbox", "sent", "drafts", "trash", "archive", "all"]
 DashboardImportJobStatus = Literal["queued", "running", "succeeded", "failed"]
 TraceStage = Literal[
     "ingestion",
@@ -48,6 +49,7 @@ class AttentionItemDetail(BaseModel):
     body: list[str] = Field(default_factory=list)
     action_label: str
     source_label: str
+    action_url: str | None = None
 
 
 class AttentionItem(BaseModel):
@@ -118,6 +120,36 @@ class GoogleAuthState(BaseModel):
     connect_url: str | None = None
 
 
+class AuthUserResponse(BaseModel):
+    """Current app user returned to authenticated clients."""
+
+    id: str
+    email: str
+    display_name: str | None = None
+    beta_enabled: bool = True
+
+
+class AuthMeResponse(BaseModel):
+    """Current app session state."""
+
+    authenticated: bool
+    user: AuthUserResponse | None = None
+
+
+class MobileSessionExchangeRequest(BaseModel):
+    """One-time iOS login code exchange request."""
+
+    login_code: str
+
+
+class MobileSessionExchangeResponse(BaseModel):
+    """Bearer session issued to iOS after Google OAuth."""
+
+    session_token: str
+    expires_at: str
+    user: AuthUserResponse
+
+
 class DashboardProfile(BaseModel):
     """Identity information resolved from the connected Google account."""
 
@@ -161,6 +193,32 @@ class DashboardImportJobResponse(BaseModel):
     stage_durations: dict[str, float] = Field(default_factory=dict)
     completed_at: str | None = None
     updated_at: str
+
+
+class FirstRunImportJobResponse(BaseModel):
+    """Durable status for first-login Gmail and dashboard setup."""
+
+    id: str
+    user_id: str
+    status: DashboardImportJobStatus
+    stage: str
+    fetched_count: int
+    total_count: int | None = None
+    thread_count: int
+    dashboard_item_count: int
+    inbox_ready_at: str | None = None
+    dashboard_ready_at: str | None = None
+    full_import_started_at: str | None = None
+    full_import_completed_at: str | None = None
+    error_message: str | None = None
+    created_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    updated_at: str
+
+    @property
+    def ready(self) -> bool:
+        return self.inbox_ready_at is not None and self.dashboard_ready_at is not None
 
 
 class TraceRecord(BaseModel):
@@ -385,6 +443,8 @@ class GmailThreadRow(BaseModel):
     message_count: int
     summary: str | None = None
     snippet: str | None = None
+    label_ids: list[str] = Field(default_factory=list)
+    unread: bool = False
     current_state: EntityCurrentState | None = None
     lifecycle_state: LifecycleState | None = None
     outcome_type: Literal["complete", "snooze", "dismiss"] | None = None
@@ -404,3 +464,32 @@ class GmailViewResponse(BaseModel):
 
     total_threads: int
     sections: list[GmailThreadSection] = Field(default_factory=list)
+
+
+class MailboxResponse(BaseModel):
+    """Label-filtered Gmail mailbox response backed by local Gmail snapshots."""
+
+    label: MailboxLabel
+    total_threads: int
+    next_cursor: str | None = None
+    sections: list[GmailThreadSection] = Field(default_factory=list)
+
+
+class MailboxSyncStateResponse(BaseModel):
+    """Current local Gmail sync/watch status for UI cache reconciliation."""
+
+    connected: bool
+    last_history_id: str | None = None
+    last_full_sync_at: str | None = None
+    watch_expiration_at: str | None = None
+    last_sync_started_at: str | None = None
+    last_sync_completed_at: str | None = None
+    last_sync_error: str | None = None
+    total_threads: int = 0
+
+
+class MailboxSyncTriggerResponse(BaseModel):
+    """Acknowledgement for a queued mailbox sync request."""
+
+    status: Literal["queued", "not_connected"]
+    state: MailboxSyncStateResponse

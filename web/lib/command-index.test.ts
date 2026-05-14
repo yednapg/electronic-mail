@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import type { DashboardResponse, FeedItem } from './types';
-import { buildCommandIndex, filterCommands, getStaticCommands } from './command-index';
+import type { DashboardResponse, FeedItem, GmailViewResponse } from './types';
+import { buildCommandIndex, buildGmailCommands, filterCommands, getStaticCommands } from './command-index';
 
 function createDashboard(items: Partial<DashboardResponse['feed']> = {}): DashboardResponse {
   return {
@@ -43,10 +43,62 @@ function createFeedItem(overrides: Partial<FeedItem> = {}): FeedItem {
   };
 }
 
+function createGmailView(): GmailViewResponse {
+  return {
+    total_threads: 1,
+    sections: [
+      {
+        id: 'today',
+        title: 'Today',
+        rows: [
+          {
+            thread_id: 'thread-northstar',
+            entity_id: 'entity-northstar',
+            latest_source_record_id: 'source-northstar',
+            latest_received_at: '2026-05-13T09:30:00+05:30',
+            latest_subject: 'Credit card bill due today',
+            latest_sender: 'Northstar Bank <alerts@northstarbank.example>',
+            participants: ['alerts@northstarbank.example', 'demo@example.test'],
+            message_count: 1,
+            summary: 'Please pay before 5 PM to avoid late fees.',
+            snippet: 'Please pay before 5 PM.',
+            current_state: 'open',
+            lifecycle_state: 'active',
+            outcome_type: null,
+            lifecycle_updates: [],
+          },
+        ],
+      },
+    ],
+  };
+}
+
 test('static commands include the core app destinations', () => {
   assert.deepEqual(
     getStaticCommands().map((command) => command.href),
-    ['/dashboard', '/gmail', '/history', '/raw-feed'],
+    ['/dashboard', '/gmail'],
+  );
+});
+
+test('empty command palette results show only top-level navigation', () => {
+  const index = buildCommandIndex(
+    createDashboard({
+      now: [
+        createFeedItem({
+          id: 'northstar-card-bill',
+          entity_id: 'entity-northstar-card-bill',
+          title: 'Northstar credit card bill due today',
+          primary_action: 'pay',
+        }),
+      ],
+    }),
+    '2026-05-13T00:00:00.000Z',
+    createGmailView(),
+  );
+
+  assert.deepEqual(
+    filterCommands(index.commands, '').map((command) => command.id),
+    ['nav:dashboard', 'nav:gmail'],
   );
 });
 
@@ -71,6 +123,32 @@ test('command index includes work and complete commands from current dashboard i
   assert.equal(workCommand?.href, '/entities/entity-northstar-card-bill/thread');
   assert.equal(completeCommand?.action?.kind, 'complete-entity');
   assert.equal(completeCommand?.action?.entityId, 'entity-northstar-card-bill');
+});
+
+test('command index includes real Gmail thread jumps for cmd-k inbox search', () => {
+  const index = buildCommandIndex(createDashboard(), '2026-05-13T00:00:00.000Z', createGmailView());
+  const emailCommand = index.commands.find((command) => command.id === 'email:thread-northstar');
+
+  assert.equal(emailCommand?.kind, 'email');
+  assert.equal(emailCommand?.title, 'Northstar Bank: Credit card bill due today');
+  assert.equal(emailCommand?.href, '/gmail/threads/thread-northstar');
+  assert.equal(filterCommands(index.commands, 'northstar bill')[0].id, 'email:thread-northstar');
+});
+
+test('gmail commands open rows even before entity derivation finishes', () => {
+  const gmail = createGmailView();
+  const commands = buildGmailCommands({
+    ...gmail,
+    sections: [
+      {
+        ...gmail.sections[0],
+        rows: [{ ...gmail.sections[0].rows[0], entity_id: null }],
+      },
+    ],
+  });
+
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0].href, '/gmail/threads/thread-northstar');
 });
 
 test('command index skips calendar items and resolved completion actions', () => {
@@ -118,6 +196,22 @@ test('work commands without an entity fall back to the dashboard and cannot comp
 
   assert.equal(index.commands.find((command) => command.id === 'work:local-work')?.href, '/dashboard');
   assert.equal(index.commands.some((command) => command.id === 'complete:'), false);
+});
+
+test('work commands prefer direct Gmail thread links when available', () => {
+  const index = buildCommandIndex(
+    createDashboard({
+      now: [
+        createFeedItem({
+          id: 'email-work',
+          entity_id: 'entity-work',
+          gmail_thread_id: 'thread-work',
+        }),
+      ],
+    }),
+  );
+
+  assert.equal(index.commands.find((command) => command.id === 'work:email-work')?.href, '/gmail/threads/thread-work');
 });
 
 test('search ranking favors matching work and done-specific action commands', () => {

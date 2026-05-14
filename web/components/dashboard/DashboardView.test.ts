@@ -4,6 +4,7 @@ import test from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
+import { SignedInAppChrome } from '../app/AppChrome';
 import { DashboardView } from './DashboardView';
 import type { DashboardSectionData } from './types';
 
@@ -15,17 +16,21 @@ test('dashboard controls stay visible when work sections are empty', () => {
   ];
 
   const markup = renderToStaticMarkup(
-    React.createElement(DashboardView, {
-      dateLabel: 'Monday, May 11',
-      timeLabel: '10:30',
-      liveMeta: false,
-      summary: { headline: 'Ready', brief: 'Nothing urgent.' },
-      agenda: [],
-      sections,
-    }),
+    React.createElement(
+      SignedInAppChrome,
+      { active: 'dashboard' },
+      React.createElement(DashboardView, {
+        dateLabel: 'Monday, May 11',
+        timeLabel: '10:30',
+        liveMeta: false,
+        summary: { headline: 'Ready', brief: 'Nothing urgent.' },
+        agenda: [],
+        sections,
+      }),
+    ),
   );
 
-  assert.match(markup, /Dashboard view settings/);
+  assert.match(markup, /App settings/);
   assert.match(markup, /Add item to Now/);
   assert.match(markup, /Add item to Today/);
   assert.match(markup, /Add item to Worth Knowing/);

@@ -26,6 +26,12 @@ VISIBLE_BUCKETS = [
 ]
 
 MAX_LIFECYCLE_UPDATES = 6
+SYNTHETIC_SUMMARY_PREFIXES = (
+    "this is still waiting on the other side for ",
+    "this still needs attention for ",
+    "this still needs a decision for ",
+    "this was already completed for ",
+)
 
 
 def build_gmail_view_response(
@@ -34,12 +40,14 @@ def build_gmail_view_response(
     user_id: str = DEFAULT_USER_ID,
     current_time: str | None = None,
 ) -> GmailViewResponse:
-    """Build a Gmail-like thread list from persisted raw Gmail records."""
-    rows = list_gmail_history_source_records(database_path, user_id=user_id)
-    reference = parse_datetime(current_time) if current_time is not None else datetime.now().astimezone()
-    thread_rows = group_records_into_threads(rows)
-    sections = bucket_thread_rows(thread_rows, reference)
-    return GmailViewResponse(total_threads=len(thread_rows), sections=sections)
+    """Build the compatibility Gmail view from the Gmail snapshot mailbox ledger."""
+    from app.services.mailbox import build_gmail_view_response_from_mailbox
+
+    return build_gmail_view_response_from_mailbox(
+        database_path,
+        user_id=user_id,
+        current_time=current_time,
+    )
 
 
 def group_records_into_threads(rows: list[StoredHistorySourceRecord]) -> list[GmailThreadRow]:
@@ -61,7 +69,7 @@ def to_thread_row(thread_id: str, rows: list[StoredHistorySourceRecord]) -> Gmai
     record = latest.source_record
     payload = record.raw_payload
     current_state = normalize_current_state(latest.current_state)
-    summary = latest.source_summary or latest.suggestion_summary or string_payload(payload, "summary")
+    summary = clean_gmail_summary(latest.source_summary or latest.suggestion_summary or string_payload(payload, "summary"), payload)
     snippet = compact_text(string_payload(payload, "snippet") or string_payload(payload, "body"))
 
     return GmailThreadRow(
@@ -151,7 +159,9 @@ def to_lifecycle_update(row: StoredHistorySourceRecord) -> GmailThreadUpdate:
     """Convert one source record into compact lifecycle text for the Gmail view."""
     record = row.source_record
     payload = record.raw_payload
-    summary = row.source_summary or compact_text(string_payload(payload, "snippet") or string_payload(payload, "body"))
+    summary = clean_gmail_summary(row.source_summary, payload) or compact_text(
+        string_payload(payload, "snippet") or string_payload(payload, "body")
+    )
 
     return GmailThreadUpdate(
         source_record_id=record.id,
@@ -168,3 +178,33 @@ def parse_datetime(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.astimezone()
     return parsed.astimezone()
+
+
+def clean_gmail_summary(summary: str | None, payload: dict[str, object]) -> str | None:
+    """Prefer real email text over old synthetic lifecycle summary copy."""
+    candidate = compact_text(summary or "")
+    if candidate and not is_synthetic_summary(candidate):
+        return candidate
+
+    fallback = compact_text(string_payload(payload, "snippet") or string_payload(payload, "body"))
+    if fallback and not is_synthetic_summary(fallback):
+        return fallback
+
+    if candidate:
+        return strip_synthetic_summary_prefix(candidate)
+
+    return None
+
+
+def is_synthetic_summary(value: str) -> bool:
+    normalized = " ".join(value.lower().split())
+    return any(normalized.startswith(prefix) for prefix in SYNTHETIC_SUMMARY_PREFIXES)
+
+
+def strip_synthetic_summary_prefix(value: str) -> str:
+    stripped = value.strip()
+    lowered = stripped.lower()
+    for prefix in SYNTHETIC_SUMMARY_PREFIXES:
+        if lowered.startswith(prefix):
+            return stripped[len(prefix) :].strip().rstrip(" .")
+    return stripped

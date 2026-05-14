@@ -95,7 +95,7 @@ class DashboardImportJobRouteTests(unittest.TestCase):
         self.tmp_dir = TemporaryDirectory()
         self.database_path = Path(self.tmp_dir.name) / "dashboard.db"
         initialize_database(str(self.database_path))
-        self.settings = SimpleNamespace(database_path=self.database_path, google_configured=True)
+        self.settings = SimpleNamespace(database_path=self.database_path, google_configured=True, app_env="local")
         self.settings_patch = patch.object(dashboard_routes, "settings", self.settings)
         self.settings_patch.start()
         self.addCleanup(self.settings_patch.stop)
@@ -178,7 +178,7 @@ class DashboardImportJobRouteTests(unittest.TestCase):
 
         run_gmail_full_history_backfill(settings)
 
-        mock_backfill.assert_called_once_with(settings)
+        mock_backfill.assert_called_once_with(settings, user_id=None)
 
     @patch("app.services.dashboard.fetch_google_account_profile")
     @patch("app.services.dashboard.fetch_google_source_records")
@@ -202,6 +202,8 @@ class DashboardImportJobRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         mock_fetch_source_records.assert_not_called()
         mock_fetch_profile.assert_not_called()
+        mock_build_feed.assert_not_called()
+        mock_briefing.assert_not_called()
 
     @patch("app.services.dashboard.fetch_google_account_profile")
     @patch("app.services.dashboard.generate_dashboard_briefing")
