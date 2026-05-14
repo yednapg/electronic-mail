@@ -17,14 +17,16 @@ from app.services.auth import (
     SESSION_COOKIE_NAME,
     auth_state_for_request,
     create_mobile_code,
-    create_or_update_beta_user,
+    create_or_update_user,
     exchange_mobile_code,
     get_current_user,
     issue_session,
     revoke_request_session,
     save_user_google_tokens,
 )
-from app.db.repository import delete_google_oauth_token, delete_user_google_data, revoke_user_app_sessions
+from app.db.repository import delete_google_oauth_token, revoke_user_app_sessions
+from app.db.jobs import cancel_user_jobs
+from app.db.mail_groups import clear_google_guard_state, delete_user_mail_data, mark_google_disconnected
 from app.services.integrations.google import get_google_auth_url, handle_google_callback
 
 
@@ -58,7 +60,7 @@ def auth_me(request: Request) -> AuthMeResponse:
         return AuthMeResponse(authenticated=False, user=None)
     return AuthMeResponse(
         authenticated=True,
-        user=AuthUserResponse(id=user.id, email=user.email, display_name=user.display_name, beta_enabled=True),
+        user=AuthUserResponse(id=user.id, email=user.email, display_name=user.display_name, access_enabled=True),
     )
 
 
@@ -89,7 +91,8 @@ def auth_delete_google_data(request: Request) -> Response:
     user = get_current_user(settings, request)
     if user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
-    delete_user_google_data(str(settings.database_path), user_id=user.id)
+    cancel_user_jobs(str(settings.database_path), user_id=user.id)
+    delete_user_mail_data(str(settings.database_path), user_id=user.id)
     return Response(status_code=204)
 
 
@@ -104,9 +107,11 @@ def auth_google_disconnect(
     if user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
+    mark_google_disconnected(str(settings.database_path), user_id=user.id)
+    cancel_user_jobs(str(settings.database_path), user_id=user.id)
     delete_google_oauth_token(str(settings.database_path), user_id=user.id)
     if delete_data:
-        delete_user_google_data(str(settings.database_path), user_id=user.id)
+        delete_user_mail_data(str(settings.database_path), user_id=user.id)
     if revoke_sessions:
         revoke_user_app_sessions(str(settings.database_path), user_id=user.id)
 
@@ -127,7 +132,7 @@ def auth_mobile_exchange(request: MobileSessionExchangeRequest) -> MobileSession
             id=session.user.id,
             email=session.user.email,
             display_name=session.user.display_name,
-            beta_enabled=True,
+            access_enabled=True,
         ),
     )
 
@@ -149,8 +154,9 @@ def auth_google_callback(
         result = handle_google_callback(settings, code, state)
         if isinstance(result, str):
             return RedirectResponse(result)
-        user = create_or_update_beta_user(settings, profile=result.profile, google_sub=result.google_sub)
+        user = create_or_update_user(settings, profile=result.profile, google_sub=result.google_sub)
         save_user_google_tokens(settings, user_id=user.id, tokens=result.tokens)
+        clear_google_guard_state(str(settings.database_path), user_id=user.id)
     except HTTPException:
         raise
     except RuntimeError as exc:

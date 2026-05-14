@@ -10,10 +10,6 @@ import {
   buildSections,
   buildSummary,
 } from '../../lib/dashboard-view-model';
-import {
-  formatDashboardImportStatus,
-  waitForDashboardImportJob,
-} from '../../lib/dashboard-import';
 import { formatClockTime, formatDate } from '../../lib/formatting';
 import type { AuthMeResponse, DashboardResponse } from '../../lib/types';
 
@@ -25,7 +21,6 @@ let inMemoryDashboardCache: { userKey: string; dashboard: DashboardResponse } | 
 export function DashboardClient() {
   const router = useRouter();
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(() => inMemoryDashboardCache?.dashboard ?? null);
-  const [importStatus, setImportStatus] = useState<string | null>(null);
   const [refreshFailed, setRefreshFailed] = useState(false);
   const now = useMemo(() => new Date(), []);
 
@@ -72,34 +67,6 @@ export function DashboardClient() {
             inMemoryDashboardCache = { userKey: userId, dashboard: nextDashboard };
             writeCachedDashboard(userId, nextDashboard);
 
-            if (shouldPrepareDashboard(nextDashboard)) {
-              setImportStatus('Preparing your dashboard from Gmail...');
-              void waitForDashboardImportJob({
-                timeoutMs: null,
-                onUpdate: (job) => {
-                  if (!cancelled) {
-                    setImportStatus(formatDashboardImportStatus(job));
-                  }
-                },
-              })
-                .then(() => fetchDashboard())
-                .then((preparedDashboard) => {
-                  if (cancelled || preparedDashboard === null) {
-                    return;
-                  }
-                  setDashboard(preparedDashboard);
-                  inMemoryDashboardCache = { userKey: userId, dashboard: preparedDashboard };
-                  writeCachedDashboard(userId, preparedDashboard);
-                  setImportStatus(null);
-                })
-                .catch((error) => {
-                  if (!cancelled) {
-                    setImportStatus(error instanceof Error ? error.message : 'Dashboard preparation failed.');
-                  }
-                });
-            } else {
-              setImportStatus(null);
-            }
           });
       })
       .catch(() => {
@@ -132,24 +99,7 @@ export function DashboardClient() {
           Dashboard could not refresh.
         </p>
       ) : null}
-      {importStatus ? (
-        <p className="inbox-refresh-status" role="status">
-          {importStatus}
-        </p>
-      ) : null}
     </SignedInAppChrome>
-  );
-}
-
-function shouldPrepareDashboard(dashboard: DashboardResponse): boolean {
-  if (!dashboard.auth.connected) {
-    return false;
-  }
-
-  return (
-    dashboard.feed.now.length === 0
-    && dashboard.feed.today.length === 0
-    && dashboard.feed.worth_knowing.length === 0
   );
 }
 

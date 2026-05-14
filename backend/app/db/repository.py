@@ -44,7 +44,7 @@ from app.db.models import (
 
 
 DEFAULT_USER_ID = os.getenv("APP_USER_ID", "local-user").strip() or "local-user"
-ALEMBIC_BASELINE_REVISION = "20260514_0002"
+ALEMBIC_BASELINE_REVISION = "20260515_0004"
 POSTGRES_URL_PREFIXES = ("postgres://", "postgresql://")
 _ENGINES: dict[str, Engine] = {}
 
@@ -188,7 +188,7 @@ def initialize_database(database_path: str) -> None:
               email TEXT NOT NULL UNIQUE,
               display_name TEXT,
               google_sub TEXT NOT NULL UNIQUE,
-              beta_enabled INTEGER NOT NULL DEFAULT 1,
+              access_enabled INTEGER NOT NULL DEFAULT 1,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
@@ -232,7 +232,7 @@ def initialize_database(database_path: str) -> None:
               FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS beta_allowed_emails (
+            CREATE TABLE IF NOT EXISTS allowed_emails (
               email TEXT PRIMARY KEY,
               enabled INTEGER NOT NULL DEFAULT 1,
               invited_at TEXT NOT NULL
@@ -619,7 +619,7 @@ def upsert_user(
     email: str,
     google_sub: str,
     display_name: str | None = None,
-    beta_enabled: bool = True,
+    access_enabled: bool = True,
 ) -> StoredUser:
     """Create or update an app user from Google identity."""
     normalized_email = email.strip().lower()
@@ -631,19 +631,19 @@ def upsert_user(
         ).fetchone()
         user_id = str(existing["id"]) if existing is not None else str(uuid4())
         created_at = str(existing["created_at"]) if existing is not None else now
-        enabled = bool(existing["beta_enabled"]) if existing is not None else beta_enabled
+        enabled = bool(existing["access_enabled"]) if existing is not None else access_enabled
         connection.execute(
             """
-            INSERT INTO users (id, email, display_name, google_sub, beta_enabled, created_at, updated_at)
+            INSERT INTO users (id, email, display_name, google_sub, access_enabled, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               email = excluded.email,
               display_name = excluded.display_name,
               google_sub = excluded.google_sub,
-              beta_enabled = excluded.beta_enabled,
+              access_enabled = excluded.access_enabled,
               updated_at = excluded.updated_at
             """,
-            (user_id, normalized_email, display_name, google_sub, 1 if enabled else 0, created_at, now),
+            (user_id, normalized_email, display_name, google_sub, enabled, created_at, now),
         )
         row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     return _to_user(row)
@@ -666,11 +666,11 @@ def get_user_by_email(database_path: str, email: str) -> StoredUser | None:
     return _to_user(row) if row is not None else None
 
 
-def is_beta_email_allowed(database_path: str, email: str) -> bool | None:
+def is_allowed_email(database_path: str, email: str) -> bool | None:
     """Return table allowlist state, or None when the table has no opinion."""
     with connect(database_path) as connection:
         row = connection.execute(
-            "SELECT enabled FROM beta_allowed_emails WHERE email = ? LIMIT 1",
+            "SELECT enabled FROM allowed_emails WHERE email = ? LIMIT 1",
             (email.strip().lower(),),
         ).fetchone()
     if row is None:
@@ -988,7 +988,7 @@ def delete_user_google_data(database_path: str, *, user_id: str) -> None:
 
 
 def clear_all_data(database_path: str) -> None:
-    """Remove all persisted runtime/auth data while preserving schema and beta allowlist."""
+    """Remove all persisted runtime/auth data while preserving schema and allowlist."""
     with connect(database_path) as connection:
         connection.execute("DELETE FROM gmail_history_events")
         connection.execute("DELETE FROM gmail_message_snapshots")
@@ -3845,7 +3845,7 @@ def _to_user(row: sqlite3.Row) -> StoredUser:
         email=str(row["email"]),
         display_name=str(row["display_name"]) if row["display_name"] is not None else None,
         google_sub=str(row["google_sub"]),
-        beta_enabled=bool(row["beta_enabled"]),
+        access_enabled=bool(row["access_enabled"]),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )

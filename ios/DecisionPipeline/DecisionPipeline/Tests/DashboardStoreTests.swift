@@ -57,7 +57,7 @@ final class MockDashboardAPIClient: DashboardAPIProviding {
         MobileSessionExchangeResponse(
             sessionToken: "ios-session-token",
             expiresAt: "2026-05-14T00:00:00+00:00",
-            user: AuthUserResponse(id: "user-1", email: "person@example.com", displayName: "Person", betaEnabled: true)
+            user: AuthUserResponse(id: "user-1", email: "person@example.com", displayName: "Person", accessEnabled: true)
         )
     }
 

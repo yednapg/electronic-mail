@@ -142,7 +142,7 @@ export interface AuthUserResponse {
   readonly id: string;
   readonly email: string;
   readonly display_name?: string | null;
-  readonly beta_enabled: boolean;
+  readonly access_enabled: boolean;
 }
 
 export interface AuthMeResponse {
@@ -175,6 +175,7 @@ export interface DashboardResponse {
   readonly profile?: DashboardProfile | null;
   readonly briefing?: DashboardBriefing | null;
   readonly feed: FeedResponse;
+  readonly runtime_status?: Record<string, unknown>;
 }
 
 export interface DashboardImportJobResponse {
@@ -207,7 +208,12 @@ export interface FirstRunImportJobResponse {
   readonly thread_count: number;
   readonly dashboard_item_count: number;
   readonly inbox_ready_at?: string | null;
+  readonly first_groups_ready_at?: string | null;
   readonly dashboard_ready_at?: string | null;
+  readonly fast_dashboard_ready_at?: string | null;
+  readonly canonical_dashboard_ready_at?: string | null;
+  readonly quality_status?: 'pending' | 'ready' | 'failed';
+  readonly quality_error?: string | null;
   readonly full_import_started_at?: string | null;
   readonly full_import_completed_at?: string | null;
   readonly error_message?: string | null;
@@ -273,6 +279,7 @@ export interface GmailThreadRow {
   readonly lifecycle_state?: LifecycleState | null;
   readonly outcome_type?: 'complete' | 'snooze' | 'dismiss' | null;
   readonly lifecycle_updates: GmailThreadUpdate[];
+  readonly enrichment_status?: 'pending' | 'ready' | 'failed';
 }
 
 export interface GmailThreadUpdate {
@@ -315,6 +322,8 @@ export interface MailboxSyncStateResponse {
 export interface MailboxSyncTriggerResponse {
   readonly status: 'queued' | 'not_connected';
   readonly state: MailboxSyncStateResponse;
+  readonly job_id?: string | null;
+  readonly queued_at?: string | null;
 }
 
 /**
@@ -409,6 +418,7 @@ export interface ThreadMessage {
   readonly bcc?: string | null;
   readonly subject?: string | null;
   readonly body: string;
+  readonly html_body?: string | null;
   readonly snippet?: string | null;
   readonly label_ids: string[];
   readonly received_at: string;
@@ -440,4 +450,32 @@ export interface FeedbackEvent {
   readonly metadata: Record<string, unknown>;
 
   readonly created_at: string;
+}
+
+export type MailGroupRow = GmailThreadRow;
+export type MailGroupSection = GmailThreadSection;
+export type MailGroupListResponse = MailboxResponse;
+export type MailGroupMessage = ThreadMessage;
+export type MailGroupDetailResponse = ThreadReaderResponse;
+export type DashboardMailGroupItem = AttentionItem;
+
+export interface BackgroundJobResponse {
+  readonly id: string;
+  readonly kind: string;
+  readonly status: string;
+  readonly stage?: string | null;
+  readonly attempt_count: number;
+  readonly last_error?: string | null;
+  readonly created_at: string;
+  readonly started_at?: string | null;
+  readonly completed_at?: string | null;
+  readonly updated_at: string;
+}
+
+export interface OpsHealthResponse {
+  readonly queue_depth: Record<string, number>;
+  readonly dead_jobs: number;
+  readonly stale_running_jobs: number;
+  readonly oldest_queued_age_seconds?: number | null;
+  readonly workers: Array<Record<string, unknown>>;
 }

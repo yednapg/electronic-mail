@@ -5,28 +5,20 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes.ai import router as ai_router
 from app.api.routes.auth_google import router as auth_google_router
 from app.api.routes.gmail import router as gmail_router
 from app.api.routes.dashboard import router as dashboard_router
-from app.api.routes.entities import router as entities_router
-from app.api.routes.feed import router as feed_router
 from app.api.routes.first_run import router as first_run_router
+from app.api.routes.jobs import router as jobs_router
+from app.api.routes.mail_groups import router as mail_groups_router
 from app.api.routes.system import router as system_router
-from app.api.routes.history import router as history_router
 from app.api.routes.mailbox import router as mailbox_router
-from app.api.routes.tasks import router as tasks_router
-from app.api.routes.trace import router as trace_router
 from app.core.config import load_settings
-from app.db.repository import initialize_database
 
 
 settings = load_settings()
-if settings.app_env == "local" and settings.database_backend == "sqlite":
-    # Ensure the local SQLite schema exists before the app starts handling requests.
-    initialize_database(str(settings.database_path))
 
-app = FastAPI(title="Decision Pipeline Backend")
+app = FastAPI(title="Mail Groups Backend")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.cors_origin],
@@ -38,11 +30,7 @@ app.include_router(system_router)
 app.include_router(auth_google_router)
 app.include_router(first_run_router)
 app.include_router(dashboard_router)
-app.include_router(feed_router)
 app.include_router(gmail_router)
 app.include_router(mailbox_router)
-app.include_router(tasks_router)
-app.include_router(entities_router)
-app.include_router(history_router)
-app.include_router(trace_router)
-app.include_router(ai_router)
+app.include_router(mail_groups_router)
+app.include_router(jobs_router)

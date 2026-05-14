@@ -29,7 +29,7 @@ class Settings:
     session_cookie_domain: str
     session_cookie_samesite: Literal["lax", "strict", "none"]
     app_encryption_key: str
-    beta_allowed_emails: tuple[str, ...]
+    allowed_emails: tuple[str, ...]
     gmail_sync_scope: str
     gmail_recent_days: int
     gmail_pubsub_topic: str
@@ -101,9 +101,10 @@ class Settings:
         if self.gmail_watch_renewal_hours < 1:
             errors.append("GMAIL_WATCH_RENEWAL_HOURS must be greater than 0")
 
+        if not self.database_url.startswith(("postgres://", "postgresql://")):
+            errors.append("DATABASE_URL must be Postgres. SQLite is no longer supported.")
+
         if self.is_production_like:
-            if not self.database_url.startswith(("postgres://", "postgresql://")):
-                errors.append("DATABASE_URL must be Postgres outside local development")
             if not self.google_configured:
                 errors.append("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required")
             if not self.gmail_pubsub_topic:
@@ -120,8 +121,8 @@ class Settings:
                 errors.append("WEB_APP_URL must be HTTPS outside local development")
             if not self.mobile_redirect_uri:
                 errors.append("MOBILE_REDIRECT_URI is required")
-            if not self.beta_allowed_emails:
-                errors.append("BETA_ALLOWED_EMAILS is required outside local development")
+            if not self.allowed_emails:
+                errors.append("ALLOWED_EMAILS is required outside local development")
             if not self.session_cookie_domain:
                 errors.append("SESSION_COOKIE_DOMAIN is required outside local development")
             if self.session_cookie_samesite != "none":
@@ -131,21 +132,18 @@ class Settings:
 
 
 def _resolve_database_path(database_url: str) -> str:
-    """Normalize either a Postgres URL or local SQLite identifier for repository use."""
+    """Normalize the Postgres URL used by the runtime repository layer."""
     normalized = database_url.strip().strip("\"'")
 
     if normalized.startswith(POSTGRES_URL_PREFIXES):
         return normalized
 
-    if normalized.startswith("file:"):
-        return str((BACKEND_DIR / normalized.removeprefix("file:")).resolve())
-
-    return str(Path(normalized).expanduser().resolve())
+    return normalized
 
 
 def load_settings() -> Settings:
     """Load environment variables once and expose a typed settings object."""
-    database_url = os.getenv("DATABASE_URL", "file:./dev.db")
+    database_url = os.getenv("DATABASE_URL", "").strip().strip("\"'")
     app_env = os.getenv("APP_ENV", "local").strip().lower() or "local"
 
     return Settings(
@@ -159,7 +157,7 @@ def load_settings() -> Settings:
         session_cookie_domain=os.getenv("SESSION_COOKIE_DOMAIN", "").strip().strip("\"'"),
         session_cookie_samesite=_resolve_session_cookie_samesite(),
         app_encryption_key=os.getenv("APP_ENCRYPTION_KEY", "local-dev-encryption-key").strip().strip("\"'"),
-        beta_allowed_emails=_parse_email_list(os.getenv("BETA_ALLOWED_EMAILS", "")),
+        allowed_emails=_parse_email_list(os.getenv("ALLOWED_EMAILS", "")),
         gmail_sync_scope=os.getenv("GMAIL_SYNC_SCOPE", "recent").strip().lower() or "recent",
         gmail_recent_days=int(os.getenv("GMAIL_RECENT_DAYS", "90")),
         gmail_pubsub_topic=os.getenv("GMAIL_PUBSUB_TOPIC", "").strip().strip("\"'"),
@@ -198,7 +196,7 @@ def _resolve_session_cookie_samesite() -> Literal["lax", "strict", "none"]:
 
 
 def _parse_email_list(value: str) -> tuple[str, ...]:
-    """Parse comma-separated beta email allowlist values."""
+    """Parse comma-separated allowed email values."""
     emails = []
     for item in value.split(","):
         email = item.strip().strip("\"'").lower()

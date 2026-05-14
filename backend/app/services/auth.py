@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""App-owned auth/session helpers for web and iOS beta users."""
+"""App-owned auth/session helpers for web and iOS users."""
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -20,8 +20,7 @@ from app.db.repository import (
     get_google_oauth_token,
     get_user,
     get_user_by_email,
-    initialize_database,
-    is_beta_email_allowed,
+    is_allowed_email,
     revoke_app_session,
     upsert_google_oauth_token,
     upsert_user,
@@ -61,7 +60,7 @@ class IssuedSession:
 
 
 def require_current_user(settings: Settings, request: Request) -> CurrentUser:
-    """Return the current beta user or raise 401."""
+    """Return the current authenticated user or raise 401."""
     user = get_current_user(settings, request)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
@@ -79,23 +78,8 @@ def get_current_user(settings: Settings, request: Request) -> CurrentUser | None
         )
         if session is not None:
             user = get_user(str(settings.database_path), session.user_id)
-            if user is not None and user.beta_enabled:
+            if user is not None and user.access_enabled:
                 return CurrentUser(id=user.id, email=user.email, display_name=user.display_name)
-
-    if _legacy_local_google_fallback_enabled(settings) and has_stored_google_tokens():
-        profile = load_google_account_profile()
-        email = (profile.email if profile and profile.email else "local-user@example.local").strip().lower()
-        if not hasattr(settings, "database_path"):
-            return CurrentUser(id=DEFAULT_USER_ID, email=email, display_name=profile.display_name if profile else None, legacy_local=True)
-        initialize_database(str(settings.database_path))
-        user = upsert_user(
-            str(settings.database_path),
-            email=email,
-            google_sub=email,
-            display_name=profile.display_name if profile else None,
-            beta_enabled=True,
-        )
-        return CurrentUser(id=DEFAULT_USER_ID, email=user.email, display_name=user.display_name, legacy_local=True)
 
     return None
 
@@ -120,30 +104,30 @@ def auth_state_for_request(settings: Settings, request: Request) -> GoogleAuthSt
     )
 
 
-def create_or_update_beta_user(settings: Settings, *, profile: DashboardProfile, google_sub: str) -> StoredUser:
-    """Create or update the beta user represented by a Google profile."""
+def create_or_update_user(settings: Settings, *, profile: DashboardProfile, google_sub: str) -> StoredUser:
+    """Create or update the user represented by a Google profile."""
     email = (profile.email or "").strip().lower()
     if not email:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Google profile did not include an email")
     if not is_email_allowed(settings, email):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This Google account is not in the beta")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This Google account is not allowed")
     return upsert_user(
         str(settings.database_path),
         email=email,
         google_sub=google_sub or email,
         display_name=profile.display_name,
-        beta_enabled=True,
+        access_enabled=True,
     )
 
 
 def is_email_allowed(settings: Settings, email: str) -> bool:
-    """Check env and DB beta allowlists."""
+    """Check env and DB allowlists."""
     normalized = email.strip().lower()
-    if getattr(settings, "app_env", "local") == "local" and not getattr(settings, "beta_allowed_emails", set()):
+    if getattr(settings, "app_env", "local") == "local" and not getattr(settings, "allowed_emails", set()):
         return True
-    if normalized in settings.beta_allowed_emails:
+    if normalized in settings.allowed_emails:
         return True
-    table_value = is_beta_email_allowed(str(settings.database_path), normalized)
+    table_value = is_allowed_email(str(settings.database_path), normalized)
     return table_value is True
 
 
@@ -195,7 +179,7 @@ def exchange_mobile_code(settings: Settings, *, code: str) -> IssuedSession:
     if login_code is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired login code")
     user = get_user(str(settings.database_path), login_code.user_id)
-    if user is None or not user.beta_enabled:
+    if user is None or not user.access_enabled:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
     return issue_session(settings, user=user, platform="ios")
 
@@ -223,11 +207,8 @@ def hash_token(settings: Settings, token: str) -> str:
 
 
 def _legacy_local_google_fallback_enabled(settings: Settings) -> bool:
-    """Keep file-backed local auth only for SQLite development."""
-    return (
-        getattr(settings, "app_env", "local") == "local"
-        and getattr(settings, "database_backend", "sqlite") == "sqlite"
-    )
+    """Legacy file-backed local auth is disabled in the Postgres-only runtime."""
+    return False
 
 
 def _bearer_token(request: Request) -> str | None:
