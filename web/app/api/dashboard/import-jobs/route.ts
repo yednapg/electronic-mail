@@ -40,6 +40,8 @@ function createDemoImportJob(status: 'succeeded' | 'running') {
     error_message: null,
     created_at: now,
     started_at: now,
+    stage_started_at: now,
+    stage_durations: status === 'succeeded' ? { gmail_fetching: 1.2 } : {},
     completed_at: status === 'succeeded' ? now : null,
     updated_at: now,
   };

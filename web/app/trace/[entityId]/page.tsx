@@ -1,6 +1,6 @@
 import type { TraceReplayResponse } from '@electronic-mail/types';
 
-import { isDemoMode } from '../../../lib/api';
+import { getBackendURL, isDemoMode } from '../../../lib/api';
 import { getDemoTrace } from '../../../lib/demo-evidence';
 
 type TracePageProps = {
@@ -10,7 +10,7 @@ type TracePageProps = {
 };
 
 async function getTrace(entityId: string): Promise<TraceReplayResponse> {
-  const response = await fetch(`http://localhost:3001/trace/${entityId}`, {
+  const response = await fetch(`${getBackendURL()}/trace/${encodeURIComponent(entityId)}`, {
     cache: 'no-store',
   });
 

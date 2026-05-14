@@ -21,7 +21,7 @@ function response(body: object, init?: ResponseInit): Response {
 function job(status: 'queued' | 'running' | 'succeeded' | 'failed', errorMessage: string | null = null) {
   return {
     id: 'job-1',
-    user_id: 'google-dev-user',
+    user_id: 'local-user',
     status,
     stage: status === 'queued' ? 'queued' : status === 'running' ? 'gmail_fetching' : status === 'succeeded' ? 'completed' : 'failed',
     imported_count: status === 'succeeded' ? 11 : status === 'running' ? 4 : 0,
@@ -95,6 +95,16 @@ test('dashboard import status formats backend-owned progress stages', () => {
     'Summarizing email evidence for 256 items...',
   );
   assert.equal(
+    formatDashboardImportStatus({
+      ...running,
+      stage: 'source_summary',
+      source_records: 256,
+      imported_count: 256,
+      stage_started_at: '2000-01-01T00:00:01+00:00',
+    }),
+    'Still summarizing email evidence for 256 items...',
+  );
+  assert.equal(
     formatDashboardImportStatus({ ...running, stage: 'memory_hydration', source_records: 256, imported_count: 256 }),
     'Grouping related emails into work for 256 items...',
   );
@@ -135,4 +145,23 @@ test('dashboard import polling times out without pretending dashboard is ready',
     () => waitForDashboardImportJob({ fetcher, timeoutMs: -1, pollMs: 0 }),
     (error) => error instanceof DashboardImportError && error.message === 'Dashboard import job timed out.',
   );
+});
+
+test('dashboard import polling can wait without a live-mode timeout', async () => {
+  const responses = [
+    response(job('queued'), { status: 202 }),
+    response(job('running')),
+    response(job('succeeded')),
+  ];
+  const fetcher = (() => {
+    const next = responses.shift();
+    if (next === undefined) {
+      throw new Error('Unexpected fetch');
+    }
+    return Promise.resolve(next);
+  }) as typeof fetch;
+
+  const completed = await waitForDashboardImportJob({ fetcher, timeoutMs: null, pollMs: 0 });
+
+  assert.equal(completed.status, 'succeeded');
 });

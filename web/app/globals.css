@@ -992,6 +992,15 @@ a {
   list-style: none;
 }
 
+.attention-empty {
+  margin: 14px 0 0;
+  color: var(--page-text-subtle);
+  font-size: var(--type-debug-body);
+  font-weight: 500;
+  line-height: 1.35;
+  letter-spacing: 0;
+}
+
 .attention-item {
   display: block;
   animation: attention-item-in 140ms cubic-bezier(0.22, 1, 0.36, 1) both;
@@ -1772,6 +1781,133 @@ a {
   line-height: 1.35;
 }
 
+.gmail-shell {
+  padding-top: 54px;
+}
+
+.gmail-groups {
+  display: grid;
+  gap: 38px;
+  margin-top: 40px;
+}
+
+.gmail-list {
+  display: grid;
+  gap: 11px;
+  margin: 15px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.gmail-thread-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: start;
+  padding: 13px 0 14px;
+  border-bottom: 1px solid var(--rule);
+  animation: attention-item-in 140ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation-delay: calc(var(--attention-index, 0) * 8ms);
+}
+
+.gmail-thread-copy {
+  min-width: 0;
+}
+
+.gmail-thread-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.gmail-thread-title {
+  margin: 0;
+  color: var(--page-text);
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+
+.gmail-thread-time {
+  flex-shrink: 0;
+  color: var(--page-text-subtle);
+  font-size: var(--type-debug-body);
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.gmail-thread-meta,
+.gmail-thread-summary,
+.gmail-thread-participants {
+  margin: 4px 0 0;
+  color: var(--page-text-subtle);
+  font-size: var(--type-debug-body);
+  font-weight: 500;
+  line-height: 1.28;
+  letter-spacing: 0;
+}
+
+.gmail-thread-summary {
+  color: var(--page-text-muted);
+}
+
+.gmail-thread-lifecycle {
+  display: grid;
+  gap: 5px;
+  margin: 9px 0 0;
+  padding: 0 0 0 12px;
+  border-left: 1px solid var(--rule);
+  list-style: none;
+}
+
+.gmail-thread-lifecycle-step {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  gap: 10px;
+  color: var(--page-text-subtle);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+.gmail-thread-lifecycle-time {
+  color: var(--page-text-subtle);
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.gmail-thread-lifecycle-copy {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gmail-thread-participants {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gmail-thread-link {
+  color: var(--page-text);
+  font-size: var(--type-debug-body);
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0;
+  text-decoration: none;
+}
+
+.gmail-thread-link:hover,
+.gmail-thread-link:focus-visible {
+  color: var(--page-text-muted);
+}
+
 :root[data-show-brief="false"] .digest-summary,
 :root[data-show-calendar="false"] .digest-agenda,
 :root[data-show-now="false"] [data-dashboard-section="now"],
@@ -2418,6 +2554,42 @@ a {
     margin-top: 6px;
     padding: 7px 0;
     font-size: var(--type-mobile-copy);
+  }
+
+  .gmail-groups {
+    gap: 34px;
+    margin-top: 34px;
+  }
+
+  .gmail-thread-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    padding: 14px 0;
+  }
+
+  .gmail-thread-heading {
+    align-items: start;
+    gap: 12px;
+  }
+
+  .gmail-thread-title {
+    font-size: 16px;
+    line-height: 1.32;
+  }
+
+  .gmail-thread-time {
+    font-size: 13px;
+    line-height: 1.28;
+  }
+
+  .gmail-thread-lifecycle-step {
+    grid-template-columns: 50px minmax(0, 1fr);
+    gap: 8px;
+    font-size: 12px;
+  }
+
+  .gmail-thread-link {
+    justify-self: start;
   }
 
   .debug-shell {

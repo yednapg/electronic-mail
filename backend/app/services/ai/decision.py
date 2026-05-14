@@ -345,10 +345,11 @@ def _create_json_response(
     reasoning_effort: str | None = None,
 ):
     """Create a JSON Responses API call with privacy and fast-quality defaults."""
+    normalized_input = input_text if "json" in input_text.lower() else f"Return JSON.\n\n{input_text}"
     return client.responses.create(
         model=model,
         instructions=instructions,
-        input=input_text,
+        input=normalized_input,
         reasoning={"effort": reasoning_effort or _openai_reasoning_effort()},
         text={"format": {"type": "json_object"}, "verbosity": verbosity},
         max_output_tokens=max_output_tokens,
@@ -375,7 +376,6 @@ def _create_json_response_content(
     if efforts[0] != "high":
         efforts.append("high")
 
-    last_content = fallback_content
     for effort in efforts:
         response = _create_json_response(
             client,
@@ -387,7 +387,6 @@ def _create_json_response_content(
             reasoning_effort=effort,
         )
         content = _response_output_text(response) or fallback_content
-        last_content = content
         _log_openai_exchange(label=label, model=model, payload=payload, content=content)
         try:
             parsed_json = json.loads(content)
@@ -395,10 +394,9 @@ def _create_json_response_content(
                 response_model.model_validate(parsed_json)  # type: ignore[attr-defined]
             return content
         except Exception:
-            if effort == "high":
-                return content
+            continue
 
-    return last_content
+    return fallback_content
 
 
 def _response_output_text(response) -> str:
@@ -483,10 +481,15 @@ def judge_feed_entities(
     if not entities:
         return []
 
-    if _should_use_llm():
+    if _should_use_llm() and _should_use_feed_judgment_llm():
         return _judge_feed_entities_with_llm(entities)
 
     return [_judge_feed_entity_heuristically(entity) for entity in entities]
+
+
+def _should_use_feed_judgment_llm() -> bool:
+    """Keep dashboard readiness fast unless synchronous feed judgment is explicitly enabled."""
+    return os.getenv("OPENAI_FEED_JUDGMENT", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def classify_entity_state(records: list[StoredSourceRecord]) -> str:
@@ -494,7 +497,7 @@ def classify_entity_state(records: list[StoredSourceRecord]) -> str:
     if not records:
         return "open"
 
-    if _should_use_llm():
+    if _should_use_llm() and _should_use_entity_state_llm():
         try:
             return _classify_entity_state_with_llm(records)
         except Exception:
@@ -503,6 +506,11 @@ def classify_entity_state(records: list[StoredSourceRecord]) -> str:
             return _classify_entity_state_heuristically(records)
 
     return _classify_entity_state_heuristically(records)
+
+
+def _should_use_entity_state_llm() -> bool:
+    """Keep first-run hydration fast unless per-entity state LLM calls are explicitly enabled."""
+    return os.getenv("OPENAI_ENTITY_STATE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def summarize_source_records(records: list[StoredSourceRecord]) -> SourceRecordSummaryBatch:
@@ -564,8 +572,16 @@ def generate_dashboard_briefing(
 ) -> DashboardBriefing:
     """Return the generated dashboard headline and summary paragraph."""
     briefing_input = _build_dashboard_briefing_input(feed, profile)
+    use_llm = _should_use_llm()
 
-    if _should_use_llm():
+    if not briefing_input.items:
+        output = _build_dashboard_briefing_fallback_output(briefing_input)
+        return _sanitize_dashboard_briefing_output(
+            DashboardBriefing(headline=output.headline, brief=output.brief),
+            briefing_input,
+        )
+
+    if use_llm:
         return _generate_dashboard_briefing_with_llm(briefing_input)
 
     return _generate_dashboard_briefing_heuristically(briefing_input)

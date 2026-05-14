@@ -14,7 +14,7 @@ from app.services.feed.memory_pipeline import hydrate_persistent_memory
 def build_source_record(record_id: str) -> SourceRecord:
     return SourceRecord(
         id=record_id,
-        user_id="google-dev-user",
+        user_id="local-user",
         source="gmail",
         thread_id=f"thread-{record_id}",
         raw_payload={

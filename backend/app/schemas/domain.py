@@ -157,6 +157,8 @@ class DashboardImportJobResponse(BaseModel):
     error_message: str | None = None
     created_at: str
     started_at: str | None = None
+    stage_started_at: str | None = None
+    stage_durations: dict[str, float] = Field(default_factory=dict)
     completed_at: str | None = None
     updated_at: str
 
@@ -358,3 +360,47 @@ class HistoryResponse(BaseModel):
     offset: int
     total: int
     years: list[HistoryYearGroup] = Field(default_factory=list)
+
+
+class GmailThreadUpdate(BaseModel):
+    """One compact raw email event inside a grouped Gmail thread."""
+
+    source_record_id: str
+    received_at: str
+    subject: str | None = None
+    sender: str | None = None
+    summary: str | None = None
+
+
+class GmailThreadRow(BaseModel):
+    """One Gmail-like conversation row grouped by Gmail thread id."""
+
+    thread_id: str
+    entity_id: str | None = None
+    latest_source_record_id: str
+    latest_received_at: str
+    latest_subject: str | None = None
+    latest_sender: str | None = None
+    participants: list[str] = Field(default_factory=list)
+    message_count: int
+    summary: str | None = None
+    snippet: str | None = None
+    current_state: EntityCurrentState | None = None
+    lifecycle_state: LifecycleState | None = None
+    outcome_type: Literal["complete", "snooze", "dismiss"] | None = None
+    lifecycle_updates: list[GmailThreadUpdate] = Field(default_factory=list)
+
+
+class GmailThreadSection(BaseModel):
+    """A non-overlapping date bucket for Gmail-like thread rows."""
+
+    id: str
+    title: str
+    rows: list[GmailThreadRow] = Field(default_factory=list)
+
+
+class GmailViewResponse(BaseModel):
+    """Raw Gmail-first view grouped into familiar Gmail-like date buckets."""
+
+    total_threads: int
+    sections: list[GmailThreadSection] = Field(default_factory=list)

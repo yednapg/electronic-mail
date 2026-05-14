@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timezone
 
 from app.db.models import StoredSourceRecord
-from app.db.repository import append_trace_record, upsert_entity_state
+from app.db.repository import DEFAULT_USER_ID, append_trace_record, upsert_entity_state
 from app.services.ai.decision import classify_entity_state
 
 
@@ -23,7 +23,7 @@ def derive_and_store_entity_state(database_path: str, entity_id: str, records: l
     append_trace_record(
         database_path,
         stage="state_derivation",
-        user_id="local-user",
+        user_id=DEFAULT_USER_ID,
         entity_id=entity_id,
         trace_id=entity_id,
         source_record_id=records[-1].id if records else None,

@@ -4,6 +4,7 @@ import type { ReactNode } from 'react';
 import localFont from 'next/font/local';
 
 import { CommandPaletteMount } from '../components/command-palette/CommandPaletteMount';
+import { LayoutInteractions } from '../components/LayoutInteractions';
 import './globals.css';
 
 const sfProRounded = localFont({
@@ -26,161 +27,11 @@ export const metadata: Metadata = {
   icons: [{ rel: 'icon', url: '/icon.svg', type: 'image/svg+xml' }],
 };
 
-const interactionScript = `
-(() => {
-  const themeStorageKey = 'electronic-mail-theme';
-  const dashboardViewStorageKey = 'electronic-mail-dashboard-view';
-  const defaultViewSettings = {
-    brief: true,
-    calendar: true,
-    now: true,
-    today: true,
-    worthKnowing: true,
-  };
-  const viewDatasetKeys = {
-    brief: 'showBrief',
-    calendar: 'showCalendar',
-    now: 'showNow',
-    today: 'showToday',
-    worthKnowing: 'showWorthKnowing',
-  };
-
-  function isThemeMode(value) {
-    return value === 'light' || value === 'dark';
-  }
-
-  function getSystemTheme() {
-    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-  }
-
-  function getStoredTheme() {
-    const storedTheme = window.localStorage.getItem(themeStorageKey);
-    return isThemeMode(storedTheme) ? storedTheme : null;
-  }
-
-  function applyTheme(theme) {
-    document.documentElement.dataset.theme = theme;
-    document.documentElement.style.colorScheme = theme;
-  }
-
-  function normalizeViewSettings(value) {
-    if (value === null || typeof value !== 'object') {
-      return { ...defaultViewSettings };
-    }
-
-    return Object.keys(defaultViewSettings).reduce((settings, key) => {
-      settings[key] = typeof value[key] === 'boolean' ? value[key] : defaultViewSettings[key];
-      return settings;
-    }, {});
-  }
-
-  function readViewSettings() {
-    try {
-      const storedSettings = window.localStorage.getItem(dashboardViewStorageKey);
-      return normalizeViewSettings(storedSettings === null ? null : JSON.parse(storedSettings));
-    } catch (_error) {
-      return { ...defaultViewSettings };
-    }
-  }
-
-  function writeViewSettings(settings) {
-    try {
-      window.localStorage.setItem(dashboardViewStorageKey, JSON.stringify(settings));
-    } catch (_error) {}
-  }
-
-  function syncViewControls(settings) {
-    document.querySelectorAll('[data-dashboard-view-control]').forEach((control) => {
-      const key = control.getAttribute('data-dashboard-view-control');
-      if (key !== null && key in settings) {
-        control.checked = settings[key];
-      }
-    });
-  }
-
-  function applyViewSettings(settings) {
-    Object.keys(defaultViewSettings).forEach((key) => {
-      document.documentElement.dataset[viewDatasetKeys[key]] = settings[key] ? 'true' : 'false';
-    });
-    syncViewControls(settings);
-  }
-
-  function readViewControls() {
-    const settings = readViewSettings();
-    document.querySelectorAll('[data-dashboard-view-control]').forEach((control) => {
-      const key = control.getAttribute('data-dashboard-view-control');
-      if (key !== null && key in settings) {
-        settings[key] = Boolean(control.checked);
-      }
-    });
-    return settings;
-  }
-
-  try {
-    applyTheme(getStoredTheme() ?? getSystemTheme());
-    applyViewSettings(readViewSettings());
-  } catch (_error) {}
-
-  document.addEventListener('click', (event) => {
-    if (!(event.target instanceof Element)) {
-      return;
-    }
-
-    const themeButton = event.target.closest('[data-theme-toggle]');
-    if (themeButton !== null) {
-      event.preventDefault();
-      const currentTheme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
-      const nextTheme = currentTheme === 'dark' ? 'light' : 'dark';
-      try {
-        window.localStorage.setItem(themeStorageKey, nextTheme);
-      } catch (_error) {}
-      applyTheme(nextTheme);
-      return;
-    }
-
-    const resetButton = event.target.closest('[data-dashboard-view-reset]');
-    if (resetButton !== null) {
-      event.preventDefault();
-      const settings = { ...defaultViewSettings };
-      writeViewSettings(settings);
-      applyViewSettings(settings);
-      return;
-    }
-
-  });
-
-  document.addEventListener('change', (event) => {
-    if (!(event.target instanceof Element)) {
-      return;
-    }
-
-    const viewControl = event.target.closest('[data-dashboard-view-control]');
-    if (viewControl === null) {
-      return;
-    }
-
-    const settings = readViewControls();
-    writeViewSettings(settings);
-    applyViewSettings(settings);
-  });
-
-  const syncAfterDomReady = () => {
-    applyViewSettings(readViewSettings());
-  };
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', syncAfterDomReady, { once: true });
-  } else {
-    syncAfterDomReady();
-  }
-})();
-`;
-
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning>
       <body className={`${sfProRounded.variable} ${sfProRounded.className}`}>
-        <script dangerouslySetInnerHTML={{ __html: interactionScript }} />
+        <LayoutInteractions />
         {children}
         <CommandPaletteMount />
         <ThemeToggleButton />

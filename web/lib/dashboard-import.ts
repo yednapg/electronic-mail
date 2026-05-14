@@ -52,7 +52,7 @@ export async function waitForDashboardImportJob({
   onUpdate,
 }: {
   fetcher?: Fetcher;
-  timeoutMs: number;
+  timeoutMs?: number | null;
   pollMs?: number;
   onUpdate?: (job: DashboardImportJobResponse) => void;
 }): Promise<DashboardImportJobResponse> {
@@ -61,7 +61,7 @@ export async function waitForDashboardImportJob({
   let latest = created;
   onUpdate?.(latest);
 
-  while (Date.now() - startedAt < timeoutMs) {
+  while (timeoutMs === null || timeoutMs === undefined || Date.now() - startedAt < timeoutMs) {
     if (latest.status === 'succeeded') {
       return latest;
     }
@@ -80,6 +80,7 @@ export async function waitForDashboardImportJob({
 
 export function formatDashboardImportStatus(job: DashboardImportJobResponse): string {
   const progress = formatImportProgress(job);
+  const longRunning = isLongRunningStage(job);
 
   switch (job.stage) {
     case 'queued':
@@ -92,19 +93,31 @@ export function formatDashboardImportStatus(job: DashboardImportJobResponse): st
     case 'gmail_persisted':
       return progress ? `Saving Gmail evidence ${progress}...` : 'Saving Gmail evidence...';
     case 'source_summary':
-      return formatCountedStatus('Summarizing email evidence', job.source_records || job.imported_count);
+      return formatCountedStatus(
+        longRunning ? 'Still summarizing email evidence' : 'Summarizing email evidence',
+        job.source_records || job.imported_count,
+      );
     case 'memory_hydration':
-      return formatCountedStatus('Grouping related emails into work', job.source_records || job.imported_count);
+      return formatCountedStatus(
+        longRunning ? 'Still grouping related emails into work' : 'Grouping related emails into work',
+        job.source_records || job.imported_count,
+      );
     case 'ai_refresh':
-      return formatCountedStatus('Finding current state and next move', job.changed_entities);
+      return formatCountedStatus(
+        longRunning ? 'Still finding current state and next move' : 'Finding current state and next move',
+        job.changed_entities,
+      );
     case 'feed_build':
-      return formatCountedStatus('Preparing refreshed dashboard items', job.refreshed_entities || job.changed_entities);
+      return formatCountedStatus(
+        longRunning ? 'Still preparing refreshed dashboard items' : 'Preparing refreshed dashboard items',
+        job.refreshed_entities || job.changed_entities,
+      );
     case 'briefing':
-      return 'Writing your morning brief...';
+      return longRunning ? 'Still writing your morning brief...' : 'Writing your morning brief...';
     case 'completed':
       return 'Dashboard is ready.';
     case 'failed':
-      return 'Preparation hit a problem. Opening the dashboard...';
+      return 'Preparation hit a problem. Please try again.';
     default:
       return 'Preparing your dashboard...';
   }
@@ -120,6 +133,19 @@ function formatImportProgress(job: DashboardImportJobResponse): string | null {
 
 function formatCountedStatus(message: string, count: number): string {
   return count > 0 ? `${message} for ${count} items...` : `${message}...`;
+}
+
+function isLongRunningStage(job: DashboardImportJobResponse): boolean {
+  if (job.status !== 'running' || typeof job.stage_started_at !== 'string') {
+    return false;
+  }
+
+  const startedAt = new Date(job.stage_started_at).getTime();
+  if (!Number.isFinite(startedAt)) {
+    return false;
+  }
+
+  return Date.now() - startedAt > 30000;
 }
 
 function wait(ms: number): Promise<void> {

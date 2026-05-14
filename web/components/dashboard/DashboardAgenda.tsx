@@ -1,4 +1,5 @@
 /** Render the compact agenda strip above the feed sections. */
+import React from 'react';
 import type { DashboardAgendaItem } from './types';
 
 type DashboardAgendaProps = {

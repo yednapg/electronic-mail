@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from app.db.models import LoadedEntity
-from app.db.repository import append_trace_record, list_all_loaded_entities, merge_entities
+from app.db.repository import DEFAULT_USER_ID, append_trace_record, list_all_loaded_entities, merge_entities
 from app.schemas.ai import EntityGroupingRequest
 from app.services.ai.decision import resolve_entity_group
 from app.services.entities.entity_resolver import (
@@ -19,6 +19,7 @@ from app.services.entities.entity_resolver import (
     get_support_confidence,
     normalize_subject,
     payload_string,
+    should_use_ai_grouping,
 )
 
 LOW_SIGNAL_ORGANIZATIONS = {
@@ -63,6 +64,9 @@ def _subject_root(subject: str) -> str:
 
 def reconcile_entities(database_path: str) -> list[str]:
     """Merge entities that later evidence proves belong to one real-world task."""
+    if not should_use_ai_grouping():
+        return []
+
     changed_entity_ids: set[str] = set()
 
     while True:
@@ -77,7 +81,7 @@ def reconcile_entities(database_path: str) -> list[str]:
         append_trace_record(
             database_path,
             stage="grouping",
-            user_id="local-user",
+            user_id=DEFAULT_USER_ID,
             entity_id=target.loaded.entity.id,
             trace_id=target.loaded.entity.id,
             input={

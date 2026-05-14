@@ -90,13 +90,7 @@ def create_or_reuse_dashboard_import_job(
 ) -> tuple[DashboardImportJobResponse, bool]:
     """Create one import job unless a fresh queued/running job already owns the work."""
     database_path = str(settings.database_path)
-    stale_before = (datetime.now(timezone.utc) - timedelta(seconds=IMPORT_JOB_STALE_AFTER_SECONDS)).isoformat()
-    mark_stale_dashboard_import_jobs_failed(
-        database_path,
-        user_id=user_id,
-        stale_before=stale_before,
-        error_message=STALE_IMPORT_JOB_MESSAGE,
-    )
+    fail_stale_dashboard_import_jobs(settings, user_id=user_id)
     active_job = get_active_dashboard_import_job(database_path, user_id=user_id)
     if active_job is not None:
         return to_dashboard_import_job_response(active_job), False
@@ -150,7 +144,11 @@ def run_dashboard_import_job(
 
 def get_dashboard_import_job_status(settings: Settings, job_id: str) -> DashboardImportJobResponse | None:
     """Return persisted status for one dashboard import/preparation job."""
-    job = get_dashboard_import_job(str(settings.database_path), job_id)
+    database_path = str(settings.database_path)
+    job = get_dashboard_import_job(database_path, job_id)
+    if job is not None and job.status in {"queued", "running"}:
+        fail_stale_dashboard_import_jobs(settings, user_id=job.user_id)
+        job = get_dashboard_import_job(database_path, job_id)
     return to_dashboard_import_job_response(job) if job is not None else None
 
 
@@ -160,8 +158,20 @@ def get_latest_dashboard_import_job_status(
     user_id: str = DEFAULT_USER_ID,
 ) -> DashboardImportJobResponse | None:
     """Return the newest persisted dashboard import/preparation job status."""
+    fail_stale_dashboard_import_jobs(settings, user_id=user_id)
     job = get_latest_dashboard_import_job(str(settings.database_path), user_id=user_id)
     return to_dashboard_import_job_response(job) if job is not None else None
+
+
+def fail_stale_dashboard_import_jobs(settings: Settings, *, user_id: str = DEFAULT_USER_ID) -> int:
+    """Mark queued/running import jobs failed when they have stopped reporting progress."""
+    stale_before = (datetime.now(timezone.utc) - timedelta(seconds=IMPORT_JOB_STALE_AFTER_SECONDS)).isoformat()
+    return mark_stale_dashboard_import_jobs_failed(
+        str(settings.database_path),
+        user_id=user_id,
+        stale_before=stale_before,
+        error_message=STALE_IMPORT_JOB_MESSAGE,
+    )
 
 
 def prepare_dashboard_state(settings: Settings) -> dict[str, object]:
@@ -175,6 +185,8 @@ def prepare_dashboard_state(settings: Settings) -> dict[str, object]:
         "job_id": job.id,
         "job_status": job.status,
         "job_stage": job.stage,
+        "stage_started_at": job.stage_started_at,
+        "stage_durations": job.stage_durations,
         "imported_count": job.imported_count,
         "total_count": job.total_count,
     }
@@ -207,6 +219,8 @@ def to_dashboard_import_job_response(job: StoredDashboardImportJob) -> Dashboard
         error_message=job.error_message,
         created_at=job.created_at,
         started_at=job.started_at,
+        stage_started_at=job.stage_started_at,
+        stage_durations=job.stage_durations,
         completed_at=job.completed_at,
         updated_at=job.updated_at,
     )
@@ -264,7 +278,7 @@ def _prepare_dashboard_state(settings: Settings, *, job_id: str | None = None) -
     update_progress("source_summary", imported_count=imported_count, source_records=imported_count)
     refresh_source_record_summaries(database_path, [record.id for record in source_records])
     update_progress("memory_hydration", imported_count=imported_count, source_records=imported_count)
-    changed_entity_ids = hydrate_persistent_memory(database_path, source_records)
+    changed_entity_ids = hydrate_persistent_memory(database_path, source_records, include_unlinked=True)
     stale_ai_entity_ids = list_entity_ids_needing_ai_refresh(database_path)
     stale_projection_entity_ids = list_stale_feed_projection_entity_ids(database_path)
     update_progress("ai_refresh", changed_entities=len(changed_entity_ids))

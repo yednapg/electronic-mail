@@ -1,6 +1,6 @@
 import type { SourceRecord } from '@electronic-mail/types';
 
-import { isDemoMode } from '../../lib/api';
+import { getBackendURL, isDemoMode } from '../../lib/api';
 import { getDemoSourceRecords } from '../../lib/demo-evidence';
 
 type RawFeedPageProps = {
@@ -10,7 +10,7 @@ type RawFeedPageProps = {
 };
 
 async function getRawFeed(): Promise<SourceRecord[]> {
-  const response = await fetch('http://localhost:3001/raw-feed', {
+  const response = await fetch(`${getBackendURL()}/raw-feed`, {
     cache: 'no-store',
   });
 
