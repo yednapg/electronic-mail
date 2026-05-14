@@ -32,12 +32,19 @@ public final class DashboardStore: ObservableObject {
 
     private let apiClient: DashboardAPIProviding
     private let oauthService: OAuthServicing
+    private let sessionTokenStore: SessionTokenStoring
 
-    public init(apiClient: DashboardAPIProviding, oauthService: OAuthServicing) {
+    public init(
+        apiClient: DashboardAPIProviding,
+        oauthService: OAuthServicing,
+        sessionTokenStore: SessionTokenStoring = KeychainSessionTokenStore()
+    ) {
         self.apiClient = apiClient
         self.oauthService = oauthService
+        self.sessionTokenStore = sessionTokenStore
         let savedURL = UserDefaults.standard.string(forKey: AppConfiguration.backendURLDefaultsKey)
         self.backendBaseURLString = savedURL ?? apiClient.baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        self.apiClient.sessionToken = sessionTokenStore.load()
 
         if let savedURL, let url = URL(string: savedURL) {
             self.apiClient.baseURL = url
@@ -50,6 +57,11 @@ public final class DashboardStore: ObservableObject {
         do {
             dashboard = try await apiClient.dashboard()
             loadState = .loaded
+        } catch APIError.httpStatus(401) {
+            apiClient.sessionToken = nil
+            sessionTokenStore.clear()
+            dashboard = nil
+            loadState = .failed("Session expired. Sign in again.")
         } catch {
             loadState = .failed(error.localizedDescription)
         }
@@ -57,10 +69,13 @@ public final class DashboardStore: ObservableObject {
 
     func connectGoogle() async {
         do {
-            try await oauthService.startGoogleAuthentication(
+            let loginCode = try await oauthService.startGoogleAuthentication(
                 baseURL: apiClient.baseURL,
                 mobileRedirectURI: AppConfiguration.mobileRedirectURI
             )
+            let session = try await apiClient.exchangeMobileLoginCode(loginCode)
+            apiClient.sessionToken = session.sessionToken
+            try sessionTokenStore.save(session.sessionToken)
             await refresh()
         } catch {
             loadState = .failed(error.localizedDescription)

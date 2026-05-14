@@ -2,8 +2,10 @@ import Foundation
 
 public protocol DashboardAPIProviding: AnyObject {
     var baseURL: URL { get set }
+    var sessionToken: String? { get set }
 
     func health() async throws
+    func exchangeMobileLoginCode(_ loginCode: String) async throws -> MobileSessionExchangeResponse
     func dashboard() async throws -> DashboardResponse
     func trace(entityID: String) async throws -> TraceReplayResponse
     func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse
@@ -26,6 +28,7 @@ public enum APIError: Error, Equatable {
 
 public final class DashboardAPIClient: DashboardAPIProviding {
     public var baseURL: URL
+    public var sessionToken: String?
 
     private let session: URLSession
     private let decoder: JSONDecoder
@@ -38,6 +41,15 @@ public final class DashboardAPIClient: DashboardAPIProviding {
 
     public func health() async throws {
         let _: [String: String] = try await request(path: "/health")
+    }
+
+    public func exchangeMobileLoginCode(_ loginCode: String) async throws -> MobileSessionExchangeResponse {
+        try await request(
+            path: "/v1/auth/mobile/exchange",
+            method: "POST",
+            body: MobileSessionExchangeRequest(loginCode: loginCode),
+            includeAuthorization: false
+        )
     }
 
     public func dashboard() async throws -> DashboardResponse {
@@ -94,15 +106,22 @@ public final class DashboardAPIClient: DashboardAPIProviding {
 
     private func request<Response: Decodable>(
         path: String,
-        method: String = "GET"
+        method: String = "GET",
+        includeAuthorization: Bool = true
     ) async throws -> Response {
-        try await request(path: path, method: method, body: Optional<EmptyBody>.none)
+        try await request(
+            path: path,
+            method: method,
+            body: Optional<EmptyBody>.none,
+            includeAuthorization: includeAuthorization
+        )
     }
 
     private func request<Response: Decodable, RequestBody: Encodable>(
         path: String,
         method: String = "GET",
-        body: RequestBody?
+        body: RequestBody?,
+        includeAuthorization: Bool = true
     ) async throws -> Response {
         guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else {
             throw APIError.invalidURL
@@ -111,6 +130,9 @@ public final class DashboardAPIClient: DashboardAPIProviding {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if includeAuthorization, let sessionToken, !sessionToken.isEmpty {
+            request.setValue("Bearer \(sessionToken)", forHTTPHeaderField: "Authorization")
+        }
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONEncoder.backend.encode(body)

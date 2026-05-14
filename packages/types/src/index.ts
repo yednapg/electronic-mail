@@ -14,6 +14,7 @@ export type EntityCurrentState = 'open' | 'waiting' | 'done';
 
 export type SourceType = 'gmail' | 'calendar' | 'manual';
 export type GmailThreadAction = 'archive' | 'unarchive' | 'mark_read';
+export type MailboxLabel = 'inbox' | 'sent' | 'drafts' | 'trash' | 'archive' | 'all';
 export type DashboardImportJobStatus = 'queued' | 'running' | 'succeeded' | 'failed';
 
 export type FeedbackType = 'acted' | 'ignored' | 'snoozed' | 'dismissed';
@@ -78,6 +79,7 @@ export interface AttentionItemDetail {
   readonly body: readonly string[];
   readonly action_label: string;
   readonly source_label: string;
+  readonly action_url?: string | null;
 }
 
 export interface AttentionItem {
@@ -136,6 +138,28 @@ export interface GoogleAuthState {
   readonly connect_url?: string | null;
 }
 
+export interface AuthUserResponse {
+  readonly id: string;
+  readonly email: string;
+  readonly display_name?: string | null;
+  readonly beta_enabled: boolean;
+}
+
+export interface AuthMeResponse {
+  readonly authenticated: boolean;
+  readonly user?: AuthUserResponse | null;
+}
+
+export interface MobileSessionExchangeRequest {
+  readonly login_code: string;
+}
+
+export interface MobileSessionExchangeResponse {
+  readonly session_token: string;
+  readonly expires_at: string;
+  readonly user: AuthUserResponse;
+}
+
 export interface DashboardProfile {
   readonly email?: string | null;
   readonly display_name?: string | null;
@@ -169,6 +193,26 @@ export interface DashboardImportJobResponse {
   readonly started_at?: string | null;
   readonly stage_started_at?: string | null;
   readonly stage_durations?: Record<string, number>;
+  readonly completed_at?: string | null;
+  readonly updated_at: string;
+}
+
+export interface FirstRunImportJobResponse {
+  readonly id: string;
+  readonly user_id: string;
+  readonly status: DashboardImportJobStatus;
+  readonly stage: string;
+  readonly fetched_count: number;
+  readonly total_count?: number | null;
+  readonly thread_count: number;
+  readonly dashboard_item_count: number;
+  readonly inbox_ready_at?: string | null;
+  readonly dashboard_ready_at?: string | null;
+  readonly full_import_started_at?: string | null;
+  readonly full_import_completed_at?: string | null;
+  readonly error_message?: string | null;
+  readonly created_at: string;
+  readonly started_at?: string | null;
   readonly completed_at?: string | null;
   readonly updated_at: string;
 }
@@ -223,6 +267,8 @@ export interface GmailThreadRow {
   readonly message_count: number;
   readonly summary?: string | null;
   readonly snippet?: string | null;
+  readonly label_ids?: string[];
+  readonly unread?: boolean;
   readonly current_state?: EntityCurrentState | null;
   readonly lifecycle_state?: LifecycleState | null;
   readonly outcome_type?: 'complete' | 'snooze' | 'dismiss' | null;
@@ -246,6 +292,29 @@ export interface GmailThreadSection {
 export interface GmailViewResponse {
   readonly total_threads: number;
   readonly sections: GmailThreadSection[];
+}
+
+export interface MailboxResponse {
+  readonly label: MailboxLabel;
+  readonly total_threads: number;
+  readonly next_cursor?: string | null;
+  readonly sections: GmailThreadSection[];
+}
+
+export interface MailboxSyncStateResponse {
+  readonly connected: boolean;
+  readonly last_history_id?: string | null;
+  readonly last_full_sync_at?: string | null;
+  readonly watch_expiration_at?: string | null;
+  readonly last_sync_started_at?: string | null;
+  readonly last_sync_completed_at?: string | null;
+  readonly last_sync_error?: string | null;
+  readonly total_threads: number;
+}
+
+export interface MailboxSyncTriggerResponse {
+  readonly status: 'queued' | 'not_connected';
+  readonly state: MailboxSyncStateResponse;
 }
 
 /**

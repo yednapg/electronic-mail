@@ -16,14 +16,20 @@ MONTH_PATTERN = re.compile(
 )
 
 
-def derive_and_store_entity_state(database_path: str, entity_id: str, records: list[StoredSourceRecord]) -> None:
+def derive_and_store_entity_state(
+    database_path: str,
+    entity_id: str,
+    records: list[StoredSourceRecord],
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> None:
     """Compute the best current state for an entity and persist it."""
     current_state, due_at = derive_state(records)
     upsert_entity_state(database_path, entity_id, current_state, due_at)
     append_trace_record(
         database_path,
         stage="state_derivation",
-        user_id=DEFAULT_USER_ID,
+        user_id=user_id,
         entity_id=entity_id,
         trace_id=entity_id,
         source_record_id=records[-1].id if records else None,

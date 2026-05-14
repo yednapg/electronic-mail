@@ -3,20 +3,19 @@
 import { useEffect, useRef, useState } from 'react';
 
 import {
-  DEMO_DASHBOARD_ROUTE,
+  DASHBOARD_ROUTE,
   POST_LOGIN_MINIMUM_MS,
-  POST_LOGIN_READY_TIMEOUT_MS,
-} from '../../lib/demo-flow';
-import { formatDashboardImportStatus, waitForDashboardImportJob } from '../../lib/dashboard-import';
+} from '../../lib/post-login-flow';
+import { waitForFirstRunImportReady } from '../../lib/first-run-import';
 
-const STATUS_VISIBLE_MS = 1600;
-const STATUS_FADE_MS = 260;
+const STATUS_VISIBLE_MS = 6000;
 
 const statusMessages = [
-  'Reading latest Gmail threads...',
-  'Grouping orders, bills, bugs, refunds, and approvals...',
-  'Finding current state and next move...',
-  'Keeping raw emails as evidence...',
+  'Importing emails ...',
+  'Grouping related emails ...',
+  'Finding to-do items ...',
+  'Building dashboard ...',
+  'Almost ready!',
 ];
 
 function wait(ms: number): Promise<void> {
@@ -25,115 +24,82 @@ function wait(ms: number): Promise<void> {
   });
 }
 
-async function waitForDashboardReady(onStatus?: (message: string) => void): Promise<void> {
-  if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'true') {
-    await waitForDashboardImportJob({
-      timeoutMs: null,
-      onUpdate: (job) => onStatus?.(formatDashboardImportStatus(job)),
-    });
-    return;
-  }
-
-  const response = await fetch(DEMO_DASHBOARD_ROUTE, {
-    cache: 'no-store',
-    credentials: 'same-origin',
-    headers: {
-      Accept: 'text/html',
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error('Dashboard is not ready yet.');
-  }
-}
-
 export function RotatingStatus() {
   const [activeIndex, setActiveIndex] = useState(0);
-  const [liveStatus, setLiveStatus] = useState<string | null>(null);
-  const [stopped, setStopped] = useState(false);
-  const [visible, setVisible] = useState(true);
-  const swapTimeoutRef = useRef<number | null>(null);
-  const activeMessage = liveStatus ?? statusMessages[activeIndex];
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const intervalRef = useRef<number | null>(null);
+  const activeMessage = errorMessage ?? statusMessages[activeIndex];
 
   useEffect(() => {
-    const interval = window.setInterval(() => {
-      if (stopped) {
-        return;
-      }
-
-      setVisible(false);
-
-      swapTimeoutRef.current = window.setTimeout(() => {
-        setActiveIndex((index) => (index + 1) % statusMessages.length);
-        setVisible(true);
-      }, STATUS_FADE_MS);
-    }, STATUS_VISIBLE_MS + STATUS_FADE_MS);
+    intervalRef.current = window.setInterval(() => {
+      setActiveIndex((index) => {
+        if (index >= statusMessages.length - 1) {
+          if (intervalRef.current !== null) {
+            window.clearInterval(intervalRef.current);
+            intervalRef.current = null;
+          }
+          return index;
+        }
+        return index + 1;
+      });
+    }, STATUS_VISIBLE_MS);
 
     return () => {
-      window.clearInterval(interval);
-      if (swapTimeoutRef.current !== null) {
-        window.clearTimeout(swapTimeoutRef.current);
+      if (intervalRef.current !== null) {
+        window.clearInterval(intervalRef.current);
       }
     };
-  }, [stopped]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
 
     function redirectToDashboard() {
-      window.location.assign(DEMO_DASHBOARD_ROUTE);
+      window.location.assign(DASHBOARD_ROUTE);
     }
 
     async function redirectWhenReady() {
-      if (process.env.NEXT_PUBLIC_DEMO_MODE !== 'true') {
-        await Promise.all([
-          wait(POST_LOGIN_MINIMUM_MS),
-          waitForDashboardReady(setLiveStatus),
-        ]);
-
-        if (!cancelled) {
-          redirectToDashboard();
-        }
-        return;
-      }
-
-      const fallbackTimer = window.setTimeout(() => {
-        redirectToDashboard();
-      }, POST_LOGIN_READY_TIMEOUT_MS);
-
       await Promise.all([
         wait(POST_LOGIN_MINIMUM_MS),
-        Promise.race([
-          waitForDashboardReady().catch(() => undefined),
-          wait(POST_LOGIN_READY_TIMEOUT_MS),
-        ]),
+        waitForFirstRunImportReady({ signal: controller.signal }),
       ]);
 
-      window.clearTimeout(fallbackTimer);
-      redirectToDashboard();
+      if (!cancelled) {
+        redirectToDashboard();
+      }
     }
 
     void redirectWhenReady().catch(async (error) => {
       await wait(POST_LOGIN_MINIMUM_MS);
       if (!cancelled) {
-        setStopped(true);
-        setVisible(true);
-        setLiveStatus(error instanceof Error ? error.message : 'Dashboard preparation failed. Please try again.');
+        setErrorMessage(error instanceof Error ? error.message : 'Setup failed. Please refresh.');
       }
     });
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, []);
 
   return (
     <p className="post-login-rotating-status" aria-live="polite" aria-label={activeMessage}>
       <span
-        className={`post-login-status-text ${visible ? 'post-login-status-text-visible' : ''}`}
+        key={activeMessage}
+        className="post-login-status-text post-login-status-text-visible"
         aria-hidden="true"
       >
-        {activeMessage}
+        {activeMessage.split('').map((character, index) => (
+          <span
+            // The text is static per animation state, so index is stable here.
+            key={`${character}-${index}`}
+            className="post-login-status-letter"
+            style={{ '--letter-index': index } as React.CSSProperties}
+          >
+            {character === ' ' ? '\u00a0' : character}
+          </span>
+        ))}
       </span>
     </p>
   );

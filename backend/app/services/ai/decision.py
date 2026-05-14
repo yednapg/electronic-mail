@@ -95,25 +95,33 @@ FEED_JUDGMENT_PROMPT = """You judge which persisted entities should appear in a 
 Rules:
 - Return one judgment max per entity.
 - The entity timeline is the memory/context for what has happened so far.
+- Only turn Gmail into a to-do when the user has a concrete action to perform.
+- Use the last 90 days as the action window for Gmail. Older Gmail may be context, not a to-do.
+- now means the user should act in the next moment: overdue, due within a few hours, security-critical, or explicitly urgent.
+- today means a concrete action that should be done today.
+- later means useful context or non-urgent future action.
+- Completed, processed, delivered, approved, confirmation, receipt, statement, and intimation emails are usually worth-knowing context, not to-dos.
 - current_state uses this memory vocabulary:
   - open: still active or needing attention
   - waiting: waiting on someone else, a scheduled item, or an acknowledged request
   - done: completed, closed, or finished
 - Repeated reminders and lifecycle updates should collapse into one meaningful item.
 - Read the whole timeline together, not just the latest subject line.
-- Title must be a natural descriptive sentence, not a scraped subject line and not a 4-word task label.
-- Title must summarize the full entity from the user's perspective in natural language.
-- Title should usually be 10-22 words when the context supports it, with enough detail that the user understands the work without opening Gmail.
+- Title must be one quick line the user can scan.
+- Title must summarize the full entity from the user's perspective in natural language, not a scraped subject line.
+- Title should usually be 6-14 words when the context supports it.
 - Prefer titles like "Northstar Bank registered your credit card upgrade and limit increase request."
 - Avoid generic titles like "Northstar request acknowledged", "Bank update", or a bare copied subject line when the timeline provides richer context.
 - When several emails are about the same request, synthesize them into one natural title that reflects the latest meaningful state.
 - When the timeline includes two meaningful milestones that both change the user's understanding, include both in the title naturally, usually with "and" or "after".
 - Do not omit important artifacts or outcomes such as reports, statements, documents, approvals, compensation, refunds, receipts, or funding requirements when they are part of the entity's latest meaning.
-- If an item is informative but still worth surfacing, prefer action = none and keep the title as a natural status sentence.
+- If an item is informative but still worth surfacing, prefer action = none and suggested_timing = later.
 - Do not force verbs like review, track, join, or open when the timeline does not imply a concrete user action.
+- Do not use action = open as a generic to-do. Prefer none unless there is a specific user action.
 - If the timeline shows the bank/vendor has acknowledged the request, registered it, taken it up for review, or promised a response within a few working days, prefer action = none unless the user is explicitly asked to do something.
 - If the provider has already completed the work from their side, prefer action = none and summarize the completed status accurately.
-- explanation should read like a short human brief: what happened, why it matters, and what is still open.
+- explanation should read like a short human brief: concrete facts from the email and why it matters.
+- Do not say "waiting on the other side", "still needs attention", or similar synthetic stance copy.
 - explanation should not repeat fields like "Current", "Next", "pipeline", "trace", "thread id", or internal identifiers.
 - action must be one of or could be something else: reply, confirm, pay, join, review, send, approve, open, register, track, none.
 - suggested_timing must be one of: now, today, later, hidden.
@@ -1409,11 +1417,11 @@ def _build_feed_explanation(subject: str, current_state: str) -> str:
     normalized_state = normalize_entity_state(current_state)
 
     if normalized_state == "waiting":
-        return f"This is still waiting on the other side for {subject}."
+        return f"Latest email says no action is needed yet for {subject}."
     if normalized_state == "done":
-        return f"This was already completed for {subject}."
+        return f"Latest email says {subject} is complete."
 
-    return f"This still needs attention for {subject}."
+    return f"Latest email asks you to act on {subject}."
 
 
 def _derive_feed_focus(entity: FeedEntityContextInput) -> str:

@@ -26,8 +26,9 @@ class DashboardBriefingTests(unittest.TestCase):
         self.assertIn("If meeting_count is 0", DASHBOARD_BRIEFING_PROMPT)
 
     def test_feed_prompt_requires_natural_task_copy_without_internal_ids(self) -> None:
-        self.assertIn("natural descriptive sentence", FEED_JUDGMENT_PROMPT)
-        self.assertIn("not a scraped subject line", FEED_JUDGMENT_PROMPT)
+        self.assertIn("Only turn Gmail into a to-do when the user has a concrete action", FEED_JUDGMENT_PROMPT)
+        self.assertIn("last 90 days", FEED_JUDGMENT_PROMPT)
+        self.assertIn("one quick line", FEED_JUDGMENT_PROMPT)
         self.assertIn("thread id", FEED_JUDGMENT_PROMPT)
 
     def test_source_summary_prompt_allows_human_readable_detail(self) -> None:

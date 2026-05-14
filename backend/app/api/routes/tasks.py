@@ -4,17 +4,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 
 from app.core.config import load_settings
 from app.db.repository import (
-    DEFAULT_USER_ID,
     create_manual_task,
     delete_manual_task,
     get_manual_task,
     update_manual_task,
 )
 from app.schemas.domain import TaskCreateRequest, TaskResponse, TaskUpdateRequest
+from app.services.auth import require_current_user
 from app.services.feed.memory_pipeline import refresh_feed_projections_for_entities
 
 
@@ -23,40 +23,43 @@ settings = load_settings()
 
 
 @router.post("/v1/tasks", response_model=TaskResponse)
-def create_task(request: TaskCreateRequest) -> TaskResponse:
+def create_task(http_request: Request, request: TaskCreateRequest) -> TaskResponse:
     """Create a first-class backend-owned task."""
     title = request.title.strip()
     if not title:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Task title is required")
 
+    user = require_current_user(settings, http_request)
     task = create_manual_task(
         str(settings.database_path),
-        user_id=DEFAULT_USER_ID,
+        user_id=user.id,
         title=title,
         notes=request.notes.strip() if isinstance(request.notes, str) and request.notes.strip() else None,
         section=request.section,
         due_at=request.due_at,
     )
-    refresh_task_projection(task.entity_id)
+    refresh_task_projection(task.entity_id, user_id=user.id)
     return to_task_response(task)
 
 
 @router.get("/v1/tasks/{task_id}", response_model=TaskResponse)
-def get_task(task_id: str) -> TaskResponse:
+def get_task(http_request: Request, task_id: str) -> TaskResponse:
     """Load one backend-owned task."""
-    task = get_manual_task(str(settings.database_path), task_id, user_id=DEFAULT_USER_ID)
+    user = require_current_user(settings, http_request)
+    task = get_manual_task(str(settings.database_path), task_id, user_id=user.id)
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
     return to_task_response(task)
 
 
 @router.patch("/v1/tasks/{task_id}", response_model=TaskResponse)
-def patch_task(task_id: str, request: TaskUpdateRequest) -> TaskResponse:
+def patch_task(http_request: Request, task_id: str, request: TaskUpdateRequest) -> TaskResponse:
     """Patch one backend-owned task."""
+    user = require_current_user(settings, http_request)
     task = update_manual_task(
         str(settings.database_path),
         task_id,
-        user_id=DEFAULT_USER_ID,
+        user_id=user.id,
         title=request.title.strip() if isinstance(request.title, str) and request.title.strip() else None,
         notes=request.notes.strip() if isinstance(request.notes, str) and request.notes.strip() else None,
         section=request.section,
@@ -65,14 +68,20 @@ def patch_task(task_id: str, request: TaskUpdateRequest) -> TaskResponse:
     )
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    refresh_task_projection(task.entity_id, user_id=user.id)
     return to_task_response(task)
 
 
 @router.delete("/v1/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_task(task_id: str) -> None:
+def remove_task(http_request: Request, task_id: str) -> None:
     """Delete one backend-owned task."""
-    if not delete_manual_task(str(settings.database_path), task_id, user_id=DEFAULT_USER_ID):
+    user = require_current_user(settings, http_request)
+    task = get_manual_task(str(settings.database_path), task_id, user_id=user.id)
+    if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    if not delete_manual_task(str(settings.database_path), task_id, user_id=user.id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    refresh_task_projection(task.entity_id, user_id=user.id)
 
 
 def to_task_response(task) -> TaskResponse:
@@ -90,9 +99,10 @@ def to_task_response(task) -> TaskResponse:
     )
 
 
-def refresh_task_projection(entity_id: str) -> None:
+def refresh_task_projection(entity_id: str, *, user_id: str) -> None:
     refresh_feed_projections_for_entities(
         str(settings.database_path),
         [entity_id],
         datetime.now(timezone.utc).isoformat(),
+        user_id=user_id,
     )

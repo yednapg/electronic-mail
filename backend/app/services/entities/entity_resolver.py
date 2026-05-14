@@ -15,7 +15,6 @@ from app.db.repository import (
     find_entity_by_member_record_id,
     find_entity_by_thread_id,
     get_entity_states,
-    list_loaded_entities,
     list_candidate_records,
 )
 from app.schemas.ai import EntityGroupingRequest, EntityGroupingResponse
@@ -178,7 +177,7 @@ def resolve_entity_for_record(
         "sender": string_value(record.raw_payload, "from") or string_value(record.raw_payload, "sender"),
     }
     normalized_subject = normalize_subject(string_value(record.raw_payload, "subject"))
-    existing_by_member = find_entity_by_member_record_id(database_path, record.id)
+    existing_by_member = find_entity_by_member_record_id(database_path, record.id, user_id=record.user_id)
 
     if existing_by_member is not None:
         attach_record_with_thread_membership(database_path, existing_by_member.id, record)
@@ -195,7 +194,9 @@ def resolve_entity_for_record(
         return existing_by_member, 1.0
 
     existing_by_thread = (
-        find_entity_by_thread_id(database_path, record.source, record.thread_id) if record.thread_id else None
+        find_entity_by_thread_id(database_path, record.source, record.thread_id, user_id=record.user_id)
+        if record.thread_id
+        else None
     )
 
     if existing_by_thread is not None:
@@ -228,7 +229,7 @@ def resolve_entity_for_record(
                 candidates = []
 
         if not candidates:
-            entity = create_entity(database_path, build_entity_seed_key(record))
+            entity = create_entity(database_path, build_entity_seed_key(record), user_id=record.user_id)
             attach_record_with_thread_membership(database_path, entity.id, record)
             append_trace_record(
                 database_path,
@@ -290,7 +291,7 @@ def resolve_entity_for_record(
                     )
                     return matched_candidate["entity"], float(ai_resolution.confidence)
 
-    entity = create_entity(database_path, build_entity_seed_key(record))
+    entity = create_entity(database_path, build_entity_seed_key(record), user_id=record.user_id)
     attach_record_with_thread_membership(database_path, entity.id, record)
     append_trace_record(
         database_path,
@@ -380,7 +381,7 @@ def find_entity_candidates(database_path: str, record: SourceRecord) -> list[dic
 
     by_entity_id: dict[str, dict[str, object]] = {}
 
-    for candidate_record, entity in list_candidate_records(database_path, None):
+    for candidate_record, entity in list_candidate_records(database_path, sender_domain or None, user_id=record.user_id):
         candidate_subject = normalize_subject(candidate_record.subject or "")
         candidate_body = grouping_body(payload_string(candidate_record.raw_payload, "body"))
         candidate_issue_markers = extract_issue_markers(candidate_record.subject or "", candidate_body)
@@ -473,16 +474,11 @@ def find_entity_candidates(database_path: str, record: SourceRecord) -> list[dic
             }
 
     states = get_entity_states(database_path, by_entity_id.keys())
-    loaded_by_entity = {
-        loaded.entity.id: loaded
-        for loaded in list_loaded_entities(database_path, [str(entity_id) for entity_id in by_entity_id.keys()])
-    }
     candidates = []
 
     for candidate in by_entity_id.values():
         entity = candidate["entity"]
-        loaded_entity = loaded_by_entity.get(entity.id)
-        candidate_summary = build_entity_summary(loaded_entity)
+        candidate_summary = str(candidate["latest_subject"])
         candidate_summary_issue_markers = extract_issue_markers(candidate_summary, "")
         candidate_summary_reference_ids = extract_reference_ids(candidate_summary)
         shared_summary_issue_markers = record_issue_markers & candidate_summary_issue_markers
@@ -630,7 +626,7 @@ def attach_record_with_thread_membership(database_path: str, entity_id: str, rec
     attach_record_to_entity(database_path, entity_id, record.id)
 
     if record.thread_id:
-        attach_thread_to_entity(database_path, entity_id, record.source, record.thread_id)
+        attach_thread_to_entity(database_path, entity_id, record.source, record.thread_id, user_id=record.user_id)
 
 
 def string_value(payload: dict[str, object], key: str) -> str:

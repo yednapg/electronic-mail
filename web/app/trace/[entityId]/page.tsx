@@ -1,7 +1,8 @@
 import type { TraceReplayResponse } from '@electronic-mail/types';
+import { redirect } from 'next/navigation';
 
-import { getBackendURL, isDemoMode } from '../../../lib/api';
-import { getDemoTrace } from '../../../lib/demo-evidence';
+import { getBackendURL, getDashboard } from '../../../lib/api';
+import { getServerCookieHeader } from '../../../lib/server-cookies';
 
 type TracePageProps = {
   params: Promise<{
@@ -9,9 +10,10 @@ type TracePageProps = {
   }>;
 };
 
-async function getTrace(entityId: string): Promise<TraceReplayResponse> {
+async function getTrace(entityId: string, cookie: string | null): Promise<TraceReplayResponse> {
   const response = await fetch(`${getBackendURL()}/trace/${encodeURIComponent(entityId)}`, {
     cache: 'no-store',
+    headers: cookie === null ? undefined : { Cookie: cookie },
   });
 
   if (!response.ok) {
@@ -22,19 +24,19 @@ async function getTrace(entityId: string): Promise<TraceReplayResponse> {
 }
 
 export default async function TracePage({ params }: TracePageProps) {
-  const { entityId } = await params;
+  const cookie = await getServerCookieHeader();
+  const [{ entityId }, dashboard] = await Promise.all([params, getDashboard({ cookie })]);
+  if (!dashboard.auth.connected) {
+    redirect('/');
+  }
+
   let trace: TraceReplayResponse | null = null;
   let errorMessage: string | null = null;
 
-  if (isDemoMode()) {
-    trace = getDemoTrace(entityId);
-    errorMessage = trace === null ? 'No demo trace exists for this entity.' : null;
-  } else {
-    try {
-      trace = await getTrace(entityId);
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : 'Trace replay is unavailable.';
-    }
+  try {
+    trace = await getTrace(entityId, cookie);
+  } catch (error) {
+    errorMessage = error instanceof Error ? error.message : 'Trace replay is unavailable.';
   }
 
   return (

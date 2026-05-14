@@ -11,8 +11,10 @@ from app.api.routes.gmail import router as gmail_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.entities import router as entities_router
 from app.api.routes.feed import router as feed_router
+from app.api.routes.first_run import router as first_run_router
 from app.api.routes.system import router as system_router
 from app.api.routes.history import router as history_router
+from app.api.routes.mailbox import router as mailbox_router
 from app.api.routes.tasks import router as tasks_router
 from app.api.routes.trace import router as trace_router
 from app.core.config import load_settings
@@ -20,8 +22,9 @@ from app.db.repository import initialize_database
 
 
 settings = load_settings()
-# Ensure the local SQLite schema exists before the app starts handling requests.
-initialize_database(str(settings.database_path))
+if settings.app_env == "local" and settings.database_backend == "sqlite":
+    # Ensure the local SQLite schema exists before the app starts handling requests.
+    initialize_database(str(settings.database_path))
 
 app = FastAPI(title="ElectronicMail Backend")
 app.add_middleware(
@@ -33,9 +36,11 @@ app.add_middleware(
 )
 app.include_router(system_router)
 app.include_router(auth_google_router)
+app.include_router(first_run_router)
 app.include_router(dashboard_router)
 app.include_router(feed_router)
 app.include_router(gmail_router)
+app.include_router(mailbox_router)
 app.include_router(tasks_router)
 app.include_router(entities_router)
 app.include_router(history_router)

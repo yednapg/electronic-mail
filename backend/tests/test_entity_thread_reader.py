@@ -121,6 +121,42 @@ class EntityThreadReaderRouteTests(unittest.TestCase):
         self.assertEqual(payload["subject"], "Message 3")
         self.assertEqual([message["id"] for message in payload["messages"]], ["message-1", "message-2"])
 
+    def test_thread_reader_can_scope_to_one_gmail_thread_inside_entity(self) -> None:
+        first_thread = StoredSourceRecord(
+            id="message-thread-1",
+            source="gmail",
+            thread_id="thread-1",
+            subject="First thread",
+            sender="sender@example.com",
+            timestamp="2026-05-11T09:00:00+00:00",
+            raw_payload={"user_id": "local-user", "subject": "First thread", "body": "First body."},
+            created_at="2026-05-11T09:00:00+00:00",
+        )
+        second_thread = StoredSourceRecord(
+            id="message-thread-2",
+            source="gmail",
+            thread_id="thread-2",
+            subject="Second thread",
+            sender="sender@example.com",
+            timestamp="2026-05-12T09:00:00+00:00",
+            raw_payload={"user_id": "local-user", "subject": "Second thread", "body": "Second body."},
+            created_at="2026-05-12T09:00:00+00:00",
+        )
+
+        upsert_source_records(self.db_file.name, [first_thread, second_thread])
+        entity = create_entity(self.db_file.name, "sender:sender@example.com")
+        attach_record_to_entity(self.db_file.name, entity.id, first_thread.id)
+        attach_record_to_entity(self.db_file.name, entity.id, second_thread.id)
+
+        response = self.client.get(f"/v1/entities/{entity.id}/thread?threadId=thread-2")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["gmail_thread_id"], "thread-2")
+        self.assertEqual(payload["subject"], "Second thread")
+        self.assertEqual(payload["total_messages"], 1)
+        self.assertEqual([message["id"] for message in payload["messages"]], ["message-thread-2"])
+
     def test_thread_reader_rejects_unbounded_page_size(self) -> None:
         entity = create_entity(self.db_file.name, "gmail-thread:thread-1")
 

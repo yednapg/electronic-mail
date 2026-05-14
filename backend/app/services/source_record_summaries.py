@@ -6,28 +6,23 @@ import hashlib
 import json
 
 from app.db.models import StoredSourceRecord
-from app.db.repository import (
-    DEFAULT_USER_ID,
-    list_source_record_summary_hashes,
-    list_source_records_by_ids,
-    upsert_source_record_summary,
-)
+from app.db.repository import list_source_record_summary_hashes, list_source_records_by_ids, upsert_source_record_summary
 from app.services.copy_quality import humanize_account_copy
 from app.services.ai.decision import summarize_source_records
 
 SOURCE_RECORD_SUMMARY_HASH_VERSION = "source-record-summary-v3"
 
 
-def refresh_source_record_summaries(database_path: str, source_record_ids: list[str]) -> int:
+def refresh_source_record_summaries(database_path: str, source_record_ids: list[str], *, user_id: str) -> int:
     """Refresh compact summaries for missing or changed source records."""
     unique_ids = sorted({source_record_id for source_record_id in source_record_ids if source_record_id})
 
     if not unique_ids:
         return 0
 
-    records = list_source_records_by_ids(database_path, unique_ids)
+    records = list_source_records_by_ids(database_path, unique_ids, user_id=user_id)
     record_hashes = {record.id: source_record_summary_hash(record) for record in records}
-    existing_hashes = list_source_record_summary_hashes(database_path, record_hashes.keys())
+    existing_hashes = list_source_record_summary_hashes(database_path, record_hashes.keys(), user_id=user_id)
     stale_records = [
         record
         for record in records
@@ -47,7 +42,7 @@ def refresh_source_record_summaries(database_path: str, source_record_ids: list[
         upsert_source_record_summary(
             database_path,
             source_record_id=record.id,
-            user_id=DEFAULT_USER_ID,
+            user_id=user_id,
             summary=polished_summary,
             model=generated.model,
             generated_from_hash=record_hashes[record.id],

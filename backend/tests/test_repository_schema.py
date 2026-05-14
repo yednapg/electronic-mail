@@ -4,7 +4,8 @@ import sqlite3
 import tempfile
 import unittest
 
-from app.db.repository import initialize_database
+from app.db.models import StoredSourceRecord
+from app.db.repository import initialize_database, list_source_records_by_ids, upsert_source_records
 
 
 class RepositorySchemaTests(unittest.TestCase):
@@ -41,6 +42,41 @@ class RepositorySchemaTests(unittest.TestCase):
             }.issubset(indexes)
         )
         self.assertIn("deleted_at", source_record_columns)
+
+    def test_provider_source_records_are_user_scoped_when_persisted(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".sqlite3") as db_file:
+            initialize_database(db_file.name)
+            upsert_source_records(
+                db_file.name,
+                [
+                    StoredSourceRecord(
+                        id="message-1",
+                        source="gmail",
+                        thread_id="thread-1",
+                        subject="A",
+                        sender="a@example.com",
+                        timestamp="2026-05-14T10:00:00+00:00",
+                        raw_payload={"user_id": "user-a", "message_id": "message-1"},
+                        created_at="2026-05-14T10:00:00+00:00",
+                    ),
+                    StoredSourceRecord(
+                        id="message-1",
+                        source="gmail",
+                        thread_id="thread-1",
+                        subject="B",
+                        sender="b@example.com",
+                        timestamp="2026-05-14T10:00:00+00:00",
+                        raw_payload={"user_id": "user-b", "message_id": "message-1"},
+                        created_at="2026-05-14T10:00:00+00:00",
+                    ),
+                ],
+            )
+
+            first = list_source_records_by_ids(db_file.name, ["user-a:gmail:message-1"], user_id="user-a")
+            second = list_source_records_by_ids(db_file.name, ["user-b:gmail:message-1"], user_id="user-b")
+
+        self.assertEqual(first[0].subject, "A")
+        self.assertEqual(second[0].subject, "B")
 
 
 if __name__ == "__main__":

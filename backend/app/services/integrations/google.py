@@ -12,6 +12,7 @@ import os
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 import google_auth_httplib2
 import httplib2
@@ -28,6 +29,8 @@ from app.db.repository import (
     clear_all_data,
     DEFAULT_USER_ID,
     get_gmail_sync_state,
+    get_google_oauth_token,
+    get_oauth_login_session,
     get_source_record_count,
     initialize_database,
     list_existing_source_record_ids,
@@ -36,10 +39,14 @@ from app.db.repository import (
     upsert_gmail_history_events,
     upsert_gmail_message_snapshots,
     upsert_gmail_sync_state,
+    upsert_google_oauth_token,
     upsert_source_records,
+    save_oauth_login_session as save_db_oauth_login_session,
+    delete_oauth_login_session as delete_db_oauth_login_session,
     utc_now_iso,
 )
 from app.schemas.domain import DashboardProfile, GoogleAuthState, SourceRecord
+from app.services.token_crypto import decrypt_json, encrypt_json
 
 
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
@@ -51,6 +58,8 @@ OAUTH_SESSION_FILE_PATH = BACKEND_DIR / ".google-oauth-session.json"
 ACCOUNT_PROFILE_FILE_PATH = BACKEND_DIR / ".google-account.json"
 DEV_USER_ID = DEFAULT_USER_ID
 GMAIL_PAGE_SIZE = 500
+GMAIL_FIRST_RUN_PAGE_SIZE = 100
+GMAIL_FIRST_RUN_MAX_MESSAGES = 250
 GMAIL_LOOKBACK_DAYS = 90
 GOOGLE_API_TIMEOUT_SECONDS = 20
 CALENDAR_MAX_RESULTS = 20
@@ -76,6 +85,14 @@ READABLE_GMAIL_MIME_TYPES = {"text/plain", "text/html"}
 GmailSyncProgressCallback = Callable[[str, int, int | None], None]
 
 
+def source_record_id_for_user(source: str, provider_id: object, *, user_id: str) -> str:
+    """Return a stable internal source-record id scoped by user for provider-owned ids."""
+    raw_id = str(provider_id)
+    if user_id == DEV_USER_ID or source not in {"gmail", "calendar"}:
+        return raw_id
+    return f"{user_id}:{source}:{raw_id}"
+
+
 @dataclass
 class GmailMessageIdPage:
     """One bounded page of Gmail message ids from messages.list."""
@@ -93,6 +110,16 @@ class GmailBatchResult:
     latest_history_id: str | None
     new_count: int
     failed_message_ids: list[str]
+
+
+@dataclass
+class GoogleCallbackResult:
+    """Result of exchanging a Google OAuth callback."""
+
+    redirect_to: str | None
+    tokens: dict[str, object]
+    profile: DashboardProfile
+    google_sub: str
 
 
 def _gmail_debug_enabled() -> bool:
@@ -155,27 +182,29 @@ def get_google_auth_url(settings: Settings, redirect_to: str | None = None) -> s
     """Build the Google authorization URL for local OAuth setup."""
     flow = create_flow(settings)
     authorization_url, state = flow.authorization_url(access_type="offline", prompt="consent")
-    session = {
-        "state": state,
-        "code_verifier": flow.code_verifier,
-    }
-
-    if redirect_to is not None:
-        session["redirect_to"] = redirect_to
-
-    save_oauth_session(session)
+    save_db_oauth_login_session(
+        str(settings.database_path),
+        state=state,
+        code_verifier=flow.code_verifier,
+        redirect_to=redirect_to,
+        expires_at=(datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
+    )
     return authorization_url
 
 
-def handle_google_callback(settings: Settings, code: str, state: str | None = None) -> str:
-    """Exchange the OAuth code, persist tokens, and return the final client redirect."""
-    session = load_oauth_session(state)
+def handle_google_callback(settings: Settings, code: str, state: str | None = None) -> GoogleCallbackResult:
+    """Exchange the OAuth code and return identity/token material for app session creation."""
+    session = (
+        get_oauth_login_session(str(settings.database_path), state=state, now=datetime.now(timezone.utc).isoformat())
+        if state is not None
+        else None
+    ) or load_oauth_session(state)
     if session is None:
         raise RuntimeError("Missing OAuth session. Start again from /auth/google.")
 
-    expected_state = session.get("state")
-    code_verifier = session.get("code_verifier")
-    redirect_to = session.get("redirect_to")
+    expected_state = session.state if hasattr(session, "state") else session.get("state")
+    code_verifier = session.code_verifier if hasattr(session, "code_verifier") else session.get("code_verifier")
+    redirect_to = session.redirect_to if hasattr(session, "redirect_to") else session.get("redirect_to")
 
     if state is not None and expected_state and state != expected_state:
         clear_oauth_session(state)
@@ -189,38 +218,33 @@ def handle_google_callback(settings: Settings, code: str, state: str | None = No
     flow.code_verifier = code_verifier
     flow.fetch_token(code=code)
     credentials = flow.credentials
-    save_tokens(
-        {
-            "token": credentials.token,
-            "refresh_token": credentials.refresh_token,
-            "token_uri": credentials.token_uri,
-            "client_id": credentials.client_id,
-            "client_secret": credentials.client_secret,
-            "scopes": credentials.scopes,
-        }
-    )
+    tokens = token_payload_from_credentials(credentials)
     profile = fetch_google_account_profile_from_credentials(credentials)
-    if profile is not None:
-        _reset_local_data_if_account_changed(settings, profile)
-        save_google_account_profile(profile)
+    if profile is None or profile.email is None:
+        raise RuntimeError("Google account profile could not be resolved")
     clear_oauth_session(state)
+    if state is not None:
+        delete_db_oauth_login_session(str(settings.database_path), state=state)
 
-    if isinstance(redirect_to, str) and redirect_to == settings.mobile_redirect_uri:
-        return redirect_to
-
-    return f"{settings.cors_origin}/post-login"
+    return GoogleCallbackResult(
+        redirect_to=redirect_to if isinstance(redirect_to, str) else None,
+        tokens=tokens,
+        profile=profile,
+        google_sub=profile.email,
+    )
 
 
 def fetch_google_source_records(
     settings: Settings,
     *,
+    user_id: str | None = None,
     progress_callback: GmailSyncProgressCallback | None = None,
     collect_records: bool = True,
     sync_scope: str | None = None,
     force_full_sync: bool = False,
 ) -> list[SourceRecord]:
     """Sync Gmail incrementally, fetch calendar updates, and return changed records."""
-    credentials = create_authorized_credentials(settings)
+    credentials = create_authorized_credentials(settings, user_id=user_id)
 
     if credentials is None:
         return []
@@ -235,8 +259,9 @@ def fetch_google_source_records(
         collect_records=collect_records,
         sync_scope=sync_scope,
         force_full_sync=force_full_sync,
+        user_id=user_id,
     )
-    calendar_records = fetch_upcoming_calendar_records(calendar_service)
+    calendar_records = fetch_upcoming_calendar_records(calendar_service, user_id=user_id or DEV_USER_ID)
 
     if calendar_records:
         persist_source_records(settings, calendar_records)
@@ -244,22 +269,23 @@ def fetch_google_source_records(
     return sorted(gmail_records + calendar_records, key=lambda record: record.received_at, reverse=True)
 
 
-def should_run_gmail_full_history_backfill(settings: Settings) -> bool:
+def should_run_gmail_full_history_backfill(settings: Settings, *, user_id: str = DEV_USER_ID) -> bool:
     """Return whether a recent-first account still needs one non-blocking full Gmail pass."""
     if resolve_gmail_sync_scope(getattr(settings, "gmail_sync_scope", "full")) != "recent":
         return False
 
-    sync_state = get_gmail_sync_state(str(settings.database_path), DEV_USER_ID)
+    sync_state = get_gmail_sync_state(str(settings.database_path), user_id)
     return sync_state is not None and bool(sync_state.last_history_id) and not sync_state.last_full_sync_at
 
 
 def backfill_full_gmail_source_records(
     settings: Settings,
     *,
+    user_id: str | None = None,
     progress_callback: GmailSyncProgressCallback | None = None,
 ) -> list[SourceRecord]:
     """Run the Gmail-only full-history pass after the first dashboard is already usable."""
-    credentials = create_authorized_credentials(settings)
+    credentials = create_authorized_credentials(settings, user_id=user_id)
 
     if credentials is None:
         return []
@@ -273,12 +299,88 @@ def backfill_full_gmail_source_records(
         collect_records=False,
         sync_scope="full",
         force_full_sync=True,
+        user_id=user_id,
     )
 
 
-def fetch_raw_gmail_source_records(settings: Settings) -> list[SourceRecord]:
+def fetch_recent_inbox_gmail_metadata(
+    settings: Settings,
+    *,
+    user_id: str | None = None,
+    progress_callback: GmailSyncProgressCallback | None = None,
+) -> tuple[int, int | None]:
+    """Fetch the visible first-run Inbox window with metadata only."""
+    credentials = create_authorized_credentials(settings, user_id=user_id)
+
+    if credentials is None:
+        return 0, None
+
+    database_path = str(settings.database_path)
+    owner_id = user_id or DEV_USER_ID
+    initialize_database(database_path)
+    gmail_service = build_google_service("gmail", "v1", credentials)
+    query = f"in:inbox newer_than:{settings.gmail_recent_days}d"
+    fetched_count = 0
+    total_count: int | None = None
+
+    def report(stage: str) -> None:
+        if progress_callback is not None:
+            progress_callback(stage, fetched_count, total_count)
+
+    report("gmail_listing")
+    for page in iter_gmail_message_id_pages(
+        gmail_service,
+        scope="recent",
+        recent_days=settings.gmail_recent_days,
+        query=query,
+        page_size=GMAIL_FIRST_RUN_PAGE_SIZE,
+        max_messages=GMAIL_FIRST_RUN_MAX_MESSAGES,
+    ):
+        total_count = page.total_count if page.total_count is not None else total_count
+        if not page.message_ids:
+            report("gmail_fetching")
+            continue
+
+        report("gmail_fetching")
+        snapshots: list[StoredGmailMessageSnapshot] = []
+        for message_id in page.message_ids:
+            try:
+                message = (
+                    gmail_service.users()
+                    .messages()
+                    .get(
+                        userId="me",
+                        id=message_id,
+                        format="metadata",
+                        metadataHeaders=["Subject", "From", "To", "Cc", "Bcc", "Date"],
+                    )
+                    .execute()
+                )
+            except Exception as error:  # pragma: no cover - exercised via behavior, not exception type
+                _log_gmail_error(
+                    "gmail_first_run_metadata_fetch_failed",
+                    {
+                        "messageId": message_id,
+                        "error": str(error),
+                    },
+                )
+                continue
+
+            snapshots.append(gmail_message_snapshot_from_payload(message, user_id=owner_id))
+            fetched_count += 1
+            if fetched_count % 25 == 0:
+                report("gmail_fetching")
+
+        if snapshots:
+            upsert_gmail_message_snapshots(database_path, snapshots)
+        report("gmail_persisted")
+
+    return fetched_count, total_count
+
+
+def fetch_raw_gmail_source_records(settings: Settings, *, user_id: str | None = None) -> list[SourceRecord]:
     """Fetch a full live Gmail snapshot for debugging, without persisting sync state."""
-    credentials = create_authorized_credentials(settings)
+    credentials = create_authorized_credentials(settings, user_id=user_id)
 
     if credentials is None:
         return []
@@ -297,12 +399,13 @@ def fetch_raw_gmail_source_records(settings: Settings) -> list[SourceRecord]:
         messages,
         scope=resolve_gmail_sync_scope(settings.gmail_sync_scope),
         recent_days=settings.gmail_recent_days,
+        user_id=user_id or DEV_USER_ID,
     )
 
 
-def fetch_raw_gmail_api_messages(settings: Settings) -> list[dict[str, object]]:
+def fetch_raw_gmail_api_messages(settings: Settings, *, user_id: str | None = None) -> list[dict[str, object]]:
     """Fetch full raw Gmail API message payloads for debugging and copy/paste inspection."""
-    credentials = create_authorized_credentials(settings)
+    credentials = create_authorized_credentials(settings, user_id=user_id)
 
     if credentials is None:
         return []
@@ -320,34 +423,37 @@ def fetch_raw_gmail_api_messages(settings: Settings) -> list[dict[str, object]]:
     return messages
 
 
-def fetch_clean_gmail_api_messages(settings: Settings) -> list[dict[str, object]]:
+def fetch_clean_gmail_api_messages(settings: Settings, *, user_id: str | None = None) -> list[dict[str, object]]:
     """Fetch Gmail API messages in a readable debugging shape without MIME/base64 noise."""
-    return [clean_gmail_api_message(message) for message in fetch_raw_gmail_api_messages(settings)]
+    return [clean_gmail_api_message(message) for message in fetch_raw_gmail_api_messages(settings, user_id=user_id)]
 
 
-def archive_gmail_thread(settings: Settings, thread_id: str) -> dict[str, object]:
+def archive_gmail_thread(settings: Settings, thread_id: str, *, user_id: str | None = None) -> dict[str, object]:
     """Archive one Gmail thread by removing its INBOX label."""
     return modify_gmail_thread_labels(
         settings,
         thread_id,
+        user_id=user_id,
         remove_label_ids=[GMAIL_INBOX_LABEL],
     )
 
 
-def unarchive_gmail_thread(settings: Settings, thread_id: str) -> dict[str, object]:
+def unarchive_gmail_thread(settings: Settings, thread_id: str, *, user_id: str | None = None) -> dict[str, object]:
     """Unarchive one Gmail thread by restoring its INBOX label."""
     return modify_gmail_thread_labels(
         settings,
         thread_id,
+        user_id=user_id,
         add_label_ids=[GMAIL_INBOX_LABEL],
     )
 
 
-def mark_gmail_thread_read(settings: Settings, thread_id: str) -> dict[str, object]:
+def mark_gmail_thread_read(settings: Settings, thread_id: str, *, user_id: str | None = None) -> dict[str, object]:
     """Mark one Gmail thread read from an explicit user action."""
     return modify_gmail_thread_labels(
         settings,
         thread_id,
+        user_id=user_id,
         remove_label_ids=[GMAIL_UNREAD_LABEL],
     )
 
@@ -355,6 +461,7 @@ def mark_gmail_thread_read(settings: Settings, thread_id: str) -> dict[str, obje
 def create_gmail_draft(
     settings: Settings,
     *,
+    user_id: str | None = None,
     to: str,
     cc: str | None = None,
     bcc: str | None = None,
@@ -363,7 +470,7 @@ def create_gmail_draft(
     thread_id: str | None = None,
 ) -> dict[str, object]:
     """Create one Gmail draft from an explicit user action."""
-    gmail_service = create_gmail_service(settings)
+    gmail_service = create_gmail_service(settings, user_id=user_id)
     message_body = {"raw": build_raw_email(to=to, cc=cc, bcc=bcc, subject=subject, body=body)}
     if thread_id:
         message_body["threadId"] = thread_id
@@ -374,6 +481,7 @@ def update_gmail_draft(
     settings: Settings,
     gmail_draft_id: str,
     *,
+    user_id: str | None = None,
     to: str,
     cc: str | None = None,
     bcc: str | None = None,
@@ -382,7 +490,7 @@ def update_gmail_draft(
     thread_id: str | None = None,
 ) -> dict[str, object]:
     """Replace one existing Gmail draft from an explicit user action."""
-    gmail_service = create_gmail_service(settings)
+    gmail_service = create_gmail_service(settings, user_id=user_id)
     message_body = {"raw": build_raw_email(to=to, cc=cc, bcc=bcc, subject=subject, body=body)}
     if thread_id:
         message_body["threadId"] = thread_id
@@ -393,20 +501,20 @@ def update_gmail_draft(
     ).execute()
 
 
-def send_gmail_draft(settings: Settings, gmail_draft_id: str) -> dict[str, object]:
+def send_gmail_draft(settings: Settings, gmail_draft_id: str, *, user_id: str | None = None) -> dict[str, object]:
     """Send one existing Gmail draft from an explicit user action."""
-    gmail_service = create_gmail_service(settings)
+    gmail_service = create_gmail_service(settings, user_id=user_id)
     return gmail_service.users().drafts().send(userId="me", body={"id": gmail_draft_id}).execute()
 
 
-def delete_gmail_draft(settings: Settings, gmail_draft_id: str) -> None:
+def delete_gmail_draft(settings: Settings, gmail_draft_id: str, *, user_id: str | None = None) -> None:
     """Delete one existing Gmail draft from an explicit user action."""
-    gmail_service = create_gmail_service(settings)
+    gmail_service = create_gmail_service(settings, user_id=user_id)
     gmail_service.users().drafts().delete(userId="me", id=gmail_draft_id).execute()
 
 
 def persist_source_records(settings: Settings, records: list[SourceRecord]) -> None:
-    """Persist normalized Google records into the local SQLite store."""
+    """Persist normalized Google records into the backend store."""
     initialize_database(str(settings.database_path))
     upsert_source_records(
         str(settings.database_path),
@@ -418,7 +526,7 @@ def persist_source_records(settings: Settings, records: list[SourceRecord]) -> N
                 subject=string_value(record.raw_payload, "subject"),
                 sender=string_value(record.raw_payload, "from") or string_value(record.raw_payload, "sender"),
                 timestamp=record.received_at,
-                raw_payload=record.raw_payload,
+                raw_payload={**record.raw_payload, "user_id": record.user_id},
                 created_at=utc_now_iso(),
             )
             for record in records
@@ -459,15 +567,15 @@ def has_stored_google_tokens() -> bool:
 
 
 def get_google_auth_state(settings: Settings) -> GoogleAuthState:
-    """Return whether Google OAuth is usable and currently connected."""
+    """Return legacy local Google connection state without refreshing tokens."""
     if not settings.google_configured:
         return GoogleAuthState(available=False, connected=False, connect_url=None)
 
-    credentials = create_authorized_credentials(settings)
+    connected = has_stored_google_tokens()
     return GoogleAuthState(
         available=True,
-        connected=credentials is not None,
-        connect_url=None if credentials is not None else f"{settings.backend_origin}/auth/google",
+        connected=connected,
+        connect_url=None if connected else f"{settings.backend_origin}/auth/google",
     )
 
 
@@ -491,15 +599,35 @@ def create_flow(settings: Settings) -> Flow:
     return flow
 
 
-def create_authorized_credentials(settings: Settings) -> Credentials | None:
+def create_authorized_credentials(settings: Settings, *, user_id: str | None = None) -> Credentials | None:
     """Load and refresh stored OAuth credentials when available."""
-    if not TOKEN_FILE_PATH.exists() or not settings.google_configured:
+    if not settings.google_configured:
         return None
 
-    try:
-        tokens = json.loads(TOKEN_FILE_PATH.read_text())
-    except json.JSONDecodeError:
-        clear_google_auth_state()
+    tokens: dict[str, object]
+    if user_id is not None:
+        token_row = get_google_oauth_token(str(settings.database_path), user_id=user_id)
+        if token_row is not None:
+            try:
+                tokens = decrypt_json(settings, token_row.token_json_encrypted)
+            except Exception:
+                return None
+        elif settings.app_env == "local" and user_id == DEV_USER_ID and TOKEN_FILE_PATH.exists():
+            try:
+                tokens = json.loads(TOKEN_FILE_PATH.read_text())
+                user_id = None
+            except json.JSONDecodeError:
+                clear_google_auth_state()
+                return None
+        else:
+            return None
+    elif TOKEN_FILE_PATH.exists():
+        try:
+            tokens = json.loads(TOKEN_FILE_PATH.read_text())
+        except json.JSONDecodeError:
+            clear_google_auth_state()
+            return None
+    else:
         return None
 
     normalized_tokens = {
@@ -510,32 +638,50 @@ def create_authorized_credentials(settings: Settings) -> Credentials | None:
         "scopes": tokens.get("scopes") or GOOGLE_SCOPES,
     }
     if normalized_tokens != tokens:
-        save_tokens(normalized_tokens)
+        persist_token_payload(settings, normalized_tokens, user_id=user_id)
 
     try:
         credentials = Credentials.from_authorized_user_info(normalized_tokens, GOOGLE_SCOPES)
     except Exception:
-        clear_google_auth_state()
+        if user_id is None:
+            clear_google_auth_state()
         return None
 
     if credentials.expired and credentials.refresh_token:
         try:
             credentials.refresh(Request())
         except Exception:
-            clear_google_auth_state()
+            if user_id is None:
+                clear_google_auth_state()
             return None
-        save_tokens(
-            {
-                "token": credentials.token,
-                "refresh_token": credentials.refresh_token,
-                "token_uri": credentials.token_uri,
-                "client_id": credentials.client_id,
-                "client_secret": credentials.client_secret,
-                "scopes": credentials.scopes,
-            }
-        )
+        persist_token_payload(settings, token_payload_from_credentials(credentials), user_id=user_id)
 
     return credentials
+
+
+def token_payload_from_credentials(credentials: Credentials) -> dict[str, object]:
+    """Serialize Google OAuth credentials including expiry for later fast checks."""
+    return {
+        "token": credentials.token,
+        "refresh_token": credentials.refresh_token,
+        "token_uri": credentials.token_uri,
+        "client_id": credentials.client_id,
+        "client_secret": credentials.client_secret,
+        "scopes": credentials.scopes,
+        "expiry": credentials.expiry.isoformat() if credentials.expiry is not None else None,
+    }
+
+
+def persist_token_payload(settings: Settings, tokens: dict[str, object], *, user_id: str | None) -> None:
+    """Persist OAuth tokens either to legacy local file or per-user DB storage."""
+    if user_id is None:
+        save_tokens(tokens)
+        return
+    upsert_google_oauth_token(
+        str(settings.database_path),
+        user_id=user_id,
+        token_json_encrypted=encrypt_json(settings, tokens),
+    )
 
 
 def save_tokens(tokens: dict[str, object]) -> None:
@@ -550,19 +696,20 @@ def clear_google_auth_state() -> None:
             file_path.unlink()
 
 
-def fetch_google_account_profile(settings: Settings) -> DashboardProfile | None:
+def fetch_google_account_profile(settings: Settings, *, user_id: str | None = None) -> DashboardProfile | None:
     """Resolve the connected Google account profile for the dashboard."""
-    credentials = create_authorized_credentials(settings)
+    credentials = create_authorized_credentials(settings, user_id=user_id)
 
     if credentials is None:
-        return load_google_account_profile()
+        return load_google_account_profile() if user_id is None else None
 
     profile = fetch_google_account_profile_from_credentials(credentials)
     if profile is not None:
-        save_google_account_profile(profile)
+        if user_id is None:
+            save_google_account_profile(profile)
         return profile
 
-    return load_google_account_profile()
+    return load_google_account_profile() if user_id is None else None
 
 
 def fetch_google_account_profile_from_credentials(credentials: Credentials) -> DashboardProfile | None:
@@ -682,6 +829,7 @@ def sync_gmail_source_records(
     settings: Settings,
     gmail_service,
     *,
+    user_id: str | None = None,
     progress_callback: GmailSyncProgressCallback | None = None,
     collect_records: bool = True,
     sync_scope: str | None = None,
@@ -689,7 +837,8 @@ def sync_gmail_source_records(
 ) -> list[SourceRecord]:
     """Run resumable Gmail sync with full initial load and history-based incremental updates."""
     database_path = str(settings.database_path)
-    sync_state = get_gmail_sync_state(database_path, DEV_USER_ID)
+    owner_id = user_id or DEV_USER_ID
+    sync_state = get_gmail_sync_state(database_path, owner_id)
     used_full_sync = force_full_sync or sync_state is None or not sync_state.last_history_id
     sync_scope = resolve_gmail_sync_scope(sync_scope or settings.gmail_sync_scope)
     history_events: list[StoredGmailHistoryEvent] = []
@@ -721,6 +870,7 @@ def sync_gmail_source_records(
                 settings,
                 gmail_service,
                 page.message_ids,
+                user_id=owner_id,
                 scope=sync_scope,
                 recent_days=settings.gmail_recent_days,
                 fetched_thread_ids=fetched_thread_ids,
@@ -738,6 +888,7 @@ def sync_gmail_source_records(
         message_ids, mailbox_history_id, needs_full_sync, history_events = fetch_incremental_gmail_changes(
             gmail_service,
             sync_state.last_history_id,
+            user_id=owner_id,
         )
         if history_events:
             upsert_gmail_history_events(database_path, history_events)
@@ -747,7 +898,11 @@ def sync_gmail_source_records(
             if event.event_type == "messagesDeleted"
         }
         if deleted_message_ids:
-            mark_source_records_deleted(database_path, deleted_message_ids)
+            mark_source_records_deleted(
+                database_path,
+                [source_record_id_for_user("gmail", message_id, user_id=owner_id) for message_id in deleted_message_ids],
+                user_id=owner_id,
+            )
         if needs_full_sync:
             used_full_sync = True
             message_ids = []
@@ -764,6 +919,7 @@ def sync_gmail_source_records(
                     settings,
                     gmail_service,
                     page.message_ids,
+                    user_id=owner_id,
                     scope=sync_scope,
                     recent_days=settings.gmail_recent_days,
                     fetched_thread_ids=fetched_thread_ids,
@@ -785,6 +941,7 @@ def sync_gmail_source_records(
                     settings,
                     gmail_service,
                     batch_ids,
+                    user_id=owner_id,
                     scope=sync_scope,
                     recent_days=settings.gmail_recent_days,
                     fetched_thread_ids=fetched_thread_ids,
@@ -813,7 +970,7 @@ def sync_gmail_source_records(
     else:
         upsert_gmail_sync_state(
             database_path,
-            user_id=DEV_USER_ID,
+            user_id=owner_id,
             last_history_id=resolved_history_id,
             last_full_sync_at=(
                 utc_now_iso()
@@ -822,13 +979,13 @@ def sync_gmail_source_records(
             ),
         )
 
-    total_source_records = get_source_record_count(database_path)
+    total_source_records = get_source_record_count(database_path, user_id=owner_id)
     if collect_records:
         records = sorted(records_by_id.values(), key=lambda record: record.received_at, reverse=True)
     else:
         records = [
             source_record_from_stored_source_record(record)
-            for record in list_source_records_by_ids(database_path, changed_record_ids)
+            for record in list_source_records_by_ids(database_path, changed_record_ids, user_id=owner_id)
         ]
     fetched_count = imported_count if not collect_records else len(records_by_id)
     if total_source_records < fetched_count:
@@ -879,15 +1036,23 @@ def iter_gmail_message_id_pages(
     *,
     scope: str,
     recent_days: int,
+    query: str | None = None,
+    page_size: int = GMAIL_PAGE_SIZE,
+    max_messages: int | None = None,
 ) -> Iterable[GmailMessageIdPage]:
     """Yield Gmail message ids one API page at a time."""
     page_token: str | None = None
-    query = None if scope == "full" else f"newer_than:{recent_days}d"
+    query = query if query is not None else (None if scope == "full" else f"newer_than:{recent_days}d")
+    bounded_page_size = max(1, min(page_size, GMAIL_PAGE_SIZE))
+    remaining = max_messages
 
     while True:
+        current_page_size = bounded_page_size if remaining is None else min(bounded_page_size, remaining)
+        if current_page_size <= 0:
+            break
         request_payload = {
             "userId": "me",
-            "maxResults": GMAIL_PAGE_SIZE,
+            "maxResults": current_page_size,
             "labelIds": None,
             "q": query,
             "pageToken": page_token,
@@ -897,7 +1062,7 @@ def iter_gmail_message_id_pages(
             .messages()
             .list(
                 userId="me",
-                maxResults=GMAIL_PAGE_SIZE,
+                maxResults=current_page_size,
                 q=query,
                 pageToken=page_token,
             )
@@ -914,9 +1079,11 @@ def iter_gmail_message_id_pages(
         estimate = listed.get("resultSizeEstimate")
         total_count = int(estimate) if isinstance(estimate, int) else None
         yield GmailMessageIdPage(message_ids=page_ids, total_count=total_count)
+        if remaining is not None:
+            remaining -= len(page_ids)
 
         page_token = listed.get("nextPageToken")
-        if not page_token:
+        if not page_token or (remaining is not None and remaining <= 0):
             break
 
 
@@ -925,6 +1092,7 @@ def persist_gmail_message_id_batch(
     gmail_service,
     message_ids: list[str],
     *,
+    user_id: str | None = None,
     scope: str,
     recent_days: int,
     fetched_thread_ids: set[str] | None = None,
@@ -935,6 +1103,7 @@ def persist_gmail_message_id_batch(
         return GmailBatchResult(records=[], threads_fetched=0, latest_history_id=None, new_count=0, failed_message_ids=[])
 
     database_path = str(settings.database_path)
+    owner_id = user_id or DEV_USER_ID
     messages, threads_fetched, latest_history_id, failed_message_ids = fetch_thread_messages_for_message_ids(
         gmail_service,
         message_ids,
@@ -944,10 +1113,10 @@ def persist_gmail_message_id_batch(
     if messages:
         upsert_gmail_message_snapshots(
             database_path,
-            [gmail_message_snapshot_from_payload(message) for message in messages],
+            [gmail_message_snapshot_from_payload(message, user_id=owner_id) for message in messages],
         )
-    records = normalize_gmail_messages(messages, scope=scope, recent_days=recent_days)
-    existing_ids = list_existing_source_record_ids(database_path, (record.id for record in records))
+    records = normalize_gmail_messages(messages, scope=scope, recent_days=recent_days, user_id=owner_id)
+    existing_ids = list_existing_source_record_ids(database_path, (record.id for record in records), user_id=owner_id)
     new_count = len([record for record in records if record.id not in existing_ids])
 
     if records:
@@ -983,6 +1152,8 @@ def fetch_incremental_gmail_message_ids(
 def fetch_incremental_gmail_changes(
     gmail_service,
     start_history_id: str,
+    *,
+    user_id: str = DEV_USER_ID,
 ) -> tuple[list[str], str | None, bool, list[StoredGmailHistoryEvent]]:
     """List changed Gmail ids and preserve History API events before hydration."""
     ids: set[str] = set()
@@ -1021,7 +1192,7 @@ def fetch_incremental_gmail_changes(
                     str(history_entry.get("id")) if history_entry.get("id") is not None else None,
                 )
                 ids.update(extract_history_message_ids(history_entry))
-                for event in extract_gmail_history_events(history_entry):
+                for event in extract_gmail_history_events(history_entry, user_id=user_id):
                     events_by_id[event.id] = event
 
             page_token = listed.get("nextPageToken")
@@ -1065,7 +1236,7 @@ def extract_history_message_ids(history_entry: dict[str, object]) -> set[str]:
     return ids
 
 
-def extract_gmail_history_events(history_entry: dict[str, object]) -> list[StoredGmailHistoryEvent]:
+def extract_gmail_history_events(history_entry: dict[str, object], *, user_id: str = DEV_USER_ID) -> list[StoredGmailHistoryEvent]:
     """Project Gmail History API records into durable local ledger events."""
     events: list[StoredGmailHistoryEvent] = []
     history_id = str(history_entry.get("id") or "")
@@ -1098,7 +1269,7 @@ def extract_gmail_history_events(history_entry: dict[str, object]) -> list[Store
                     label_ids=normalized_label_ids,
                     index=index,
                 ),
-                user_id=DEV_USER_ID,
+                user_id=user_id,
                 history_id=history_id,
                 event_type=event_type,
                 message_id=str(message_id),
@@ -1232,13 +1403,14 @@ def normalize_gmail_messages(
     *,
     scope: str = "full",
     recent_days: int = GMAIL_LOOKBACK_DAYS,
+    user_id: str | None = None,
 ) -> list[SourceRecord]:
     """Normalize Gmail API payloads into source records for the configured sync scope."""
     records_by_id: dict[str, SourceRecord] = {}
     cutoff_iso = get_gmail_cutoff_iso(recent_days) if scope == "recent" else None
 
     for message in messages:
-        record = to_gmail_source_record(message)
+        record = to_gmail_source_record(message, user_id=user_id or DEV_USER_ID)
         if record is None:
             continue
         if cutoff_iso is not None and record.received_at < cutoff_iso:
@@ -1298,12 +1470,12 @@ def compact_gmail_message_payload(message: dict[str, object]) -> dict[str, objec
     }
 
 
-def gmail_message_snapshot_from_payload(message: dict[str, object]) -> StoredGmailMessageSnapshot:
+def gmail_message_snapshot_from_payload(message: dict[str, object], *, user_id: str = DEV_USER_ID) -> StoredGmailMessageSnapshot:
     """Build a local Gmail ledger snapshot from a full Gmail API message payload."""
     now = utc_now_iso()
     label_ids = message.get("labelIds") if isinstance(message.get("labelIds"), list) else []
     return StoredGmailMessageSnapshot(
-        user_id=DEV_USER_ID,
+        user_id=user_id,
         message_id=str(message.get("id") or ""),
         thread_id=str(message.get("threadId")) if message.get("threadId") is not None else None,
         history_id=str(message.get("historyId")) if message.get("historyId") is not None else None,
@@ -1319,7 +1491,7 @@ def gmail_message_snapshot_from_payload(message: dict[str, object]) -> StoredGma
     )
 
 
-def fetch_upcoming_calendar_records(calendar_service) -> list[SourceRecord]:
+def fetch_upcoming_calendar_records(calendar_service, *, user_id: str = DEV_USER_ID) -> list[SourceRecord]:
     """Fetch near-term primary-calendar events within the configured window."""
     from datetime import datetime, timedelta, timezone
 
@@ -1341,7 +1513,7 @@ def fetch_upcoming_calendar_records(calendar_service) -> list[SourceRecord]:
     records = []
 
     for event in listed.get("items", []):
-        record = to_calendar_source_record(event)
+        record = to_calendar_source_record(event, user_id=user_id)
 
         if record is not None:
             records.append(record)
@@ -1349,7 +1521,7 @@ def fetch_upcoming_calendar_records(calendar_service) -> list[SourceRecord]:
     return records
 
 
-def to_gmail_source_record(message: dict[str, object]) -> SourceRecord | None:
+def to_gmail_source_record(message: dict[str, object], *, user_id: str = DEV_USER_ID) -> SourceRecord | None:
     """Normalize a Gmail API message payload into a SourceRecord."""
     payload = message.get("payload") or {}
     headers = payload.get("headers") or []
@@ -1388,8 +1560,8 @@ def to_gmail_source_record(message: dict[str, object]) -> SourceRecord | None:
         return None
 
     record = SourceRecord(
-        id=str(message_id),
-        user_id=DEV_USER_ID,
+        id=source_record_id_for_user("gmail", message_id, user_id=user_id),
+        user_id=user_id,
         source="gmail",
         thread_id=str(thread_id),
         raw_payload={
@@ -1422,7 +1594,7 @@ def to_gmail_source_record(message: dict[str, object]) -> SourceRecord | None:
     return record
 
 
-def to_calendar_source_record(event: dict[str, object]) -> SourceRecord | None:
+def to_calendar_source_record(event: dict[str, object], *, user_id: str = DEV_USER_ID) -> SourceRecord | None:
     """Normalize a Calendar API event payload into a SourceRecord."""
     subject = str(event.get("summary") or "").strip()
     body = str(event.get("description") or "").strip()
@@ -1450,11 +1622,12 @@ def to_calendar_source_record(event: dict[str, object]) -> SourceRecord | None:
     ]
 
     return SourceRecord(
-        id=str(event_id),
-        user_id=DEV_USER_ID,
+        id=source_record_id_for_user("calendar", event_id, user_id=user_id),
+        user_id=user_id,
         source="calendar",
         thread_id=str(event_id),
         raw_payload={
+            "event_id": str(event_id),
             "subject": subject,
             "body": body,
             "from": organizer,
@@ -1480,6 +1653,7 @@ def modify_gmail_thread_labels(
     settings: Settings,
     thread_id: str,
     *,
+    user_id: str | None = None,
     add_label_ids: list[str] | None = None,
     remove_label_ids: list[str] | None = None,
 ) -> dict[str, object]:
@@ -1487,7 +1661,7 @@ def modify_gmail_thread_labels(
     if not thread_id.strip():
         raise RuntimeError("Missing Gmail thread id")
 
-    credentials = create_authorized_credentials(settings)
+    credentials = create_authorized_credentials(settings, user_id=user_id)
     if credentials is None:
         raise RuntimeError("Google account is not connected")
 
@@ -1536,9 +1710,9 @@ def modify_gmail_thread_labels(
     return response
 
 
-def create_gmail_service(settings: Settings):
+def create_gmail_service(settings: Settings, *, user_id: str | None = None):
     """Build an authorized Gmail service or fail with a user-facing runtime error."""
-    credentials = create_authorized_credentials(settings)
+    credentials = create_authorized_credentials(settings, user_id=user_id)
     if credentials is None:
         raise RuntimeError("Google account is not connected")
     return build_google_service("gmail", "v1", credentials)
