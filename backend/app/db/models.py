@@ -14,7 +14,7 @@ class StoredUser:
     email: str
     display_name: str | None
     google_sub: str
-    beta_enabled: bool
+    access_enabled: bool
     created_at: str
     updated_at: str
 

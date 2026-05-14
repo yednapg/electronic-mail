@@ -7,9 +7,9 @@ import { SignedInAppChrome } from '../../components/app/AppChrome';
 import type { AuthMeResponse, GmailThreadRow, GoogleAuthState, MailboxResponse, ThreadMessage, ThreadReaderResponse } from '../../lib/types';
 import { GmailList, formatGmailSender } from './GmailView';
 
-const MAILBOX_STORAGE_PREFIX = 'electronic-mail-mailbox:inbox:v2:';
+const MAILBOX_STORAGE_PREFIX = 'electronic-mail-mailbox:inbox:v3:';
 const MAILBOX_SYNC_STORAGE_PREFIX = 'electronic-mail-mailbox-sync:v2:';
-const THREAD_STORAGE_PREFIX = 'electronic-mail-mailbox-thread:v2:';
+const THREAD_STORAGE_PREFIX = 'electronic-mail-mailbox-thread:v3:';
 const DEFAULT_BROWSER_BACKEND_URL = 'http://localhost:3001';
 const MAILBOX_FETCH_LIMIT = 150;
 const THREAD_FETCH_LIMIT = 50;
@@ -394,6 +394,7 @@ function GmailThreadPanel({
 function GmailThreadMessageCard({ message }: { message: ThreadMessage }) {
   const subject = message.subject?.trim() || 'Untitled message';
   const body = message.body.trim();
+  const htmlBody = message.html_body?.trim();
 
   return (
     <li className="thread-message">
@@ -429,7 +430,16 @@ function GmailThreadMessageCard({ message }: { message: ThreadMessage }) {
           ) : null}
         </dl>
         {message.snippet ? <p className="thread-message-snippet">{message.snippet}</p> : null}
-        <p className="thread-message-body">{body.length > 0 ? body : 'No persisted body text.'}</p>
+        {htmlBody ? (
+          <iframe
+            className="thread-message-html-frame"
+            title={subject}
+            sandbox=""
+            srcDoc={htmlBody}
+          />
+        ) : (
+          <p className="thread-message-body">{body.length > 0 ? body : 'No persisted body text.'}</p>
+        )}
       </article>
     </li>
   );

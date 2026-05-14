@@ -73,7 +73,7 @@ export function toSectionItem(item: FeedItem): DashboardSectionItem {
   return {
     id: item.id,
     entityId: item.entity_id,
-    title: toActionSentence(item),
+    title: item.source === 'gmail' ? item.title : toActionSentence(item),
     detail: toSectionDetail(item),
     cta: toSectionCta(item),
   };
@@ -290,7 +290,7 @@ function withDetailLinks(
   return {
     ...detail,
     links: {
-      threadHref: `/entities/${entityId}/thread`,
+      threadHref: `/gmail/threads/${entityId}`,
     },
   };
 }

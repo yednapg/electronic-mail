@@ -9,11 +9,13 @@ import {
 import { waitForFirstRunImportReady } from '../../lib/first-run-import';
 
 const STATUS_VISIBLE_MS = 6000;
+const LONG_WAIT_MS = 90000;
 
 const statusMessages = [
   'Importing emails ...',
-  'Grouping related emails ...',
-  'Finding to-do items ...',
+  'Understanding threads ...',
+  'Writing titles and summaries ...',
+  'Finding what needs action ...',
   'Building dashboard ...',
   'Almost ready!',
 ];
@@ -27,8 +29,9 @@ function wait(ms: number): Promise<void> {
 export function RotatingStatus() {
   const [activeIndex, setActiveIndex] = useState(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isLongWait, setIsLongWait] = useState(false);
   const intervalRef = useRef<number | null>(null);
-  const activeMessage = errorMessage ?? statusMessages[activeIndex];
+  const activeMessage = errorMessage ?? (isLongWait ? 'Still working, keep this open ...' : statusMessages[activeIndex]);
 
   useEffect(() => {
     intervalRef.current = window.setInterval(() => {
@@ -77,8 +80,15 @@ export function RotatingStatus() {
       }
     });
 
+    const longWaitTimeout = window.setTimeout(() => {
+      if (!cancelled) {
+        setIsLongWait(true);
+      }
+    }, LONG_WAIT_MS);
+
     return () => {
       cancelled = true;
+      window.clearTimeout(longWaitTimeout);
       controller.abort();
     };
   }, []);

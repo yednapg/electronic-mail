@@ -1,48 +1,80 @@
 from __future__ import annotations
 
-"""First-login setup endpoints."""
+"""First-login setup endpoints backed by durable Gmail import jobs."""
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from app.core.config import load_settings
+from app.db.jobs import get_job
+from app.db.mail_groups import get_import_state
 from app.schemas.domain import FirstRunImportJobResponse
 from app.services.auth import require_current_user
-from app.services.first_run import (
-    create_or_reuse_first_run_import_job,
-    get_first_run_import_job_status,
-    get_latest_first_run_import_job_status,
-    run_first_run_import_job,
-)
+from app.services.mail_groups import enqueue_first_run
 
 router = APIRouter()
 settings = load_settings()
 
 
 @router.post("/v1/first-run/import-jobs", response_model=FirstRunImportJobResponse, status_code=202)
-def create_first_run_import_job(request: Request, background_tasks: BackgroundTasks) -> FirstRunImportJobResponse:
-    """Start the first-run setup job that gates initial Dashboard/Inbox entry."""
+def create_first_run_import_job(request: Request) -> FirstRunImportJobResponse:
     user = require_current_user(settings, request)
-    job, should_start = create_or_reuse_first_run_import_job(settings, user_id=user.id)
-    if should_start:
-        background_tasks.add_task(run_first_run_import_job, settings, job.id, user_id=user.id)
-    return job
+    job_id = enqueue_first_run(settings, user_id=user.id)
+    return _first_run_response(user.id, job_id=job_id)
 
 
 @router.get("/v1/first-run/import-jobs/latest", response_model=FirstRunImportJobResponse)
 def latest_first_run_import_job(request: Request) -> FirstRunImportJobResponse:
-    """Return the newest first-run setup job for the current user."""
     user = require_current_user(settings, request)
-    job = get_latest_first_run_import_job_status(settings, user_id=user.id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="No first-run import job found")
-    return job
+    return _first_run_response(user.id, job_id=f"first-run:{user.id}")
 
 
 @router.get("/v1/first-run/import-jobs/{job_id}", response_model=FirstRunImportJobResponse)
 def first_run_import_job(request: Request, job_id: str) -> FirstRunImportJobResponse:
-    """Return one first-run setup job for the current user."""
     user = require_current_user(settings, request)
-    job = get_first_run_import_job_status(settings, job_id, user_id=user.id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="First-run import job not found")
-    return job
+    return _first_run_response(user.id, job_id=job_id)
+
+
+def _first_run_response(user_id: str, *, job_id: str) -> FirstRunImportJobResponse:
+    state = get_import_state(str(settings.database_path), user_id=user_id)
+    job = get_job(str(settings.database_path), job_id)
+    ready = bool(state and state.first_batch_imported_at and state.first_groups_ready_at and state.first_dashboard_ready_at)
+    job_is_active = bool(job and job.status in {"queued", "running"})
+    error_message = None if job_is_active else (state.last_sync_error if state else None) or (job.last_error if job else None)
+    status = "succeeded" if ready else "failed" if error_message and not ready else (job.status if job else "queued")
+    if status in {"dead", "cancelled"}:
+        status = "failed"
+    if status not in {"queued", "running", "succeeded", "failed"}:
+        status = "queued"
+    if ready:
+        stage = "ready"
+    elif not state or not state.first_batch_imported_at:
+        stage = "importing_gmail"
+    elif not state.first_groups_ready_at:
+        stage = "ai_grouping"
+    elif not state.first_dashboard_ready_at:
+        stage = "dashboard_filtering"
+    else:
+        stage = "queued"
+    quality_status = "ready" if ready else "failed" if error_message else "pending"
+    return FirstRunImportJobResponse(
+        id=job.id if job else job_id,
+        user_id=user_id,
+        status=status,  # type: ignore[arg-type]
+        stage=stage,
+        fetched_count=0,
+        total_count=None,
+        thread_count=0,
+        dashboard_item_count=0,
+        inbox_ready_at=state.first_batch_imported_at if state else None,
+        first_groups_ready_at=state.first_groups_ready_at if state else None,
+        dashboard_ready_at=state.first_dashboard_ready_at if state else None,
+        fast_dashboard_ready_at=state.first_dashboard_ready_at if state else None,
+        canonical_dashboard_ready_at=state.first_dashboard_ready_at if state else None,
+        quality_status=quality_status,  # type: ignore[arg-type]
+        quality_error=error_message,
+        error_message=error_message,
+        created_at=job.created_at if job else (state.updated_at if state else ""),
+        started_at=job.started_at if job else (state.last_import_started_at if state else None),
+        completed_at=job.completed_at if job else (state.last_import_completed_at if state else None),
+        updated_at=job.updated_at if job else (state.updated_at if state else ""),
+    )

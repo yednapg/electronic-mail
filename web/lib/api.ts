@@ -9,22 +9,13 @@ import type {
   MailboxSyncTriggerResponse,
   ThreadReaderResponse,
 } from './types';
-import type {
-  EntityOutcomeResponse,
-  DashboardImportJobResponse,
-  FirstRunImportJobResponse,
-  GmailDraftRequest,
-  GmailDraftResponse,
-  TaskCreateRequest,
-  TaskResponse,
-} from '@electronic-mail/types';
+import type { FirstRunImportJobResponse } from '@electronic-mail/types';
 
 const DEFAULT_BACKEND_URL = 'http://localhost:3001';
 
-export type EntityThreadOptions = {
+export type MailGroupDetailOptions = {
   limit?: number;
   offset?: number;
-  threadId?: string;
 };
 
 export type BackendRequestOptions = {
@@ -51,20 +42,6 @@ export async function getGoogleAuthState(options: BackendRequestOptions = {}): P
     headers: backendHeaders(options),
   });
   if (!res.ok) throw new Error('Failed to fetch Google auth state');
-  return res.json();
-}
-
-export async function getLatestDashboardImportJob(
-  options: BackendRequestOptions = {},
-): Promise<DashboardImportJobResponse | null> {
-  const res = await fetch(`${getBackendURL()}/v1/dashboard/import-jobs/latest`, {
-    cache: 'no-store',
-    headers: backendHeaders(options),
-  });
-  if (res.status === 404) {
-    return null;
-  }
-  if (!res.ok) throw new Error('Failed to fetch latest dashboard import job');
   return res.json();
 }
 
@@ -118,7 +95,7 @@ options: BackendRequestOptions = {}): Promise<MailboxResponse> {
 
 export async function getMailboxThread(
   threadId: string,
-  { limit, offset }: Omit<EntityThreadOptions, 'threadId'> = {},
+  { limit, offset }: MailGroupDetailOptions = {},
   options: BackendRequestOptions = {},
 ): Promise<ThreadReaderResponse> {
   const params = new URLSearchParams();
@@ -150,62 +127,6 @@ export async function triggerMailboxSync(options: BackendRequestOptions = {}): P
   return postJSON('/v1/mailbox/sync', {}, options);
 }
 
-export async function getEntityThread(
-  entityId: string,
-  { limit, offset, threadId }: EntityThreadOptions = {},
-  options: BackendRequestOptions = {},
-): Promise<ThreadReaderResponse> {
-  const params = new URLSearchParams();
-  if (limit !== undefined) {
-    params.set('limit', String(limit));
-  }
-  if (offset !== undefined) {
-    params.set('offset', String(offset));
-  }
-  if (threadId !== undefined && threadId.length > 0) {
-    params.set('threadId', threadId);
-  }
-  const query = params.toString();
-  const url = `${getBackendURL()}/v1/entities/${encodeURIComponent(entityId)}/thread${query ? `?${query}` : ''}`;
-
-  const res = await fetch(url, {
-    cache: 'no-store',
-    headers: backendHeaders(options),
-  });
-  if (!res.ok) throw new Error('Failed to fetch entity thread');
-  return res.json();
-}
-
-export async function createTask(request: TaskCreateRequest, options: BackendRequestOptions = {}): Promise<TaskResponse> {
-  return postJSON('/v1/tasks', request, options);
-}
-
-export async function createGmailDraft(
-  request: GmailDraftRequest,
-  options: BackendRequestOptions = {},
-): Promise<GmailDraftResponse> {
-  return postJSON('/v1/gmail/drafts', request, options);
-}
-
-export async function completeEntity(
-  entityId: string,
-  options: BackendRequestOptions = {},
-): Promise<EntityOutcomeResponse> {
-  return postJSON(`/v1/entities/${encodeURIComponent(entityId)}/complete`, {}, options);
-}
-
-export async function snoozeEntity(
-  entityId: string,
-  snoozeUntil: string,
-  options: BackendRequestOptions = {},
-): Promise<EntityOutcomeResponse> {
-  return postJSON(`/v1/entities/${encodeURIComponent(entityId)}/snooze`, { snooze_until: snoozeUntil }, options);
-}
-
-export async function dismissEntity(entityId: string, options: BackendRequestOptions = {}): Promise<EntityOutcomeResponse> {
-  return postJSON(`/v1/entities/${encodeURIComponent(entityId)}/dismiss`, {}, options);
-}
-
 async function postJSON<Response>(
   path: string,
   body: unknown,
@@ -217,8 +138,8 @@ async function postJSON<Response>(
       ...options,
       headers: {
         ...headersToObject(options.headers),
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
       },
     }),
     body: JSON.stringify(body),

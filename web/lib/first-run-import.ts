@@ -3,15 +3,18 @@ import type { FirstRunImportJobResponse } from './types';
 const FIRST_RUN_POLL_MS = 1200;
 
 export function isFirstRunImportReady(job: FirstRunImportJobResponse): boolean {
-  return Boolean(job.inbox_ready_at && job.dashboard_ready_at);
+  return Boolean(job.inbox_ready_at && job.first_groups_ready_at && job.dashboard_ready_at);
 }
 
 export function formatFirstRunImportStatus(job: FirstRunImportJobResponse): string {
-  if (job.dashboard_ready_at) {
+  if (isFirstRunImportReady(job)) {
     return 'Dashboard is ready. Opening the app...';
   }
+  if (job.first_groups_ready_at) {
+    return 'Finding what needs action...';
+  }
   if (job.inbox_ready_at) {
-    return 'Inbox is ready. Building your dashboard...';
+    return 'Writing titles and summaries...';
   }
 
   switch (job.stage) {
@@ -19,15 +22,22 @@ export function formatFirstRunImportStatus(job: FirstRunImportJobResponse): stri
       return 'Starting MailPause setup...';
     case 'gmail_recent_sync':
     case 'gmail_listing':
-      return 'Finding recent Gmail threads...';
+      return 'Finding recent emails...';
+    case 'importing_gmail':
     case 'gmail_fetching':
-      return `Importing Gmail threads${job.total_count ? ` (${job.fetched_count}/${job.total_count})` : '...'}`;
+      return `Importing emails${job.total_count ? ` (${job.fetched_count}/${job.total_count})` : '...'}`;
     case 'gmail_persisted':
-      return `Saving Gmail threads${job.fetched_count ? ` (${job.fetched_count})` : '...'}`;
+      return `Saving emails${job.fetched_count ? ` (${job.fetched_count})` : '...'}`;
     case 'inbox_projection':
       return 'Preparing your 90-day Inbox...';
     case 'dashboard_fast_feed':
       return 'Building your 7-day work dashboard...';
+    case 'mail_group_enrich':
+    case 'ai_grouping':
+    case 'ai_summarizing':
+      return 'Grouping Gmail into real-life work...';
+    case 'dashboard_filtering':
+      return 'Building your dashboard...';
     case 'ready':
       return 'Dashboard and Inbox are ready...';
     default:

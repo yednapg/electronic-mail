@@ -38,7 +38,7 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [refreshState, setRefreshState] = useState<RefreshState>('idle');
-  const [runningCommandId, setRunningCommandId] = useState<string | null>(null);
+  const [runningCommandId] = useState<string | null>(null);
   const normalizedQuery = useMemo(() => normalizeSearchText(query), [query]);
   const commands = useMemo(
     () =>
@@ -170,43 +170,11 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
       return;
     }
 
-    if (command.action?.kind === 'complete-entity') {
-      setRunningCommandId(command.id);
-      try {
-        const response = await fetch(`/api/entities/${encodeURIComponent(command.action.entityId)}/complete`, {
-          method: 'POST',
-          cache: 'no-store',
-          headers: {
-            Accept: 'application/json',
-          },
-        });
-
-        if (!response.ok) {
-          throw new Error('Complete command failed');
-        }
-
-        removeEntityCommands(command.action.entityId);
-        router.refresh();
-        closePalette();
-      } finally {
-        setRunningCommandId(null);
-      }
-      return;
-    }
-
     if (command.href) {
       closePalette();
       router.prefetch(command.href);
       router.push(command.href);
     }
-  }
-
-  function removeEntityCommands(entityId: string) {
-    setDynamicCommands((currentCommands) => {
-      const nextCommands = currentCommands.filter((command) => command.entityId !== entityId);
-      writeCachedIndex({ generatedAt: new Date().toISOString(), commands: nextCommands });
-      return nextCommands;
-    });
   }
 
   function closePalette() {

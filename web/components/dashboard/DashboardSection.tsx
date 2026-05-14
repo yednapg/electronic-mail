@@ -1,21 +1,9 @@
 'use client';
 
-/** Render one checklist-style dashboard section and manage local checked state. */
-import React, { useState, type CSSProperties, type FormEvent } from 'react';
+/** Render one mail-group-backed dashboard section and manage local dismissal state. */
+import React, { useState, type CSSProperties } from 'react';
 
-import { completeEntity, createGmailDraft, createTask } from '../../lib/api';
 import type { DashboardSectionItem } from './types';
-
-type ComposeMode = 'todo' | 'email';
-
-type EmailDraftState = {
-  to: string;
-  cc: string;
-  bcc: string;
-  subject: string;
-  body: string;
-  hasAttachment: boolean;
-};
 
 type DashboardSectionProps = {
   sectionId: 'now' | 'today' | 'worth-knowing';
@@ -25,262 +13,25 @@ type DashboardSectionProps = {
   collapsedByDefault?: boolean;
 };
 
-const emptyEmailDraft: EmailDraftState = {
-  to: '',
-  cc: '',
-  bcc: '',
-  subject: '',
-  body: '',
-  hasAttachment: false,
-};
-
 export function DashboardSection({
-  sectionId,
   title,
   items,
   maxVisible,
   collapsedByDefault = true,
 }: DashboardSectionProps) {
-  const [localItems, setLocalItems] = useState<DashboardSectionItem[]>([]);
-  const [composeOpen, setComposeOpen] = useState(false);
-  const [composeMode, setComposeMode] = useState<ComposeMode>('todo');
-  const [todoTitle, setTodoTitle] = useState('');
-  const [todoNotes, setTodoNotes] = useState('');
-  const [emailDraft, setEmailDraft] = useState<EmailDraftState>(emptyEmailDraft);
-  const [showCc, setShowCc] = useState(false);
-  const [showBcc, setShowBcc] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [composeError, setComposeError] = useState<string | null>(null);
   const [hiddenItemIds, setHiddenItemIds] = useState<Set<string>>(new Set());
-  const sectionItems = [...localItems, ...items].filter((item) => !hiddenItemIds.has(item.id));
+  const sectionItems = items.filter((item) => !hiddenItemIds.has(item.id));
   const hasOverflow = maxVisible !== undefined && sectionItems.length > maxVisible;
   const [expanded, setExpanded] = useState(!hasOverflow || !collapsedByDefault);
   const visibleItems = hasOverflow && !expanded ? sectionItems.slice(0, maxVisible) : sectionItems;
   const overflowCount = hasOverflow ? sectionItems.length - (maxVisible ?? sectionItems.length) : 0;
-  const canSubmit =
-    composeMode === 'email'
-      ? emailDraft.to.trim().length > 0 && formatEmailDraftTitle(emailDraft).length > 0
-      : todoTitle.trim().length > 0;
-
-  function updateEmailDraft(key: keyof EmailDraftState, value: string | boolean) {
-    setEmailDraft((draft) => ({ ...draft, [key]: value }));
-  }
-
-  async function submitInlineComposer(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-
-    const titleText =
-      composeMode === 'email'
-        ? formatEmailDraftTitle(emailDraft)
-        : todoTitle.trim();
-    if (titleText.length === 0) {
-      return;
-    }
-
-    if (isSubmitting) {
-      return;
-    }
-
-    setIsSubmitting(true);
-    setComposeError(null);
-
-    try {
-      if (composeMode === 'email') {
-        const draft = await createGmailDraft({
-          to: emailDraft.to.trim(),
-          cc: emailDraft.cc.trim() || null,
-          bcc: emailDraft.bcc.trim() || null,
-          subject: emailDraft.subject.trim(),
-          body: emailDraft.body.trim(),
-        });
-        setLocalItems((currentItems) => [
-          {
-            id: draft.id,
-            entityId: draft.entity_id ?? undefined,
-            title: titleText,
-          },
-          ...currentItems,
-        ]);
-      } else {
-        const task = await createTask({
-          title: todoTitle.trim(),
-          notes: todoNotes.trim() || null,
-          section: sectionId === 'worth-knowing' ? 'later' : sectionId,
-        });
-        setLocalItems((currentItems) => [
-          {
-            id: task.id,
-            entityId: task.entity_id,
-            title: task.title,
-          },
-          ...currentItems,
-        ]);
-      }
-
-      setTodoTitle('');
-      setTodoNotes('');
-      setEmailDraft(emptyEmailDraft);
-      setShowCc(false);
-      setShowBcc(false);
-      setComposeMode('todo');
-      setComposeOpen(false);
-      setExpanded(true);
-    } catch (_error) {
-      setComposeError(composeMode === 'email' ? 'Could not save this draft.' : 'Could not add this item.');
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
 
   return (
     <section className="digest-section" aria-label={title}>
       <div className="digest-section-header">
         <h2 className="digest-section-title">{title}</h2>
         <span className="digest-section-rule" aria-hidden="true" />
-        <button
-          type="button"
-          className="digest-section-add"
-          aria-label={`Add item to ${title}`}
-          aria-expanded={composeOpen}
-          onClick={() => setComposeOpen((isOpen) => !isOpen)}
-        >
-          {composeOpen ? '−' : '+'}
-        </button>
       </div>
-
-      {composeOpen ? (
-        <form className={`inline-compose inline-compose-${composeMode}`} onSubmit={submitInlineComposer}>
-          <div className="inline-compose-toolbar">
-            <div className="inline-compose-mode" role="group" aria-label="New item type">
-              <button
-                type="button"
-                className={`inline-compose-mode-button ${composeMode === 'todo' ? 'is-selected' : ''}`}
-                onClick={() => {
-                  setComposeMode('todo');
-                  setComposeError(null);
-                }}
-                aria-pressed={composeMode === 'todo'}
-                disabled={isSubmitting}
-              >
-                To-do
-              </button>
-              <button
-                type="button"
-                className={`inline-compose-mode-button ${composeMode === 'email' ? 'is-selected' : ''}`}
-                onClick={() => {
-                  setComposeMode('email');
-                  setComposeError(null);
-                }}
-                aria-pressed={composeMode === 'email'}
-                disabled={isSubmitting}
-              >
-                Email
-              </button>
-            </div>
-            <button type="submit" className="inline-compose-submit" disabled={!canSubmit || isSubmitting}>
-              {isSubmitting ? 'Saving...' : composeMode === 'email' ? 'Draft' : 'Add'}
-            </button>
-          </div>
-
-          {composeError ? (
-            <p className="inline-compose-error" role="alert">
-              {composeError}
-            </p>
-          ) : null}
-
-          {composeMode === 'todo' ? (
-            <div className="inline-compose-todo">
-              <div className="inline-compose-line">
-                <span className="inline-compose-checkbox" aria-hidden="true" />
-                <input
-                  className="inline-compose-input"
-                  value={todoTitle}
-                  onChange={(event) => setTodoTitle(event.target.value)}
-                  placeholder="New to-do"
-                  autoFocus
-                />
-              </div>
-              <input
-                className="inline-compose-notes"
-                value={todoNotes}
-                onChange={(event) => setTodoNotes(event.target.value)}
-                placeholder="Notes"
-              />
-            </div>
-          ) : (
-            <div className="inline-compose-email">
-              <div className="inline-compose-recipient-row">
-                <label className="inline-compose-field inline-compose-field-to">
-                  <span>To</span>
-                  <input
-                    value={emailDraft.to}
-                    onChange={(event) => updateEmailDraft('to', event.target.value)}
-                    placeholder="name@email.com"
-                    autoFocus
-                  />
-                </label>
-                <div className="inline-compose-recipient-actions" aria-label="Optional recipients">
-                  {showCc ? null : (
-                    <button type="button" className="inline-compose-recipient-toggle" onClick={() => setShowCc(true)}>
-                      Cc
-                    </button>
-                  )}
-                  {showBcc ? null : (
-                    <button type="button" className="inline-compose-recipient-toggle" onClick={() => setShowBcc(true)}>
-                      Bcc
-                    </button>
-                  )}
-                </div>
-              </div>
-              {showCc || showBcc ? (
-                <div className="inline-compose-optional-recipients">
-                  {showCc ? (
-                    <label className="inline-compose-field">
-                      <span>Cc</span>
-                      <input value={emailDraft.cc} onChange={(event) => updateEmailDraft('cc', event.target.value)} />
-                    </label>
-                  ) : null}
-                  {showBcc ? (
-                    <label className="inline-compose-field">
-                      <span>Bcc</span>
-                      <input value={emailDraft.bcc} onChange={(event) => updateEmailDraft('bcc', event.target.value)} />
-                    </label>
-                  ) : null}
-                </div>
-              ) : null}
-              <input
-                className="inline-compose-subject"
-                value={emailDraft.subject}
-                onChange={(event) => updateEmailDraft('subject', event.target.value)}
-                placeholder="Subject"
-                aria-label="Subject"
-              />
-              <textarea
-                className="inline-compose-body"
-                value={emailDraft.body}
-                onChange={(event) => updateEmailDraft('body', event.target.value)}
-                placeholder="Write a note..."
-                aria-label="Email body"
-                rows={2}
-              />
-              <div className="inline-compose-email-tools">
-                <button
-                  type="button"
-                  className={`inline-compose-tool ${emailDraft.hasAttachment ? 'is-selected' : ''}`}
-                  aria-pressed={emailDraft.hasAttachment}
-                  onClick={() => updateEmailDraft('hasAttachment', !emailDraft.hasAttachment)}
-                  disabled={isSubmitting}
-                >
-                  <svg viewBox="0 0 24 24" className="inline-compose-tool-icon" aria-hidden="true">
-                    <path d="M8 12.7 15.5 5.2a3.3 3.3 0 0 1 4.7 4.7l-9.4 9.4a5 5 0 0 1-7.1-7.1L13 2.9" />
-                  </svg>
-                  Attach
-                </button>
-              </div>
-            </div>
-          )}
-        </form>
-      ) : null}
 
       {visibleItems.length > 0 ? (
         <ul className="attention-list">
@@ -309,27 +60,6 @@ export function DashboardSection({
       ) : null}
     </section>
   );
-}
-
-function formatEmailDraftTitle(draft: EmailDraftState) {
-  const subject = draft.subject.trim();
-  const to = draft.to.trim();
-  const body = draft.body.trim();
-  const fallback = subject.length > 0 ? subject : body;
-
-  if (fallback.length === 0 && to.length === 0) {
-    return '';
-  }
-
-  if (to.length === 0) {
-    return `Draft email: ${fallback}`;
-  }
-
-  if (fallback.length === 0) {
-    return `Draft email to ${to}`;
-  }
-
-  return `Draft email to ${to}: ${fallback}`;
 }
 
 function DashboardSectionItemRow({
@@ -377,27 +107,14 @@ function DashboardSectionItemRow({
     }
   }
 
-  async function completeItem() {
+  function completeItem() {
     if (isCompleting || checked) {
       return;
     }
 
     setChecked(true);
     setIsCompleting(true);
-
-    if (!item.entityId) {
-      onComplete();
-      return;
-    }
-
-    try {
-      await completeEntity(item.entityId);
-      onComplete();
-    } catch (_error) {
-      setChecked(false);
-    } finally {
-      setIsCompleting(false);
-    }
+    onComplete();
   }
 
   const itemStyle = { '--attention-index': index } as CSSProperties;
@@ -417,7 +134,7 @@ function DashboardSectionItemRow({
         suppressHydrationWarning
         onChange={(event) => {
           if (event.currentTarget.checked) {
-            void completeItem();
+            completeItem();
           } else {
             setChecked(false);
           }
@@ -518,21 +235,15 @@ function DashboardItemDetail({
               ) : null}
             </span>
           </div>
+          <div className="attention-detail-actions">
+            <label className="attention-detail-complete" htmlFor={checkboxId}>
+              {item.detail.confirmLabel}
+            </label>
+          </div>
         </div>
       </div>
     </div>
   );
-}
-
-function formatDetailSourceLabel(sourceLabel: string): string {
-  return sourceLabel.replace(/^\s*Sources?:\s*/i, '').trim();
-}
-
-function getDetailFactValue(
-  facts: NonNullable<DashboardSectionItem['detail']>['facts'],
-  label: string,
-): string | undefined {
-  return facts?.find((fact) => fact.label.toLowerCase() === label.toLowerCase())?.value;
 }
 
 function SectionCta({
@@ -548,18 +259,31 @@ function SectionCta({
     return null;
   }
 
-  const label = ctaState === 'done' ? 'Done' : ctaState === 'loading' ? 'Working...' : item.cta.label;
+  const label = ctaState === 'loading' ? 'Working...' : ctaState === 'done' ? 'Done' : item.cta.label;
 
-  return item.cta.action ? (
+  return (
     <button
       type="button"
-      className={`attention-cta attention-cta-${item.cta.tone} attention-cta-button`}
-      onClick={runCtaAction}
-      disabled={ctaState !== 'idle'}
+      className={`attention-action-button attention-action-button-${item.cta.tone}`}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        runCtaAction();
+      }}
+      disabled={ctaState === 'loading' || ctaState === 'done'}
     >
       {label}
     </button>
-  ) : (
-    <span className={`attention-cta attention-cta-${item.cta.tone}`}>{label}</span>
   );
+}
+
+function getDetailFactValue(facts: Array<{ label: string; value: string }> | undefined, label: string) {
+  return facts?.find((fact) => fact.label.toLowerCase() === label.toLowerCase())?.value;
+}
+
+function formatDetailSourceLabel(label: string) {
+  if (label.toLowerCase() === 'gmail') {
+    return 'Gmail';
+  }
+  return label;
 }

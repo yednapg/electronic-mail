@@ -126,7 +126,7 @@ class AuthUserResponse(BaseModel):
     id: str
     email: str
     display_name: str | None = None
-    beta_enabled: bool = True
+    access_enabled: bool = True
 
 
 class AuthMeResponse(BaseModel):
@@ -171,6 +171,7 @@ class DashboardResponse(BaseModel):
     profile: DashboardProfile | None = None
     briefing: DashboardBriefing | None = None
     feed: FeedResponse = Field(default_factory=FeedResponse)
+    runtime_status: dict[str, Any] = Field(default_factory=dict)
 
 
 class DashboardImportJobResponse(BaseModel):
@@ -207,7 +208,12 @@ class FirstRunImportJobResponse(BaseModel):
     thread_count: int
     dashboard_item_count: int
     inbox_ready_at: str | None = None
+    first_groups_ready_at: str | None = None
     dashboard_ready_at: str | None = None
+    fast_dashboard_ready_at: str | None = None
+    canonical_dashboard_ready_at: str | None = None
+    quality_status: Literal["pending", "ready", "failed"] = "pending"
+    quality_error: str | None = None
     full_import_started_at: str | None = None
     full_import_completed_at: str | None = None
     error_message: str | None = None
@@ -218,7 +224,7 @@ class FirstRunImportJobResponse(BaseModel):
 
     @property
     def ready(self) -> bool:
-        return self.inbox_ready_at is not None and self.dashboard_ready_at is not None
+        return self.inbox_ready_at is not None and self.first_groups_ready_at is not None and self.dashboard_ready_at is not None
 
 
 class TraceRecord(BaseModel):
@@ -351,6 +357,7 @@ class ThreadMessage(BaseModel):
     bcc: str | None = None
     subject: str | None = None
     body: str
+    html_body: str | None = None
     snippet: str | None = None
     label_ids: list[str] = Field(default_factory=list)
     received_at: str
@@ -449,6 +456,7 @@ class GmailThreadRow(BaseModel):
     lifecycle_state: LifecycleState | None = None
     outcome_type: Literal["complete", "snooze", "dismiss"] | None = None
     lifecycle_updates: list[GmailThreadUpdate] = Field(default_factory=list)
+    enrichment_status: Literal["pending", "ready", "failed"] = "ready"
 
 
 class GmailThreadSection(BaseModel):
@@ -493,3 +501,39 @@ class MailboxSyncTriggerResponse(BaseModel):
 
     status: Literal["queued", "not_connected"]
     state: MailboxSyncStateResponse
+    job_id: str | None = None
+    queued_at: str | None = None
+
+
+class BackgroundJobResponse(BaseModel):
+    """User/admin visible durable job status."""
+
+    id: str
+    kind: str
+    queue: str
+    status: str
+    user_id: str | None = None
+    attempt_count: int
+    max_attempts: int
+    last_error: str | None = None
+    created_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    updated_at: str
+
+
+class OpsHealthResponse(BaseModel):
+    """Small operational snapshot for production debugging."""
+
+    queue_depth: dict[str, int] = Field(default_factory=dict)
+    dead_jobs: int = 0
+    stale_running_jobs: int = 0
+    oldest_queued_age_seconds: int | None = None
+    workers: list[dict[str, Any]] = Field(default_factory=list)
+
+MailGroupRow = GmailThreadRow
+MailGroupSection = GmailThreadSection
+MailGroupListResponse = MailboxResponse
+MailGroupMessage = ThreadMessage
+MailGroupDetailResponse = ThreadReaderResponse
+DashboardMailGroupItem = AttentionItem

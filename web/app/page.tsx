@@ -20,7 +20,7 @@ export default async function HomePage() {
 
   if (dashboard?.auth.connected) {
     const latestImportJob = await getLatestFirstRunImportJob({ cookie });
-    const firstRunReady = Boolean(latestImportJob?.inbox_ready_at && latestImportJob?.dashboard_ready_at);
+    const firstRunReady = Boolean(latestImportJob?.inbox_ready_at && latestImportJob?.first_groups_ready_at && latestImportJob?.dashboard_ready_at);
     redirect(firstRunReady ? '/dashboard' : '/post-login');
   }
 

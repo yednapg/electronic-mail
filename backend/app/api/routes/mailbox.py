@@ -1,28 +1,21 @@
 from __future__ import annotations
 
-"""Mailbox-first Gmail endpoints backed by local Gmail snapshots."""
+"""Mailbox endpoints backed by AI-created mail groups."""
 
+from base64 import urlsafe_b64decode
 import asyncio
 import json
+from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from app.core.config import load_settings
-from app.schemas.domain import (
-    MailboxResponse,
-    MailboxSyncStateResponse,
-    MailboxSyncTriggerResponse,
-    ThreadReaderResponse,
-)
-from app.services.mailbox import (
-    build_mailbox_response,
-    build_mailbox_sync_state_response,
-    build_mailbox_thread_response,
-)
-from app.services.mailbox_sync import ensure_gmail_watch, handle_pubsub_notification, queueable_mailbox_sync
+from app.db.jobs import enqueue_job
+from app.db.repository import get_user_by_email
+from app.schemas.domain import MailboxResponse, MailboxSyncStateResponse, MailboxSyncTriggerResponse, ThreadReaderResponse
 from app.services.auth import require_current_user
-
+from app.services.mail_groups import build_group_detail_response, build_mailbox_response, build_mailbox_sync_state, enqueue_mailbox_sync
 
 router = APIRouter(tags=["mailbox"])
 settings = load_settings()
@@ -35,68 +28,47 @@ def mailbox(
     limit: int = Query(default=100, ge=1, le=250),
     cursor: str | None = Query(default=None),
 ) -> MailboxResponse:
-    """Return a label-filtered Gmail mailbox from local snapshots."""
     user = require_current_user(settings, request)
-    return build_mailbox_response(
-        str(settings.database_path),
-        user_id=user.id,
-        label=label,
-        limit=limit,
-        cursor=cursor,
-    )
+    return build_mailbox_response(settings, user_id=user.id, label=label, limit=limit, cursor=cursor)
 
 
-@router.get("/v1/mailbox/threads/{thread_id}", response_model=ThreadReaderResponse)
+@router.get("/v1/mailbox/threads/{group_id}", response_model=ThreadReaderResponse)
 def mailbox_thread(
     request: Request,
-    thread_id: str,
-    limit: int = Query(default=25, ge=1, le=100),
+    group_id: str,
+    limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ) -> ThreadReaderResponse:
-    """Open a Gmail thread directly from the mailbox snapshot ledger."""
     user = require_current_user(settings, request)
-    thread = build_mailbox_thread_response(
-        str(settings.database_path),
-        user_id=user.id,
-        thread_id=thread_id,
-        limit=limit,
-        offset=offset,
-    )
-    if thread.total_messages == 0:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found")
-    return thread
+    detail = build_group_detail_response(settings, user_id=user.id, group_id=group_id, limit=limit, offset=offset)
+    if detail is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mail group not found")
+    return detail
 
 
 @router.get("/v1/mailbox/sync-state", response_model=MailboxSyncStateResponse)
 def mailbox_sync_state(request: Request) -> MailboxSyncStateResponse:
-    """Return Gmail sync/watch status for cache reconciliation."""
     user = require_current_user(settings, request)
-    return build_mailbox_sync_state_response(settings, user_id=user.id)
+    return build_mailbox_sync_state(settings, user_id=user.id)
 
 
 @router.post("/v1/mailbox/sync", response_model=MailboxSyncTriggerResponse, status_code=202)
-def mailbox_sync(request: Request, background_tasks: BackgroundTasks) -> MailboxSyncTriggerResponse:
-    """Queue a Gmail sync without blocking mailbox/dashboard routes."""
+def mailbox_sync(request: Request) -> MailboxSyncTriggerResponse:
     user = require_current_user(settings, request)
-    state = build_mailbox_sync_state_response(settings, user_id=user.id)
-    auth = state.connected
-    if not auth:
+    state = build_mailbox_sync_state(settings, user_id=user.id)
+    if not state.connected:
         return MailboxSyncTriggerResponse(status="not_connected", state=state)
-
-    background_tasks.add_task(ensure_gmail_watch, settings, user_id=user.id)
-    background_tasks.add_task(queueable_mailbox_sync, settings, user_id=user.id)
-    return MailboxSyncTriggerResponse(status="queued", state=state)
+    job_id = enqueue_mailbox_sync(settings, user_id=user.id)
+    return MailboxSyncTriggerResponse(status="queued", state=state, job_id=job_id)
 
 
 @router.get("/v1/events/mailbox")
 async def mailbox_events(request: Request) -> StreamingResponse:
-    """SSE stream for mailbox cache invalidation and sync-state heartbeats."""
-
     user = require_current_user(settings, request)
 
     async def event_stream():
         while True:
-            state = build_mailbox_sync_state_response(settings, user_id=user.id)
+            state = build_mailbox_sync_state(settings, user_id=user.id)
             yield f"event: sync-state\ndata: {json.dumps(state.model_dump())}\n\n"
             await asyncio.sleep(15)
 
@@ -105,8 +77,29 @@ async def mailbox_events(request: Request) -> StreamingResponse:
 
 @router.post("/v1/mailbox/pubsub", status_code=202)
 async def mailbox_pubsub(request: Request) -> dict[str, object]:
-    """Process one Gmail Pub/Sub push notification by the notified mailbox owner."""
     payload = await request.json()
     message = payload.get("message") if isinstance(payload, dict) and isinstance(payload.get("message"), dict) else payload
-    state = handle_pubsub_notification(settings, message)
-    return {"status": "processed", "state": state.model_dump()}
+    data = message.get("data") if isinstance(message, dict) else None
+    decoded: dict[str, Any] = {}
+    if isinstance(data, str):
+        try:
+            padding = "=" * (-len(data) % 4)
+            decoded = json.loads(urlsafe_b64decode(f"{data}{padding}".encode()).decode())
+        except Exception:
+            decoded = {}
+    email_address = str(decoded.get("emailAddress") or "").strip().lower()
+    history_id = str(decoded.get("historyId") or "")
+    user = get_user_by_email(str(settings.database_path), email_address) if email_address else None
+    if user is None:
+        return {"status": "ignored", "reason": "unknown_user"}
+    dedupe = f"gmail-pubsub:{user.id}:{history_id}"
+    job = enqueue_job(
+        str(settings.database_path),
+        kind="gmail_pubsub_sync",
+        queue="critical",
+        user_id=user.id,
+        dedupe_key=dedupe,
+        payload={"user_id": user.id, "email_address": email_address, "history_id": history_id, "batch_size": 100, "pubsub": payload},
+        priority=80,
+    )
+    return {"status": "queued", "job_id": job.id}
