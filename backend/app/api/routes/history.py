@@ -6,7 +6,8 @@ from fastapi import APIRouter, Query
 
 from app.core.config import load_settings
 from app.db.repository import DEFAULT_USER_ID
-from app.schemas.domain import HistoryResponse
+from app.schemas.domain import GmailViewResponse, HistoryResponse
+from app.services.gmail_view import build_gmail_view_response
 from app.services.history import build_history_response
 
 
@@ -26,3 +27,9 @@ def history(
         limit=limit,
         offset=offset,
     )
+
+
+@router.get("/v1/gmail-view", response_model=GmailViewResponse)
+def gmail_view() -> GmailViewResponse:
+    """Return raw Gmail threads grouped into Gmail-like date buckets."""
+    return build_gmail_view_response(str(settings.database_path), user_id=DEFAULT_USER_ID)

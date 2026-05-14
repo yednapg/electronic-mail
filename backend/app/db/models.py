@@ -168,6 +168,8 @@ class StoredDashboardImportJob:
     error_message: str | None
     created_at: str
     started_at: str | None
+    stage_started_at: str | None
+    stage_durations: dict[str, float]
     completed_at: str | None
     updated_at: str
 

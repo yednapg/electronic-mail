@@ -26,6 +26,7 @@ from app.db.models import StoredGmailHistoryEvent, StoredGmailMessageSnapshot, S
 from app.db.repository import (
     append_trace_record,
     clear_all_data,
+    DEFAULT_USER_ID,
     get_gmail_sync_state,
     get_source_record_count,
     initialize_database,
@@ -48,7 +49,7 @@ GOOGLE_SCOPES = [GMAIL_SCOPE, GMAIL_WRITE_SCOPE, CALENDAR_SCOPE]
 TOKEN_FILE_PATH = BACKEND_DIR / ".google-oauth.json"
 OAUTH_SESSION_FILE_PATH = BACKEND_DIR / ".google-oauth-session.json"
 ACCOUNT_PROFILE_FILE_PATH = BACKEND_DIR / ".google-account.json"
-DEV_USER_ID = "google-dev-user"
+DEV_USER_ID = DEFAULT_USER_ID
 GMAIL_PAGE_SIZE = 500
 GMAIL_LOOKBACK_DAYS = 90
 GOOGLE_API_TIMEOUT_SECONDS = 20

@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import React from 'react';
 
 import { DashboardAgenda } from './DashboardAgenda';
 import { DashboardMeta } from './DashboardMeta';
@@ -42,24 +43,22 @@ export function DashboardView({ dateLabel, timeLabel, liveMeta, summary, agenda,
         <DashboardSummary summary={summary} />
         <DashboardAgenda items={agenda} />
 
-        {sections.length > 0 ? (
-          <div className="digest-sections">
-            {sections.map((section) => (
-              <div key={section.id} className="digest-section-slot" data-dashboard-section={section.id}>
-                <DashboardSection
-                  sectionId={section.id}
-                  title={section.title}
-                  items={section.items}
-                  maxVisible={section.maxVisible}
-                  collapsedByDefault={section.collapsedByDefault}
-                />
-              </div>
-            ))}
-          </div>
-        ) : null}
+        <div className="digest-sections">
+          {sections.map((section) => (
+            <div key={section.id} className="digest-section-slot" data-dashboard-section={section.id}>
+              <DashboardSection
+                sectionId={section.id}
+                title={section.title}
+                items={section.items}
+                maxVisible={section.maxVisible}
+                collapsedByDefault={section.collapsedByDefault}
+              />
+            </div>
+          ))}
+        </div>
 
         <p className="digest-empty-state" data-dashboard-empty>
-          All dashboard blocks are hidden.
+          All dashboard blocks are hidden by view settings.
         </p>
       </div>
     </main>
@@ -82,6 +81,9 @@ function DashboardSettingsPanel() {
           </div>
           <Link href="/history" className="view-settings-link">
             History
+          </Link>
+          <Link href="/gmail" className="view-settings-link">
+            Gmail
           </Link>
           <div className="view-settings-options">
             {VIEW_SETTING_OPTIONS.map((option) => (

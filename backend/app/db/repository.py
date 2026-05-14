@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+import os
 import sqlite3
 from typing import Iterator, Iterable
 from uuid import uuid4
@@ -29,7 +30,12 @@ from app.db.models import (
 )
 
 
-DEFAULT_USER_ID = "google-dev-user"
+DEFAULT_USER_ID = os.getenv("APP_USER_ID", "local-user").strip() or "local-user"
+
+
+def _sql_string_literal(value: str) -> str:
+    """Return a SQLite string literal for schema defaults."""
+    return "'" + value.replace("'", "''") + "'"
 
 
 def utc_now_iso() -> str:
@@ -39,14 +45,15 @@ def utc_now_iso() -> str:
 
 def initialize_database(database_path: str) -> None:
     """Create the SQLite schema if it does not already exist."""
+    default_user_sql = _sql_string_literal(DEFAULT_USER_ID)
     with connect(database_path) as connection:
         connection.executescript(
-            """
+            f"""
             PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS source_records (
               id TEXT PRIMARY KEY,
-              user_id TEXT NOT NULL DEFAULT 'google-dev-user',
+              user_id TEXT NOT NULL DEFAULT {default_user_sql},
               source TEXT NOT NULL,
               thread_id TEXT,
               subject TEXT,
@@ -84,7 +91,7 @@ def initialize_database(database_path: str) -> None:
 
             CREATE TABLE IF NOT EXISTS entities (
               id TEXT PRIMARY KEY,
-              user_id TEXT NOT NULL DEFAULT 'google-dev-user',
+              user_id TEXT NOT NULL DEFAULT {default_user_sql},
               canonical_key TEXT NOT NULL UNIQUE,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
@@ -232,6 +239,8 @@ def initialize_database(database_path: str) -> None:
               error_message TEXT,
               created_at TEXT NOT NULL,
               started_at TEXT,
+              stage_started_at TEXT,
+              stage_durations TEXT NOT NULL DEFAULT '{{}}',
               completed_at TEXT,
               updated_at TEXT NOT NULL
             );
@@ -289,13 +298,15 @@ def initialize_database(database_path: str) -> None:
             );
             """
         )
-        _ensure_column(connection, "source_records", "user_id", "TEXT NOT NULL DEFAULT 'google-dev-user'")
+        _ensure_column(connection, "source_records", "user_id", f"TEXT NOT NULL DEFAULT {default_user_sql}")
         _ensure_column(connection, "source_records", "deleted_at", "TEXT")
-        _ensure_column(connection, "entities", "user_id", "TEXT NOT NULL DEFAULT 'google-dev-user'")
+        _ensure_column(connection, "entities", "user_id", f"TEXT NOT NULL DEFAULT {default_user_sql}")
         _ensure_column(connection, "gmail_message_snapshots", "internal_date", "TEXT")
         _ensure_column(connection, "dashboard_import_jobs", "stage", "TEXT NOT NULL DEFAULT 'queued'")
         _ensure_column(connection, "dashboard_import_jobs", "imported_count", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(connection, "dashboard_import_jobs", "total_count", "INTEGER")
+        _ensure_column(connection, "dashboard_import_jobs", "stage_started_at", "TEXT")
+        _ensure_column(connection, "dashboard_import_jobs", "stage_durations", "TEXT NOT NULL DEFAULT '{}'")
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_gmail_message_snapshots_internal_date
@@ -748,6 +759,8 @@ def create_dashboard_import_job(database_path: str, *, user_id: str = DEFAULT_US
         error_message=None,
         created_at=now,
         started_at=None,
+        stage_started_at=now,
+        stage_durations={},
         completed_at=None,
         updated_at=now,
     )
@@ -758,9 +771,9 @@ def create_dashboard_import_job(database_path: str, *, user_id: str = DEFAULT_US
             INSERT INTO dashboard_import_jobs (
               id, user_id, status, stage, imported_count, total_count, source_records,
               changed_entities, refreshed_entities, result_status, error_message,
-              created_at, started_at, completed_at, updated_at
+              created_at, started_at, stage_started_at, stage_durations, completed_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.id,
@@ -776,6 +789,8 @@ def create_dashboard_import_job(database_path: str, *, user_id: str = DEFAULT_US
                 job.error_message,
                 job.created_at,
                 job.started_at,
+                job.stage_started_at,
+                json.dumps(job.stage_durations, sort_keys=True),
                 job.completed_at,
                 job.updated_at,
             ),
@@ -792,10 +807,11 @@ def mark_dashboard_import_job_running(database_path: str, job_id: str) -> Stored
             """
             UPDATE dashboard_import_jobs
             SET status = ?, started_at = COALESCE(started_at, ?), completed_at = NULL,
-                stage = ?, error_message = NULL, updated_at = ?
+                stage = ?, stage_started_at = ?, stage_durations = ?,
+                error_message = NULL, updated_at = ?
             WHERE id = ?
             """,
-            ("running", now, "starting", now, job_id),
+            ("running", now, "starting", now, "{}", now, job_id),
         )
     return require_dashboard_import_job(database_path, job_id)
 
@@ -814,21 +830,34 @@ def update_dashboard_import_job_progress(
     """Persist incremental dashboard import progress."""
     current = require_dashboard_import_job(database_path, job_id)
     now = utc_now_iso()
+    next_stage = stage if stage is not None else current.stage
+    stage_started_at = current.stage_started_at
+    stage_durations = current.stage_durations
+    if next_stage != current.stage:
+        stage_durations = _record_stage_duration(current, now)
+        stage_started_at = now
+        _log_dashboard_import_stage_duration(current.stage, stage_durations.get(current.stage))
+    elif stage_started_at is None:
+        stage_started_at = now
+
     with connect(database_path) as connection:
         connection.execute(
             """
             UPDATE dashboard_import_jobs
             SET stage = ?, imported_count = ?, total_count = ?, source_records = ?,
-                changed_entities = ?, refreshed_entities = ?, updated_at = ?
+                changed_entities = ?, refreshed_entities = ?, stage_started_at = ?,
+                stage_durations = ?, updated_at = ?
             WHERE id = ?
             """,
             (
-                stage if stage is not None else current.stage,
+                next_stage,
                 imported_count if imported_count is not None else current.imported_count,
                 total_count if total_count is not None else current.total_count,
                 source_records if source_records is not None else current.source_records,
                 changed_entities if changed_entities is not None else current.changed_entities,
                 refreshed_entities if refreshed_entities is not None else current.refreshed_entities,
+                stage_started_at,
+                json.dumps(stage_durations, sort_keys=True),
                 now,
                 job_id,
             ),
@@ -848,12 +877,15 @@ def mark_dashboard_import_job_succeeded(
     """Persist a successful dashboard import/preparation result."""
     now = utc_now_iso()
     current = require_dashboard_import_job(database_path, job_id)
+    stage_durations = _record_stage_duration(current, now)
+    _log_dashboard_import_stage_duration(current.stage, stage_durations.get(current.stage))
     with connect(database_path) as connection:
         connection.execute(
             """
             UPDATE dashboard_import_jobs
             SET status = ?, stage = ?, imported_count = ?, source_records = ?, changed_entities = ?, refreshed_entities = ?,
-                result_status = ?, error_message = NULL, completed_at = ?, updated_at = ?
+                result_status = ?, error_message = NULL, stage_started_at = ?,
+                stage_durations = ?, completed_at = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -865,6 +897,8 @@ def mark_dashboard_import_job_succeeded(
                 refreshed_entities,
                 result_status,
                 now,
+                json.dumps(stage_durations, sort_keys=True),
+                now,
                 now,
                 job_id,
             ),
@@ -875,14 +909,18 @@ def mark_dashboard_import_job_succeeded(
 def mark_dashboard_import_job_failed(database_path: str, job_id: str, *, error_message: str) -> StoredDashboardImportJob:
     """Persist a failed dashboard import/preparation result."""
     now = utc_now_iso()
+    current = require_dashboard_import_job(database_path, job_id)
+    stage_durations = _record_stage_duration(current, now)
+    _log_dashboard_import_stage_duration(current.stage, stage_durations.get(current.stage))
     with connect(database_path) as connection:
         connection.execute(
             """
             UPDATE dashboard_import_jobs
-            SET status = ?, stage = ?, result_status = ?, error_message = ?, completed_at = ?, updated_at = ?
+            SET status = ?, stage = ?, result_status = ?, error_message = ?,
+                stage_started_at = ?, stage_durations = ?, completed_at = ?, updated_at = ?
             WHERE id = ?
             """,
-            ("failed", "failed", "failed", error_message, now, now, job_id),
+            ("failed", "failed", "failed", error_message, now, json.dumps(stage_durations, sort_keys=True), now, now, job_id),
         )
     return require_dashboard_import_job(database_path, job_id)
 
@@ -1317,6 +1355,44 @@ def list_source_record_ids(
     return [str(row["id"]) for row in rows]
 
 
+def _record_stage_duration(job: StoredDashboardImportJob, ended_at: str) -> dict[str, float]:
+    """Return updated per-stage duration totals for a job stage transition."""
+    if not job.stage or job.stage in {"completed", "failed"}:
+        return dict(job.stage_durations)
+
+    started_at = job.stage_started_at or job.updated_at or job.started_at
+    if started_at is None:
+        return dict(job.stage_durations)
+
+    started = _parse_iso_timestamp(started_at)
+    ended = _parse_iso_timestamp(ended_at)
+    if started is None or ended is None:
+        return dict(job.stage_durations)
+
+    elapsed_seconds = max(0.0, (ended - started).total_seconds())
+    durations = dict(job.stage_durations)
+    durations[job.stage] = round(float(durations.get(job.stage, 0.0)) + elapsed_seconds, 3)
+    return durations
+
+
+def _parse_iso_timestamp(value: str) -> datetime | None:
+    """Parse an ISO timestamp persisted by this repository."""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _log_dashboard_import_stage_duration(stage: str, duration: float | None) -> None:
+    """Print lightweight import timings for local debugging."""
+    if duration is None:
+        return
+    try:
+        print(json.dumps({"dashboard_import_stage": stage, "duration_seconds": duration}, sort_keys=True))
+    except BrokenPipeError:
+        return
+
+
 def list_history_source_records(
     database_path: str,
     *,
@@ -1374,27 +1450,57 @@ def list_history_source_records(
             (user_id, bounded_limit, bounded_offset, user_id),
         ).fetchall()
 
-    return [
-            StoredHistorySourceRecord(
-                source_record=_to_source_record(row),
-                entity_id=str(row["history_entity_id"]) if row["history_entity_id"] is not None else None,
-                source_summary=str(row["history_source_summary"])
-                if row["history_source_summary"] is not None
-                else None,
-                current_state=str(row["history_current_state"]) if row["history_current_state"] is not None else None,
-            suggestion_title=str(row["history_suggestion_title"])
-            if row["history_suggestion_title"] is not None
-            else None,
-            suggestion_summary=str(row["history_suggestion_summary"])
-            if row["history_suggestion_summary"] is not None
-            else None,
-            outcome_type=str(row["history_outcome_type"]) if row["history_outcome_type"] is not None else None,
-            outcome_created_at=str(row["history_outcome_created_at"])
-            if row["history_outcome_created_at"] is not None
-            else None,
-        )
-        for row in rows
-    ]
+    return [_to_history_source_record(row) for row in rows]
+
+
+def list_gmail_history_source_records(
+    database_path: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+) -> list[StoredHistorySourceRecord]:
+    """Return persisted Gmail records with app-owned entity/state enrichment for Gmail-like views."""
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            WITH latest_outcomes AS (
+              SELECT *
+              FROM (
+                SELECT
+                  entity_outcomes.*,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY entity_id
+                    ORDER BY created_at DESC, id DESC
+                  ) AS row_number
+                FROM entity_outcomes
+                WHERE user_id = ?
+              )
+              WHERE row_number = 1
+            )
+            SELECT
+              source_records.*,
+              entity_members.entity_id AS history_entity_id,
+              source_record_summaries.summary AS history_source_summary,
+              entity_states.current_state AS history_current_state,
+              entity_ai_suggestions.title AS history_suggestion_title,
+              entity_ai_suggestions.explanation AS history_suggestion_summary,
+              latest_outcomes.outcome_type AS history_outcome_type,
+              latest_outcomes.created_at AS history_outcome_created_at
+            FROM source_records
+            LEFT JOIN source_record_summaries
+              ON source_record_summaries.source_record_id = source_records.id
+            LEFT JOIN entity_members ON entity_members.source_record_id = source_records.id
+            LEFT JOIN entity_states ON entity_states.entity_id = entity_members.entity_id
+            LEFT JOIN entity_ai_suggestions ON entity_ai_suggestions.entity_id = entity_members.entity_id
+            LEFT JOIN latest_outcomes ON latest_outcomes.entity_id = entity_members.entity_id
+            WHERE source_records.user_id = ?
+              AND source_records.source = 'gmail'
+              AND source_records.deleted_at IS NULL
+            ORDER BY source_records.timestamp DESC, source_records.id DESC
+            """,
+            (user_id, user_id),
+        ).fetchall()
+
+    return [_to_history_source_record(row) for row in rows]
 
 
 def get_entity_member_count(database_path: str) -> int:
@@ -2177,9 +2283,51 @@ def _to_dashboard_import_job(row: sqlite3.Row) -> StoredDashboardImportJob:
         error_message=str(row["error_message"]) if row["error_message"] is not None else None,
         created_at=str(row["created_at"]),
         started_at=str(row["started_at"]) if row["started_at"] is not None else None,
+        stage_started_at=str(row["stage_started_at"]) if row["stage_started_at"] is not None else None,
+        stage_durations=_parse_stage_durations(row["stage_durations"]),
         completed_at=str(row["completed_at"]) if row["completed_at"] is not None else None,
         updated_at=str(row["updated_at"]),
     )
+
+
+def _to_history_source_record(row: sqlite3.Row) -> StoredHistorySourceRecord:
+    return StoredHistorySourceRecord(
+        source_record=_to_source_record(row),
+        entity_id=str(row["history_entity_id"]) if row["history_entity_id"] is not None else None,
+        source_summary=str(row["history_source_summary"]) if row["history_source_summary"] is not None else None,
+        current_state=str(row["history_current_state"]) if row["history_current_state"] is not None else None,
+        suggestion_title=str(row["history_suggestion_title"])
+        if row["history_suggestion_title"] is not None
+        else None,
+        suggestion_summary=str(row["history_suggestion_summary"])
+        if row["history_suggestion_summary"] is not None
+        else None,
+        outcome_type=str(row["history_outcome_type"]) if row["history_outcome_type"] is not None else None,
+        outcome_created_at=str(row["history_outcome_created_at"])
+        if row["history_outcome_created_at"] is not None
+        else None,
+    )
+
+
+def _parse_stage_durations(value: object) -> dict[str, float]:
+    if not isinstance(value, str) or not value:
+        return {}
+
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(decoded, dict):
+        return {}
+
+    durations: dict[str, float] = {}
+    for key, raw_duration in decoded.items():
+        if not isinstance(key, str):
+            continue
+        if isinstance(raw_duration, (int, float)):
+            durations[key] = float(raw_duration)
+    return durations
 
 
 def _to_entity(row: sqlite3.Row) -> StoredEntity:

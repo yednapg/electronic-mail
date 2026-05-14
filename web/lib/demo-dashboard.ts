@@ -51,11 +51,11 @@ export const demoDashboard: DashboardResponse = {
     connect_url: null,
   },
   profile: {
-    email: 'gaurav@example.com',
-    display_name: 'Gaurav Pandey',
+    email: 'demo@example.com',
+    display_name: 'Demo User',
   },
   briefing: {
-    headline: 'Good morning, Gaurav.',
+    headline: 'Good morning, Demo User.',
     brief:
       'You have 📆 5 meetings, ✅ 8 open tasks and 📨 11 useful emails pulled into work. Your credit card bill and YC RSVP need a decision before noon. You’re mostly free after 🌄 4 pm.',
   },

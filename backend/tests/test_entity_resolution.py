@@ -194,7 +194,7 @@ class EntityResolutionTests(unittest.TestCase):
         self.assertEqual(confidence, 0.0)
         self.assertEqual(entity.canonical_key, "gmail-thread:gmail-thread-email-update")
 
-    def test_exact_reference_overlap_is_passed_to_ai_for_cross_thread_merge(self) -> None:
+    def test_exact_reference_overlap_merges_without_ai(self) -> None:
         reference_record = build_record(
             record_id="gmail-ref-seed",
             source="gmail",
@@ -225,11 +225,12 @@ class EntityResolutionTests(unittest.TestCase):
         ), patch(
             "app.services.entities.entity_resolver.resolve_entity_with_ai",
             return_value=EntityGroupingResponse(entity_id=reference_entity.id, confidence=0.96),
-        ):
+        ) as mock_ai:
             entity, confidence = resolve_entity_for_record(self.database_path, followup_record)
 
         self.assertEqual(entity.id, reference_entity.id)
-        self.assertEqual(confidence, 0.96)
+        self.assertEqual(confidence, 0.94)
+        mock_ai.assert_not_called()
 
     def test_grouping_body_ignores_quoted_history_and_html(self) -> None:
         body = """

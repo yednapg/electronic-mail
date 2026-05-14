@@ -1,7 +1,8 @@
 /** Dashboard fetcher shared by server-rendered app routes. */
-import type { DashboardResponse, HistoryResponse, ThreadReaderResponse } from './types';
+import type { DashboardResponse, GmailViewResponse, HistoryResponse, ThreadReaderResponse } from './types';
 import type {
   EntityOutcomeResponse,
+  DashboardImportJobResponse,
   GmailDraftRequest,
   GmailDraftResponse,
   TaskCreateRequest,
@@ -9,6 +10,7 @@ import type {
 } from '@decision-pipeline/types';
 import { demoDashboard } from './demo-dashboard';
 import { getDemoThread } from './demo-evidence';
+import { demoGmailView } from './demo-gmail-view';
 import { demoHistory } from './demo-history';
 
 const DEFAULT_BACKEND_URL = 'http://localhost:3001';
@@ -38,6 +40,21 @@ export async function getDashboard(): Promise<DashboardResponse> {
   return res.json();
 }
 
+export async function getLatestDashboardImportJob(): Promise<DashboardImportJobResponse | null> {
+  if (isDemoMode()) {
+    return null;
+  }
+
+  const res = await fetch(`${getBackendURL()}/v1/dashboard/import-jobs/latest`, {
+    cache: 'no-store',
+  });
+  if (res.status === 404) {
+    return null;
+  }
+  if (!res.ok) throw new Error('Failed to fetch latest dashboard import job');
+  return res.json();
+}
+
 export async function getHistory({ limit = 60, offset = 0 } = {}): Promise<HistoryResponse> {
   if (isDemoMode()) {
     return demoHistory;
@@ -51,6 +68,18 @@ export async function getHistory({ limit = 60, offset = 0 } = {}): Promise<Histo
     cache: 'no-store',
   });
   if (!res.ok) throw new Error('Failed to fetch history');
+  return res.json();
+}
+
+export async function getGmailView(): Promise<GmailViewResponse> {
+  if (isDemoMode()) {
+    return demoGmailView;
+  }
+
+  const res = await fetch(`${getBackendURL()}/v1/gmail-view`, {
+    cache: 'no-store',
+  });
+  if (!res.ok) throw new Error('Failed to fetch Gmail view');
   return res.json();
 }
 

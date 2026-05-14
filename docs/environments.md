@@ -7,6 +7,7 @@ This pass keeps SQLite as the runtime database and makes configuration environme
 | Variable | Local default | Notes |
 | --- | --- | --- |
 | `APP_ENV` | `local` | One of `local`, `staging`, or `production`. |
+| `APP_USER_ID` | `local-user` | Runtime owner key for local single-user data. |
 | `PORT` | `3001` | Backend HTTP port. |
 | `DATABASE_URL` | `file:./dev.db` | SQLite file URL for this pass. |
 | `CORS_ORIGIN` | `http://localhost:5173` | Web origin allowed by CORS. Must be HTTPS outside local development. |

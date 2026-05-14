@@ -1,7 +1,7 @@
 "use client";
 
 /** Live-updating date and clock header for the dashboard. */
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 
 import { formatClockTime, formatDate } from '../../lib/formatting';
 

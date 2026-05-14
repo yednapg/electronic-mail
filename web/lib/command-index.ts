@@ -37,6 +37,15 @@ const STATIC_COMMANDS: Array<Omit<CommandItem, 'searchText'>> = [
     href: '/dashboard',
   },
   {
+    id: 'nav:gmail',
+    kind: 'navigation',
+    title: 'Gmail',
+    subtitle: 'Review raw Gmail threads',
+    keywords: ['gmail', 'mail', 'inbox', 'threads'],
+    priority: 24,
+    href: '/gmail',
+  },
+  {
     id: 'nav:history',
     kind: 'navigation',
     title: 'History',

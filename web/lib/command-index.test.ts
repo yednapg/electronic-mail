@@ -46,7 +46,7 @@ function createFeedItem(overrides: Partial<FeedItem> = {}): FeedItem {
 test('static commands include the core app destinations', () => {
   assert.deepEqual(
     getStaticCommands().map((command) => command.href),
-    ['/dashboard', '/history', '/raw-feed'],
+    ['/dashboard', '/gmail', '/history', '/raw-feed'],
   );
 });
 

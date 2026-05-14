@@ -209,7 +209,12 @@ class EntityStateAndFeedTests(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            {"OPENAI_API_KEY": "test-key", "OPENAI_REQUIRED": "true", "OPENAI_REASONING_EFFORT": ""},
+            {
+                "OPENAI_API_KEY": "test-key",
+                "OPENAI_REQUIRED": "true",
+                "OPENAI_REASONING_EFFORT": "",
+                "OPENAI_ENTITY_STATE": "true",
+            },
             clear=False,
         ):
             state = classify_entity_state(

@@ -167,6 +167,8 @@ export interface DashboardImportJobResponse {
   readonly error_message?: string | null;
   readonly created_at: string;
   readonly started_at?: string | null;
+  readonly stage_started_at?: string | null;
+  readonly stage_durations?: Record<string, number>;
   readonly completed_at?: string | null;
   readonly updated_at: string;
 }
@@ -208,6 +210,42 @@ export interface HistoryResponse {
   readonly offset: number;
   readonly total: number;
   readonly years: HistoryYearGroup[];
+}
+
+export interface GmailThreadRow {
+  readonly thread_id: string;
+  readonly entity_id?: string | null;
+  readonly latest_source_record_id: string;
+  readonly latest_received_at: string;
+  readonly latest_subject?: string | null;
+  readonly latest_sender?: string | null;
+  readonly participants: string[];
+  readonly message_count: number;
+  readonly summary?: string | null;
+  readonly snippet?: string | null;
+  readonly current_state?: EntityCurrentState | null;
+  readonly lifecycle_state?: LifecycleState | null;
+  readonly outcome_type?: 'complete' | 'snooze' | 'dismiss' | null;
+  readonly lifecycle_updates: GmailThreadUpdate[];
+}
+
+export interface GmailThreadUpdate {
+  readonly source_record_id: string;
+  readonly received_at: string;
+  readonly subject?: string | null;
+  readonly sender?: string | null;
+  readonly summary?: string | null;
+}
+
+export interface GmailThreadSection {
+  readonly id: string;
+  readonly title: string;
+  readonly rows: GmailThreadRow[];
+}
+
+export interface GmailViewResponse {
+  readonly total_threads: number;
+  readonly sections: GmailThreadSection[];
 }
 
 /**
