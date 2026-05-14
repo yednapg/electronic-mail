@@ -2,11 +2,6 @@ import type { DashboardResponse, FeedItem, FeedResponse, GmailThreadRow, GmailVi
 
 export type CommandKind = 'navigation' | 'work' | 'email' | 'action';
 
-export type CommandAction = {
-  kind: 'complete-entity';
-  entityId: string;
-};
-
 export type CommandItem = {
   id: string;
   kind: CommandKind;
@@ -17,7 +12,6 @@ export type CommandItem = {
   priority: number;
   href?: string;
   entityId?: string;
-  action?: CommandAction;
 };
 
 export type CommandIndexResponse = {
@@ -75,19 +69,12 @@ export function buildDashboardCommands(dashboard: DashboardResponse | null): Com
   }
 
   const commands: CommandItem[] = [];
-  const completedEntityIds = new Set<string>();
-
   for (const section of SECTION_CONFIGS) {
     const items = dashboard.feed[section.key];
     items.forEach((item, index) => {
       const workCommand = toWorkCommand(item, section.title, section.priority + index);
       if (workCommand !== null) {
         commands.push(workCommand);
-      }
-
-      const completeCommand = toCompleteCommand(item, section.title, section.priority + index, completedEntityIds);
-      if (completeCommand !== null) {
-        commands.push(completeCommand);
       }
     });
   }
@@ -167,7 +154,7 @@ function toWorkCommand(
   const href = gmailThreadId
     ? `/gmail/threads/${encodeURIComponent(gmailThreadId)}`
     : entityId
-      ? `/entities/${encodeURIComponent(entityId)}/thread`
+      ? `/gmail/threads/${encodeURIComponent(entityId)}`
       : '/dashboard';
 
   return withSearchText({
@@ -179,35 +166,6 @@ function toWorkCommand(
     priority,
     href,
     entityId: entityId || undefined,
-  });
-}
-
-function toCompleteCommand(
-  item: FeedItem,
-  sectionTitle: string,
-  priority: number,
-  completedEntityIds: Set<string>,
-): CommandItem | null {
-  const entityId = cleanOptionalText(item.entity_id);
-  if (!entityId || completedEntityIds.has(entityId) || !canCompleteItem(item)) {
-    return null;
-  }
-
-  completedEntityIds.add(entityId);
-  const title = titleForItem(item);
-
-  return withSearchText({
-    id: `complete:${entityId}`,
-    kind: 'action',
-    title: `Mark done: ${title}`,
-    subtitle: `${sectionTitle} - Complete this work item`,
-    keywords: ['complete', 'done', 'finish', 'resolve', ...keywordsForItem(item, sectionTitle)],
-    priority: priority + 50,
-    entityId,
-    action: {
-      kind: 'complete-entity',
-      entityId,
-    },
   });
 }
 

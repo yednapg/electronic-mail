@@ -54,7 +54,9 @@ class GmailThreadActionRouteTests(unittest.TestCase):
         self.addCleanup(self.settings_patch.stop)
 
     @patch("app.api.routes.gmail.archive_gmail_thread_service")
-    def test_archive_endpoint_returns_action_payload(self, mock_archive: Mock) -> None:
+    @patch("app.api.routes.gmail.require_current_user")
+    def test_archive_endpoint_returns_action_payload(self, mock_user: Mock, mock_archive: Mock) -> None:
+        mock_user.return_value = SimpleNamespace(id="user-1")
         mock_archive.return_value = {"id": "thread-1"}
 
         response = self.client.post("/gmail/threads/thread-1/archive")
@@ -64,7 +66,9 @@ class GmailThreadActionRouteTests(unittest.TestCase):
         mock_archive.assert_called_once()
 
     @patch("app.api.routes.gmail.unarchive_gmail_thread_service")
-    def test_unarchive_endpoint_returns_action_payload(self, mock_unarchive: Mock) -> None:
+    @patch("app.api.routes.gmail.require_current_user")
+    def test_unarchive_endpoint_returns_action_payload(self, mock_user: Mock, mock_unarchive: Mock) -> None:
+        mock_user.return_value = SimpleNamespace(id="user-1")
         mock_unarchive.return_value = {"id": "thread-1"}
 
         response = self.client.post("/gmail/threads/thread-1/unarchive")
@@ -74,7 +78,9 @@ class GmailThreadActionRouteTests(unittest.TestCase):
         mock_unarchive.assert_called_once()
 
     @patch("app.api.routes.gmail.archive_gmail_thread_service", side_effect=RuntimeError("Google account is not connected"))
-    def test_archive_endpoint_surfaces_missing_auth(self, _mock_archive: Mock) -> None:
+    @patch("app.api.routes.gmail.require_current_user")
+    def test_archive_endpoint_surfaces_missing_auth(self, mock_user: Mock, _mock_archive: Mock) -> None:
+        mock_user.return_value = SimpleNamespace(id="user-1")
         response = self.client.post("/gmail/threads/thread-1/archive")
 
         self.assertEqual(response.status_code, 400)

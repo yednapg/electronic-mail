@@ -68,13 +68,13 @@ public struct AuthUserResponse: Codable, Equatable {
     let id: String
     let email: String
     let displayName: String?
-    let betaEnabled: Bool
+    let accessEnabled: Bool
 
     enum CodingKeys: String, CodingKey {
         case id
         case email
         case displayName = "display_name"
-        case betaEnabled = "beta_enabled"
+        case accessEnabled = "access_enabled"
     }
 }
 

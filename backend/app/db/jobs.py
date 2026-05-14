@@ -1,0 +1,397 @@
+from __future__ import annotations
+
+"""Postgres-backed durable background job queue."""
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+from typing import Any
+from uuid import uuid4
+
+from sqlalchemy import text
+
+from app.db.repository import get_engine
+
+ACTIVE_STATUSES = {"queued", "running"}
+
+
+@dataclass(frozen=True)
+class BackgroundJob:
+    id: str
+    kind: str
+    queue: str
+    status: str
+    user_id: str | None
+    dedupe_key: str | None
+    priority: int
+    payload_version: int
+    payload: dict[str, Any]
+    attempt_count: int
+    max_attempts: int
+    run_after: str
+    lease_owner: str | None
+    lease_expires_at: str | None
+    last_error: str | None
+    trace_id: str | None
+    created_at: str
+    started_at: str | None
+    completed_at: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class QueueHealth:
+    queue_depth: dict[str, int]
+    dead_jobs: int
+    stale_running_jobs: int
+    oldest_queued_age_seconds: int | None
+    workers: list[dict[str, Any]]
+
+
+def enqueue_job(
+    database_url: str,
+    *,
+    kind: str,
+    payload: dict[str, Any] | None = None,
+    user_id: str | None = None,
+    dedupe_key: str | None = None,
+    queue: str = "default",
+    priority: int = 0,
+    max_attempts: int = 5,
+    payload_version: int = 1,
+) -> BackgroundJob:
+    engine = get_engine(database_url)
+    job_id = str(uuid4())
+    payload_json = json.dumps(payload or {}, ensure_ascii=True)
+    with engine.begin() as connection:
+        if dedupe_key:
+            existing = connection.execute(
+                text(
+                    """
+                    SELECT * FROM background_jobs
+                    WHERE kind = :kind AND dedupe_key = :dedupe_key AND status IN ('queued', 'running')
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"kind": kind, "dedupe_key": dedupe_key},
+            ).mappings().first()
+            if existing is not None:
+                if str(existing["status"]) == "queued":
+                    existing = connection.execute(
+                        text(
+                            """
+                            UPDATE background_jobs
+                            SET run_after = now(),
+                                priority = GREATEST(priority, :priority),
+                                updated_at = now()
+                            WHERE id = :id
+                            RETURNING *
+                            """
+                        ),
+                        {"id": existing["id"], "priority": priority},
+                    ).mappings().first()
+                    if existing is not None:
+                        _insert_event(connection, str(existing["id"]), "progress", None, {"reason": "dedupe_woke_queued_job"})
+                return _job_from_row(existing)
+
+        row = connection.execute(
+            text(
+                """
+                INSERT INTO background_jobs (
+                  id, kind, queue, status, user_id, dedupe_key, priority, payload_version,
+                  payload_json, max_attempts, run_after, created_at, updated_at
+                ) VALUES (
+                  :id, :kind, :queue, 'queued', :user_id, :dedupe_key, :priority, :payload_version,
+                  :payload_json, :max_attempts, now(), now(), now()
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING *
+                """
+            ),
+            {
+                "id": job_id,
+                "kind": kind,
+                "queue": queue,
+                "user_id": user_id,
+                "dedupe_key": dedupe_key,
+                "priority": priority,
+                "payload_version": payload_version,
+                "payload_json": payload_json,
+                "max_attempts": max_attempts,
+            },
+        ).mappings().first()
+        if row is None and dedupe_key:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT * FROM background_jobs
+                    WHERE kind = :kind AND dedupe_key = :dedupe_key AND status IN ('queued', 'running')
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"kind": kind, "dedupe_key": dedupe_key},
+            ).mappings().first()
+        if row is None:
+            raise RuntimeError("Job enqueue failed")
+        _insert_event(connection, str(row["id"]), "queued", None, {})
+        return _job_from_row(row)
+
+
+def get_job(database_url: str, job_id: str) -> BackgroundJob | None:
+    with get_engine(database_url).connect() as connection:
+        row = connection.execute(
+            text("SELECT * FROM background_jobs WHERE id = :id"),
+            {"id": job_id},
+        ).mappings().first()
+    return _job_from_row(row) if row is not None else None
+
+
+def claim_job(database_url: str, *, worker_id: str, queues: list[str], lease_seconds: int = 300) -> BackgroundJob | None:
+    if not queues:
+        return None
+    with get_engine(database_url).begin() as connection:
+        row = connection.execute(
+            text(
+                """
+                WITH candidate AS (
+                  SELECT id
+                  FROM background_jobs
+                  WHERE queue = ANY(:queues)
+                    AND (
+                      (status = 'queued' AND run_after <= now())
+                      OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < now())
+                    )
+                  ORDER BY priority DESC, run_after ASC, created_at ASC
+                  LIMIT 1
+                  FOR UPDATE SKIP LOCKED
+                )
+                UPDATE background_jobs AS jobs
+                SET status = 'running',
+                    lease_owner = :worker_id,
+                    lease_expires_at = now() + (:lease_seconds * interval '1 second'),
+                    started_at = COALESCE(started_at, now()),
+                    attempt_count = attempt_count + 1,
+                    updated_at = now()
+                FROM candidate
+                WHERE jobs.id = candidate.id
+                RETURNING jobs.*
+                """
+            ),
+            {"queues": queues, "worker_id": worker_id, "lease_seconds": lease_seconds},
+        ).mappings().first()
+        if row is None:
+            return None
+        _insert_event(connection, str(row["id"]), "claimed", None, {"worker_id": worker_id})
+        return _job_from_row(row)
+
+
+def renew_heartbeat(database_url: str, *, worker_id: str, queues: list[str], current_job_id: str | None = None) -> None:
+    with get_engine(database_url).begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO worker_heartbeats (worker_id, queues_json, current_job_id, last_seen_at)
+                VALUES (:worker_id, :queues_json, :current_job_id, now())
+                ON CONFLICT (worker_id) DO UPDATE SET
+                  queues_json = excluded.queues_json,
+                  current_job_id = excluded.current_job_id,
+                  last_seen_at = now()
+                """
+            ),
+            {"worker_id": worker_id, "queues_json": json.dumps(queues), "current_job_id": current_job_id},
+        )
+
+
+def complete_job(database_url: str, job_id: str) -> None:
+    with get_engine(database_url).begin() as connection:
+        connection.execute(
+            text(
+                """
+                UPDATE background_jobs
+                SET status = 'succeeded', completed_at = now(), lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+                WHERE id = :id
+                """
+            ),
+            {"id": job_id},
+        )
+        _insert_event(connection, job_id, "succeeded", None, {})
+
+
+def fail_job(database_url: str, job: BackgroundJob, error: str) -> None:
+    final = job.attempt_count >= job.max_attempts
+    delay_seconds = _backoff_seconds(job.attempt_count)
+    with get_engine(database_url).begin() as connection:
+        if final:
+            connection.execute(
+                text(
+                    """
+                    UPDATE background_jobs
+                    SET status = 'dead', last_error = :error, completed_at = now(), lease_owner = NULL,
+                        lease_expires_at = NULL, updated_at = now()
+                    WHERE id = :id
+                    """
+                ),
+                {"id": job.id, "error": error[:4000]},
+            )
+            _insert_event(connection, job.id, "dead", error, {})
+        else:
+            connection.execute(
+                text(
+                    """
+                    UPDATE background_jobs
+                    SET status = 'queued', last_error = :error, run_after = now() + (:delay_seconds * interval '1 second'),
+                        lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+                    WHERE id = :id
+                    """
+                ),
+                {"id": job.id, "error": error[:4000], "delay_seconds": delay_seconds},
+            )
+            _insert_event(connection, job.id, "retry", error, {"delay_seconds": delay_seconds})
+
+
+def cancel_user_jobs(database_url: str, *, user_id: str) -> int:
+    with get_engine(database_url).begin() as connection:
+        result = connection.execute(
+            text(
+                """
+                UPDATE background_jobs
+                SET status = 'cancelled', completed_at = now(), lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+                WHERE user_id = :user_id AND status IN ('queued', 'running')
+                """
+            ),
+            {"user_id": user_id},
+        )
+    return int(result.rowcount or 0)
+
+
+def get_queue_health(database_url: str) -> QueueHealth:
+    with get_engine(database_url).connect() as connection:
+        depths = connection.execute(
+            text("SELECT queue, COUNT(*) AS count FROM background_jobs WHERE status = 'queued' GROUP BY queue")
+        ).mappings().all()
+        dead_jobs = connection.execute(text("SELECT COUNT(*) FROM background_jobs WHERE status = 'dead'")).scalar_one()
+        stale_running = connection.execute(
+            text("SELECT COUNT(*) FROM background_jobs WHERE status = 'running' AND lease_expires_at < now()")
+        ).scalar_one()
+        oldest_age = connection.execute(
+            text("SELECT EXTRACT(EPOCH FROM (now() - MIN(created_at))) FROM background_jobs WHERE status = 'queued'")
+        ).scalar()
+        workers = connection.execute(
+            text("SELECT worker_id, queues_json, current_job_id, last_seen_at FROM worker_heartbeats ORDER BY last_seen_at DESC")
+        ).mappings().all()
+    return QueueHealth(
+        queue_depth={str(row["queue"]): int(row["count"]) for row in depths},
+        dead_jobs=int(dead_jobs or 0),
+        stale_running_jobs=int(stale_running or 0),
+        oldest_queued_age_seconds=int(oldest_age) if oldest_age is not None else None,
+        workers=[
+            {
+                "worker_id": row["worker_id"],
+                "queues": json.loads(row["queues_json"] or "[]"),
+                "current_job_id": row["current_job_id"],
+                "last_seen_at": _iso(row["last_seen_at"]),
+            }
+            for row in workers
+        ],
+    )
+
+
+def cleanup_old_jobs(database_url: str, *, succeeded_days: int = 30, dead_days: int = 90) -> int:
+    """Delete expired historical job rows and their events."""
+    with get_engine(database_url).begin() as connection:
+        event_result = connection.execute(
+            text(
+                """
+                DELETE FROM background_job_events
+                WHERE job_id IN (
+                  SELECT id
+                  FROM background_jobs
+                  WHERE (
+                    status IN ('succeeded', 'cancelled')
+                    AND completed_at IS NOT NULL
+                    AND completed_at < now() - (:succeeded_days * interval '1 day')
+                  ) OR (
+                    status = 'dead'
+                    AND completed_at IS NOT NULL
+                    AND completed_at < now() - (:dead_days * interval '1 day')
+                  )
+                )
+                """
+            ),
+            {"succeeded_days": succeeded_days, "dead_days": dead_days},
+        )
+        job_result = connection.execute(
+            text(
+                """
+                DELETE FROM background_jobs
+                WHERE (
+                  status IN ('succeeded', 'cancelled')
+                  AND completed_at IS NOT NULL
+                  AND completed_at < now() - (:succeeded_days * interval '1 day')
+                ) OR (
+                  status = 'dead'
+                  AND completed_at IS NOT NULL
+                  AND completed_at < now() - (:dead_days * interval '1 day')
+                )
+                """
+            ),
+            {"succeeded_days": succeeded_days, "dead_days": dead_days},
+        )
+    return int(event_result.rowcount or 0) + int(job_result.rowcount or 0)
+
+
+def _insert_event(connection, job_id: str, event_type: str, message: str | None, metadata: dict[str, Any]) -> None:
+    connection.execute(
+        text(
+            """
+            INSERT INTO background_job_events (id, job_id, event_type, message, metadata_json, created_at)
+            VALUES (:id, :job_id, :event_type, :message, :metadata_json, now())
+            """
+        ),
+        {
+            "id": str(uuid4()),
+            "job_id": job_id,
+            "event_type": event_type,
+            "message": message,
+            "metadata_json": json.dumps(metadata, ensure_ascii=True),
+        },
+    )
+
+
+def _job_from_row(row) -> BackgroundJob:
+    return BackgroundJob(
+        id=str(row["id"]),
+        kind=str(row["kind"]),
+        queue=str(row["queue"]),
+        status=str(row["status"]),
+        user_id=str(row["user_id"]) if row["user_id"] is not None else None,
+        dedupe_key=str(row["dedupe_key"]) if row["dedupe_key"] is not None else None,
+        priority=int(row["priority"]),
+        payload_version=int(row["payload_version"]),
+        payload=json.loads(row["payload_json"] or "{}"),
+        attempt_count=int(row["attempt_count"]),
+        max_attempts=int(row["max_attempts"]),
+        run_after=_iso(row["run_after"]),
+        lease_owner=str(row["lease_owner"]) if row["lease_owner"] is not None else None,
+        lease_expires_at=_iso(row["lease_expires_at"]) if row["lease_expires_at"] is not None else None,
+        last_error=str(row["last_error"]) if row["last_error"] is not None else None,
+        trace_id=str(row["trace_id"]) if row["trace_id"] is not None else None,
+        created_at=_iso(row["created_at"]),
+        started_at=_iso(row["started_at"]) if row["started_at"] is not None else None,
+        completed_at=_iso(row["completed_at"]) if row["completed_at"] is not None else None,
+        updated_at=_iso(row["updated_at"]),
+    )
+
+
+def _iso(value: Any) -> str:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    return str(value)
+
+
+def _backoff_seconds(attempt_count: int) -> int:
+    return [0, 30, 120, 600, 3600][min(max(attempt_count, 0), 4)]
