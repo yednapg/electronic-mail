@@ -9,12 +9,20 @@ import { GmailView, formatGmailReceivedAt } from './page';
 import type { GmailViewResponse } from '../../lib/types';
 
 const gmailThreadPageSource = readFileSync(new URL('./threads/[threadId]/page.tsx', import.meta.url), 'utf8');
+const gmailInboxClientSource = readFileSync(new URL('./GmailInboxClient.tsx', import.meta.url), 'utf8');
 
 test('gmail received time stays compact', () => {
-  assert.match(formatGmailReceivedAt('2026-05-11T09:30:00'), /9:30/);
+  assert.match(
+    formatGmailReceivedAt('2026-05-11T09:30:00+05:30', new Date('2026-05-11T10:00:00+05:30')),
+    /9:30/,
+  );
+  assert.equal(
+    formatGmailReceivedAt('2026-05-08T11:00:00+05:30', new Date('2026-05-11T10:00:00+05:30')),
+    'May 8',
+  );
 });
 
-test('gmail view renders raw thread buckets before lifecycle grouping', () => {
+test('gmail view renders clean mail-group rows without duplicating summaries', () => {
   const gmail: GmailViewResponse = {
     total_threads: 2,
     sections: [
@@ -94,10 +102,10 @@ test('gmail view renders raw thread buckets before lifecycle grouping', () => {
   assert.match(markup, /Today/);
   assert.match(markup, /Last seven days/);
   assert.match(markup, /Order shipped/);
-  assert.match(markup, /Apple shipped your order/);
   assert.match(markup, /href="\/gmail\/threads\/thread-order"/);
   assert.match(markup, /href="\/gmail\/threads\/thread-bank"/);
   assert.match(markup, /Statement ready/);
+  assert.doesNotMatch(markup, /Apple shipped your order/);
   assert.doesNotMatch(markup, /Archive|Unarchive/);
   assert.doesNotMatch(markup, /Apple confirmed the order/);
 });
@@ -106,4 +114,11 @@ test('gmail thread route uses the mounted mailbox client instead of server threa
   assert.match(gmailThreadPageSource, /\bGmailInboxClient\b/);
   assert.doesNotMatch(gmailThreadPageSource, /\bgetMailboxThread\b/);
   assert.doesNotMatch(gmailThreadPageSource, /\bThreadDetail\b/);
+});
+
+test('gmail background processing copy does not imply first-run grouping is blocking', () => {
+  assert.match(gmailInboxClientSource, /Importing older mail in background/);
+  assert.match(gmailInboxClientSource, /Finishing AI titles for older mail/);
+  assert.doesNotMatch(gmailInboxClientSource, /Processing older mail: /);
+  assert.doesNotMatch(gmailInboxClientSource, /groups left/);
 });

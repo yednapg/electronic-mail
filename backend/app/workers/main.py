@@ -6,6 +6,7 @@ import argparse
 from base64 import urlsafe_b64decode
 import json
 import signal
+import threading
 import time
 from typing import Any
 from uuid import uuid4
@@ -13,16 +14,27 @@ from uuid import uuid4
 from app.core.config import load_settings
 from app.db.jobs import claim_job, cleanup_old_jobs, complete_job, enqueue_job, fail_job, renew_heartbeat
 from app.db.repository import get_user_by_email
-from app.services.gmail_importer import run_gmail_backfill, run_gmail_import_batch
-from app.services.mail_groups import BACKFILL_BATCH_SIZE, FIRST_BATCH_SIZE, rebuild_mail_groups, run_first_run_ai_grouping
+from app.services.gmail_importer import run_gmail_backfill, run_gmail_delta_sync, run_gmail_import_batch
+from app.services.gmail_watch import ensure_gmail_watch
+from app.services.mail_groups import (
+    FIRST_BATCH_SIZE,
+    MAILBOX_REBUILD_LIMIT,
+    MAIL_GROUP_ENRICH_BATCH_SIZE,
+    enqueue_projection_refresh,
+    enrich_pending_mail_groups,
+    rebuild_mail_groups,
+    refresh_app_session_snapshot,
+    run_first_run_ai_grouping,
+)
 
 STOP = False
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--queues", default="critical,default,slow")
+    parser.add_argument("--queues", default="critical,default")
     parser.add_argument("--sleep", type=float, default=2.0)
+    parser.add_argument("--heartbeat-interval", type=float, default=30.0)
     args = parser.parse_args()
     queues = [item.strip() for item in args.queues.split(",") if item.strip()]
     worker_id = f"worker-{uuid4()}"
@@ -38,12 +50,21 @@ def main() -> None:
             time.sleep(args.sleep)
             continue
         renew_heartbeat(str(settings.database_path), worker_id=worker_id, queues=queues, current_job_id=job.id)
+        stop_heartbeat = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=_job_heartbeat_loop,
+            args=(str(settings.database_path), worker_id, queues, job.id, args.heartbeat_interval, stop_heartbeat),
+            daemon=True,
+        )
+        heartbeat_thread.start()
         try:
             _run_job(settings, job)
             complete_job(str(settings.database_path), job.id)
         except Exception as exc:
             fail_job(str(settings.database_path), job, f"{type(exc).__name__}: {exc}")
         finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join(timeout=1.0)
             renew_heartbeat(str(settings.database_path), worker_id=worker_id, queues=queues)
 
 
@@ -67,10 +88,28 @@ def _run_job(settings, job) -> None:
             raise RuntimeError("gmail_backfill missing user_id")
         run_gmail_backfill(settings, user_id=user_id, batch_size=int(payload.get("batch_size") or 100))
         return
+    if job.kind == "gmail_delta_sync":
+        if not isinstance(user_id, str):
+            raise RuntimeError("gmail_delta_sync missing user_id")
+        run_gmail_delta_sync(
+            settings,
+            user_id=user_id,
+            batch_size=int(payload.get("batch_size") or 100),
+            target_history_id=str(payload.get("target_history_id") or "") or None,
+        )
+        return
+    if job.kind == "gmail_body_fetch":
+        if not isinstance(user_id, str):
+            raise RuntimeError("gmail_body_fetch missing user_id")
+        from app.services.gmail_importer import run_gmail_body_fetch
+
+        run_gmail_body_fetch(settings, user_id=user_id, group_id=str(payload.get("group_id") or ""))
+        return
     if job.kind == "mail_group_candidates":
         if not isinstance(user_id, str):
             raise RuntimeError(f"{job.kind} missing user_id")
-        rebuild_mail_groups(settings, user_id=user_id, use_ai=False)
+        rebuild_mail_groups(settings, user_id=user_id, limit=MAILBOX_REBUILD_LIMIT, use_ai=False)
+        enqueue_projection_refresh(settings, user_id=user_id)
         enqueue_job(
             str(settings.database_path),
             kind="mail_group_enrich",
@@ -84,15 +123,16 @@ def _run_job(settings, job) -> None:
     if job.kind == "mail_group_enrich":
         if not isinstance(user_id, str):
             raise RuntimeError(f"{job.kind} missing user_id")
-        touched = rebuild_mail_groups(settings, user_id=user_id, use_ai=True, max_ai_groups=3)
-        if touched >= 3:
+        touched = enrich_pending_mail_groups(settings, user_id=user_id, limit=MAIL_GROUP_ENRICH_BATCH_SIZE)
+        enqueue_projection_refresh(settings, user_id=user_id, priority=20)
+        if touched >= MAIL_GROUP_ENRICH_BATCH_SIZE:
             enqueue_job(
                 str(settings.database_path),
                 kind="mail_group_enrich",
                 queue="default",
                 user_id=user_id,
                 dedupe_key=f"mail-group-enrich:{user_id}:{uuid4()}",
-                priority=9,
+                priority=40,
                 payload={"user_id": user_id},
             )
         return
@@ -100,15 +140,6 @@ def _run_job(settings, job) -> None:
         if not isinstance(user_id, str):
             raise RuntimeError("first_run_ai_grouping missing user_id")
         run_first_run_ai_grouping(settings, user_id=user_id, limit=int(payload.get("batch_size") or FIRST_BATCH_SIZE))
-        enqueue_job(
-            str(settings.database_path),
-            kind="gmail_backfill",
-            queue="slow",
-            user_id=user_id,
-            dedupe_key=f"gmail-backfill:{user_id}",
-            priority=1,
-            payload={"user_id": user_id, "batch_size": BACKFILL_BATCH_SIZE},
-        )
         return
     if job.kind == "first_run_ready_check":
         if not isinstance(user_id, str):
@@ -119,7 +150,23 @@ def _run_job(settings, job) -> None:
         resolved_user_id = _user_id_from_pubsub(settings, payload) or user_id
         if not isinstance(resolved_user_id, str):
             return
-        run_gmail_import_batch(settings, user_id=resolved_user_id, batch_size=int(payload.get("batch_size") or 30))
+        run_gmail_delta_sync(
+            settings,
+            user_id=resolved_user_id,
+            batch_size=int(payload.get("batch_size") or 100),
+            target_history_id=str(payload.get("history_id") or "") or None,
+        )
+        refresh_app_session_snapshot(settings, user_id=resolved_user_id)
+        return
+    if job.kind == "gmail_watch_renewal":
+        if not isinstance(user_id, str):
+            raise RuntimeError("gmail_watch_renewal missing user_id")
+        ensure_gmail_watch(settings, user_id=user_id, force=True)
+        return
+    if job.kind == "projection_refresh":
+        if not isinstance(user_id, str):
+            raise RuntimeError("projection_refresh missing user_id")
+        refresh_app_session_snapshot(settings, user_id=user_id)
         return
     if job.kind == "job_retention_cleanup":
         cleanup_old_jobs(str(settings.database_path))
@@ -130,6 +177,18 @@ def _run_job(settings, job) -> None:
 def _stop(_signum, _frame) -> None:
     global STOP
     STOP = True
+
+
+def _job_heartbeat_loop(
+    database_url: str,
+    worker_id: str,
+    queues: list[str],
+    job_id: str,
+    interval_seconds: float,
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.wait(max(1.0, interval_seconds)):
+        renew_heartbeat(database_url, worker_id=worker_id, queues=queues, current_job_id=job_id)
 
 
 def _user_id_from_pubsub(settings, payload: dict[str, Any]) -> str | None:

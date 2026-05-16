@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Core domain models shared across ingest, memory, and feed projection."""
+"""Core API response models for auth, dashboard, Gmail, jobs, and app session state."""
 
 from typing import Any, Literal
 
@@ -17,20 +17,7 @@ LifecycleState = Literal["active", "scheduled", "resolved", "suppressed"]
 EntityCurrentState = Literal["open", "waiting", "done"]
 GmailThreadAction = Literal["archive", "unarchive", "mark_read"]
 MailboxLabel = Literal["inbox", "sent", "drafts", "trash", "archive", "all"]
-DashboardImportJobStatus = Literal["queued", "running", "succeeded", "failed"]
-TraceStage = Literal[
-    "ingestion",
-    "normalization",
-    "grouping",
-    "state_derivation",
-    "decision",
-    "action_selection",
-    "timing",
-    "ranking",
-    "output",
-    "lifecycle_transition",
-]
-
+JobStatus = Literal["queued", "running", "succeeded", "failed"]
 
 class SourceRecord(BaseModel):
     """Normalized source record entering the backend pipeline."""
@@ -162,6 +149,9 @@ class DashboardBriefing(BaseModel):
 
     headline: str
     brief: str
+    parts: list[dict[str, Any]] = Field(default_factory=list)
+    important: dict[str, Any] | None = None
+    calendar_availability: dict[str, Any] | None = None
 
 
 class DashboardResponse(BaseModel):
@@ -174,34 +164,13 @@ class DashboardResponse(BaseModel):
     runtime_status: dict[str, Any] = Field(default_factory=dict)
 
 
-class DashboardImportJobResponse(BaseModel):
-    """Durable status for backend-owned dashboard import/preparation."""
-
-    id: str
-    user_id: str
-    status: DashboardImportJobStatus
-    stage: str
-    imported_count: int
-    total_count: int | None = None
-    source_records: int
-    changed_entities: int
-    refreshed_entities: int
-    result_status: str | None = None
-    error_message: str | None = None
-    created_at: str
-    started_at: str | None = None
-    stage_started_at: str | None = None
-    stage_durations: dict[str, float] = Field(default_factory=dict)
-    completed_at: str | None = None
-    updated_at: str
-
 
 class FirstRunImportJobResponse(BaseModel):
     """Durable status for first-login Gmail and dashboard setup."""
 
     id: str
     user_id: str
-    status: DashboardImportJobStatus
+    status: JobStatus
     stage: str
     fetched_count: int
     total_count: int | None = None
@@ -210,7 +179,6 @@ class FirstRunImportJobResponse(BaseModel):
     inbox_ready_at: str | None = None
     first_groups_ready_at: str | None = None
     dashboard_ready_at: str | None = None
-    fast_dashboard_ready_at: str | None = None
     canonical_dashboard_ready_at: str | None = None
     quality_status: Literal["pending", "ready", "failed"] = "pending"
     quality_error: str | None = None
@@ -227,204 +195,29 @@ class FirstRunImportJobResponse(BaseModel):
         return self.inbox_ready_at is not None and self.first_groups_ready_at is not None and self.dashboard_ready_at is not None
 
 
-class TraceRecord(BaseModel):
-    """Replayable trace event emitted by one stage of the backend pipeline."""
+class PostLoginReadinessResponse(BaseModel):
+    """Product readiness contract for the post-login holding screen."""
 
-    id: str
-    trace_id: str
-    entity_id: str | None = None
-    source_record_id: str | None = None
-    user_id: str
-    stage: TraceStage
-    input: dict[str, Any]
-    output: dict[str, Any]
-    created_at: str
-
-
-class TraceReplayResponse(BaseModel):
-    """Full trace payload for replaying one entity from member records to output."""
-
-    entity_id: str
-    source_record_ids: list[str] = Field(default_factory=list)
-    items: list[TraceRecord] = Field(default_factory=list)
-
-
-class TaskCreateRequest(BaseModel):
-    """Create a backend-owned manual task."""
-
-    title: str
-    notes: str | None = None
-    section: Literal["now", "today", "later"] = "today"
-    due_at: str | None = None
-
-
-class TaskUpdateRequest(BaseModel):
-    """Patch a backend-owned manual task."""
-
-    title: str | None = None
-    notes: str | None = None
-    section: Literal["now", "today", "later"] | None = None
-    due_at: str | None = None
-    status: Literal["open", "done"] | None = None
-
-
-class TaskResponse(BaseModel):
-    """Backend-owned manual task response."""
-
-    id: str
-    user_id: str
-    entity_id: str
-    title: str
-    notes: str | None = None
-    section: Literal["now", "today", "later"]
-    due_at: str | None = None
-    status: Literal["open", "done"]
-    created_at: str
-    updated_at: str
-
-
-class EntityOutcomeRequest(BaseModel):
-    """Explicit app-state outcome for one entity."""
-
-    note: str | None = None
-
-
-class EntitySnoozeRequest(EntityOutcomeRequest):
-    """Snooze an entity until a backend-owned timestamp."""
-
-    snooze_until: str
-
-
-class EntityOutcomeResponse(BaseModel):
-    """Persisted entity outcome."""
-
-    id: str
-    user_id: str
-    entity_id: str
-    outcome_type: Literal["complete", "snooze", "dismiss"]
-    snooze_until: str | None = None
-    note: str | None = None
-    created_at: str
-
-
-class GmailDraftRequest(BaseModel):
-    """Create or update an explicit Gmail draft."""
-
-    to: str
-    cc: str | None = None
-    bcc: str | None = None
-    subject: str
-    body: str
-    entity_id: str | None = None
-    thread_id: str | None = None
-
-
-class GmailDraftResponse(BaseModel):
-    """Local/backend representation of a Gmail draft."""
-
-    id: str
-    user_id: str
-    entity_id: str | None = None
-    gmail_draft_id: str
-    gmail_message_id: str | None = None
-    thread_id: str | None = None
-    to: str
-    cc: str | None = None
-    bcc: str | None = None
-    subject: str
-    body: str
-    status: Literal["draft", "sent", "deleted"]
-    created_at: str
-    updated_at: str
-
-
-class GmailThreadMutationResponse(BaseModel):
-    """Response payload for explicit Gmail thread mutations."""
-
-    thread_id: str
-    action: GmailThreadAction
-
-
-class ThreadMessage(BaseModel):
-    """One message in a backend-owned thread reader payload."""
-
-    id: str
-    source: SourceType
-    thread_id: str | None = None
-    from_address: str | None = None
-    to: str | None = None
-    cc: str | None = None
-    bcc: str | None = None
-    subject: str | None = None
-    body: str
-    html_body: str | None = None
-    snippet: str | None = None
-    label_ids: list[str] = Field(default_factory=list)
-    received_at: str
-
-
-class ThreadReaderResponse(BaseModel):
-    """Thread reader payload shared by web and iOS."""
-
-    entity_id: str
-    user_id: str
-    source: SourceType | None = None
-    gmail_thread_id: str | None = None
-    subject: str | None = None
-    total_messages: int
-    limit: int
-    offset: int
-    has_more: bool
-    messages: list[ThreadMessage] = Field(default_factory=list)
-
-
-class HistoryRow(BaseModel):
-    """One compact historical line backed by a persisted source record."""
-
-    source_record_id: str
-    entity_id: str | None = None
-    source: SourceType
-    thread_id: str | None = None
-    received_at: str
-    subject: str | None = None
-    title: str | None = None
-    sender: str | None = None
-    snippet: str | None = None
-    summary: str | None = None
-    current_state: EntityCurrentState | None = None
-    lifecycle_state: LifecycleState | None = None
-    outcome_type: Literal["complete", "snooze", "dismiss"] | None = None
-    outcome_created_at: str | None = None
-
-
-class HistoryDayGroup(BaseModel):
-    """History rows for one calendar day."""
-
-    date: str
-    rows: list[HistoryRow] = Field(default_factory=list)
-
-
-class HistoryMonthGroup(BaseModel):
-    """History days for one calendar month."""
-
-    month: str
-    days: list[HistoryDayGroup] = Field(default_factory=list)
-
-
-class HistoryYearGroup(BaseModel):
-    """History months for one calendar year."""
-
-    year: str
-    months: list[HistoryMonthGroup] = Field(default_factory=list)
-
-
-class HistoryResponse(BaseModel):
-    """Paginated persisted-history projection grouped for the history UI."""
-
-    limit: int
-    offset: int
-    total: int
-    years: list[HistoryYearGroup] = Field(default_factory=list)
+    mode: Literal["returning", "first_time"]
+    stage: Literal[
+        "welcome_back",
+        "starting_full_import",
+        "importing_recent_gmail",
+        "grouping_threads",
+        "writing_titles",
+        "building_dashboard",
+        "ready",
+        "failed",
+    ]
+    ready_to_enter: bool
+    dashboard_ready: bool
+    mailbox_ready: bool
+    ready_dashboard_count: int
+    ready_mail_group_count: int
+    full_import_running: bool
+    full_import_completed: bool
+    user_display_name: str | None = None
+    error_message: str | None = None
 
 
 class GmailThreadUpdate(BaseModel):
@@ -437,21 +230,38 @@ class GmailThreadUpdate(BaseModel):
     summary: str | None = None
 
 
+class GmailThreadMutationResponse(BaseModel):
+    """Acknowledgement for a Gmail thread mutation."""
+
+    thread_id: str
+    action: GmailThreadAction
+
+
 class GmailThreadRow(BaseModel):
     """One Gmail-like conversation row grouped by Gmail thread id."""
 
     thread_id: str
     entity_id: str | None = None
+    title: str | None = None
+    href: str | None = None
     latest_source_record_id: str
     latest_received_at: str
+    latest_message_at: str | None = None
     latest_subject: str | None = None
     latest_sender: str | None = None
+    sender: str | None = None
     participants: list[str] = Field(default_factory=list)
     message_count: int
     summary: str | None = None
     snippet: str | None = None
     label_ids: list[str] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list)
     unread: bool = False
+    action_needed: bool = False
+    action_type: Literal["pay", "reply", "confirm", "track", "review", "read", "open", "none"] = "none"
+    action_type_key: Literal["pay", "reply", "confirm", "track", "review", "read", "open", "none"] = "none"
+    priority: int = 0
+    dashboard_visible: bool = False
     current_state: EntityCurrentState | None = None
     lifecycle_state: LifecycleState | None = None
     outcome_type: Literal["complete", "snooze", "dismiss"] | None = None
@@ -481,6 +291,11 @@ class MailboxResponse(BaseModel):
     total_threads: int
     next_cursor: str | None = None
     sections: list[GmailThreadSection] = Field(default_factory=list)
+    ready_count: int = 0
+    pending_count: int = 0
+    oldest_imported_at: str | None = None
+    full_import_running: bool = False
+    full_import_completed: bool = False
 
 
 class MailboxSyncStateResponse(BaseModel):
@@ -499,10 +314,45 @@ class MailboxSyncStateResponse(BaseModel):
 class MailboxSyncTriggerResponse(BaseModel):
     """Acknowledgement for a queued mailbox sync request."""
 
-    status: Literal["queued", "not_connected"]
+    status: Literal["queued", "synced", "not_connected"]
     state: MailboxSyncStateResponse
     job_id: str | None = None
     queued_at: str | None = None
+
+
+class ThreadMessage(BaseModel):
+    """One message inside a mail group detail timeline."""
+
+    id: str
+    source: SourceType
+    thread_id: str | None = None
+    from_address: str | None = None
+    to: str | None = None
+    cc: str | None = None
+    bcc: str | None = None
+    subject: str | None = None
+    body: str
+    html_body: str | None = None
+    snippet: str | None = None
+    label_ids: list[str] = Field(default_factory=list)
+    received_at: str
+
+
+class ThreadReaderResponse(BaseModel):
+    """Detail payload for one product-ready mail group."""
+
+    entity_id: str
+    user_id: str
+    source: SourceType | None = None
+    gmail_thread_id: str | None = None
+    subject: str | None = None
+    title: str | None = None
+    summary: str | None = None
+    total_messages: int
+    limit: int
+    offset: int
+    has_more: bool
+    messages: list[ThreadMessage] = Field(default_factory=list)
 
 
 class BackgroundJobResponse(BaseModel):
@@ -530,6 +380,37 @@ class OpsHealthResponse(BaseModel):
     stale_running_jobs: int = 0
     oldest_queued_age_seconds: int | None = None
     workers: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AppSessionUser(BaseModel):
+    """User identity in the single app-session snapshot."""
+
+    id: str
+    email: str
+    first_name: str | None = None
+    display_name: str | None = None
+
+
+class AppSessionSyncState(BaseModel):
+    """Import/enrichment status in the single app-session snapshot."""
+
+    last_sync_at: str | None = None
+    last_error: str | None = None
+    enrichment_pending_count: int = 0
+    ready_group_count: int = 0
+    oldest_imported_at: str | None = None
+    full_import_running: bool = False
+    full_import_completed: bool = False
+
+
+class AppSessionResponse(BaseModel):
+    """Single product-state snapshot consumed by post-login, dashboard, and Gmail."""
+
+    user: AppSessionUser
+    readiness: PostLoginReadinessResponse
+    dashboard: DashboardResponse
+    mailbox: MailboxResponse
+    sync: AppSessionSyncState
 
 MailGroupRow = GmailThreadRow
 MailGroupSection = GmailThreadSection

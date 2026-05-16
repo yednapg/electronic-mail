@@ -18,6 +18,9 @@ settings = load_settings()
 @router.post("/v1/first-run/import-jobs", response_model=FirstRunImportJobResponse, status_code=202)
 def create_first_run_import_job(request: Request) -> FirstRunImportJobResponse:
     user = require_current_user(settings, request)
+    state = get_import_state(str(settings.database_path), user_id=user.id)
+    if state and state.first_batch_imported_at and state.first_groups_ready_at and state.first_dashboard_ready_at:
+        return _first_run_response(user.id, job_id=f"first-run:{user.id}")
     job_id = enqueue_first_run(settings, user_id=user.id)
     return _first_run_response(user.id, job_id=job_id)
 
@@ -68,7 +71,6 @@ def _first_run_response(user_id: str, *, job_id: str) -> FirstRunImportJobRespon
         inbox_ready_at=state.first_batch_imported_at if state else None,
         first_groups_ready_at=state.first_groups_ready_at if state else None,
         dashboard_ready_at=state.first_dashboard_ready_at if state else None,
-        fast_dashboard_ready_at=state.first_dashboard_ready_at if state else None,
         canonical_dashboard_ready_at=state.first_dashboard_ready_at if state else None,
         quality_status=quality_status,  # type: ignore[arg-type]
         quality_error=error_message,

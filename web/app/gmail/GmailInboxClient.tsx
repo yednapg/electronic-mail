@@ -4,28 +4,30 @@ import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { SignedInAppChrome } from '../../components/app/AppChrome';
-import type { AuthMeResponse, GmailThreadRow, GoogleAuthState, MailboxResponse, ThreadMessage, ThreadReaderResponse } from '../../lib/types';
+import { useAppSession } from '../../lib/app-session-store';
+import { getDemoThreadReader } from '../../lib/demo-data';
+import { isDemoMode } from '../../lib/demo-mode';
+import { useActiveMailboxSync } from '../../lib/use-active-mailbox-sync';
+import type { GmailThreadRow, MailboxResponse, ThreadMessage, ThreadReaderResponse } from '../../lib/types';
 import { GmailList, formatGmailSender } from './GmailView';
 
-const MAILBOX_STORAGE_PREFIX = 'decision-pipeline-mailbox:inbox:v3:';
-const MAILBOX_SYNC_STORAGE_PREFIX = 'decision-pipeline-mailbox-sync:v2:';
 const THREAD_STORAGE_PREFIX = 'decision-pipeline-mailbox-thread:v3:';
 const DEFAULT_BROWSER_BACKEND_URL = 'http://localhost:3001';
-const MAILBOX_FETCH_LIMIT = 150;
 const THREAD_FETCH_LIMIT = 50;
 const PREFETCH_THREAD_COUNT = 10;
-const MAILBOX_SYNC_COOLDOWN_MS = 30_000;
 
-let inMemoryMailboxCache: { userKey: string; gmail: MailboxResponse } | null = null;
 let inMemoryThreadCache: { userKey: string; threads: Record<string, ThreadReaderResponse> } | null = null;
+type ActiveRowSource = 'keyboard' | 'programmatic';
 
 type GmailInboxClientProps = {
   initialThreadId?: string | null;
+  initialMailbox?: MailboxResponse | null;
 };
 
-export function GmailInboxClient({ initialThreadId = null }: GmailInboxClientProps) {
+export function GmailInboxClient({ initialThreadId = null, initialMailbox = null }: GmailInboxClientProps) {
   const router = useRouter();
-  const [gmail, setGmail] = useState<MailboxResponse | null>(() => inMemoryMailboxCache?.gmail ?? null);
+  const { session, refreshFailed: appSessionRefreshFailed } = useAppSession();
+  const [gmail, setGmail] = useState<MailboxResponse | null>(() => session?.mailbox ?? initialMailbox);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(() => cleanThreadId(initialThreadId));
   const [threadCache, setThreadCache] = useState<Record<string, ThreadReaderResponse>>(
     () => inMemoryThreadCache?.threads ?? {},
@@ -33,17 +35,44 @@ export function GmailInboxClient({ initialThreadId = null }: GmailInboxClientPro
   const [threadErrors, setThreadErrors] = useState<Record<string, string>>({});
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [refreshFailed, setRefreshFailed] = useState(false);
-  const [cacheUserKey, setCacheUserKey] = useState<string | null>(() => inMemoryMailboxCache?.userKey ?? null);
+  const [cacheUserKey, setCacheUserKey] = useState<string | null>(() => session?.user.id ?? null);
   const threadCacheRef = useRef(threadCache);
+  const gmailRef = useRef(gmail);
   const inFlightThreadsRef = useRef(new Set<string>());
+  const activeRowFrameRef = useRef<number | null>(null);
+  const activePrefetchTimeoutRef = useRef<number | null>(null);
+  const activeRowSourceRef = useRef<ActiveRowSource>('programmatic');
+
+  useActiveMailboxSync(Boolean(session?.dashboard.auth.connected));
 
   useEffect(() => {
     threadCacheRef.current = threadCache;
   }, [threadCache]);
 
   useEffect(() => {
+    gmailRef.current = gmail;
+  }, [gmail]);
+
+  useEffect(() => {
+    return () => {
+      if (activeRowFrameRef.current !== null) {
+        window.cancelAnimationFrame(activeRowFrameRef.current);
+      }
+      if (activePrefetchTimeoutRef.current !== null) {
+        window.clearTimeout(activePrefetchTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     router.prefetch('/dashboard');
   }, [router]);
+
+  useEffect(() => {
+    if (session === null && appSessionRefreshFailed) {
+      router.replace('/');
+    }
+  }, [appSessionRefreshFailed, router, session]);
 
   const fetchThread = useCallback((threadId: string, options: { force?: boolean; silent?: boolean } = {}) => {
     const cleanId = cleanThreadId(threadId);
@@ -98,70 +127,23 @@ export function GmailInboxClient({ initialThreadId = null }: GmailInboxClientPro
   }, [cacheUserKey, router]);
 
   useEffect(() => {
-    let cancelled = false;
-
-    void fetchAuthMe()
-      .then((me) => {
-        if (cancelled) {
-          return;
-        }
-        if (!me.authenticated || me.user === undefined || me.user === null) {
-          clearMailboxCaches();
-          router.replace('/');
-          return;
-        }
-        const nextCacheUserKey = me.user.id;
-        setCacheUserKey(nextCacheUserKey);
-        const cachedMailbox = inMemoryMailboxCache?.userKey === nextCacheUserKey
-          ? inMemoryMailboxCache.gmail
-          : readCachedMailbox(nextCacheUserKey);
-        if (cachedMailbox !== null) {
-          setGmail(cachedMailbox);
-        } else if (inMemoryMailboxCache?.userKey !== nextCacheUserKey) {
-          setGmail(null);
-        }
-        if (inMemoryThreadCache?.userKey === nextCacheUserKey) {
-          setThreadCache(inMemoryThreadCache.threads);
-        } else {
-          setThreadCache({});
-        }
-
-        void maybeTriggerMailboxSync(nextCacheUserKey);
-
-        return fetchMailbox()
-          .then((nextGmail) => {
-            if (cancelled || nextGmail === null) {
-              return;
-            }
-            setGmail(nextGmail);
-            setRefreshFailed(false);
-            inMemoryMailboxCache = { userKey: nextCacheUserKey, gmail: nextGmail };
-            writeCachedMailbox(nextCacheUserKey, nextGmail);
-          });
-      })
-      .catch(() => {
-        if (!cancelled) {
-          void verifyGoogleConnection()
-            .then((auth) => {
-              if (auth.connected) {
-                return;
-              }
-              clearMailboxCaches();
-              if (auth.connect_url) {
-                window.location.assign(auth.connect_url);
-                return;
-              }
-              router.replace('/');
-            })
-            .catch(() => {});
-          setRefreshFailed(true);
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [router]);
+    if (session === null) {
+      return;
+    }
+    const nextCacheUserKey = session.user.id;
+    setCacheUserKey(nextCacheUserKey);
+    setGmail((current) => {
+      const nextMailbox = session.mailbox;
+      if (current !== null && current.total_threads > 0 && nextMailbox.total_threads === 0) {
+        return current;
+      }
+      return nextMailbox;
+    });
+    setRefreshFailed(false);
+    if (inMemoryThreadCache?.userKey === nextCacheUserKey) {
+      setThreadCache(inMemoryThreadCache.threads);
+    }
+  }, [session]);
 
   useEffect(() => {
     const nextSelectedThreadId = cleanThreadId(initialThreadId);
@@ -187,6 +169,11 @@ export function GmailInboxClient({ initialThreadId = null }: GmailInboxClientPro
 
   const mailboxRows = useMemo(() => (gmail === null ? [] : flattenMailboxRows(gmail)), [gmail]);
 
+  const activateThread = useCallback((threadId: string, source: ActiveRowSource) => {
+    activeRowSourceRef.current = source;
+    setActiveThreadId(threadId);
+  }, []);
+
   useEffect(() => {
     if (mailboxRows.length === 0) {
       setActiveThreadId(null);
@@ -197,7 +184,7 @@ export function GmailInboxClient({ initialThreadId = null }: GmailInboxClientPro
       if (current !== null && mailboxRows.some((row) => row.thread_id === current)) {
         return current;
       }
-      return mailboxRows[0]?.thread_id ?? null;
+      return null;
     });
   }, [mailboxRows]);
 
@@ -216,6 +203,55 @@ export function GmailInboxClient({ initialThreadId = null }: GmailInboxClientPro
     };
   }, [fetchThread, mailboxRows]);
 
+  useEffect(() => {
+    if (activeThreadId === null || selectedThreadId !== null || mailboxRows.length === 0) {
+      return;
+    }
+    if (!mailboxRows.some((row) => row.thread_id === activeThreadId)) {
+      return;
+    }
+    if (activeRowSourceRef.current !== 'keyboard') {
+      return;
+    }
+
+    if (activeRowFrameRef.current !== null) {
+      window.cancelAnimationFrame(activeRowFrameRef.current);
+    }
+    activeRowFrameRef.current = window.requestAnimationFrame(() => {
+      activeRowFrameRef.current = null;
+      const activeLink = document.querySelector<HTMLAnchorElement>(
+        `[data-gmail-thread-id="${escapeSelectorValue(activeThreadId)}"]`,
+      );
+      if (activeLink === null) {
+        return;
+      }
+      activeLink.scrollIntoView({
+        block: 'nearest',
+        inline: 'nearest',
+        behavior: 'auto',
+      });
+    });
+
+    if (activePrefetchTimeoutRef.current !== null) {
+      window.clearTimeout(activePrefetchTimeoutRef.current);
+    }
+    activePrefetchTimeoutRef.current = window.setTimeout(() => {
+      activePrefetchTimeoutRef.current = null;
+      fetchThread(activeThreadId, { silent: true });
+    }, 90);
+
+    return () => {
+      if (activeRowFrameRef.current !== null) {
+        window.cancelAnimationFrame(activeRowFrameRef.current);
+        activeRowFrameRef.current = null;
+      }
+      if (activePrefetchTimeoutRef.current !== null) {
+        window.clearTimeout(activePrefetchTimeoutRef.current);
+        activePrefetchTimeoutRef.current = null;
+      }
+    };
+  }, [activeThreadId, fetchThread, mailboxRows, selectedThreadId]);
+
   const selectedRow = useMemo(() => {
     if (selectedThreadId === null) {
       return null;
@@ -229,11 +265,11 @@ export function GmailInboxClient({ initialThreadId = null }: GmailInboxClientPro
 
   const openThread = useCallback((row: GmailThreadRow) => {
     setSelectedThreadId(row.thread_id);
-    setActiveThreadId(row.thread_id);
+    activateThread(row.thread_id, 'programmatic');
     setThreadErrors((current) => omitKey(current, row.thread_id));
     pushMailboxURL(row.thread_id);
     fetchThread(row.thread_id);
-  }, [fetchThread]);
+  }, [activateThread, fetchThread]);
 
   const closeThread = useCallback(() => {
     setSelectedThreadId(null);
@@ -258,26 +294,31 @@ export function GmailInboxClient({ initialThreadId = null }: GmailInboxClientPro
         return;
       }
 
-      const activeIndex = Math.max(0, mailboxRows.findIndex((row) => row.thread_id === activeThreadId));
+      const activeIndex = activeThreadId === null
+        ? -1
+        : mailboxRows.findIndex((row) => row.thread_id === activeThreadId);
       if (event.key === 'ArrowDown' || event.key.toLowerCase() === 'j') {
         event.preventDefault();
-        const nextRow = mailboxRows[Math.min(activeIndex + 1, mailboxRows.length - 1)];
+        const nextIndex = activeIndex < 0 ? 0 : Math.min(activeIndex + 1, mailboxRows.length - 1);
+        const nextRow = mailboxRows[nextIndex];
         if (nextRow) {
-          setActiveThreadId(nextRow.thread_id);
-          fetchThread(nextRow.thread_id, { silent: true });
+          activateThread(nextRow.thread_id, 'keyboard');
         }
         return;
       }
       if (event.key === 'ArrowUp' || event.key.toLowerCase() === 'k') {
         event.preventDefault();
-        const nextRow = mailboxRows[Math.max(activeIndex - 1, 0)];
+        const nextIndex = activeIndex < 0 ? mailboxRows.length - 1 : Math.max(activeIndex - 1, 0);
+        const nextRow = mailboxRows[nextIndex];
         if (nextRow) {
-          setActiveThreadId(nextRow.thread_id);
-          fetchThread(nextRow.thread_id, { silent: true });
+          activateThread(nextRow.thread_id, 'keyboard');
         }
         return;
       }
       if (event.key === 'Enter' || event.key.toLowerCase() === 'o') {
+        if (activeIndex < 0) {
+          return;
+        }
         const row = mailboxRows[activeIndex];
         if (row) {
           event.preventDefault();
@@ -290,7 +331,7 @@ export function GmailInboxClient({ initialThreadId = null }: GmailInboxClientPro
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [activeThreadId, closeThread, fetchThread, mailboxRows, openThread, selectedThreadId]);
+  }, [activateThread, activeThreadId, closeThread, mailboxRows, openThread, selectedThreadId]);
 
   if (gmail !== null || selectedThreadId !== null) {
     return (
@@ -307,16 +348,24 @@ export function GmailInboxClient({ initialThreadId = null }: GmailInboxClientPro
           <GmailList
             gmail={gmail}
             activeThreadId={activeThreadId}
-            onActivateThread={setActiveThreadId}
             onOpenThread={openThread}
             onPrefetchThread={(threadId) => fetchThread(threadId, { silent: true })}
           />
         ) : (
           <MailboxLoadingView />
         )}
-        {refreshFailed ? (
+        {session?.mailbox.full_import_running ? (
           <p className="inbox-refresh-status" role="status">
-            Inbox could not refresh.
+            Importing older mail in background.
+          </p>
+        ) : (session?.mailbox.pending_count ?? 0) > 0 ? (
+          <p className="inbox-refresh-status" role="status">
+            Finishing AI titles for older mail.
+          </p>
+        ) : null}
+        {refreshFailed || appSessionRefreshFailed ? (
+          <p className="inbox-refresh-status" role="status">
+            Inbox could not refresh. Showing last saved state.
           </p>
         ) : null}
       </SignedInAppChrome>
@@ -358,6 +407,7 @@ function GmailThreadPanel({
   onBack: () => void;
 }) {
   const title = thread?.subject?.trim() || row?.latest_subject?.trim() || 'Thread';
+  const summary = row?.summary?.trim() || row?.snippet?.trim() || null;
   const messages = thread?.messages ?? [];
 
   return (
@@ -374,6 +424,7 @@ function GmailThreadPanel({
             Back to Inbox
           </button>
           <h1 className="thread-reader-title">{title}</h1>
+          {summary ? <p className="thread-reader-summary">{summary}</p> : null}
           {errorMessage ? <p className="thread-reader-empty" role="status">{errorMessage}</p> : null}
         </header>
 
@@ -395,13 +446,14 @@ function GmailThreadMessageCard({ message }: { message: ThreadMessage }) {
   const subject = message.subject?.trim() || 'Untitled message';
   const body = message.body.trim();
   const htmlBody = message.html_body?.trim();
+  const sender = message.from_address?.trim() || 'Unknown sender';
 
   return (
     <li className="thread-message">
       <article className="thread-message-card" aria-label={subject}>
         <header className="thread-message-header">
-          <h2 className="thread-message-subject">{subject}</h2>
-          <p className="thread-message-source">Gmail · {formatThreadReceivedAt(message.received_at)}</p>
+          <h2 className="thread-message-subject">{sender}</h2>
+          <p className="thread-message-source">{formatThreadReceivedAt(message.received_at)}</p>
         </header>
         <dl className="thread-message-fields">
           {message.from_address ? (
@@ -429,7 +481,6 @@ function GmailThreadMessageCard({ message }: { message: ThreadMessage }) {
             </>
           ) : null}
         </dl>
-        {message.snippet ? <p className="thread-message-snippet">{message.snippet}</p> : null}
         {htmlBody ? (
           <iframe
             className="thread-message-html-frame"
@@ -480,63 +531,17 @@ function flattenMailboxRows(gmail: MailboxResponse): GmailThreadRow[] {
   return gmail.sections.flatMap((section) => section.rows);
 }
 
-function readCachedMailbox(userKey: string): MailboxResponse | null {
-  try {
-    const cached = window.localStorage.getItem(mailboxStorageKey(userKey));
-    if (cached === null) {
-      return null;
-    }
-
-    const parsed = JSON.parse(cached) as Partial<MailboxResponse>;
-    if (parsed.label !== 'inbox' || typeof parsed.total_threads !== 'number' || !Array.isArray(parsed.sections)) {
-      return null;
-    }
-
-    return parsed as MailboxResponse;
-  } catch (_error) {
-    return null;
+function escapeSelectorValue(value: string): string {
+  if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+    return CSS.escape(value);
   }
-}
-
-function writeCachedMailbox(userKey: string, gmail: MailboxResponse) {
-  try {
-    window.localStorage.setItem(mailboxStorageKey(userKey), JSON.stringify(gmail));
-  } catch (_error) {}
-}
-
-async function fetchMailbox(): Promise<MailboxResponse | null> {
-  const query = `label=inbox&limit=${MAILBOX_FETCH_LIMIT}`;
-  const urls = [
-    `${getBrowserBackendURL()}/v1/mailbox?${query}`,
-    `/api/mailbox?${query}`,
-  ];
-
-  let lastError: unknown = null;
-  for (const url of urls) {
-    try {
-      const response = await fetch(url, {
-        cache: 'no-store',
-        credentials: 'include',
-        headers: {
-          Accept: 'application/json',
-        },
-      });
-      if (response.status === 401) {
-        return null;
-      }
-      if (!response.ok) {
-        throw new Error('Gmail inbox refresh failed');
-      }
-      return response.json() as Promise<MailboxResponse>;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError instanceof Error ? lastError : new Error('Gmail inbox refresh failed');
+  return value.replace(/["\\]/g, '\\$&');
 }
 
 async function fetchMailboxThread(threadId: string): Promise<ThreadReaderResponse | null> {
+  if (isDemoMode()) {
+    return getDemoThreadReader(threadId);
+  }
   const query = `limit=${THREAD_FETCH_LIMIT}`;
   const urls = [
     `${getBrowserBackendURL()}/v1/mailbox/threads/${encodeURIComponent(threadId)}?${query}`,
@@ -568,78 +573,6 @@ async function fetchMailboxThread(threadId: string): Promise<ThreadReaderRespons
   throw lastError instanceof Error ? lastError : new Error('Thread could not refresh.');
 }
 
-async function verifyGoogleConnection(): Promise<GoogleAuthState> {
-  const response = await fetch(`${getBrowserBackendURL()}/v1/auth/google/state`, {
-    cache: 'no-store',
-    credentials: 'include',
-    headers: {
-      Accept: 'application/json',
-    },
-  });
-  if (!response.ok) {
-    throw new Error('Google auth state could not refresh.');
-  }
-  return response.json() as Promise<GoogleAuthState>;
-}
-
-async function fetchAuthMe(): Promise<AuthMeResponse> {
-  const response = await fetch(`${getBrowserBackendURL()}/v1/auth/me`, {
-    cache: 'no-store',
-    credentials: 'include',
-    headers: {
-      Accept: 'application/json',
-    },
-  });
-  if (!response.ok) {
-    throw new Error('Session could not refresh.');
-  }
-  return response.json() as Promise<AuthMeResponse>;
-}
-
-async function maybeTriggerMailboxSync(userKey: string): Promise<void> {
-  if (!shouldTriggerMailboxSync(userKey)) {
-    return;
-  }
-
-  const urls = [
-    `${getBrowserBackendURL()}/v1/mailbox/sync`,
-    '/api/mailbox/sync',
-  ];
-
-  for (const url of urls) {
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        cache: 'no-store',
-        credentials: 'include',
-        headers: {
-          Accept: 'application/json',
-        },
-      });
-      if (response.ok) {
-        writeLastMailboxSyncAttempt(userKey);
-        return;
-      }
-    } catch (_error) {}
-  }
-}
-
-function shouldTriggerMailboxSync(userKey: string): boolean {
-  try {
-    const rawValue = window.localStorage.getItem(mailboxSyncStorageKey(userKey));
-    const lastAttempt = rawValue === null ? 0 : Number(rawValue);
-    return !Number.isFinite(lastAttempt) || Date.now() - lastAttempt > MAILBOX_SYNC_COOLDOWN_MS;
-  } catch (_error) {
-    return true;
-  }
-}
-
-function writeLastMailboxSyncAttempt(userKey: string) {
-  try {
-    window.localStorage.setItem(mailboxSyncStorageKey(userKey), String(Date.now()));
-  } catch (_error) {}
-}
-
 function getBrowserBackendURL(): string {
   return (process.env.NEXT_PUBLIC_DECISION_PIPELINE_BACKEND_URL ?? DEFAULT_BROWSER_BACKEND_URL).replace(/\/+$/, '');
 }
@@ -664,31 +597,6 @@ function writeCachedThread(userKey: string, threadId: string, thread: ThreadRead
   try {
     window.localStorage.setItem(threadStorageKey(userKey, threadId), JSON.stringify(thread));
   } catch (_error) {}
-}
-
-function clearMailboxCaches() {
-  inMemoryMailboxCache = null;
-  inMemoryThreadCache = null;
-  try {
-    for (let index = window.localStorage.length - 1; index >= 0; index -= 1) {
-      const key = window.localStorage.key(index);
-      if (
-        key?.startsWith(THREAD_STORAGE_PREFIX)
-        || key?.startsWith(MAILBOX_STORAGE_PREFIX)
-        || key?.startsWith(MAILBOX_SYNC_STORAGE_PREFIX)
-      ) {
-        window.localStorage.removeItem(key);
-      }
-    }
-  } catch (_error) {}
-}
-
-function mailboxStorageKey(userKey: string): string {
-  return `${MAILBOX_STORAGE_PREFIX}${userKey}`;
-}
-
-function mailboxSyncStorageKey(userKey: string): string {
-  return `${MAILBOX_SYNC_STORAGE_PREFIX}${userKey}`;
 }
 
 function threadStorageKey(userKey: string, threadId: string): string {

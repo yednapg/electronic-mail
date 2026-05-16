@@ -12,6 +12,7 @@ import os
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BACKEND_DIR / ".env")
+load_dotenv(BACKEND_DIR / ".env.local", override=True)
 POSTGRES_URL_PREFIXES = ("postgres://", "postgresql://")
 
 
@@ -169,7 +170,7 @@ def load_settings() -> Settings:
             "GOOGLE_REDIRECT_URI",
             "http://localhost:3001/auth/google/callback",
         ),
-        mobile_redirect_uri=os.getenv("MOBILE_REDIRECT_URI", "decisionpipeline://auth/callback").strip(),
+        mobile_redirect_uri=os.getenv("MOBILE_REDIRECT_URI", "electronicmail://auth/callback").strip(),
         openai_api_key=os.getenv("OPENAI_API_KEY", "").strip().strip("\"'"),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-5.4-mini").strip().strip("\"'") or "gpt-5.4-mini",
         openai_reasoning_effort=_resolve_openai_reasoning_effort(),

@@ -1,6 +1,9 @@
 /** Web-local aliases over the shared feed contract package. */
 import type {
   AttentionItem,
+  AppSessionStateResponse,
+  AppSessionSyncState,
+  AppSessionUser,
   DashboardBriefing,
   DashboardResponse,
   DashboardProfile,
@@ -19,9 +22,9 @@ import type {
   MobileSessionExchangeResponse,
   MailboxSyncStateResponse,
   MailboxSyncTriggerResponse,
+  PostLoginReadinessResponse,
   ThreadMessage,
   ThreadReaderResponse,
-  TraceReplayResponse,
   TimingBand,
 } from '@decision-pipeline/types';
 
@@ -29,6 +32,9 @@ export type FeedItem = AttentionItem;
 export type PrimaryActionType = AttentionItem['primary_action'];
 
 export type {
+  AppSessionStateResponse,
+  AppSessionSyncState,
+  AppSessionUser,
   DashboardBriefing,
   DashboardProfile,
   DashboardResponse,
@@ -47,8 +53,8 @@ export type {
   MobileSessionExchangeResponse,
   MailboxSyncStateResponse,
   MailboxSyncTriggerResponse,
+  PostLoginReadinessResponse,
   ThreadMessage,
   ThreadReaderResponse,
-  TraceReplayResponse,
   TimingBand,
 };

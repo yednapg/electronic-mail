@@ -1,84 +1,44 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo } from 'react';
 
 import { SignedInAppChrome } from '../../components/app/AppChrome';
 import { DashboardView } from '../../components/dashboard/DashboardView';
+import { useAppSession } from '../../lib/app-session-store';
+import { useActiveMailboxSync } from '../../lib/use-active-mailbox-sync';
 import {
   buildAgenda,
   buildSections,
   buildSummary,
 } from '../../lib/dashboard-view-model';
 import { formatClockTime, formatDate } from '../../lib/formatting';
-import type { AuthMeResponse, DashboardResponse } from '../../lib/types';
+import type { DashboardResponse } from '../../lib/types';
 
-const DASHBOARD_STORAGE_PREFIX = 'decision-pipeline-dashboard:v2:';
-const DEFAULT_BROWSER_BACKEND_URL = 'http://localhost:3001';
+type DashboardClientProps = {
+  initialDashboard?: DashboardResponse | null;
+};
 
-let inMemoryDashboardCache: { userKey: string; dashboard: DashboardResponse } | null = null;
-
-export function DashboardClient() {
+export function DashboardClient({ initialDashboard = null }: DashboardClientProps) {
   const router = useRouter();
-  const [dashboard, setDashboard] = useState<DashboardResponse | null>(() => inMemoryDashboardCache?.dashboard ?? null);
-  const [refreshFailed, setRefreshFailed] = useState(false);
+  const { session, refreshFailed } = useAppSession();
   const now = useMemo(() => new Date(), []);
+  const dashboard = session?.dashboard ?? initialDashboard;
+
+  useActiveMailboxSync(Boolean(session?.dashboard.auth.connected));
 
   useEffect(() => {
     router.prefetch('/gmail');
   }, [router]);
 
   useEffect(() => {
-    let cancelled = false;
-
-    void fetchAuthMe()
-      .then((me) => {
-        if (cancelled) {
-          return;
-        }
-        if (!me.authenticated || me.user === undefined || me.user === null) {
-          clearDashboardCaches();
-          router.replace('/');
-          return;
-        }
-
-        const userId = me.user.id;
-        const cachedDashboard = inMemoryDashboardCache?.userKey === userId
-          ? inMemoryDashboardCache.dashboard
-          : readCachedDashboard(userId);
-        if (cachedDashboard !== null) {
-          setDashboard(cachedDashboard);
-        } else if (inMemoryDashboardCache?.userKey !== userId) {
-          setDashboard(null);
-        }
-
-        return fetchDashboard()
-          .then((nextDashboard) => {
-            if (cancelled || nextDashboard === null) {
-              return;
-            }
-            if (!nextDashboard.auth.connected) {
-              clearDashboardCaches();
-              router.replace('/');
-              return;
-            }
-            setDashboard(nextDashboard);
-            setRefreshFailed(false);
-            inMemoryDashboardCache = { userKey: userId, dashboard: nextDashboard };
-            writeCachedDashboard(userId, nextDashboard);
-
-          });
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setRefreshFailed(true);
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [router]);
+    if (session !== null && !session.dashboard.auth.connected) {
+      router.replace('/');
+    }
+    if (session === null && refreshFailed) {
+      router.replace('/');
+    }
+  }, [refreshFailed, router, session]);
 
   return (
     <SignedInAppChrome active="dashboard">
@@ -94,9 +54,14 @@ export function DashboardClient() {
           sections={buildSections(dashboard.feed)}
         />
       )}
+      {session?.mailbox.full_import_running ? (
+        <p className="inbox-refresh-status" role="status">
+          Processing older mail in background.
+        </p>
+      ) : null}
       {refreshFailed ? (
         <p className="inbox-refresh-status" role="status">
-          Dashboard could not refresh.
+          Dashboard could not refresh. Showing last saved state.
         </p>
       ) : null}
     </SignedInAppChrome>
@@ -109,7 +74,7 @@ function DashboardLoadingView({ dateLabel, timeLabel }: { dateLabel: string; tim
       dateLabel={dateLabel}
       timeLabel={timeLabel}
       liveMeta={false}
-      summary={{ headline: 'Dashboard', brief: 'Refreshing your work cache...' }}
+      summary={{ headline: 'Dashboard', brief: 'Loading your saved workspace...' }}
       agenda={[]}
       sections={[
         { id: 'now', title: 'Now', items: [], maxVisible: 6, collapsedByDefault: true },
@@ -118,93 +83,4 @@ function DashboardLoadingView({ dateLabel, timeLabel }: { dateLabel: string; tim
       ]}
     />
   );
-}
-
-async function fetchAuthMe(): Promise<AuthMeResponse> {
-  const response = await fetch(`${getBrowserBackendURL()}/v1/auth/me`, {
-    cache: 'no-store',
-    credentials: 'include',
-    headers: {
-      Accept: 'application/json',
-    },
-  });
-  if (!response.ok) {
-    throw new Error('Session could not refresh.');
-  }
-  return response.json() as Promise<AuthMeResponse>;
-}
-
-async function fetchDashboard(): Promise<DashboardResponse | null> {
-  const urls = [
-    `${getBrowserBackendURL()}/dashboard`,
-    '/api/dashboard',
-  ];
-
-  let lastError: unknown = null;
-  for (const url of urls) {
-    try {
-      const response = await fetch(url, {
-        cache: 'no-store',
-        credentials: 'include',
-        headers: {
-          Accept: 'application/json',
-        },
-      });
-      if (response.status === 401) {
-        return null;
-      }
-      if (!response.ok) {
-        throw new Error('Dashboard refresh failed.');
-      }
-      return response.json() as Promise<DashboardResponse>;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError instanceof Error ? lastError : new Error('Dashboard refresh failed.');
-}
-
-function readCachedDashboard(userKey: string): DashboardResponse | null {
-  try {
-    const cached = window.localStorage.getItem(dashboardStorageKey(userKey));
-    if (cached === null) {
-      return null;
-    }
-
-    const parsed = JSON.parse(cached) as Partial<DashboardResponse>;
-    if (parsed.auth === undefined || parsed.feed === undefined) {
-      return null;
-    }
-
-    return parsed as DashboardResponse;
-  } catch (_error) {
-    return null;
-  }
-}
-
-function writeCachedDashboard(userKey: string, dashboard: DashboardResponse) {
-  try {
-    window.localStorage.setItem(dashboardStorageKey(userKey), JSON.stringify(dashboard));
-  } catch (_error) {}
-}
-
-function clearDashboardCaches() {
-  inMemoryDashboardCache = null;
-  try {
-    for (let index = window.localStorage.length - 1; index >= 0; index -= 1) {
-      const key = window.localStorage.key(index);
-      if (key?.startsWith(DASHBOARD_STORAGE_PREFIX)) {
-        window.localStorage.removeItem(key);
-      }
-    }
-  } catch (_error) {}
-}
-
-function dashboardStorageKey(userKey: string): string {
-  return `${DASHBOARD_STORAGE_PREFIX}${userKey}`;
-}
-
-function getBrowserBackendURL(): string {
-  return (process.env.NEXT_PUBLIC_DECISION_PIPELINE_BACKEND_URL ?? DEFAULT_BROWSER_BACKEND_URL).replace(/\/+$/, '');
 }

@@ -36,6 +36,7 @@ def ready() -> dict[str, object]:
                     )
                 connection.exec_driver_sql("SELECT 1 FROM gmail_messages LIMIT 1")
                 connection.exec_driver_sql("SELECT 1 FROM mail_groups LIMIT 1")
+                connection.exec_driver_sql("SELECT 1 FROM app_session_snapshots LIMIT 1")
         except Exception as exc:
             errors.append(f"Postgres readiness check failed: {exc}")
 
@@ -69,6 +70,7 @@ def root() -> dict[str, str]:
         "health": "/health",
         "ready": "/ready",
         "dashboard": "/dashboard",
+        "app_session": "/v1/app/session",
         "mail_groups": "/v1/mail-groups",
         "mailbox": "/v1/mailbox",
         "jobs": "/v1/jobs/{job_id}",

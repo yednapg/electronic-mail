@@ -114,6 +114,17 @@ function DashboardSectionItemRow({
 
     setChecked(true);
     setIsCompleting(true);
+    window.dispatchEvent(
+      new CustomEvent('dashboard:item-completed', {
+        detail: {
+          id: item.id,
+          entityId: item.entityId,
+          primaryAction: item.primaryAction,
+          needType: item.needType,
+          source: item.source,
+        },
+      }),
+    );
     onComplete();
   }
 

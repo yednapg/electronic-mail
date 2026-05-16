@@ -1,5 +1,5 @@
 {
-  "name": "decision-pipeline-system",
+  "name": "electronic-mail-system",
   "private": true,
   "workspaces": [
     "web",
@@ -10,19 +10,29 @@
     "start": "npm run setup && npm run dev",
     "dev": "npm run dev:web",
     "dev:web": "npm run dev -w @decision-pipeline/web",
+    "dev:web:demo": "npm run dev:demo -w @decision-pipeline/web",
+    "web:build": "npm run build -w @decision-pipeline/web",
+    "web:build:demo": "npm run build:demo -w @decision-pipeline/web",
+    "db:local:setup": "bash scripts/setup-local-postgres.sh",
+    "db:migrate": "cd backend && ../.venv/bin/alembic upgrade head",
+    "db:reset": "cd backend && ../.venv/bin/python reset_data.py",
+    "backend:api": "cd backend && .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-3001}",
+    "backend:worker:fast": "cd backend && .venv/bin/python -m app.workers.main --queues critical,default",
+    "backend:worker:slow": "cd backend && .venv/bin/python -m app.workers.main --queues slow --sleep 5",
     "backend:test": "cd backend && ../.venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'",
     "backend:compile": "cd backend && ../.venv/bin/python -m compileall -q app tests db_init.py reset_data.py",
     "web:test": "npm run test -w @decision-pipeline/web",
     "web:typecheck": "npm run typecheck -w @decision-pipeline/types && npm run typecheck -w @decision-pipeline/web",
-    "ios:generate": "cd ios/DecisionPipeline && tuist generate",
-    "ios:fast-run": "bash scripts/ios-fast-run.sh",
-    "ios:typecheck": "xcodebuild build-for-testing -workspace ios/DecisionPipeline/DecisionPipeline.xcworkspace -scheme DecisionPipeline -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO",
-    "ios:build": "xcodebuild -workspace ios/DecisionPipeline/DecisionPipeline.xcworkspace -scheme DecisionPipeline -destination 'platform=iOS Simulator,name=iPhone 17' build",
-    "ios:test": "xcodebuild test -workspace ios/DecisionPipeline/DecisionPipeline.xcworkspace -scheme DecisionPipeline -destination 'platform=iOS Simulator,name=iPhone 17'",
+    "macos:generate": "cd macos/ElectronicMail && tuist generate",
+    "macos:typecheck": "xcodebuild build-for-testing -workspace macos/ElectronicMail/ElectronicMail.xcworkspace -scheme ElectronicMail -destination 'platform=macOS' COMPILER_INDEX_STORE_ENABLE=NO -jobs 2 -derivedDataPath /tmp/ElectronicMailDerivedData CODE_SIGNING_ALLOWED=NO",
+    "macos:build": "xcodebuild build -workspace macos/ElectronicMail/ElectronicMail.xcworkspace -scheme ElectronicMail -destination 'platform=macOS' COMPILER_INDEX_STORE_ENABLE=NO -jobs 2 -derivedDataPath /tmp/ElectronicMailDerivedData CODE_SIGNING_ALLOWED=NO",
+    "macos:test": "xcodebuild test -workspace macos/ElectronicMail/ElectronicMail.xcworkspace -scheme ElectronicMail -destination 'platform=macOS' COMPILER_INDEX_STORE_ENABLE=NO -jobs 2 -derivedDataPath /tmp/ElectronicMailDerivedData CODE_SIGNING_ALLOWED=NO",
+    "macos:open": "open /tmp/ElectronicMailDerivedData/Build/Products/Debug/ElectronicMail.app",
+    "macos:run": "npm run macos:build && npm run macos:open",
     "test": "npm run web:test",
     "typecheck": "npm run web:typecheck",
     "verify": "npm run backend:test && npm run backend:compile && npm run web:typecheck && npm run web:test",
-    "verify:ios": "npm run ios:generate && npm run ios:typecheck && npm run ios:build && npm run ios:test"
+    "verify:macos": "npm run macos:generate && npm run macos:typecheck && npm run macos:build && npm run macos:test"
   },
   "devDependencies": {
     "typescript": "^5.8.3"

@@ -1,0 +1,18 @@
+- generic [active] [ref=e1]:
+  - main [ref=e2]:
+    - generic [ref=e3]:
+      - img "Email becomes done" [ref=e4]:
+        - generic [ref=e5]: 📨
+        - generic [ref=e6]: →
+        - generic [ref=e7]: ✅
+      - heading "Work first. Emails underneath." [level=1] [ref=e9]:
+        - generic [ref=e10]: Work first.
+        - generic [ref=e11]: Emails underneath.
+      - link "Continue with Google" [ref=e12] [cursor=pointer]:
+        - /url: http://localhost:3001/auth/google
+        - img [ref=e14]
+        - generic [ref=e19]: Continue with Google
+  - button "Switch theme" [ref=e20] [cursor=pointer]:
+    - img [ref=e22]
+  - button "Open Next.js Dev Tools" [ref=e29] [cursor=pointer]:
+    - img [ref=e30]

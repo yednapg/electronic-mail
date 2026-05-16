@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from app.core.config import load_settings
 from app.schemas.domain import GmailViewResponse, MailboxResponse, ThreadReaderResponse
 from app.services.auth import require_current_user
-from app.services.mail_groups import build_group_detail_response, build_mailbox_response
+from app.services.mail_groups import build_app_session_response, build_group_detail_response, build_mailbox_response
 
 router = APIRouter(tags=["mail-groups"])
 settings = load_settings()
@@ -22,7 +22,7 @@ def mail_groups(request: Request, limit: int = Query(default=150, ge=1, le=250))
 @router.get("/v1/gmail-view", response_model=GmailViewResponse)
 def gmail_view(request: Request) -> GmailViewResponse:
     user = require_current_user(settings, request)
-    mailbox = build_mailbox_response(settings, user_id=user.id, label="inbox", limit=250)
+    mailbox = build_app_session_response(settings, user=user).mailbox
     return GmailViewResponse(total_threads=mailbox.total_threads, sections=mailbox.sections)
 
 

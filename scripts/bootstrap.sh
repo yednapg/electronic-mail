@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NODE_DEPS_DIR="$ROOT_DIR/node_modules"
 VENV_DIR="$ROOT_DIR/.venv"
 
-echo "==> Decision Pipeline bootstrap started"
+echo "==> Electronic Mail bootstrap started"
 
 if [ ! -d "$NODE_DEPS_DIR" ]; then
   echo "==> Installing Node dependencies (npm install)"
@@ -37,8 +37,9 @@ echo "==> Installing Python dependencies for the backend"
 "$VENV_DIR/bin/pip" install --upgrade pip
 "$VENV_DIR/bin/pip" install -r "$ROOT_DIR/backend/requirements.txt"
 
-echo "==> Creating local SQLite db schema"
+echo "==> Validating backend database configuration"
 "$VENV_DIR/bin/python" "$ROOT_DIR/backend/db_init.py"
+echo "==> For a local Postgres database, run: npm run db:local:setup"
 
 echo "==> Bootstrap complete"
 echo "Frontend: npm run dev"
