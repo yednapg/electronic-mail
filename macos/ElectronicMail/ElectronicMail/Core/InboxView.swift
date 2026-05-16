@@ -4,6 +4,8 @@ import SwiftUI
 public struct InboxView: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var store: InboxStore
+    @State private var scrollViewportHeight: CGFloat = 0
+    @State private var keyboardWindowStartIndex: Int = 0
 
     public init(store: InboxStore) {
         self.store = store
@@ -44,9 +46,22 @@ public struct InboxView: View {
                                 }
                                 .padding(.bottom, ElectronicMailTypography.bodyLineHeight)
                             }
+                            .background(
+                                GeometryReader { geometry in
+                                    Color.clear.preference(
+                                        key: InboxViewportHeightPreferenceKey.self,
+                                        value: geometry.size.height
+                                    )
+                                }
+                            )
+                            .onPreferenceChange(InboxViewportHeightPreferenceKey.self) { height in
+                                if scrollViewportHeight != height {
+                                    scrollViewportHeight = height
+                                }
+                            }
 
                             InboxKeyboardEventCapture(
-                                onMove: { delta in moveSelection(delta: delta, proxy: scrollProxy) },
+                                onMove: { delta in moveSelection(delta: delta, scrollProxy: scrollProxy) },
                                 onOpen: { store.openActiveSelection() }
                             )
                             .frame(width: 1, height: 1)
@@ -85,7 +100,7 @@ public struct InboxView: View {
         .environment(\.font, .system(.body, design: .rounded))
     }
 
-    private func moveSelection(delta: Int, proxy: ScrollViewProxy) {
+    private func moveSelection(delta: Int, scrollProxy: ScrollViewProxy) {
         let rows = store.flatRows
         guard !rows.isEmpty else {
             return
@@ -104,11 +119,46 @@ public struct InboxView: View {
         }
 
         let nextThreadID = rows[nextIndex].threadID
+        let scrollAnchor = keyboardScrollAnchor(for: nextIndex, rowCount: rows.count)
         store.select(threadID: nextThreadID, prefetch: false)
 
-        withAnimation(.easeOut(duration: 0.08)) {
-            proxy.scrollTo(nextThreadID)
+        if let scrollAnchor {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                scrollProxy.scrollTo(nextThreadID, anchor: scrollAnchor)
+            }
         }
+    }
+
+    private func keyboardScrollAnchor(for targetIndex: Int, rowCount: Int) -> UnitPoint? {
+        let visibleCapacity = max(1, min(rowCount, keyboardVisibleRowCapacity()))
+
+        if targetIndex < keyboardWindowStartIndex {
+            keyboardWindowStartIndex = targetIndex
+            return .top
+        }
+
+        let windowEndIndex = keyboardWindowStartIndex + visibleCapacity - 1
+        if targetIndex > windowEndIndex {
+            keyboardWindowStartIndex = targetIndex - visibleCapacity + 1
+            return .bottom
+        }
+
+        return nil
+    }
+
+    private func keyboardVisibleRowCapacity() -> Int {
+        let visibleLineCount = Int((scrollViewportHeight / ElectronicMailTypography.bodyLineHeight).rounded(.down))
+        return max(6, visibleLineCount - 4)
+    }
+}
+
+private struct InboxViewportHeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 
@@ -292,11 +342,7 @@ private struct InboxKeyboardEventCapture: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: KeyView, context: Context) {
-        nsView.onMove = onMove
-        nsView.onOpen = onOpen
-        DispatchQueue.main.async {
-            nsView.window?.makeFirstResponder(nsView)
-        }
+        nsView.updateHandlers(onMove: onMove, onOpen: onOpen)
     }
 
     final class KeyView: NSView {
@@ -309,11 +355,70 @@ private struct InboxKeyboardEventCapture: NSViewRepresentable {
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
+            KeyMonitor.install(
+                window: window,
+                onMove: onMove,
+                onOpen: onOpen
+            )
             DispatchQueue.main.async { [weak self] in
                 guard let self else {
                     return
                 }
                 self.window?.makeFirstResponder(self)
+            }
+        }
+
+        func updateHandlers(onMove: @escaping (Int) -> Void, onOpen: @escaping () -> Void) {
+            self.onMove = onMove
+            self.onOpen = onOpen
+            KeyMonitor.install(window: window, onMove: onMove, onOpen: onOpen)
+        }
+
+        private enum KeyMonitor {
+            static weak var window: NSWindow?
+            static var onMove: ((Int) -> Void)?
+            static var onOpen: (() -> Void)?
+            static var monitor: Any?
+
+            static func install(
+                window: NSWindow?,
+                onMove: ((Int) -> Void)?,
+                onOpen: (() -> Void)?
+            ) {
+                self.window = window
+                self.onMove = onMove
+                self.onOpen = onOpen
+
+                guard monitor == nil else {
+                    return
+                }
+
+                monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    handle(event)
+                }
+            }
+
+            private static func handle(_ event: NSEvent) -> NSEvent? {
+                guard
+                    window?.isKeyWindow == true,
+                    !(window?.firstResponder is NSTextView)
+                else {
+                    return event
+                }
+
+                switch event.keyCode {
+                case 125:
+                    onMove?(1)
+                    return nil
+                case 126:
+                    onMove?(-1)
+                    return nil
+                case 36, 76:
+                    onOpen?()
+                    return nil
+                default:
+                    return event
+                }
             }
         }
 
