@@ -2,6 +2,31 @@
 export type DashboardSummaryData = {
   headline: string;
   brief: string;
+  parts?: DashboardSummaryPart[];
+  important?: DashboardSummaryImportant | null;
+  calendarAvailability?: DashboardCalendarAvailability | null;
+};
+
+export type DashboardSummaryPart = {
+  type: string;
+  emoji: string;
+  count: number;
+  text: string;
+};
+
+export type DashboardSummaryImportant = {
+  emoji: string;
+  count: number;
+  text: string;
+  mailGroupId?: string | null;
+  actionType?: string | null;
+};
+
+export type DashboardCalendarAvailability = {
+  emoji: string;
+  kind: string;
+  time?: string | null;
+  text: string;
 };
 
 export type DashboardAgendaItem = {
@@ -19,6 +44,9 @@ export type DashboardSectionItem = {
   entityId?: string;
   title: string;
   checked?: boolean;
+  primaryAction?: string;
+  needType?: string;
+  source?: string;
   detail?: {
     facts?: Array<{
       label: string;

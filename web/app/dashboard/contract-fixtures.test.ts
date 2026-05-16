@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import type { DashboardResponse, GoogleAuthState, ThreadReaderResponse, TraceReplayResponse } from '../../lib/types';
+import type { DashboardResponse, GoogleAuthState, ThreadReaderResponse } from '../../lib/types';
 import { buildSections, buildSummary } from './page';
 
 function fixturePath(name: string): string {
@@ -40,13 +40,10 @@ test('dashboard fixture maps to dashboard view models', () => {
   assert.equal(worthKnowing?.items[0].id, 'item-2');
 });
 
-test('auth and trace fixtures match shared TypeScript contracts', () => {
+test('auth fixture matches shared TypeScript contracts', () => {
   const auth = readFixture<GoogleAuthState>('google-auth-state.json');
-  const trace = readFixture<TraceReplayResponse>('trace.json');
 
   assert.equal(auth.connected, true);
-  assert.equal(trace.entity_id, 'entity-1');
-  assert.equal(trace.items[0].output.merged, true);
 });
 
 test('thread reader fixture includes persisted source evidence', () => {

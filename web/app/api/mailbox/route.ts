@@ -10,7 +10,7 @@ export async function GET(request: Request) {
   const searchParams = new URL(request.url).searchParams;
   const rawLabel = searchParams.get('label') ?? 'inbox';
   const label = MAILBOX_LABELS.has(rawLabel) ? (rawLabel as MailboxLabel) : 'inbox';
-  const limit = parseBoundedInteger(searchParams.get('limit'), 100, 1, 250);
+  const limit = parseBoundedInteger(searchParams.get('limit'), 100, 1, 1000);
   const cursor = searchParams.get('cursor');
   const cookie = getRequestCookieHeader(request);
   const authPromise = requireConnectedGoogleAccount(request);

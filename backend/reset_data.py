@@ -5,20 +5,27 @@ from __future__ import annotations
 from app.core.config import load_settings
 from app.db.repository import get_engine
 
-TABLES = [
-    "background_job_events",
-    "background_jobs",
-    "worker_heartbeats",
-    "mail_group_members",
-    "mail_groups",
-    "gmail_messages",
-    "gmail_import_state",
-    "google_oauth_tokens",
-    "mobile_login_codes",
-    "oauth_login_sessions",
-    "app_sessions",
-    "users",
-]
+PRESERVED_TABLES = {
+    "alembic_version",
+    "allowed_emails",
+}
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _runtime_tables(connection) -> list[str]:
+    rows = connection.exec_driver_sql(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_type = 'BASE TABLE'
+        ORDER BY table_name
+        """
+    ).fetchall()
+    return [str(row[0]) for row in rows if str(row[0]) not in PRESERVED_TABLES]
 
 
 def main() -> None:
@@ -26,9 +33,11 @@ def main() -> None:
     if settings.database_backend != "postgres":
         raise SystemExit("DATABASE_URL must be Postgres")
     with get_engine(str(settings.database_path)).begin() as connection:
-        for table in TABLES:
-            connection.exec_driver_sql(f"DELETE FROM {table}")
-    print("Reset Postgres app data.")
+        tables = _runtime_tables(connection)
+        if tables:
+            joined_tables = ", ".join(_quote_identifier(table) for table in tables)
+            connection.exec_driver_sql(f"TRUNCATE TABLE {joined_tables} RESTART IDENTITY CASCADE")
+    print(f"Reset Postgres app data ({len(tables)} tables).")
 
 
 if __name__ == "__main__":

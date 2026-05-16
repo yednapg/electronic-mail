@@ -12,6 +12,7 @@ import os
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BACKEND_DIR / ".env")
+load_dotenv(BACKEND_DIR / ".env.local", override=True)
 POSTGRES_URL_PREFIXES = ("postgres://", "postgresql://")
 
 

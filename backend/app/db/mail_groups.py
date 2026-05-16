@@ -80,6 +80,19 @@ class GmailImportState:
     last_import_started_at: str | None
     last_import_completed_at: str | None
     last_sync_error: str | None
+    gmail_watch_history_id: str | None
+    gmail_watch_expiration_at: str | None
+    gmail_watch_started_at: str | None
+    gmail_watch_error: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class AppSessionSnapshotRecord:
+    user_id: str
+    dashboard: dict[str, Any]
+    mailbox: dict[str, Any]
+    sync: dict[str, Any]
     updated_at: str
 
 
@@ -126,6 +139,20 @@ def mark_google_disconnected(database_url: str, *, user_id: str) -> None:
             text("UPDATE users SET google_disconnected_at = now(), updated_at = now() WHERE id = :user_id"),
             {"user_id": user_id},
         )
+        connection.execute(
+            text(
+                """
+                UPDATE gmail_import_state
+                SET gmail_watch_history_id = NULL,
+                    gmail_watch_expiration_at = NULL,
+                    gmail_watch_started_at = NULL,
+                    gmail_watch_error = NULL,
+                    updated_at = now()
+                WHERE user_id = :user_id
+                """
+            ),
+            {"user_id": user_id},
+        )
 
 
 def delete_user_mail_data(database_url: str, *, user_id: str) -> None:
@@ -141,7 +168,7 @@ def delete_user_mail_data(database_url: str, *, user_id: str) -> None:
             ),
             {"user_id": user_id},
         )
-        for table in ["mail_group_members", "mail_groups", "gmail_messages", "gmail_import_state"]:
+        for table in ["app_session_snapshots", "mail_group_members", "mail_groups", "gmail_messages", "gmail_import_state"]:
             connection.execute(text(f"DELETE FROM {table} WHERE user_id = :user_id"), {"user_id": user_id})
         connection.execute(
             text(
@@ -181,6 +208,7 @@ def mark_import_completed(
     dashboard_ready: bool = False,
     last_history_id: str | None = None,
     full_backfill_cursor: str | None = None,
+    clear_full_backfill_cursor: bool = False,
 ) -> None:
     with get_engine(database_url).begin() as connection:
         connection.execute(
@@ -198,7 +226,10 @@ def mark_import_completed(
                 )
                 ON CONFLICT (user_id) DO UPDATE SET
                   last_history_id = COALESCE(excluded.last_history_id, gmail_import_state.last_history_id),
-                  full_backfill_cursor = COALESCE(excluded.full_backfill_cursor, gmail_import_state.full_backfill_cursor),
+                  full_backfill_cursor = CASE
+                    WHEN :clear_full_backfill_cursor THEN NULL
+                    ELSE COALESCE(excluded.full_backfill_cursor, gmail_import_state.full_backfill_cursor)
+                  END,
                   first_batch_imported_at = COALESCE(gmail_import_state.first_batch_imported_at, excluded.first_batch_imported_at),
                   first_groups_ready_at = COALESCE(gmail_import_state.first_groups_ready_at, excluded.first_groups_ready_at),
                   first_dashboard_ready_at = COALESCE(gmail_import_state.first_dashboard_ready_at, excluded.first_dashboard_ready_at),
@@ -211,6 +242,7 @@ def mark_import_completed(
                 "user_id": user_id,
                 "last_history_id": last_history_id,
                 "full_backfill_cursor": full_backfill_cursor,
+                "clear_full_backfill_cursor": clear_full_backfill_cursor,
                 "first_batch": first_batch,
                 "groups_ready": groups_ready,
                 "dashboard_ready": dashboard_ready,
@@ -226,6 +258,50 @@ def mark_import_error(database_url: str, *, user_id: str, error: str) -> None:
                 INSERT INTO gmail_import_state (user_id, last_sync_error, updated_at)
                 VALUES (:user_id, :error, now())
                 ON CONFLICT (user_id) DO UPDATE SET last_sync_error = excluded.last_sync_error, updated_at = now()
+                """
+            ),
+            {"user_id": user_id, "error": error[:4000]},
+        )
+
+
+def mark_gmail_watch_started(
+    database_url: str,
+    *,
+    user_id: str,
+    history_id: str | None,
+    expiration_at: str | None,
+) -> None:
+    with get_engine(database_url).begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO gmail_import_state (
+                  user_id, gmail_watch_history_id, gmail_watch_expiration_at,
+                  gmail_watch_started_at, gmail_watch_error, updated_at
+                )
+                VALUES (:user_id, :history_id, :expiration_at, now(), NULL, now())
+                ON CONFLICT (user_id) DO UPDATE SET
+                  gmail_watch_history_id = excluded.gmail_watch_history_id,
+                  gmail_watch_expiration_at = excluded.gmail_watch_expiration_at,
+                  gmail_watch_started_at = now(),
+                  gmail_watch_error = NULL,
+                  updated_at = now()
+                """
+            ),
+            {"user_id": user_id, "history_id": history_id, "expiration_at": expiration_at},
+        )
+
+
+def mark_gmail_watch_error(database_url: str, *, user_id: str, error: str) -> None:
+    with get_engine(database_url).begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO gmail_import_state (user_id, gmail_watch_error, updated_at)
+                VALUES (:user_id, :error, now())
+                ON CONFLICT (user_id) DO UPDATE SET
+                  gmail_watch_error = excluded.gmail_watch_error,
+                  updated_at = now()
                 """
             ),
             {"user_id": user_id, "error": error[:4000]},
@@ -266,9 +342,13 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                       recipients_json = excluded.recipients_json,
                       headers_json = excluded.headers_json,
                       snippet = excluded.snippet,
-                      raw_payload_json = excluded.raw_payload_json,
-                      html_body_sanitized = excluded.html_body_sanitized,
-                      text_body = excluded.text_body,
+                      raw_payload_json = CASE
+                        WHEN excluded.html_body_sanitized IS NOT NULL OR excluded.text_body IS NOT NULL
+                        THEN excluded.raw_payload_json
+                        ELSE gmail_messages.raw_payload_json
+                      END,
+                      html_body_sanitized = COALESCE(excluded.html_body_sanitized, gmail_messages.html_body_sanitized),
+                      text_body = COALESCE(excluded.text_body, gmail_messages.text_body),
                       extracted_signals_json = excluded.extracted_signals_json,
                       body_hash = excluded.body_hash,
                       updated_at = now()
@@ -277,6 +357,123 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                 _message_params(message),
             )
     return len(rows)
+
+
+def delete_gmail_messages(database_url: str, *, user_id: str, message_ids: list[str]) -> list[str]:
+    unique_message_ids = list(dict.fromkeys([message_id for message_id in message_ids if message_id]))
+    if not unique_message_ids:
+        return []
+    with get_engine(database_url).begin() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT DISTINCT group_id
+                FROM mail_group_members
+                WHERE user_id = :user_id
+                  AND gmail_message_id = ANY(:message_ids)
+                """
+            ),
+            {"user_id": user_id, "message_ids": unique_message_ids},
+        ).mappings().all()
+        connection.execute(
+            text(
+                """
+                DELETE FROM mail_group_members
+                WHERE user_id = :user_id
+                  AND gmail_message_id = ANY(:message_ids)
+                """
+            ),
+            {"user_id": user_id, "message_ids": unique_message_ids},
+        )
+        connection.execute(
+            text(
+                """
+                DELETE FROM gmail_messages
+                WHERE user_id = :user_id
+                  AND message_id = ANY(:message_ids)
+                """
+            ),
+            {"user_id": user_id, "message_ids": unique_message_ids},
+        )
+    return [str(row["group_id"]) for row in rows]
+
+
+def prune_empty_mail_groups(database_url: str, *, user_id: str, group_ids: list[str]) -> list[str]:
+    unique_group_ids = list(dict.fromkeys([group_id for group_id in group_ids if group_id]))
+    if not unique_group_ids:
+        return []
+    with get_engine(database_url).begin() as connection:
+        rows = connection.execute(
+            text(
+                """
+                UPDATE mail_groups AS groups
+                SET
+                  status = 'deleted',
+                  enrichment_status = 'ready',
+                  dashboard_visible = FALSE,
+                  updated_at = now()
+                WHERE groups.user_id = :user_id
+                  AND groups.id = ANY(:group_ids)
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM mail_group_members members
+                    WHERE members.user_id = groups.user_id
+                      AND members.group_id = groups.id
+                  )
+                RETURNING groups.id
+                """
+            ),
+            {"user_id": user_id, "group_ids": unique_group_ids},
+        ).mappings().all()
+    return [str(row["id"]) for row in rows]
+
+
+def mark_mail_groups_pending(database_url: str, *, user_id: str, group_ids: list[str]) -> list[str]:
+    unique_group_ids = list(dict.fromkeys([group_id for group_id in group_ids if group_id]))
+    if not unique_group_ids:
+        return []
+    with get_engine(database_url).begin() as connection:
+        rows = connection.execute(
+            text(
+                """
+                UPDATE mail_groups AS groups
+                SET
+                  enrichment_status = 'pending',
+                  generated_at = NULL,
+                  ai_model = NULL,
+                  ai_error = NULL,
+                  ai_generated_at = NULL,
+                  dashboard_visible = FALSE,
+                  updated_at = now()
+                WHERE groups.user_id = :user_id
+                  AND groups.id = ANY(:group_ids)
+                  AND groups.status = 'active'
+                RETURNING groups.id
+                """
+            ),
+            {"user_id": user_id, "group_ids": unique_group_ids},
+        ).mappings().all()
+    return [str(row["id"]) for row in rows]
+
+
+def list_messages_by_ids(database_url: str, *, user_id: str, message_ids: list[str]) -> list[GmailMessageRecord]:
+    if not message_ids:
+        return []
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM gmail_messages
+                WHERE user_id = :user_id
+                  AND message_id = ANY(:message_ids)
+                ORDER BY internal_date DESC NULLS LAST, updated_at DESC
+                """
+            ),
+            {"user_id": user_id, "message_ids": message_ids},
+        ).mappings().all()
+    by_id = {str(row["message_id"]): _message_from_row(row) for row in rows}
+    return [by_id[message_id] for message_id in message_ids if message_id in by_id]
 
 
 def list_recent_messages(database_url: str, *, user_id: str, limit: int = 500) -> list[GmailMessageRecord]:
@@ -291,6 +488,23 @@ def list_recent_messages(database_url: str, *, user_id: str, limit: int = 500) -
                 """
             ),
             {"user_id": user_id, "limit": limit},
+        ).mappings().all()
+    return [_message_from_row(row) for row in rows]
+
+
+def list_recent_messages_since(database_url: str, *, user_id: str, since_iso: str, limit: int = 500) -> list[GmailMessageRecord]:
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT * FROM gmail_messages
+                WHERE user_id = :user_id
+                  AND internal_date >= :since_iso
+                ORDER BY internal_date DESC NULLS LAST, updated_at DESC
+                LIMIT :limit
+                """
+            ),
+            {"user_id": user_id, "since_iso": since_iso, "limit": limit},
         ).mappings().all()
     return [_message_from_row(row) for row in rows]
 
@@ -320,6 +534,48 @@ def list_group_messages(database_url: str, *, user_id: str, group_id: str) -> li
             {"user_id": user_id, "group_id": group_id},
         ).mappings().all()
     return [_message_from_row(row) for row in rows]
+
+
+def list_messages_for_groups(database_url: str, *, user_id: str, group_ids: list[str]) -> dict[str, list[GmailMessageRecord]]:
+    if not group_ids:
+        return {}
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT
+                  members.group_id AS member_group_id,
+                  messages.user_id,
+                  messages.message_id,
+                  messages.gmail_thread_id,
+                  messages.history_id,
+                  messages.label_ids_json,
+                  messages.internal_date,
+                  messages.subject,
+                  messages.sender,
+                  messages.recipients_json,
+                  messages.headers_json,
+                  messages.snippet,
+                  '{}' AS raw_payload_json,
+                  NULL AS html_body_sanitized,
+                  NULL AS text_body,
+                  messages.extracted_signals_json,
+                  messages.body_hash,
+                  messages.created_at,
+                  messages.updated_at
+                FROM mail_group_members members
+                JOIN gmail_messages messages
+                  ON messages.user_id = members.user_id AND messages.message_id = members.gmail_message_id
+                WHERE members.user_id = :user_id AND members.group_id = ANY(:group_ids)
+                ORDER BY members.group_id, messages.internal_date ASC NULLS LAST, messages.created_at ASC
+                """
+            ),
+            {"user_id": user_id, "group_ids": group_ids},
+        ).mappings().all()
+    grouped: dict[str, list[GmailMessageRecord]] = {group_id: [] for group_id in group_ids}
+    for row in rows:
+        grouped.setdefault(str(row["member_group_id"]), []).append(_message_from_row(row))
+    return grouped
 
 
 def upsert_mail_group(
@@ -441,7 +697,54 @@ def replace_group_members(
             )
 
 
-def list_mail_groups(database_url: str, *, user_id: str, limit: int = 150) -> list[MailGroupRecord]:
+def append_group_members(
+    database_url: str,
+    *,
+    user_id: str,
+    group_id: str,
+    members: list[tuple[GmailMessageRecord, str, float]],
+) -> None:
+    if not members:
+        return
+    with get_engine(database_url).begin() as connection:
+        for message, reason, confidence in members:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO mail_group_members (id, user_id, group_id, gmail_message_id, gmail_thread_id, reason, confidence, created_at)
+                    VALUES (:id, :user_id, :group_id, :gmail_message_id, :gmail_thread_id, :reason, :confidence, now())
+                    ON CONFLICT (user_id, group_id, gmail_message_id) DO NOTHING
+                    """
+                ),
+                {
+                    "id": str(uuid4()),
+                    "user_id": user_id,
+                    "group_id": group_id,
+                    "gmail_message_id": message.message_id,
+                    "gmail_thread_id": message.gmail_thread_id,
+                    "reason": reason,
+                    "confidence": confidence,
+                },
+            )
+
+
+def list_mail_groups(database_url: str, *, user_id: str, limit: int = 150, include_pending: bool = False) -> list[MailGroupRecord]:
+    if include_pending:
+        with get_engine(database_url).connect() as connection:
+            rows = connection.execute(
+                text(
+                    """
+                    SELECT * FROM mail_groups
+                    WHERE user_id = :user_id
+                      AND status = 'active'
+                    ORDER BY latest_message_at DESC NULLS LAST, updated_at DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"user_id": user_id, "limit": limit},
+            ).mappings().all()
+        return [_group_from_row(row) for row in rows]
+
     with get_engine(database_url).connect() as connection:
         rows = connection.execute(
             text(
@@ -449,8 +752,30 @@ def list_mail_groups(database_url: str, *, user_id: str, limit: int = 150) -> li
                 SELECT * FROM mail_groups
                 WHERE user_id = :user_id
                   AND status = 'active'
-                  AND enrichment_status = 'ready'
-                ORDER BY latest_message_at DESC NULLS LAST, updated_at DESC
+                  AND (:include_pending OR enrichment_status = 'ready')
+                ORDER BY
+                  CASE WHEN enrichment_status = 'ready' THEN 0 ELSE 1 END,
+                  latest_message_at DESC NULLS LAST,
+                  updated_at DESC
+                LIMIT :limit
+                """
+            ),
+            {"user_id": user_id, "limit": limit, "include_pending": include_pending},
+        ).mappings().all()
+    return [_group_from_row(row) for row in rows]
+
+
+def list_pending_mail_groups(database_url: str, *, user_id: str, limit: int = 10) -> list[MailGroupRecord]:
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM mail_groups
+                WHERE user_id = :user_id
+                  AND status = 'active'
+                  AND enrichment_status = 'pending'
+                ORDER BY latest_message_at DESC NULLS LAST, priority DESC, updated_at ASC
                 LIMIT :limit
                 """
             ),
@@ -489,7 +814,6 @@ def get_mail_group_detail(database_url: str, *, user_id: str, group_id: str) -> 
                 WHERE user_id = :user_id
                   AND id = :id
                   AND status = 'active'
-                  AND enrichment_status = 'ready'
                 """
             ),
             {"user_id": user_id, "id": group_id},
@@ -517,6 +841,43 @@ def count_mail_groups(database_url: str, *, user_id: str) -> int:
     return int(value)
 
 
+def count_ready_mail_groups_since(database_url: str, *, user_id: str, since_iso: str) -> int:
+    with get_engine(database_url).connect() as connection:
+        value = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM mail_groups
+                WHERE user_id = :user_id
+                  AND status = 'active'
+                  AND enrichment_status = 'ready'
+                  AND latest_message_at >= :since_iso
+                """
+            ),
+            {"user_id": user_id, "since_iso": since_iso},
+        ).scalar_one()
+    return int(value)
+
+
+def count_dashboard_mail_groups(database_url: str, *, user_id: str, since_iso: str) -> int:
+    with get_engine(database_url).connect() as connection:
+        value = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM mail_groups
+                WHERE user_id = :user_id
+                  AND status = 'active'
+                  AND enrichment_status = 'ready'
+                  AND dashboard_visible = TRUE
+                  AND latest_message_at >= :since_iso
+                """
+            ),
+            {"user_id": user_id, "since_iso": since_iso},
+        ).scalar_one()
+    return int(value)
+
+
 def count_mail_groups_by_enrichment_status(database_url: str, *, user_id: str) -> dict[str, int]:
     with get_engine(database_url).connect() as connection:
         rows = connection.execute(
@@ -532,6 +893,68 @@ def count_mail_groups_by_enrichment_status(database_url: str, *, user_id: str) -
             {"user_id": user_id},
         ).mappings().all()
     return {str(row["enrichment_status"]): int(row["count"]) for row in rows}
+
+
+def oldest_imported_message_at(database_url: str, *, user_id: str) -> str | None:
+    with get_engine(database_url).connect() as connection:
+        value = connection.execute(
+            text(
+                """
+                SELECT MIN(internal_date)
+                FROM gmail_messages
+                WHERE user_id = :user_id
+                """
+            ),
+            {"user_id": user_id},
+        ).scalar_one_or_none()
+    return _iso(value) if value is not None else None
+
+
+def get_app_session_snapshot(database_url: str, *, user_id: str) -> AppSessionSnapshotRecord | None:
+    with get_engine(database_url).connect() as connection:
+        row = connection.execute(
+            text("SELECT * FROM app_session_snapshots WHERE user_id = :user_id"),
+            {"user_id": user_id},
+        ).mappings().first()
+    if row is None:
+        return None
+    return AppSessionSnapshotRecord(
+        user_id=str(row["user_id"]),
+        dashboard=json.loads(row["dashboard_json"] or "{}"),
+        mailbox=json.loads(row["mailbox_json"] or "{}"),
+        sync=json.loads(row["sync_json"] or "{}"),
+        updated_at=_iso(row["updated_at"]),
+    )
+
+
+def upsert_app_session_snapshot(
+    database_url: str,
+    *,
+    user_id: str,
+    dashboard: dict[str, Any],
+    mailbox: dict[str, Any],
+    sync: dict[str, Any],
+) -> None:
+    with get_engine(database_url).begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO app_session_snapshots (user_id, dashboard_json, mailbox_json, sync_json, updated_at)
+                VALUES (:user_id, :dashboard_json, :mailbox_json, :sync_json, now())
+                ON CONFLICT (user_id) DO UPDATE SET
+                  dashboard_json = excluded.dashboard_json,
+                  mailbox_json = excluded.mailbox_json,
+                  sync_json = excluded.sync_json,
+                  updated_at = now()
+                """
+            ),
+            {
+                "user_id": user_id,
+                "dashboard_json": json.dumps(dashboard, ensure_ascii=True),
+                "mailbox_json": json.dumps(mailbox, ensure_ascii=True),
+                "sync_json": json.dumps(sync, ensure_ascii=True),
+            },
+        )
 
 
 def _message_params(message: GmailMessageRecord) -> dict[str, Any]:
@@ -618,6 +1041,10 @@ def _state_from_row(row) -> GmailImportState:
         last_import_started_at=_iso(row["last_import_started_at"]) if row["last_import_started_at"] is not None else None,
         last_import_completed_at=_iso(row["last_import_completed_at"]) if row["last_import_completed_at"] is not None else None,
         last_sync_error=str(row["last_sync_error"]) if row["last_sync_error"] is not None else None,
+        gmail_watch_history_id=str(row["gmail_watch_history_id"]) if "gmail_watch_history_id" in row and row["gmail_watch_history_id"] is not None else None,
+        gmail_watch_expiration_at=_iso(row["gmail_watch_expiration_at"]) if "gmail_watch_expiration_at" in row and row["gmail_watch_expiration_at"] is not None else None,
+        gmail_watch_started_at=_iso(row["gmail_watch_started_at"]) if "gmail_watch_started_at" in row and row["gmail_watch_started_at"] is not None else None,
+        gmail_watch_error=str(row["gmail_watch_error"]) if "gmail_watch_error" in row and row["gmail_watch_error"] is not None else None,
         updated_at=_iso(row["updated_at"]),
     )
 
