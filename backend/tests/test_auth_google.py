@@ -17,6 +17,7 @@ class GoogleAuthRouteTests(unittest.TestCase):
             google_configured=True,
             cors_origin="http://localhost:5173",
             mobile_redirect_uri="electronicmail://auth/callback",
+            backend_origin="http://localhost:3001",
         )
         self.settings_patch = patch.object(auth_routes, "settings", self.settings)
         self.settings_patch.start()

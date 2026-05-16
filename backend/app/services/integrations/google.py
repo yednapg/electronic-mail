@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from urllib.error import URLError
+from urllib.request import Request as UrlRequest, urlopen
 
 import google_auth_httplib2
 import httplib2
@@ -28,7 +30,8 @@ from app.services.token_crypto import decrypt_json, encrypt_json
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_WRITE_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
-GOOGLE_SCOPES = [GMAIL_SCOPE, GMAIL_WRITE_SCOPE, CALENDAR_SCOPE]
+GOOGLE_PROFILE_SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"]
+GOOGLE_SCOPES = [*GOOGLE_PROFILE_SCOPES, GMAIL_SCOPE, GMAIL_WRITE_SCOPE, CALENDAR_SCOPE]
 GOOGLE_API_TIMEOUT_SECONDS = 20
 GMAIL_INBOX_LABEL = "INBOX"
 GMAIL_UNREAD_LABEL = "UNREAD"
@@ -179,6 +182,19 @@ def create_gmail_service(settings: Settings, *, user_id: str | None = None):
     return build_google_service("gmail", "v1", credentials)
 
 
+def start_gmail_watch(settings: Settings, *, user_id: str) -> dict[str, object]:
+    """Ask Gmail to push future mailbox changes to the configured Pub/Sub topic."""
+    if not settings.gmail_pubsub_topic:
+        raise RuntimeError("GMAIL_PUBSUB_TOPIC is not configured")
+    gmail_service = create_gmail_service(settings, user_id=user_id)
+    body = {
+        "topicName": settings.gmail_pubsub_topic,
+        "labelIds": [GMAIL_INBOX_LABEL],
+        "labelFilterBehavior": "include",
+    }
+    return gmail_service.users().watch(userId="me", body=body).execute()
+
+
 def archive_gmail_thread(settings: Settings, thread_id: str, *, user_id: str | None = None) -> dict[str, object]:
     return modify_gmail_thread_labels(settings, thread_id, user_id=user_id, remove_label_ids=[GMAIL_INBOX_LABEL])
 
@@ -235,13 +251,28 @@ def persist_token_payload(settings: Settings, tokens: dict[str, object], *, user
 
 
 def fetch_google_account_profile_from_credentials(credentials: Credentials) -> DashboardProfile | None:
+    display_name: str | None = None
+    email: str | None = None
+    try:
+        if credentials.token:
+            request = UrlRequest(
+                "https://openidconnect.googleapis.com/v1/userinfo",
+                headers={"Authorization": f"Bearer {credentials.token}"},
+            )
+            with urlopen(request, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            display_name = str(payload.get("given_name") or payload.get("name") or "").strip() or None
+            email = str(payload.get("email") or "").strip() or None
+    except (OSError, URLError, ValueError, json.JSONDecodeError):
+        display_name = None
+
     try:
         gmail_service = build_google_service("gmail", "v1", credentials)
         payload = gmail_service.users().getProfile(userId="me").execute()
     except Exception:
-        return None
-    email = str(payload.get("emailAddress") or "").strip() or None
-    return DashboardProfile(email=email)
+        return DashboardProfile(email=email, display_name=display_name) if email else None
+    email = email or str(payload.get("emailAddress") or "").strip() or None
+    return DashboardProfile(email=email, display_name=display_name)
 
 
 def has_stored_google_tokens() -> bool:

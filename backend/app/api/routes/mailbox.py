@@ -15,7 +15,9 @@ from app.db.jobs import enqueue_job
 from app.db.repository import get_user_by_email
 from app.schemas.domain import MailboxResponse, MailboxSyncStateResponse, MailboxSyncTriggerResponse, ThreadReaderResponse
 from app.services.auth import require_current_user
-from app.services.mail_groups import build_group_detail_response, build_mailbox_response, build_mailbox_sync_state, enqueue_mailbox_sync
+from app.services.gmail_importer import run_gmail_delta_sync
+from app.services.gmail_watch import ensure_gmail_watch
+from app.services.mail_groups import build_app_session_response, build_group_detail_response, build_mailbox_response, build_mailbox_sync_state, enqueue_mailbox_sync, refresh_app_session_snapshot
 
 router = APIRouter(tags=["mailbox"])
 settings = load_settings()
@@ -25,10 +27,12 @@ settings = load_settings()
 def mailbox(
     request: Request,
     label: str = Query(default="inbox"),
-    limit: int = Query(default=100, ge=1, le=250),
+    limit: int = Query(default=100, ge=1, le=1000),
     cursor: str | None = Query(default=None),
 ) -> MailboxResponse:
     user = require_current_user(settings, request)
+    if label == "inbox" and cursor is None and limit >= 100:
+        return build_app_session_response(settings, user=user).mailbox
     return build_mailbox_response(settings, user_id=user.id, label=label, limit=limit, cursor=cursor)
 
 
@@ -60,6 +64,18 @@ def mailbox_sync(request: Request) -> MailboxSyncTriggerResponse:
         return MailboxSyncTriggerResponse(status="not_connected", state=state)
     job_id = enqueue_mailbox_sync(settings, user_id=user.id)
     return MailboxSyncTriggerResponse(status="queued", state=state, job_id=job_id)
+
+
+@router.post("/v1/mailbox/sync-now", response_model=MailboxSyncTriggerResponse)
+def mailbox_sync_now(request: Request) -> MailboxSyncTriggerResponse:
+    user = require_current_user(settings, request)
+    state = build_mailbox_sync_state(settings, user_id=user.id)
+    if not state.connected:
+        return MailboxSyncTriggerResponse(status="not_connected", state=state)
+    ensure_gmail_watch(settings, user_id=user.id)
+    run_gmail_delta_sync(settings, user_id=user.id, batch_size=50)
+    refresh_app_session_snapshot(settings, user_id=user.id)
+    return MailboxSyncTriggerResponse(status="synced", state=build_mailbox_sync_state(settings, user_id=user.id))
 
 
 @router.get("/v1/events/mailbox")

@@ -59,10 +59,12 @@ def enqueue_job(
     priority: int = 0,
     max_attempts: int = 5,
     payload_version: int = 1,
+    run_after_seconds: int = 0,
 ) -> BackgroundJob:
     engine = get_engine(database_url)
     job_id = str(uuid4())
     payload_json = json.dumps(payload or {}, ensure_ascii=True)
+    run_after_seconds = max(0, int(run_after_seconds))
     with engine.begin() as connection:
         if dedupe_key:
             existing = connection.execute(
@@ -82,14 +84,14 @@ def enqueue_job(
                         text(
                             """
                             UPDATE background_jobs
-                            SET run_after = now(),
+                            SET run_after = LEAST(run_after, now() + (:run_after_seconds * interval '1 second')),
                                 priority = GREATEST(priority, :priority),
                                 updated_at = now()
                             WHERE id = :id
                             RETURNING *
                             """
                         ),
-                        {"id": existing["id"], "priority": priority},
+                        {"id": existing["id"], "priority": priority, "run_after_seconds": run_after_seconds},
                     ).mappings().first()
                     if existing is not None:
                         _insert_event(connection, str(existing["id"]), "progress", None, {"reason": "dedupe_woke_queued_job"})
@@ -103,7 +105,7 @@ def enqueue_job(
                   payload_json, max_attempts, run_after, created_at, updated_at
                 ) VALUES (
                   :id, :kind, :queue, 'queued', :user_id, :dedupe_key, :priority, :payload_version,
-                  :payload_json, :max_attempts, now(), now(), now()
+                  :payload_json, :max_attempts, now() + (:run_after_seconds * interval '1 second'), now(), now()
                 )
                 ON CONFLICT DO NOTHING
                 RETURNING *
@@ -119,6 +121,7 @@ def enqueue_job(
                 "payload_version": payload_version,
                 "payload_json": payload_json,
                 "max_attempts": max_attempts,
+                "run_after_seconds": run_after_seconds,
             },
         ).mappings().first()
         if row is None and dedupe_key:
@@ -146,6 +149,22 @@ def get_job(database_url: str, job_id: str) -> BackgroundJob | None:
             {"id": job_id},
         ).mappings().first()
     return _job_from_row(row) if row is not None else None
+
+
+def count_active_jobs(database_url: str, *, user_id: str, kinds: list[str] | None = None) -> int:
+    sql = """
+        SELECT COUNT(*)
+        FROM background_jobs
+        WHERE user_id = :user_id
+          AND status IN ('queued', 'running')
+    """
+    params: dict[str, Any] = {"user_id": user_id}
+    if kinds:
+        sql += " AND kind = ANY(:kinds)"
+        params["kinds"] = kinds
+    with get_engine(database_url).connect() as connection:
+        value = connection.execute(text(sql), params).scalar_one()
+    return int(value)
 
 
 def claim_job(database_url: str, *, worker_id: str, queues: list[str], lease_seconds: int = 300) -> BackgroundJob | None:
@@ -187,7 +206,14 @@ def claim_job(database_url: str, *, worker_id: str, queues: list[str], lease_sec
         return _job_from_row(row)
 
 
-def renew_heartbeat(database_url: str, *, worker_id: str, queues: list[str], current_job_id: str | None = None) -> None:
+def renew_heartbeat(
+    database_url: str,
+    *,
+    worker_id: str,
+    queues: list[str],
+    current_job_id: str | None = None,
+    lease_seconds: int = 300,
+) -> None:
     with get_engine(database_url).begin() as connection:
         connection.execute(
             text(
@@ -202,6 +228,20 @@ def renew_heartbeat(database_url: str, *, worker_id: str, queues: list[str], cur
             ),
             {"worker_id": worker_id, "queues_json": json.dumps(queues), "current_job_id": current_job_id},
         )
+        if current_job_id is not None:
+            connection.execute(
+                text(
+                    """
+                    UPDATE background_jobs
+                    SET lease_expires_at = now() + (:lease_seconds * interval '1 second'),
+                        updated_at = now()
+                    WHERE id = :id
+                      AND status = 'running'
+                      AND lease_owner = :worker_id
+                    """
+                ),
+                {"id": current_job_id, "worker_id": worker_id, "lease_seconds": lease_seconds},
+            )
 
 
 def complete_job(database_url: str, job_id: str) -> None:

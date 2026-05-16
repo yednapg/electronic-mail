@@ -12,11 +12,48 @@ import type {
   DashboardSummaryData,
 } from '../components/dashboard/types';
 
-export function buildSummary(dashboard: { briefing?: { headline: string; brief: string } | null }): DashboardSummaryData {
+export function buildSummary(dashboard: {
+  briefing?: {
+    headline: string;
+    brief: string;
+    parts?: ReadonlyArray<{ type: string; emoji: string; count: number; text: string }>;
+    important?: {
+      emoji: string;
+      count: number;
+      text: string;
+      mail_group_id?: string | null;
+      action_type?: string | null;
+    } | null;
+    calendar_availability?: {
+      emoji: string;
+      kind: string;
+      time?: string | null;
+      text: string;
+    } | null;
+  } | null;
+}): DashboardSummaryData {
   if (dashboard.briefing !== undefined && dashboard.briefing !== null) {
     return {
       headline: dashboard.briefing.headline,
       brief: dashboard.briefing.brief,
+      parts: dashboard.briefing.parts?.map((part) => ({ ...part })),
+      important: dashboard.briefing.important
+        ? {
+            emoji: dashboard.briefing.important.emoji,
+            count: dashboard.briefing.important.count,
+            text: dashboard.briefing.important.text,
+            mailGroupId: dashboard.briefing.important.mail_group_id,
+            actionType: dashboard.briefing.important.action_type,
+          }
+        : null,
+      calendarAvailability: dashboard.briefing.calendar_availability
+        ? {
+            emoji: dashboard.briefing.calendar_availability.emoji,
+            kind: dashboard.briefing.calendar_availability.kind,
+            time: dashboard.briefing.calendar_availability.time,
+            text: dashboard.briefing.calendar_availability.text,
+          }
+        : null,
     };
   }
 
@@ -65,6 +102,9 @@ export function toSectionItem(item: FeedItem): DashboardSectionItem {
         item.source === 'calendar' && item.why_this_is_here.trim().length > 0
           ? item.why_this_is_here
           : item.title,
+      primaryAction: item.primary_action,
+      needType: item.need_type,
+      source: item.source ?? undefined,
       detail: toSectionDetail(item),
       cta: toSectionCta(item),
     };
@@ -73,7 +113,10 @@ export function toSectionItem(item: FeedItem): DashboardSectionItem {
   return {
     id: item.id,
     entityId: item.entity_id,
-    title: item.source === 'gmail' ? item.title : toActionSentence(item),
+    title: item.title,
+    primaryAction: item.primary_action,
+    needType: item.need_type,
+    source: item.source ?? undefined,
     detail: toSectionDetail(item),
     cta: toSectionCta(item),
   };

@@ -7,7 +7,6 @@ import type { GmailThreadRow, GmailViewResponse } from '../../lib/types';
 type GmailListProps = {
   gmail: GmailViewResponse;
   activeThreadId?: string | null;
-  onActivateThread?: (threadId: string) => void;
   onOpenThread?: (row: GmailThreadRow) => void;
   onPrefetchThread?: (threadId: string) => void;
 };
@@ -23,13 +22,12 @@ export function GmailView({ gmail }: { gmail: GmailViewResponse }) {
 export function GmailList({
   gmail,
   activeThreadId,
-  onActivateThread,
   onOpenThread,
   onPrefetchThread,
 }: GmailListProps) {
   return (
     <main className="digest-page">
-      <div className="digest-shell gmail-shell">
+      <div className="digest-shell gmail-shell gmail-inbox-shell">
         <div className="inbox-topline">
           <p className="inbox-count">{gmail.total_threads} threads</p>
         </div>
@@ -49,7 +47,6 @@ export function GmailList({
                       row={row}
                       index={index}
                       isActive={row.thread_id === activeThreadId}
-                      onActivateThread={onActivateThread}
                       onOpenThread={onOpenThread}
                       onPrefetchThread={onPrefetchThread}
                     />
@@ -70,26 +67,22 @@ function GmailThreadRowItem({
   row,
   index,
   isActive,
-  onActivateThread,
   onOpenThread,
   onPrefetchThread,
 }: {
   row: GmailThreadRow;
   index: number;
   isActive: boolean;
-  onActivateThread?: (threadId: string) => void;
   onOpenThread?: (row: GmailThreadRow) => void;
   onPrefetchThread?: (threadId: string) => void;
 }) {
   const sender = formatGmailSender(row.latest_sender);
-  const title = row.latest_subject?.trim() || 'Untitled thread';
-  const summary = row.summary ?? row.snippet;
-  const oneLine = buildInboxLine(title, summary);
+  const title = row.title?.trim() || row.latest_subject?.trim() || 'Untitled thread';
   const detailHref = `/gmail/threads/${encodeURIComponent(row.thread_id)}`;
   const rowCopy = (
     <>
       <span className="gmail-thread-sender">{sender}</span>
-      <span className="gmail-thread-message">{oneLine}</span>
+      <span className="gmail-thread-message">{compactInboxText(title, 120)}</span>
       <span className="gmail-thread-time">{formatGmailReceivedAt(row.latest_received_at)}</span>
     </>
   );
@@ -98,6 +91,7 @@ function GmailThreadRowItem({
     <li className="gmail-thread-row" style={{ '--attention-index': index } as CSSProperties}>
       <a
         className={`gmail-thread-link ${isActive ? 'is-active' : ''}`}
+        data-gmail-thread-id={row.thread_id}
         href={detailHref}
         aria-label={`Open ${title}`}
         onClick={(event) => {
@@ -107,14 +101,8 @@ function GmailThreadRowItem({
           event.preventDefault();
           onOpenThread(row);
         }}
-        onFocus={() => {
-          onActivateThread?.(row.thread_id);
-          onPrefetchThread?.(row.thread_id);
-        }}
-        onMouseEnter={() => {
-          onActivateThread?.(row.thread_id);
-          onPrefetchThread?.(row.thread_id);
-        }}
+        onFocus={() => onPrefetchThread?.(row.thread_id)}
+        onMouseEnter={() => onPrefetchThread?.(row.thread_id)}
       >
         {rowCopy}
       </a>
@@ -145,25 +133,22 @@ function compactInboxText(value: string, maxLength: number): string {
   return `${compacted.slice(0, maxLength - 3).trim()}...`;
 }
 
-function buildInboxLine(subject: string, summary: string | null | undefined): string {
-  const compactSubject = compactInboxText(subject, 92);
-  const compactSummary = summary ? compactInboxText(summary, 150) : '';
-
-  if (!compactSummary || normalizedInboxText(compactSummary) === normalizedInboxText(compactSubject)) {
-    return compactSubject;
-  }
-
-  return `${compactSubject} - ${compactSummary}`;
-}
-
-function normalizedInboxText(value: string): string {
-  return value.replace(/\s+/g, ' ').trim().toLowerCase();
-}
-
-export function formatGmailReceivedAt(value: string): string {
+export function formatGmailReceivedAt(value: string, now: Date = new Date()): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
     return value;
+  }
+
+  const sameDay =
+    date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate();
+
+  if (!sameDay) {
+    return new Intl.DateTimeFormat('en-US', {
+      month: 'short',
+      day: 'numeric',
+    }).format(date);
   }
 
   return new Intl.DateTimeFormat('en-US', {
