@@ -25,6 +25,9 @@ public protocol AppClient: AnyObject {
     func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse
     func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse
     func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse
+    func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse
+    func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse
 }
 
 public final class LiveBackendAppClient: AppClient {
@@ -90,6 +93,21 @@ public final class LiveBackendAppClient: AppClient {
 
     public func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
         try await request(path: "/v1/gmail/threads/\(threadID.urlPathEncoded)/mark-read", method: "POST")
+    }
+
+    public func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        let body = try JSONEncoder.backend.encode(request)
+        return try await self.request(path: "/v1/tasks", method: "POST", body: body)
+    }
+
+    public func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse {
+        let body = try JSONEncoder.backend.encode(request)
+        return try await self.request(path: "/v1/tasks/\(taskID.urlPathEncoded)", method: "PATCH", body: body)
+    }
+
+    public func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
+        let body = try JSONEncoder.backend.encode(request)
+        return try await self.request(path: "/v1/entities/\(entityID.urlPathEncoded)/complete", method: "POST", body: body)
     }
 
     private func request<Response: Decodable>(

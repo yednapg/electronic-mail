@@ -313,6 +313,57 @@ export interface GmailThreadUpdate {
   readonly summary?: string | null;
 }
 
+export interface GmailThreadMutationResponse {
+  readonly thread_id: string;
+  readonly action: GmailThreadAction;
+}
+
+export interface TaskCreateRequest {
+  readonly title: string;
+  readonly notes?: string | null;
+  readonly section?: 'now' | 'today' | 'later';
+  readonly due_at?: string | null;
+}
+
+export interface TaskUpdateRequest {
+  readonly title?: string | null;
+  readonly notes?: string | null;
+  readonly section?: 'now' | 'today' | 'later' | null;
+  readonly due_at?: string | null;
+  readonly status?: 'open' | 'done' | null;
+}
+
+export interface TaskResponse {
+  readonly id: string;
+  readonly user_id: string;
+  readonly entity_id: string;
+  readonly title: string;
+  readonly notes?: string | null;
+  readonly section: 'now' | 'today' | 'later';
+  readonly due_at?: string | null;
+  readonly status: 'open' | 'done';
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface EntityOutcomeRequest {
+  readonly note?: string | null;
+}
+
+export interface EntitySnoozeRequest extends EntityOutcomeRequest {
+  readonly snooze_until: string;
+}
+
+export interface EntityOutcomeResponse {
+  readonly id: string;
+  readonly user_id: string;
+  readonly entity_id: string;
+  readonly outcome_type: 'complete' | 'snooze' | 'dismiss';
+  readonly snooze_until?: string | null;
+  readonly note?: string | null;
+  readonly created_at: string;
+}
+
 export interface GmailThreadSection {
   readonly id: string;
   readonly title: string;
@@ -348,7 +399,7 @@ export interface MailboxSyncStateResponse {
 }
 
 export interface MailboxSyncTriggerResponse {
-  readonly status: 'queued' | 'not_connected';
+  readonly status: 'queued' | 'synced' | 'not_connected';
   readonly state: MailboxSyncStateResponse;
   readonly job_id?: string | null;
   readonly queued_at?: string | null;

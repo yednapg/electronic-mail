@@ -150,6 +150,29 @@ public final class InboxStore: ObservableObject {
     }
 
     public func refresh() async {
+        await refresh(allowEmptyDashboard: false)
+    }
+
+    public func createManualTask(title: String, notes: String? = nil, section: String = "today") async throws -> TaskResponse {
+        let task = try await client.createTask(
+            TaskCreateRequest(
+                title: title,
+                notes: notes,
+                section: section,
+                dueAt: nil
+            )
+        )
+        await refresh(allowEmptyDashboard: true)
+        return task
+    }
+
+    public func completeEntity(entityID: String, note: String? = nil) async throws -> EntityOutcomeResponse {
+        let outcome = try await client.completeEntity(entityID, request: EntityOutcomeRequest(note: note))
+        await refresh(allowEmptyDashboard: true)
+        return outcome
+    }
+
+    private func refresh(allowEmptyDashboard: Bool) async {
         do {
             let task = inFlightSessionRefresh ?? Task { [client] in
                 try await client.appSession()
@@ -157,7 +180,7 @@ public final class InboxStore: ObservableObject {
             inFlightSessionRefresh = task
             let next = try await task.value
             inFlightSessionRefresh = nil
-            let merged = sessionCache.merge(current: session ?? sessionCache.read(), next: next)
+            let merged = sessionCache.merge(current: session ?? sessionCache.read(), next: next, allowEmptyDashboard: allowEmptyDashboard)
             session = merged
             sessionCache.write(merged)
             refreshFailed = false

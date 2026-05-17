@@ -105,6 +105,37 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(store.phase, .failed("Sign in with Google to load your mailbox."))
         XCTAssertNil(store.session)
     }
+
+    func testTodoMapperSplitsDashboardFeedSections() {
+        let snapshot = TodoHomeMapper.snapshot(from: DemoAppFixtures.appSession, now: Date(timeIntervalSince1970: 0))
+
+        XCTAssertEqual(snapshot.now.map(\.entityID), ["demo-apple-today"])
+        XCTAssertEqual(snapshot.today.map(\.entityID), ["demo-github-today", "manual-task:demo-manual-seed"])
+        XCTAssertEqual(snapshot.worthKnowing.map(\.entityID), ["demo-rbi-today"])
+        XCTAssertTrue(snapshot.agenda.isEmpty)
+    }
+
+    func testManualTaskCreationRefreshesDashboard() async throws {
+        let store = InboxStore(client: DemoAppClient(), sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+
+        await store.load()
+        let task = try await store.createManualTask(title: "Ship macOS to-do page", notes: "Use backend tasks", section: "today")
+
+        XCTAssertEqual(task.status, "open")
+        XCTAssertTrue(store.session?.dashboard.feed.today.contains { $0.entityID == task.entityID } ?? false)
+    }
+
+    func testCompletionRemovesItemFromDashboard() async throws {
+        let store = InboxStore(client: DemoAppClient(), sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+
+        await store.load()
+        let entityID = "demo-apple-today"
+        XCTAssertTrue(store.session?.dashboard.feed.now.contains { $0.entityID == entityID } ?? false)
+
+        _ = try await store.completeEntity(entityID: entityID)
+
+        XCTAssertFalse(store.session?.dashboard.feed.now.contains { $0.entityID == entityID } ?? true)
+    }
 }
 
 private final class FailingAppClient: AppClient {
@@ -121,6 +152,9 @@ private final class FailingAppClient: AppClient {
     func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse { throw APIError.httpStatus(503) }
     func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse { throw APIError.httpStatus(503) }
     func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse { throw APIError.httpStatus(503) }
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse { throw APIError.httpStatus(503) }
+    func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse { throw APIError.httpStatus(503) }
+    func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse { throw APIError.httpStatus(503) }
 }
 
 private final class SlowThreadAppClient: AppClient {
@@ -174,6 +208,18 @@ private final class SlowThreadAppClient: AppClient {
 
     func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
         GmailThreadMutationResponse(threadID: threadID, action: .markRead)
+    }
+
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        try await DemoAppClient().createTask(request)
+    }
+
+    func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse {
+        try await DemoAppClient().updateTask(taskID, request: request)
+    }
+
+    func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
+        try await DemoAppClient().completeEntity(entityID, request: request)
     }
 }
 
