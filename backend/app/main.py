@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.auth_google import router as auth_google_router
 from app.api.routes.app_session import router as app_session_router
+from app.api.routes.entities import router as entities_router
 from app.api.routes.gmail import router as gmail_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.first_run import router as first_run_router
@@ -15,6 +16,7 @@ from app.api.routes.mail_groups import router as mail_groups_router
 from app.api.routes.post_login import router as post_login_router
 from app.api.routes.system import router as system_router
 from app.api.routes.mailbox import router as mailbox_router
+from app.api.routes.tasks import router as tasks_router
 from app.core.config import load_settings
 
 
@@ -35,6 +37,8 @@ app.include_router(first_run_router)
 app.include_router(post_login_router)
 app.include_router(dashboard_router)
 app.include_router(gmail_router)
+app.include_router(tasks_router)
+app.include_router(entities_router)
 app.include_router(mailbox_router)
 app.include_router(mail_groups_router)
 app.include_router(jobs_router)

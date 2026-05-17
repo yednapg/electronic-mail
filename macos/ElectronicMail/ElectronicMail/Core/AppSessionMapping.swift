@@ -1,6 +1,16 @@
 import Foundation
 
 extension AppSessionResponse {
+    func replacingDashboardFeed(_ transform: (FeedResponse) -> FeedResponse) -> AppSessionResponse {
+        AppSessionResponse(
+            user: user,
+            readiness: readiness,
+            dashboard: dashboard.replacingFeed(transform(dashboard.feed)),
+            mailbox: mailbox,
+            sync: sync
+        )
+    }
+
     func replacingMailboxRows(_ transform: (GmailThreadRow) -> GmailThreadRow) -> AppSessionResponse {
         AppSessionResponse(
             user: user,
@@ -9,6 +19,37 @@ extension AppSessionResponse {
             mailbox: mailbox.replacingRows(transform),
             sync: sync
         )
+    }
+}
+
+extension DashboardResponse {
+    func replacingFeed(_ feed: FeedResponse) -> DashboardResponse {
+        DashboardResponse(
+            auth: auth,
+            profile: profile,
+            briefing: briefing,
+            feed: feed
+        )
+    }
+}
+
+extension FeedResponse {
+    func removingEntity(_ entityID: String) -> FeedResponse {
+        FeedResponse(
+            now: now.filter { $0.entityID != entityID },
+            today: today.filter { $0.entityID != entityID },
+            worthKnowing: worthKnowing.filter { $0.entityID != entityID }
+        )
+    }
+
+    func appending(_ item: AttentionItem, section: String) -> FeedResponse {
+        if section == "now" {
+            return FeedResponse(now: now + [item], today: today, worthKnowing: worthKnowing)
+        }
+        if section == "later" {
+            return FeedResponse(now: now, today: today, worthKnowing: worthKnowing + [item])
+        }
+        return FeedResponse(now: now, today: today + [item], worthKnowing: worthKnowing)
     }
 }
 

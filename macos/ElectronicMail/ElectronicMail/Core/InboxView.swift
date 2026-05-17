@@ -4,8 +4,7 @@ import SwiftUI
 public struct InboxView: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var store: InboxStore
-    @State private var scrollViewportHeight: CGFloat = 0
-    @State private var keyboardWindowStartIndex: Int = 0
+    @State private var scrollView: NSScrollView?
 
     public init(store: InboxStore) {
         self.store = store
@@ -16,57 +15,43 @@ public struct InboxView: View {
             let metrics = InboxLayoutMetrics(windowSize: proxy.size)
 
             ZStack {
-                ElectronicMailColors.background(for: colorScheme)
+                ElectronicMailDesign.background(for: colorScheme)
                     .ignoresSafeArea()
 
                 VStack(alignment: .leading, spacing: 0) {
-                    InboxHeader(
-                        metrics: metrics,
-                        navigationPlaceholderVisible: store.navigationPlaceholderVisible,
-                        onMenu: { store.toggleNavigationPlaceholder() }
-                    )
-                    .frame(height: ElectronicMailTypography.bodyLineHeight)
-                    .padding(.top, metrics.headerTop)
-                    .padding(.bottom, metrics.headerBottom)
+                    Spacer(minLength: 0)
+                        .frame(height: ElectronicMailShellMetrics.contentTop)
 
-                    ScrollViewReader { scrollProxy in
-                        ZStack(alignment: .topLeading) {
-                            ScrollView(.vertical, showsIndicators: false) {
-                                LazyVStack(alignment: .leading, spacing: 0) {
-                                    ForEach(store.sections) { section in
-                                        InboxSectionView(
-                                            section: section,
-                                            metrics: metrics,
-                                            colorScheme: colorScheme,
-                                            onSelect: { threadID in
-                                                store.select(threadID: threadID, prefetch: false)
-                                            }
-                                        )
-                                    }
-                                }
-                                .padding(.bottom, ElectronicMailTypography.bodyLineHeight)
-                            }
-                            .background(
-                                GeometryReader { geometry in
-                                    Color.clear.preference(
-                                        key: InboxViewportHeightPreferenceKey.self,
-                                        value: geometry.size.height
+                    ZStack(alignment: .topLeading) {
+                        ScrollView(.vertical, showsIndicators: false) {
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(store.sections) { section in
+                                    InboxSectionView(
+                                        section: section,
+                                        metrics: metrics,
+                                        colorScheme: colorScheme,
+                                        onSelect: { threadID in
+                                            select(threadID: threadID)
+                                        }
                                     )
                                 }
-                            )
-                            .onPreferenceChange(InboxViewportHeightPreferenceKey.self) { height in
-                                if scrollViewportHeight != height {
-                                    scrollViewportHeight = height
-                                }
                             }
-
-                            InboxKeyboardEventCapture(
-                                onMove: { delta in moveSelection(delta: delta, scrollProxy: scrollProxy) },
-                                onOpen: { store.openActiveSelection() }
-                            )
-                            .frame(width: 1, height: 1)
-                            .opacity(0.01)
+                            .padding(.bottom, ElectronicMailTypography.bodyLineHeight)
                         }
+                        .background(
+                            InboxScrollViewAccessor { scrollView in
+                                self.scrollView = scrollView
+                            }
+                        )
+
+                        InboxKeyboardEventCapture(
+                            onMove: { delta in
+                                moveSelection(delta: delta, metrics: metrics)
+                            },
+                            onOpen: { store.openActiveSelection() }
+                        )
+                        .frame(width: 1, height: 1)
+                        .opacity(0.01)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -100,7 +85,7 @@ public struct InboxView: View {
         .environment(\.font, .system(.body, design: .rounded))
     }
 
-    private func moveSelection(delta: Int, scrollProxy: ScrollViewProxy) {
+    private func moveSelection(delta: Int, metrics: InboxLayoutMetrics) {
         let rows = store.flatRows
         guard !rows.isEmpty else {
             return
@@ -119,47 +104,105 @@ public struct InboxView: View {
         }
 
         let nextThreadID = rows[nextIndex].threadID
-        let scrollAnchor = keyboardScrollAnchor(for: nextIndex, rowCount: rows.count)
-        store.select(threadID: nextThreadID, prefetch: false)
+        select(threadID: nextThreadID)
+        scrollThreadIntoKeyboardRange(
+            threadID: nextThreadID,
+            direction: delta,
+            metrics: metrics
+        )
+    }
 
-        if let scrollAnchor {
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                scrollProxy.scrollTo(nextThreadID, anchor: scrollAnchor)
-            }
+    private func select(threadID: String) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            store.select(threadID: threadID, prefetch: false)
         }
     }
 
-    private func keyboardScrollAnchor(for targetIndex: Int, rowCount: Int) -> UnitPoint? {
-        let visibleCapacity = max(1, min(rowCount, keyboardVisibleRowCapacity()))
-
-        if targetIndex < keyboardWindowStartIndex {
-            keyboardWindowStartIndex = targetIndex
-            return .top
+    private func scrollThreadIntoKeyboardRange(
+        threadID: String,
+        direction: Int,
+        metrics: InboxLayoutMetrics
+    ) {
+        guard
+            let scrollView,
+            let rowRange = contentYRange(for: threadID, metrics: metrics)
+        else {
+            return
         }
 
-        let windowEndIndex = keyboardWindowStartIndex + visibleCapacity - 1
-        if targetIndex > windowEndIndex {
-            keyboardWindowStartIndex = targetIndex - visibleCapacity + 1
-            return .bottom
+        let viewportMinY = scrollView.contentView.bounds.minY
+        let viewportHeight = metrics.visibleScrollHeight
+        guard viewportHeight > 0 else {
+            return
+        }
+
+        let topLimit = viewportMinY + InboxKeyboardScroll.runwayAbove
+        let bottomLimit = viewportMinY + viewportHeight - InboxKeyboardScroll.runwayBelow
+        if direction > 0, rowRange.upperBound > bottomLimit {
+            scroll(
+                scrollView,
+                to: rowRange.upperBound - viewportHeight + InboxKeyboardScroll.runwayBelow,
+                metrics: metrics
+            )
+        } else if direction < 0, rowRange.lowerBound < topLimit {
+            scroll(
+                scrollView,
+                to: rowRange.lowerBound - InboxKeyboardScroll.runwayAbove,
+                metrics: metrics
+            )
+        }
+    }
+
+    private func scroll(_ scrollView: NSScrollView, to requestedY: CGFloat, metrics: InboxLayoutMetrics) {
+        let viewportHeight = metrics.visibleScrollHeight
+        let contentHeight = totalContentHeight(metrics: metrics) + ElectronicMailTypography.bodyLineHeight
+        let maxY = max(0, contentHeight - viewportHeight)
+        let targetY = min(max(0, requestedY), maxY)
+        let currentOrigin = scrollView.contentView.bounds.origin
+
+        guard abs(currentOrigin.y - targetY) > 0.5 else {
+            return
+        }
+
+        scrollView.contentView.scroll(to: CGPoint(x: currentOrigin.x, y: targetY))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    private func contentYRange(for threadID: String, metrics: InboxLayoutMetrics) -> Range<CGFloat>? {
+        var y: CGFloat = 0
+
+        for section in store.sections {
+            y += metrics.sectionHeaderHeight(for: section.id)
+
+            for row in section.rows {
+                let rowStart = y
+                let rowEnd = rowStart + ElectronicMailTypography.bodyLineHeight
+
+                if row.threadID == threadID {
+                    return rowStart..<rowEnd
+                }
+
+                y = rowEnd
+            }
         }
 
         return nil
     }
 
-    private func keyboardVisibleRowCapacity() -> Int {
-        let visibleLineCount = Int((scrollViewportHeight / ElectronicMailTypography.bodyLineHeight).rounded(.down))
-        return max(6, visibleLineCount - 4)
+    private func totalContentHeight(metrics: InboxLayoutMetrics) -> CGFloat {
+        store.sections.reduce(CGFloat(0)) { height, section in
+            height
+                + metrics.sectionHeaderHeight(for: section.id)
+                + CGFloat(section.rows.count) * ElectronicMailTypography.bodyLineHeight
+        }
     }
 }
 
-private struct InboxViewportHeightPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
+private enum InboxKeyboardScroll {
+    static let runwayAbove = ElectronicMailTypography.bodyLineHeight
+    static let runwayBelow = ElectronicMailTypography.bodyLineHeight
 }
 
 private struct InboxHeader: View {
@@ -168,25 +211,25 @@ private struct InboxHeader: View {
     let onMenu: () -> Void
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
+        HStack(spacing: ElectronicMailShellMetrics.navTitleGap) {
             Button(action: onMenu) {
-                Image(systemName: "line.3.horizontal")
-                    .font(.rounded(size: ElectronicMailTypography.iconSize, weight: .semibold))
+                ElectronicMailHamburgerIcon()
                     .foregroundStyle(.primary)
-                    .frame(width: 16, height: 20)
+                    .frame(width: ElectronicMailShellMetrics.navIconFrame, height: ElectronicMailShellMetrics.navIconFrame)
             }
             .buttonStyle(.plain)
             .help(navigationPlaceholderVisible ? "Hide navigation" : "Show navigation")
-            .frame(width: 30, height: 30)
-            .position(x: metrics.groupedIconX, y: ElectronicMailTypography.bodyLineHeight / 2)
+            .frame(width: ElectronicMailShellMetrics.navIconFrame, height: ElectronicMailShellMetrics.navIconFrame)
 
             Text("Inbox")
                 .font(.rounded(size: ElectronicMailTypography.titleSize, weight: .bold))
                 .tracking(ElectronicMailTypography.titleTracking)
                 .foregroundStyle(.primary)
                 .frame(height: ElectronicMailTypography.bodyLineHeight, alignment: .center)
-                .offset(x: metrics.contentLeading)
         }
+        .opacity(navigationPlaceholderVisible ? 0 : 1)
+        .accessibilityHidden(navigationPlaceholderVisible)
+        .padding(.leading, ElectronicMailShellMetrics.navLeading)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
@@ -228,13 +271,13 @@ private struct InboxSectionHeader: View {
             Text(section.title)
                 .font(.rounded(size: ElectronicMailTypography.bodySize, weight: .regular))
                 .tracking(ElectronicMailTypography.bodyTracking)
-                .foregroundStyle(ElectronicMailColors.sectionTitle(for: colorScheme))
+                .foregroundStyle(ElectronicMailDesign.sectionText(for: colorScheme))
                 .lineLimit(1)
                 .frame(height: ElectronicMailTypography.bodyLineHeight)
                 .offset(x: metrics.contentLeading, y: metrics.sectionTopSpacing(for: section.id))
 
             Rectangle()
-                .fill(ElectronicMailColors.divider(for: colorScheme))
+                .fill(ElectronicMailDesign.divider(for: colorScheme))
                 .frame(
                     width: max(0, metrics.windowSize.width - metrics.contentLeading - metrics.dividerTrailing),
                     height: 1
@@ -261,7 +304,7 @@ private struct InboxRowView: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
             if row.isSelected {
-                ElectronicMailColors.appleBlue
+                ElectronicMailDesign.appleBlue
                     .frame(width: metrics.windowSize.width, height: ElectronicMailTypography.bodyLineHeight)
             }
 
@@ -269,7 +312,7 @@ private struct InboxRowView: View {
                 Image(systemName: "chevron.right.circle")
                     .font(.rounded(size: ElectronicMailTypography.iconSize, weight: .regular))
                     .symbolRenderingMode(.monochrome)
-                    .foregroundStyle(row.isSelected ? .white : ElectronicMailColors.appleBlue)
+                    .foregroundStyle(row.isSelected ? ElectronicMailDesign.selectedText(for: colorScheme) : ElectronicMailDesign.appleBlue)
                     .frame(width: 22, height: 22)
                     .position(
                         x: metrics.groupedIconX,
@@ -318,12 +361,12 @@ private struct InboxRowView: View {
 
     private var textColor: Color {
         if row.isSelected {
-            return .white
+            return ElectronicMailDesign.selectedText(for: colorScheme)
         }
         if row.isUnread {
-            return ElectronicMailColors.primaryText(for: colorScheme)
+            return ElectronicMailDesign.unreadText(for: colorScheme)
         }
-        return ElectronicMailColors.readText(for: colorScheme)
+        return ElectronicMailDesign.readText(for: colorScheme)
     }
 }
 
@@ -420,6 +463,7 @@ private struct InboxKeyboardEventCapture: NSViewRepresentable {
                     return event
                 }
             }
+
         }
 
         override func keyDown(with event: NSEvent) {
@@ -437,27 +481,29 @@ private struct InboxKeyboardEventCapture: NSViewRepresentable {
     }
 }
 
-private enum ElectronicMailColors {
-    static let appleBlue = Color(red: 0.0, green: 90.0 / 255.0, blue: 205.0 / 255.0)
+private struct InboxScrollViewAccessor: NSViewRepresentable {
+    let onResolve: (NSScrollView) -> Void
 
-    static func background(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? .black : .white
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        DispatchQueue.main.async {
+            resolve(from: view)
+        }
+        return view
     }
 
-    static func primaryText(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? .white : .black
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            resolve(from: nsView)
+        }
     }
 
-    static func divider(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? .white.opacity(0.10) : .black.opacity(0.10)
-    }
+    private func resolve(from view: NSView) {
+        guard let scrollView = view.enclosingScrollView else {
+            return
+        }
 
-    static func sectionTitle(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? .white.opacity(0.25) : .black.opacity(0.25)
-    }
-
-    static func readText(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? .white.opacity(0.34) : .black.opacity(0.42)
+        onResolve(scrollView)
     }
 }
 
@@ -476,11 +522,21 @@ private struct InboxLayoutMetrics {
     let timeWidth: CGFloat = 190
 
     var headerTop: CGFloat {
-        max(16, contentLeading - 80)
+        ElectronicMailShellMetrics.navTop
     }
 
     var headerBottom: CGFloat {
-        30
+        0
+    }
+
+    var visibleScrollHeight: CGFloat {
+        max(
+            0,
+            windowSize.height
+                - headerTop
+                - ElectronicMailTypography.bodyLineHeight
+                - headerBottom
+        )
     }
 
     var contentLeading: CGFloat {
@@ -521,6 +577,10 @@ private struct InboxLayoutMetrics {
 
     func sectionTopSpacing(for sectionID: String) -> CGFloat {
         sectionID == "today" ? 0 : ElectronicMailTypography.bodyLineHeight
+    }
+
+    func sectionHeaderHeight(for sectionID: String) -> CGFloat {
+        sectionTopSpacing(for: sectionID) + ElectronicMailTypography.bodyLineHeight + 3
     }
 }
 

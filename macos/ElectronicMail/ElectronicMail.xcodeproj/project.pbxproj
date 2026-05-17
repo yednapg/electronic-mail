@@ -7,19 +7,44 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		043C55ECC28A6165147139CD /* ElectronicMailShared.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 12A865E23955430580FFD02C /* ElectronicMailShared.framework */; };
+		0767FCCA198DEB06D906F8E4 /* ElectronicMailShared.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 12A865E23955430580FFD02C /* ElectronicMailShared.framework */; };
+		0906C070D57C3F9538FDD697 /* ElectronicMailiOSRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3E279E99C5A2401814A085C /* ElectronicMailiOSRootView.swift */; };
+		099D4835441FACE42D1B3A9F /* InboxStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D17382F2DECC14A57EC0403 /* InboxStore.swift */; };
 		0A0E192A501A911995236E49 /* InboxStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9141CA5AE6E7172E02A2E82E /* InboxStoreTests.swift */; };
+		0A55E3A899E2ADD637B82617 /* TodoHomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92D2884BBE64513E0F521850 /* TodoHomeView.swift */; };
+		18EF5C51209D8BC30FE34A1E /* AppHaptics.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC585B873996A7E2C39F574C /* AppHaptics.swift */; };
+		19C928479C0D23D50EBB9FD6 /* DashboardViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 875474372675C0BB533356A2 /* DashboardViewModelTests.swift */; };
 		1D98A43F420A4A228816E31E /* OAuthService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95F1402204821AD28FD21C68 /* OAuthService.swift */; };
 		3709BB98DACBC3EA02588F53 /* APIClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E978EC1605F65D46914F4B58 /* APIClientTests.swift */; };
+		43C4E9360B2153C3AFED1FE0 /* DashboardStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1248366AFBD8E041955962EB /* DashboardStore.swift */; };
+		44F11154D52AC0E19A462409 /* DashboardViewModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3E23CEC3BF04A0C374FE7AF /* DashboardViewModels.swift */; };
+		450DF872F290F5105277BAFD /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4B0DA2215CE7CF473AE431B /* Models.swift */; };
 		4A90C425C83E253DE4697898 /* AppConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51A82E6E83CB2F01653310C9 /* AppConfiguration.swift */; };
+		5B9CB4C7A88FF38FC9BA197A /* SignedInShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54F56B91356DB66565F5138F /* SignedInShellView.swift */; };
+		623B2C8D6E927A9B2BF7C378 /* InboxViewModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 942CBD31879339E0CDAE5995 /* InboxViewModels.swift */; };
+		651BB7C33CC24DEE38C5B627 /* AppClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1139801E4AE9E09FEFCADE0 /* AppClient.swift */; };
+		65F37F311D28311433DE1566 /* ElectronicMailiOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF8EB2F7AAE441E701EB7B95 /* ElectronicMailiOSApp.swift */; };
 		8295184470A5D6D34BBD8F55 /* ThreadCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8FE689D2E289C4C3F63FF8C /* ThreadCache.swift */; };
+		83355D735E886188024D7239 /* ElectronicMailDesign.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08B383FFABFBC62AA3421FAC /* ElectronicMailDesign.swift */; };
+		85BE8CDEC5D21EBB44723AAB /* MobileAuthFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70934CFC827A51900D954C83 /* MobileAuthFlow.swift */; };
 		85C4B68C65C7EFD1F92F2CA0 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4B0DA2215CE7CF473AE431B /* Models.swift */; };
+		8D30DBD18079D48BC39BD99A /* AppSessionCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9A1D426A580DEF065947EE2 /* AppSessionCache.swift */; };
 		986F65AF29012E65ECBD6FD1 /* InboxView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98E41167B98D870A2F18DC05 /* InboxView.swift */; };
+		990981521EBE4C811C8F7692 /* AppConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51A82E6E83CB2F01653310C9 /* AppConfiguration.swift */; };
 		9CE3077210497D6B468695F8 /* InboxStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D17382F2DECC14A57EC0403 /* InboxStore.swift */; };
 		A241E5F8B9718F4773A019D9 /* DemoAppClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73C32468817FF1F83CFB3464 /* DemoAppClient.swift */; };
+		B3CB9CB1DB57C9E21455E52E /* ThreadCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8FE689D2E289C4C3F63FF8C /* ThreadCache.swift */; };
 		BE1F6B1BE413185277F42DA7 /* AppClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1139801E4AE9E09FEFCADE0 /* AppClient.swift */; };
 		C98D334B8B820CCACD131F38 /* AppSessionCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9A1D426A580DEF065947EE2 /* AppSessionCache.swift */; };
 		CE62C8779126D9002A2FA43D /* AppSessionMapping.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22CC350DC44E46D561DAFA71 /* AppSessionMapping.swift */; };
+		DA05008C672E0548839441C0 /* AppSessionMapping.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22CC350DC44E46D561DAFA71 /* AppSessionMapping.swift */; };
+		DAA5DA20FA65EF694CFF0EE0 /* IOSGoogleOAuthService.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7EE5BEA17BC2ECC7B4F475B /* IOSGoogleOAuthService.swift */; };
 		DE8C7E79CC0215E5B95E1ACA /* ElectronicMailCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 15E3C181BB57958668D88D57 /* ElectronicMailCore.framework */; };
+		DF5A116CB24B57B3CF64D16E /* ElectronicMailShared.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 12A865E23955430580FFD02C /* ElectronicMailShared.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		E1B743566A6BE1A98D3DB500 /* DemoAppClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73C32468817FF1F83CFB3464 /* DemoAppClient.swift */; };
+		E9C700846464333F35155C55 /* DashboardScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02859D68EE1494543F23A5CD /* DashboardScreen.swift */; };
+		ED6C61D0FE66A5B81D6398CD /* SessionTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86C22B47DC30CD35E982D179 /* SessionTokenStore.swift */; };
 		F1FF97F99746DEF4C47A03B2 /* ElectronicMailCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 15E3C181BB57958668D88D57 /* ElectronicMailCore.framework */; };
 		F49A43FB346D75EDE3B788D4 /* ElectronicMailApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0FC09E991BA1990B0E99113 /* ElectronicMailApp.swift */; };
 		F844A9085964F93CD2953825 /* SessionTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86C22B47DC30CD35E982D179 /* SessionTokenStore.swift */; };
@@ -35,6 +60,20 @@
 			remoteGlobalIDString = D62CDE54C431140CDA5731B0;
 			remoteInfo = ElectronicMailCore;
 		};
+		8925C75A517EAF7912215BB2 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 3A5EE8B3C5757292D8732377 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 2E9B8F391BBA1F29399BDE35;
+			remoteInfo = ElectronicMailShared;
+		};
+		B09108C6172564D4DE1292D9 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 3A5EE8B3C5757292D8732377 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 2E9B8F391BBA1F29399BDE35;
+			remoteInfo = ElectronicMailShared;
+		};
 		D72D57F35B1FBDFACB99D38F /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 3A5EE8B3C5757292D8732377 /* Project object */;
@@ -45,6 +84,17 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
+		474220727010382A99F4D357 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				DF5A116CB24B57B3CF64D16E /* ElectronicMailShared.framework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		BCCD2F560262272DE832F4E2 /* Embed Frameworks */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
@@ -66,6 +116,26 @@
 			name = "Embed Frameworks";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		CA1BE18439C295D96145BC49 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CA6F53D106C8DBE61D9B97CD /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		D65DAEB3F7841552CB719F23 /* Embed Frameworks */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
@@ -79,30 +149,56 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		02859D68EE1494543F23A5CD /* DashboardScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardScreen.swift; sourceTree = "<group>"; };
+		08B383FFABFBC62AA3421FAC /* ElectronicMailDesign.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElectronicMailDesign.swift; sourceTree = "<group>"; };
 		0BF632318F4994F17ADAD299 /* ElectronicMailTests-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMailTests-Info.plist"; sourceTree = "<group>"; };
+		1248366AFBD8E041955962EB /* DashboardStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardStore.swift; sourceTree = "<group>"; };
+		12A865E23955430580FFD02C /* ElectronicMailShared.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = ElectronicMailShared.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		15E3C181BB57958668D88D57 /* ElectronicMailCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = ElectronicMailCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		1C5DDD1365FADF33AA1EC1DA /* ElectronicMailSharedTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ElectronicMailSharedTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		22CC350DC44E46D561DAFA71 /* AppSessionMapping.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSessionMapping.swift; sourceTree = "<group>"; };
 		43A3E049DE45CDAA7CC199EA /* ElectronicMailTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ElectronicMailTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		45C5A000FE76CCA615285F09 /* ElectronicMail-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMail-Info.plist"; sourceTree = "<group>"; };
 		51A82E6E83CB2F01653310C9 /* AppConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfiguration.swift; sourceTree = "<group>"; };
+		54F56B91356DB66565F5138F /* SignedInShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignedInShellView.swift; sourceTree = "<group>"; };
+		5C72F421B0EAAA68C237A376 /* ElectronicMailiOS-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMailiOS-Info.plist"; sourceTree = "<group>"; };
 		6D17382F2DECC14A57EC0403 /* InboxStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxStore.swift; sourceTree = "<group>"; };
+		70934CFC827A51900D954C83 /* MobileAuthFlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileAuthFlow.swift; sourceTree = "<group>"; };
 		73C32468817FF1F83CFB3464 /* DemoAppClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DemoAppClient.swift; sourceTree = "<group>"; };
 		86C22B47DC30CD35E982D179 /* SessionTokenStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionTokenStore.swift; sourceTree = "<group>"; };
+		875474372675C0BB533356A2 /* DashboardViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardViewModelTests.swift; sourceTree = "<group>"; };
 		9141CA5AE6E7172E02A2E82E /* InboxStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxStoreTests.swift; sourceTree = "<group>"; };
+		92D2884BBE64513E0F521850 /* TodoHomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TodoHomeView.swift; sourceTree = "<group>"; };
+		942CBD31879339E0CDAE5995 /* InboxViewModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxViewModels.swift; sourceTree = "<group>"; };
 		95F1402204821AD28FD21C68 /* OAuthService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OAuthService.swift; sourceTree = "<group>"; };
+		9840DAA09904CBD17DD1AB9C /* ElectronicMailiOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ElectronicMailiOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		98E41167B98D870A2F18DC05 /* InboxView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxView.swift; sourceTree = "<group>"; };
 		A89D2A08606ADBA921590EED /* ElectronicMailCore-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMailCore-Info.plist"; sourceTree = "<group>"; };
 		AFB79EFC32537484EE3D6FBE /* ModelDecodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDecodingTests.swift; sourceTree = "<group>"; };
+		B3E279E99C5A2401814A085C /* ElectronicMailiOSRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElectronicMailiOSRootView.swift; sourceTree = "<group>"; };
 		C4B0DA2215CE7CF473AE431B /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		C9A1D426A580DEF065947EE2 /* AppSessionCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSessionCache.swift; sourceTree = "<group>"; };
+		CB0697E28A5D995EE4729866 /* ElectronicMailSharedTests-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMailSharedTests-Info.plist"; sourceTree = "<group>"; };
+		CC585B873996A7E2C39F574C /* AppHaptics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppHaptics.swift; sourceTree = "<group>"; };
 		D1139801E4AE9E09FEFCADE0 /* AppClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppClient.swift; sourceTree = "<group>"; };
 		D8FE689D2E289C4C3F63FF8C /* ThreadCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadCache.swift; sourceTree = "<group>"; };
+		DF8EB2F7AAE441E701EB7B95 /* ElectronicMailiOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElectronicMailiOSApp.swift; sourceTree = "<group>"; };
 		E0FC09E991BA1990B0E99113 /* ElectronicMailApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElectronicMailApp.swift; sourceTree = "<group>"; };
+		E3E23CEC3BF04A0C374FE7AF /* DashboardViewModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardViewModels.swift; sourceTree = "<group>"; };
 		E978EC1605F65D46914F4B58 /* APIClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClientTests.swift; sourceTree = "<group>"; };
+		E9F5EA6CD49C28E817A839FF /* ElectronicMailShared-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMailShared-Info.plist"; sourceTree = "<group>"; };
 		EEA81CF16E7AA4459285DF8C /* ElectronicMail.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ElectronicMail.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F7EE5BEA17BC2ECC7B4F475B /* IOSGoogleOAuthService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSGoogleOAuthService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		1256869A7DB6F4AA4E08CC1A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		190BD16C9B937B46DE5F2BEF /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -118,6 +214,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AE0ECFA80C5EF973FF04BE31 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				043C55ECC28A6165147139CD /* ElectronicMailShared.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C1322D700071CF3480E9F6C0 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0767FCCA198DEB06D906F8E4 /* ElectronicMailShared.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		C41C69765079B22F4F207DF1 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -129,6 +241,18 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		39DEB813791B3978681F4F27 /* iOS */ = {
+			isa = PBXGroup;
+			children = (
+				CC585B873996A7E2C39F574C /* AppHaptics.swift */,
+				02859D68EE1494543F23A5CD /* DashboardScreen.swift */,
+				DF8EB2F7AAE441E701EB7B95 /* ElectronicMailiOSApp.swift */,
+				B3E279E99C5A2401814A085C /* ElectronicMailiOSRootView.swift */,
+				F7EE5BEA17BC2ECC7B4F475B /* IOSGoogleOAuthService.swift */,
+			);
+			path = iOS;
+			sourceTree = "<group>";
+		};
 		419A89142590165866AEDFFB /* Derived */ = {
 			isa = PBXGroup;
 			children = (
@@ -141,10 +265,21 @@
 			isa = PBXGroup;
 			children = (
 				F7A710C78824B1D98666B4BC /* Core */,
+				39DEB813791B3978681F4F27 /* iOS */,
 				6D0D2A20D9DE64EC82321723 /* Mac */,
+				CE84899C63AAE657DCD3A6D0 /* Shared */,
+				6C66A68F32552B1899249D0F /* SharedTests */,
 				EEC97656418EA2400864B708 /* Tests */,
 			);
 			path = ElectronicMail;
+			sourceTree = "<group>";
+		};
+		6C66A68F32552B1899249D0F /* SharedTests */ = {
+			isa = PBXGroup;
+			children = (
+				875474372675C0BB533356A2 /* DashboardViewModelTests.swift */,
+			);
+			path = SharedTests;
 			sourceTree = "<group>";
 		};
 		6D0D2A20D9DE64EC82321723 /* Mac */ = {
@@ -160,6 +295,9 @@
 			children = (
 				EEA81CF16E7AA4459285DF8C /* ElectronicMail.app */,
 				15E3C181BB57958668D88D57 /* ElectronicMailCore.framework */,
+				9840DAA09904CBD17DD1AB9C /* ElectronicMailiOS.app */,
+				12A865E23955430580FFD02C /* ElectronicMailShared.framework */,
+				1C5DDD1365FADF33AA1EC1DA /* ElectronicMailSharedTests.xctest */,
 				43A3E049DE45CDAA7CC199EA /* ElectronicMailTests.xctest */,
 			);
 			name = Products;
@@ -173,11 +311,25 @@
 			);
 			sourceTree = "<group>";
 		};
+		CE84899C63AAE657DCD3A6D0 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				1248366AFBD8E041955962EB /* DashboardStore.swift */,
+				E3E23CEC3BF04A0C374FE7AF /* DashboardViewModels.swift */,
+				942CBD31879339E0CDAE5995 /* InboxViewModels.swift */,
+				70934CFC827A51900D954C83 /* MobileAuthFlow.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
 		D24F83F759C2C34B06A17450 /* InfoPlists */ = {
 			isa = PBXGroup;
 			children = (
 				45C5A000FE76CCA615285F09 /* ElectronicMail-Info.plist */,
 				A89D2A08606ADBA921590EED /* ElectronicMailCore-Info.plist */,
+				5C72F421B0EAAA68C237A376 /* ElectronicMailiOS-Info.plist */,
+				E9F5EA6CD49C28E817A839FF /* ElectronicMailShared-Info.plist */,
+				CB0697E28A5D995EE4729866 /* ElectronicMailSharedTests-Info.plist */,
 				0BF632318F4994F17ADAD299 /* ElectronicMailTests-Info.plist */,
 			);
 			path = InfoPlists;
@@ -210,12 +362,15 @@
 				C9A1D426A580DEF065947EE2 /* AppSessionCache.swift */,
 				22CC350DC44E46D561DAFA71 /* AppSessionMapping.swift */,
 				73C32468817FF1F83CFB3464 /* DemoAppClient.swift */,
+				08B383FFABFBC62AA3421FAC /* ElectronicMailDesign.swift */,
 				6D17382F2DECC14A57EC0403 /* InboxStore.swift */,
 				98E41167B98D870A2F18DC05 /* InboxView.swift */,
 				C4B0DA2215CE7CF473AE431B /* Models.swift */,
 				95F1402204821AD28FD21C68 /* OAuthService.swift */,
 				86C22B47DC30CD35E982D179 /* SessionTokenStore.swift */,
+				54F56B91356DB66565F5138F /* SignedInShellView.swift */,
 				D8FE689D2E289C4C3F63FF8C /* ThreadCache.swift */,
+				92D2884BBE64513E0F521850 /* TodoHomeView.swift */,
 			);
 			path = Core;
 			sourceTree = "<group>";
@@ -223,6 +378,47 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		183BDFDB2D33020577445E42 /* ElectronicMailiOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CADBFE93D338FBBA11AB4CBF /* Build configuration list for PBXNativeTarget "ElectronicMailiOS" */;
+			buildPhases = (
+				ACDFDAF53521EA16085D42D5 /* Sources */,
+				B15F8C61205F829A6A2F6A3B /* Resources */,
+				C1322D700071CF3480E9F6C0 /* Frameworks */,
+				474220727010382A99F4D357 /* Embed Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A208AC4E991FE80669E8B713 /* PBXTargetDependency */,
+			);
+			name = ElectronicMailiOS;
+			packageProductDependencies = (
+			);
+			productName = ElectronicMailiOS;
+			productReference = 9840DAA09904CBD17DD1AB9C /* ElectronicMailiOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+		2E9B8F391BBA1F29399BDE35 /* ElectronicMailShared */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 6BADB744B9311FDEDDCA9654 /* Build configuration list for PBXNativeTarget "ElectronicMailShared" */;
+			buildPhases = (
+				1B4202458124ED969F2B169E /* Sources */,
+				2A5B63925F28265912F1C942 /* Resources */,
+				1256869A7DB6F4AA4E08CC1A /* Frameworks */,
+				CA1BE18439C295D96145BC49 /* Embed Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ElectronicMailShared;
+			packageProductDependencies = (
+			);
+			productName = ElectronicMailShared;
+			productReference = 12A865E23955430580FFD02C /* ElectronicMailShared.framework */;
+			productType = "com.apple.product-type.framework";
+		};
 		5257CC477337719E2F319636 /* ElectronicMailTests */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 2F8C67D7BF4A81FFA81F9148 /* Build configuration list for PBXNativeTarget "ElectronicMailTests" */;
@@ -242,6 +438,27 @@
 			);
 			productName = ElectronicMailTests;
 			productReference = 43A3E049DE45CDAA7CC199EA /* ElectronicMailTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		6D410AFB238A602ACD874B50 /* ElectronicMailSharedTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = DBD05F924EF02D69AB02A38A /* Build configuration list for PBXNativeTarget "ElectronicMailSharedTests" */;
+			buildPhases = (
+				AE021E0FE5BECBC410F05D5C /* Sources */,
+				CDAB4F7F3FC72A91CCC11215 /* Resources */,
+				AE0ECFA80C5EF973FF04BE31 /* Frameworks */,
+				CA6F53D106C8DBE61D9B97CD /* Embed Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A43C7270A9C5D35BFECC2D29 /* PBXTargetDependency */,
+			);
+			name = ElectronicMailSharedTests;
+			packageProductDependencies = (
+			);
+			productName = ElectronicMailSharedTests;
+			productReference = 1C5DDD1365FADF33AA1EC1DA /* ElectronicMailSharedTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
 		D62CDE54C431140CDA5731B0 /* ElectronicMailCore */ = {
@@ -310,13 +527,23 @@
 			targets = (
 				FEBCE34A910C9833FED721D8 /* ElectronicMail */,
 				D62CDE54C431140CDA5731B0 /* ElectronicMailCore */,
+				2E9B8F391BBA1F29399BDE35 /* ElectronicMailShared */,
+				6D410AFB238A602ACD874B50 /* ElectronicMailSharedTests */,
 				5257CC477337719E2F319636 /* ElectronicMailTests */,
+				183BDFDB2D33020577445E42 /* ElectronicMailiOS */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		146BDDA62137EBB479111C3F /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		2A5B63925F28265912F1C942 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -337,9 +564,43 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B15F8C61205F829A6A2F6A3B /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CDAB4F7F3FC72A91CCC11215 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		1B4202458124ED969F2B169E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				651BB7C33CC24DEE38C5B627 /* AppClient.swift in Sources */,
+				990981521EBE4C811C8F7692 /* AppConfiguration.swift in Sources */,
+				8D30DBD18079D48BC39BD99A /* AppSessionCache.swift in Sources */,
+				DA05008C672E0548839441C0 /* AppSessionMapping.swift in Sources */,
+				E1B743566A6BE1A98D3DB500 /* DemoAppClient.swift in Sources */,
+				099D4835441FACE42D1B3A9F /* InboxStore.swift in Sources */,
+				450DF872F290F5105277BAFD /* Models.swift in Sources */,
+				ED6C61D0FE66A5B81D6398CD /* SessionTokenStore.swift in Sources */,
+				B3CB9CB1DB57C9E21455E52E /* ThreadCache.swift in Sources */,
+				43C4E9360B2153C3AFED1FE0 /* DashboardStore.swift in Sources */,
+				44F11154D52AC0E19A462409 /* DashboardViewModels.swift in Sources */,
+				623B2C8D6E927A9B2BF7C378 /* InboxViewModels.swift in Sources */,
+				85BE8CDEC5D21EBB44723AAB /* MobileAuthFlow.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		38627E6A8EFDFA56D50743AE /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -367,12 +628,35 @@
 				C98D334B8B820CCACD131F38 /* AppSessionCache.swift in Sources */,
 				CE62C8779126D9002A2FA43D /* AppSessionMapping.swift in Sources */,
 				A241E5F8B9718F4773A019D9 /* DemoAppClient.swift in Sources */,
+				83355D735E886188024D7239 /* ElectronicMailDesign.swift in Sources */,
 				9CE3077210497D6B468695F8 /* InboxStore.swift in Sources */,
 				986F65AF29012E65ECBD6FD1 /* InboxView.swift in Sources */,
 				85C4B68C65C7EFD1F92F2CA0 /* Models.swift in Sources */,
 				1D98A43F420A4A228816E31E /* OAuthService.swift in Sources */,
 				F844A9085964F93CD2953825 /* SessionTokenStore.swift in Sources */,
+				5B9CB4C7A88FF38FC9BA197A /* SignedInShellView.swift in Sources */,
 				8295184470A5D6D34BBD8F55 /* ThreadCache.swift in Sources */,
+				0A55E3A899E2ADD637B82617 /* TodoHomeView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		ACDFDAF53521EA16085D42D5 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				18EF5C51209D8BC30FE34A1E /* AppHaptics.swift in Sources */,
+				E9C700846464333F35155C55 /* DashboardScreen.swift in Sources */,
+				65F37F311D28311433DE1566 /* ElectronicMailiOSApp.swift in Sources */,
+				0906C070D57C3F9538FDD697 /* ElectronicMailiOSRootView.swift in Sources */,
+				DAA5DA20FA65EF694CFF0EE0 /* IOSGoogleOAuthService.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AE021E0FE5BECBC410F05D5C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				19C928479C0D23D50EBB9FD6 /* DashboardViewModelTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -391,9 +675,64 @@
 			target = D62CDE54C431140CDA5731B0 /* ElectronicMailCore */;
 			targetProxy = D72D57F35B1FBDFACB99D38F /* PBXContainerItemProxy */;
 		};
+		A208AC4E991FE80669E8B713 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = ElectronicMailShared;
+			target = 2E9B8F391BBA1F29399BDE35 /* ElectronicMailShared */;
+			targetProxy = 8925C75A517EAF7912215BB2 /* PBXContainerItemProxy */;
+		};
+		A43C7270A9C5D35BFECC2D29 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = ElectronicMailShared;
+			target = 2E9B8F391BBA1F29399BDE35 /* ElectronicMailShared */;
+			targetProxy = B09108C6172564D4DE1292D9 /* PBXContainerItemProxy */;
+		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
+		0D18F0801A1F47972CC99EE3 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				DEFINES_MODULE = YES;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				INFOPLIST_FILE = "Derived/InfoPlists/ElectronicMailShared-Info.plist";
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMailShared;
+				PRODUCT_NAME = ElectronicMailShared;
+				SDKROOT = auto;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5;
+				TARGETED_DEVICE_FAMILY = 1;
+				VERSIONING_SYSTEM = "apple-generic";
+				VERSION_INFO_PREFIX = "";
+			};
+			name = Release;
+		};
 		4952C45646924E7A11E2747F /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -480,6 +819,53 @@
 			};
 			name = Debug;
 		};
+		62CE62E7DB377A1415BB6DC7 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				DEFINES_MODULE = YES;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				INFOPLIST_FILE = "Derived/InfoPlists/ElectronicMailShared-Info.plist";
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMailShared;
+				PRODUCT_NAME = ElectronicMailShared;
+				SDKROOT = auto;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = (
+					"$(inherited)",
+					DEBUG,
+				);
+				SWIFT_COMPILATION_MODE = singlefile;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5;
+				TARGETED_DEVICE_FAMILY = 1;
+				VERSIONING_SYSTEM = "apple-generic";
+				VERSION_INFO_PREFIX = "";
+			};
+			name = Debug;
+		};
 		95B8CB7A678495C255B8F72C /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -530,6 +916,38 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		CDFD669D7FF629D66F2B5AB6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				ELECTRONIC_MAIL_IOS_BACKEND_URL = "https://electronic-mail-backend.invalid";
+				ENABLE_PREVIEWS = YES;
+				INFOPLIST_FILE = "Derived/InfoPlists/ElectronicMailiOS-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMail.iOS;
+				PRODUCT_NAME = ElectronicMailiOS;
+				SDKROOT = iphoneos;
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5;
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};
@@ -593,6 +1011,70 @@
 				SWIFT_VERSION = 5;
 				VERSIONING_SYSTEM = "apple-generic";
 				VERSION_INFO_PREFIX = "";
+			};
+			name = Debug;
+		};
+		E2C22BFBF3195F9B98497772 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				ELECTRONIC_MAIL_IOS_BACKEND_URL = "https://electronic-mail-backend.invalid";
+				ENABLE_PREVIEWS = YES;
+				INFOPLIST_FILE = "Derived/InfoPlists/ElectronicMailiOS-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMail.iOS;
+				PRODUCT_NAME = ElectronicMailiOS;
+				SDKROOT = iphoneos;
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = (
+					"$(inherited)",
+					DEBUG,
+				);
+				SWIFT_COMPILATION_MODE = singlefile;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		EC066AC839CEBB4E544A856B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "-";
+				INFOPLIST_FILE = "Derived/InfoPlists/ElectronicMailSharedTests-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMailSharedTests;
+				PRODUCT_NAME = ElectronicMailSharedTests;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = (
+					"$(inherited)",
+					DEBUG,
+				);
+				SWIFT_COMPILATION_MODE = singlefile;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5;
 			};
 			name = Debug;
 		};
@@ -690,6 +1172,30 @@
 			};
 			name = Debug;
 		};
+		F5266AACBD61314C9ACA1E23 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "-";
+				INFOPLIST_FILE = "Derived/InfoPlists/ElectronicMailSharedTests-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMailSharedTests;
+				PRODUCT_NAME = ElectronicMailSharedTests;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -720,11 +1226,38 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		6BADB744B9311FDEDDCA9654 /* Build configuration list for PBXNativeTarget "ElectronicMailShared" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				62CE62E7DB377A1415BB6DC7 /* Debug */,
+				0D18F0801A1F47972CC99EE3 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		866CAD87DE9B1DACD501BF1A /* Build configuration list for PBXNativeTarget "ElectronicMail" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				4F7974409CBEA225D4F34FC9 /* Debug */,
 				4952C45646924E7A11E2747F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		CADBFE93D338FBBA11AB4CBF /* Build configuration list for PBXNativeTarget "ElectronicMailiOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E2C22BFBF3195F9B98497772 /* Debug */,
+				CDFD669D7FF629D66F2B5AB6 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		DBD05F924EF02D69AB02A38A /* Build configuration list for PBXNativeTarget "ElectronicMailSharedTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				EC066AC839CEBB4E544A856B /* Debug */,
+				F5266AACBD61314C9ACA1E23 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

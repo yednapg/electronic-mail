@@ -42,9 +42,51 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
+               BlueprintIdentifier = "2E9B8F391BBA1F29399BDE35"
+               BuildableName = "ElectronicMailShared.framework"
+               BlueprintName = "ElectronicMailShared"
+               ReferencedContainer = "container:ElectronicMail.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "6D410AFB238A602ACD874B50"
+               BuildableName = "ElectronicMailSharedTests.xctest"
+               BlueprintName = "ElectronicMailSharedTests"
+               ReferencedContainer = "container:ElectronicMail.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
                BlueprintIdentifier = "5257CC477337719E2F319636"
                BuildableName = "ElectronicMailTests.xctest"
                BlueprintName = "ElectronicMailTests"
+               ReferencedContainer = "container:ElectronicMail.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "183BDFDB2D33020577445E42"
+               BuildableName = "ElectronicMailiOS.app"
+               BlueprintName = "ElectronicMailiOS"
                ReferencedContainer = "container:ElectronicMail.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -56,6 +98,17 @@
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       shouldUseLaunchSchemeArgsEnv = "YES">
       <Testables>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "6D410AFB238A602ACD874B50"
+               BuildableName = "ElectronicMailSharedTests.xctest"
+               BlueprintName = "ElectronicMailSharedTests"
+               ReferencedContainer = "container:ElectronicMail.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
          <TestableReference
             skipped = "NO"
             parallelizable = "NO">
