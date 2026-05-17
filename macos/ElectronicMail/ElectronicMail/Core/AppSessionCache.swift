@@ -44,7 +44,7 @@ public final class AppSessionCache {
         }
     }
 
-    func merge(current: AppSessionResponse?, next: AppSessionResponse) -> AppSessionResponse {
+    func merge(current: AppSessionResponse?, next: AppSessionResponse, allowEmptyDashboard: Bool = false) -> AppSessionResponse {
         guard let current, current.user.id == next.user.id else {
             return next
         }
@@ -55,7 +55,7 @@ public final class AppSessionCache {
         let nextDashboardCount = next.dashboard.feed.now.count
             + next.dashboard.feed.today.count
             + next.dashboard.feed.worthKnowing.count
-        let dashboard = currentDashboardCount > 0 && nextDashboardCount == 0 ? current.dashboard : next.dashboard
+        let dashboard = !allowEmptyDashboard && currentDashboardCount > 0 && nextDashboardCount == 0 ? current.dashboard : next.dashboard
         let mailbox = !current.mailbox.isEmpty && next.mailbox.isEmpty ? current.mailbox : next.mailbox
 
         return AppSessionResponse(

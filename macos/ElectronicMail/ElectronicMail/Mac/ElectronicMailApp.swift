@@ -12,13 +12,21 @@ struct ElectronicMailApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1440, height: 900)
+        .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Open Command Palette") {
+                    NotificationCenter.default.post(name: .electronicMailOpenCommandPalette, object: nil)
+                }
+                .keyboardShortcut("k", modifiers: [.command])
+            }
+        }
     }
 }
 
 private enum AppLaunchStage {
     case signIn
     case setup
-    case inbox
+    case app
 }
 
 private struct ElectronicMailRootView: View {
@@ -45,8 +53,8 @@ private struct ElectronicMailRootView: View {
             case .setup:
                 SetupAnimationView(startedAt: setupStartedAt)
                 .transition(.opacity)
-            case .inbox:
-                InboxView(store: store)
+            case .app:
+                SignedInShellView(store: store)
                     .transition(.opacity)
             }
         }
@@ -75,7 +83,7 @@ private struct ElectronicMailRootView: View {
         }
 
         withAnimation(.easeInOut(duration: 0.35)) {
-            stage = .inbox
+            stage = .app
         }
     }
 
@@ -125,7 +133,7 @@ private struct ElectronicMailRootView: View {
                 return
             }
             withAnimation(.easeInOut(duration: 0.45)) {
-                stage = .inbox
+                stage = .app
             }
         }
         setupCompletionTimer = timer
@@ -141,17 +149,17 @@ private struct GoogleSignInView: View {
 
     var body: some View {
         ZStack {
-            ElectronicMailSurface.background(for: colorScheme)
+            ElectronicMailDesign.background(for: colorScheme)
                 .ignoresSafeArea()
 
             VStack(spacing: 54) {
                 HStack(spacing: 28) {
                     Image(systemName: "envelope.open.fill")
                         .symbolRenderingMode(.palette)
-                        .foregroundStyle(.white, ElectronicMailSurface.appleBlue)
+                        .foregroundStyle(ElectronicMailDesign.selectedText(for: colorScheme), ElectronicMailDesign.appleBlue)
 
                     Image(systemName: "arrow.right")
-                        .foregroundStyle(ElectronicMailSurface.primaryText(for: colorScheme))
+                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
 
                     Image(systemName: "checkmark.square.fill")
                         .symbolRenderingMode(.palette)
@@ -161,7 +169,7 @@ private struct GoogleSignInView: View {
 
                 Text("Turn your emails into to-do's!")
                     .font(.system(size: 44, weight: .bold, design: .rounded))
-                    .foregroundStyle(ElectronicMailSurface.primaryText(for: colorScheme))
+                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                     .tracking(0.44)
 
                 Button(action: onSignIn) {
@@ -171,17 +179,17 @@ private struct GoogleSignInView: View {
 
                         Text(isSigningIn ? "Signing in ..." : "Sign in with Google")
                             .font(.system(size: 32, weight: .regular, design: .rounded))
-                            .foregroundStyle(ElectronicMailSurface.primaryText(for: colorScheme))
+                            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                     }
                     .padding(.horizontal, 26)
                     .frame(height: 72)
                     .background(
                         RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(ElectronicMailSurface.controlFill(for: colorScheme))
+                            .fill(ElectronicMailDesign.controlFill(for: colorScheme))
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .stroke(ElectronicMailSurface.controlBorder(for: colorScheme), lineWidth: 1)
+                            .stroke(ElectronicMailDesign.panelBorder(for: colorScheme), lineWidth: 1)
                     )
                 }
                 .buttonStyle(.plain)
@@ -217,7 +225,7 @@ private struct SetupAnimationView: View {
 
     var body: some View {
         ZStack {
-            ElectronicMailSurface.background(for: colorScheme)
+            ElectronicMailDesign.background(for: colorScheme)
                 .ignoresSafeArea()
 
             TimelineView(.periodic(from: startedAt, by: 0.25)) { timeline in
@@ -250,7 +258,7 @@ private struct WavyStatusText: View {
 
                     Text(String(character))
                         .font(.system(size: 46, weight: .bold, design: .rounded))
-                        .foregroundStyle(ElectronicMailSurface.primaryText(for: colorScheme).opacity(opacity))
+                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme).opacity(opacity))
                 }
             }
             .accessibilityLabel(text)
@@ -266,26 +274,6 @@ private struct GoogleGlyph: View {
                 .foregroundStyle(Color(red: 66.0 / 255.0, green: 133.0 / 255.0, blue: 244.0 / 255.0))
         }
         .accessibilityHidden(true)
-    }
-}
-
-private enum ElectronicMailSurface {
-    static let appleBlue = Color(red: 0.0, green: 90.0 / 255.0, blue: 205.0 / 255.0)
-
-    static func background(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? .black : .white
-    }
-
-    static func primaryText(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? .white : .black
-    }
-
-    static func controlFill(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.03)
-    }
-
-    static func controlBorder(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.24) : Color.black.opacity(0.22)
     }
 }
 

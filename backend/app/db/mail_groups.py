@@ -70,6 +70,31 @@ class MailGroupDetail:
 
 
 @dataclass(frozen=True)
+class ManualTaskRecord:
+    id: str
+    user_id: str
+    entity_id: str
+    title: str
+    notes: str | None
+    section: str
+    due_at: str | None
+    status: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class EntityOutcomeRecord:
+    id: str
+    user_id: str
+    entity_id: str
+    outcome_type: str
+    snooze_until: str | None
+    note: str | None
+    created_at: str
+
+
+@dataclass(frozen=True)
 class GmailImportState:
     user_id: str
     last_history_id: str | None
@@ -728,6 +753,191 @@ def append_group_members(
             )
 
 
+def create_manual_task(
+    database_url: str,
+    *,
+    user_id: str,
+    title: str,
+    notes: str | None,
+    section: str = "today",
+    due_at: str | None = None,
+) -> ManualTaskRecord:
+    task_id = str(uuid4())
+    entity_id = f"manual-task:{task_id}"
+    with get_engine(database_url).begin() as connection:
+        row = connection.execute(
+            text(
+                """
+                INSERT INTO manual_tasks (
+                  id, user_id, entity_id, title, notes, section, due_at, status, created_at, updated_at
+                ) VALUES (
+                  :id, :user_id, :entity_id, :title, :notes, :section, :due_at, 'open', now(), now()
+                )
+                RETURNING *
+                """
+            ),
+            {
+                "id": task_id,
+                "user_id": user_id,
+                "entity_id": entity_id,
+                "title": title,
+                "notes": notes,
+                "section": section,
+                "due_at": due_at,
+            },
+        ).mappings().one()
+    return _manual_task_from_row(row)
+
+
+def update_manual_task(
+    database_url: str,
+    task_id: str,
+    *,
+    user_id: str,
+    title: str | None = None,
+    notes: str | None = None,
+    section: str | None = None,
+    due_at: str | None = None,
+    status: str | None = None,
+) -> ManualTaskRecord | None:
+    existing = get_manual_task(database_url, task_id, user_id=user_id)
+    if existing is None:
+        return None
+    with get_engine(database_url).begin() as connection:
+        row = connection.execute(
+            text(
+                """
+                UPDATE manual_tasks
+                SET title = :title,
+                    notes = :notes,
+                    section = :section,
+                    due_at = :due_at,
+                    status = :status,
+                    updated_at = now()
+                WHERE id = :id AND user_id = :user_id
+                RETURNING *
+                """
+            ),
+            {
+                "id": task_id,
+                "user_id": user_id,
+                "title": title if title is not None else existing.title,
+                "notes": notes if notes is not None else existing.notes,
+                "section": section if section is not None else existing.section,
+                "due_at": due_at if due_at is not None else existing.due_at,
+                "status": status if status is not None else existing.status,
+            },
+        ).mappings().first()
+    return _manual_task_from_row(row) if row is not None else None
+
+
+def get_manual_task(database_url: str, task_id: str, *, user_id: str) -> ManualTaskRecord | None:
+    with get_engine(database_url).connect() as connection:
+        row = connection.execute(
+            text("SELECT * FROM manual_tasks WHERE id = :id AND user_id = :user_id"),
+            {"id": task_id, "user_id": user_id},
+        ).mappings().first()
+    return _manual_task_from_row(row) if row is not None else None
+
+
+def get_manual_task_by_entity_id(database_url: str, *, user_id: str, entity_id: str) -> ManualTaskRecord | None:
+    with get_engine(database_url).connect() as connection:
+        row = connection.execute(
+            text("SELECT * FROM manual_tasks WHERE entity_id = :entity_id AND user_id = :user_id"),
+            {"entity_id": entity_id, "user_id": user_id},
+        ).mappings().first()
+    return _manual_task_from_row(row) if row is not None else None
+
+
+def list_open_manual_tasks(database_url: str, *, user_id: str) -> list[ManualTaskRecord]:
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM manual_tasks
+                WHERE user_id = :user_id
+                  AND status = 'open'
+                ORDER BY
+                  CASE section WHEN 'now' THEN 0 WHEN 'today' THEN 1 ELSE 2 END,
+                  COALESCE(due_at, created_at) ASC,
+                  created_at ASC
+                """
+            ),
+            {"user_id": user_id},
+        ).mappings().all()
+    return [_manual_task_from_row(row) for row in rows]
+
+
+def append_entity_outcome(
+    database_url: str,
+    *,
+    user_id: str,
+    entity_id: str,
+    outcome_type: str,
+    snooze_until: str | None = None,
+    note: str | None = None,
+) -> EntityOutcomeRecord:
+    with get_engine(database_url).begin() as connection:
+        row = connection.execute(
+            text(
+                """
+                INSERT INTO entity_outcomes (id, user_id, entity_id, outcome_type, snooze_until, note, created_at)
+                VALUES (:id, :user_id, :entity_id, :outcome_type, :snooze_until, :note, now())
+                RETURNING *
+                """
+            ),
+            {
+                "id": str(uuid4()),
+                "user_id": user_id,
+                "entity_id": entity_id,
+                "outcome_type": outcome_type,
+                "snooze_until": snooze_until,
+                "note": note,
+            },
+        ).mappings().one()
+    return _entity_outcome_from_row(row)
+
+
+def get_latest_entity_outcomes(
+    database_url: str,
+    *,
+    user_id: str,
+    entity_ids: list[str] | None = None,
+) -> dict[str, EntityOutcomeRecord]:
+    if entity_ids is not None:
+        entity_ids = [entity_id for entity_id in dict.fromkeys(entity_ids) if entity_id]
+        if not entity_ids:
+            return {}
+    with get_engine(database_url).connect() as connection:
+        if entity_ids is None:
+            rows = connection.execute(
+                text(
+                    """
+                    SELECT DISTINCT ON (entity_id) *
+                    FROM entity_outcomes
+                    WHERE user_id = :user_id
+                    ORDER BY entity_id, created_at DESC, id DESC
+                    """
+                ),
+                {"user_id": user_id},
+            ).mappings().all()
+        else:
+            rows = connection.execute(
+                text(
+                    """
+                    SELECT DISTINCT ON (entity_id) *
+                    FROM entity_outcomes
+                    WHERE user_id = :user_id
+                      AND entity_id = ANY(:entity_ids)
+                    ORDER BY entity_id, created_at DESC, id DESC
+                    """
+                ),
+                {"user_id": user_id, "entity_ids": entity_ids},
+            ).mappings().all()
+    return {str(row["entity_id"]): _entity_outcome_from_row(row) for row in rows}
+
+
 def list_mail_groups(database_url: str, *, user_id: str, limit: int = 150, include_pending: bool = False) -> list[MailGroupRecord]:
     if include_pending:
         with get_engine(database_url).connect() as connection:
@@ -1027,6 +1237,33 @@ def _group_from_row(row) -> MailGroupRecord:
         generated_at=_iso(row["generated_at"]) if row["generated_at"] is not None else None,
         created_at=_iso(row["created_at"]),
         updated_at=_iso(row["updated_at"]),
+    )
+
+
+def _manual_task_from_row(row) -> ManualTaskRecord:
+    return ManualTaskRecord(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        entity_id=str(row["entity_id"]),
+        title=str(row["title"]),
+        notes=str(row["notes"]) if row["notes"] is not None else None,
+        section=str(row["section"]),
+        due_at=_iso(row["due_at"]) if row["due_at"] is not None else None,
+        status=str(row["status"]),
+        created_at=_iso(row["created_at"]),
+        updated_at=_iso(row["updated_at"]),
+    )
+
+
+def _entity_outcome_from_row(row) -> EntityOutcomeRecord:
+    return EntityOutcomeRecord(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        entity_id=str(row["entity_id"]),
+        outcome_type=str(row["outcome_type"]),
+        snooze_until=_iso(row["snooze_until"]) if row["snooze_until"] is not None else None,
+        note=str(row["note"]) if row["note"] is not None else None,
+        created_at=_iso(row["created_at"]),
     )
 
 

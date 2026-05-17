@@ -52,9 +52,64 @@ public struct DashboardProfile: Codable, Equatable {
     }
 }
 
+public struct DashboardBriefingPart: Codable, Equatable, Hashable {
+    let type: String
+    let emoji: String
+    let count: Int
+    let text: String
+}
+
+public struct DashboardBriefingImportant: Codable, Equatable, Hashable {
+    let emoji: String
+    let count: Int
+    let text: String
+    let mailGroupID: String?
+    let actionType: String?
+
+    enum CodingKeys: String, CodingKey {
+        case emoji
+        case count
+        case text
+        case mailGroupID = "mail_group_id"
+        case actionType = "action_type"
+    }
+}
+
+public struct DashboardCalendarAvailability: Codable, Equatable, Hashable {
+    let emoji: String
+    let kind: String
+    let time: String?
+    let text: String
+}
+
 public struct DashboardBriefing: Codable, Equatable {
     let headline: String
     let brief: String
+    let parts: [DashboardBriefingPart]?
+    let important: DashboardBriefingImportant?
+    let calendarAvailability: DashboardCalendarAvailability?
+
+    public init(
+        headline: String,
+        brief: String,
+        parts: [DashboardBriefingPart]? = nil,
+        important: DashboardBriefingImportant? = nil,
+        calendarAvailability: DashboardCalendarAvailability? = nil
+    ) {
+        self.headline = headline
+        self.brief = brief
+        self.parts = parts
+        self.important = important
+        self.calendarAvailability = calendarAvailability
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case headline
+        case brief
+        case parts
+        case important
+        case calendarAvailability = "calendar_availability"
+    }
 }
 
 public struct DashboardResponse: Codable, Equatable {
@@ -453,6 +508,22 @@ public struct TaskCreateRequest: Codable, Equatable {
     }
 }
 
+public struct TaskUpdateRequest: Codable, Equatable {
+    let title: String?
+    let notes: String?
+    let section: String?
+    let dueAt: String?
+    let status: String?
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case notes
+        case section
+        case dueAt = "due_at"
+        case status
+    }
+}
+
 public struct TaskResponse: Codable, Equatable {
     let id: String
     let userID: String
@@ -476,6 +547,20 @@ public struct TaskResponse: Codable, Equatable {
         case status
         case createdAt = "created_at"
         case updatedAt = "updated_at"
+    }
+}
+
+public struct EntityOutcomeRequest: Codable, Equatable {
+    let note: String?
+}
+
+public struct EntitySnoozeRequest: Codable, Equatable {
+    let snoozeUntil: String
+    let note: String?
+
+    enum CodingKeys: String, CodingKey {
+        case snoozeUntil = "snooze_until"
+        case note
     }
 }
 

@@ -13,8 +13,10 @@ from typing import Any
 from app.core.config import Settings
 from app.db.jobs import count_active_jobs, enqueue_job
 from app.db.mail_groups import (
+    EntityOutcomeRecord,
     GmailMessageRecord,
     MailGroupRecord,
+    ManualTaskRecord,
     append_group_members,
     count_mail_groups,
     count_mail_groups_by_enrichment_status,
@@ -22,6 +24,7 @@ from app.db.mail_groups import (
     count_ready_mail_groups_since,
     get_app_session_snapshot,
     get_import_state,
+    get_latest_entity_outcomes,
     get_mail_group_by_key,
     get_mail_group_detail,
     list_dashboard_mail_groups,
@@ -29,6 +32,7 @@ from app.db.mail_groups import (
     list_mail_groups,
     list_messages_by_ids,
     list_messages_for_groups,
+    list_open_manual_tasks,
     list_pending_mail_groups,
     list_recent_messages,
     list_recent_messages_since,
@@ -672,18 +676,22 @@ def build_dashboard_response(settings: Settings, *, user_id: str | None, auth: G
     since = (datetime.now(timezone.utc) - timedelta(days=DASHBOARD_DAYS)).isoformat()
     database_url = str(settings.database_path)
     groups = list_dashboard_mail_groups(database_url, user_id=user_id, since_iso=since)
+    manual_tasks = list_open_manual_tasks(database_url, user_id=user_id)
+    outcomes = get_latest_entity_outcomes(
+        database_url,
+        user_id=user_id,
+        entity_ids=[*[group.id for group in groups], *[task.entity_id for task in manual_tasks]],
+    )
+    groups = [group for group in groups if not _outcome_suppresses(outcomes.get(group.id))]
+    manual_tasks = [task for task in manual_tasks if not _outcome_suppresses(outcomes.get(task.entity_id))]
     group_messages = list_messages_for_groups(database_url, user_id=user_id, group_ids=[group.id for group in groups])
     groups = _dedupe_groups_by_messages(groups, group_messages)
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user_id)
     feed = FeedResponse()
     for group in groups:
-        item = _attention_item_from_group(group)
-        if group.timing_band == "now":
-            feed.now.append(item)
-        elif group.timing_band == "today":
-            feed.today.append(item)
-        else:
-            feed.worth_knowing.append(item)
+        _append_feed_item(feed, _attention_item_from_group(group))
+    for task in manual_tasks:
+        _append_feed_item(feed, _attention_item_from_manual_task(task))
     briefing = _dashboard_briefing(profile=profile, feed=feed)
     return DashboardResponse(
         auth=auth,
@@ -691,7 +699,7 @@ def build_dashboard_response(settings: Settings, *, user_id: str | None, auth: G
         briefing=briefing,
         feed=feed,
         runtime_status={
-            "feed_source": "ai_mail_groups" if groups else "empty",
+            "feed_source": "ai_mail_groups" if groups else "manual_tasks" if manual_tasks else "empty",
             "canonical_ready": bool(status_counts.get("ready", 0)),
             "ai_groups_ready": bool(status_counts.get("ready", 0)),
             "pending_group_count": status_counts.get("pending", 0),
@@ -739,7 +747,7 @@ def _dashboard_briefing(*, profile: DashboardProfile | None, feed: FeedResponse)
     task_items = [
         item
         for item in items
-        if item.source == "gmail"
+        if item.source in {"gmail", "manual"}
         and item.need_type == "decision"
         and item.primary_action != "reply"
         and (important_item is None or item.entity_id != important_item["mail_group_id"])
@@ -911,6 +919,8 @@ def build_mailbox_response(settings: Settings, *, user_id: str, label: str = "in
     state = get_import_state(database_url, user_id=user_id)
     full_import_running = bool(state and state.full_backfill_cursor)
     groups = list_mail_groups(database_url, user_id=user_id, limit=limit, include_pending=True)
+    outcomes = get_latest_entity_outcomes(database_url, user_id=user_id, entity_ids=[group.id for group in groups])
+    groups = [group for group in groups if not _outcome_suppresses(outcomes.get(group.id))]
     group_messages = list_messages_for_groups(database_url, user_id=user_id, group_ids=[group.id for group in groups])
     groups = _dedupe_groups_by_messages(groups, group_messages)
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user_id)
@@ -1476,6 +1486,52 @@ def _attention_item_from_group(group: MailGroupRecord) -> AttentionItem:
         trace_id=f"mail-group:{group.id}",
         created_at=group.created_at,
     )
+
+
+def _attention_item_from_manual_task(task: ManualTaskRecord) -> AttentionItem:
+    notes = (task.notes or "").strip()
+    body = notes or "Manual to-do."
+    return AttentionItem(
+        id=f"manual-task:{task.id}",
+        entity_id=task.entity_id,
+        user_id=task.user_id,
+        need_type="decision",
+        action_type="none",
+        effort_level="quick",
+        timing_band=task.section if task.section in {"now", "today", "later", "hidden"} else "today",
+        action_confidence="high",
+        primary_action="open",
+        fallback_action="open",
+        title=task.title,
+        why_this_is_here=body,
+        detail=AttentionItemDetail(
+            body=[body],
+            action_label="Mark done",
+            source_label="Manual",
+        ),
+        due_at=task.due_at,
+        importance_level="medium",
+        lifecycle_state="active",
+        current_state="open",
+        source="manual",
+        gmail_thread_id=None,
+        gmail_thread_action=None,
+        trace_id=f"manual-task:{task.id}",
+        created_at=task.created_at,
+    )
+
+
+def _append_feed_item(feed: FeedResponse, item: AttentionItem) -> None:
+    if item.timing_band == "now":
+        feed.now.append(item)
+    elif item.timing_band == "today":
+        feed.today.append(item)
+    elif item.timing_band != "hidden":
+        feed.worth_knowing.append(item)
+
+
+def _outcome_suppresses(outcome: EntityOutcomeRecord | None) -> bool:
+    return outcome is not None and outcome.outcome_type in {"complete", "dismiss"}
 
 
 def _gmail_row_from_group(group: MailGroupRecord, messages: list[GmailMessageRecord]) -> GmailThreadRow:

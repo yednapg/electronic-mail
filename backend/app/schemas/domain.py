@@ -237,6 +237,64 @@ class GmailThreadMutationResponse(BaseModel):
     action: GmailThreadAction
 
 
+class TaskCreateRequest(BaseModel):
+    """Create a backend-owned manual task."""
+
+    title: str
+    notes: str | None = None
+    section: Literal["now", "today", "later"] = "today"
+    due_at: str | None = None
+
+
+class TaskUpdateRequest(BaseModel):
+    """Patch a backend-owned manual task."""
+
+    title: str | None = None
+    notes: str | None = None
+    section: Literal["now", "today", "later"] | None = None
+    due_at: str | None = None
+    status: Literal["open", "done"] | None = None
+
+
+class TaskResponse(BaseModel):
+    """Backend-owned manual task response."""
+
+    id: str
+    user_id: str
+    entity_id: str
+    title: str
+    notes: str | None = None
+    section: Literal["now", "today", "later"]
+    due_at: str | None = None
+    status: Literal["open", "done"]
+    created_at: str
+    updated_at: str
+
+
+class EntityOutcomeRequest(BaseModel):
+    """Explicit app-state outcome for one entity."""
+
+    note: str | None = None
+
+
+class EntitySnoozeRequest(EntityOutcomeRequest):
+    """Snooze an entity until a backend-owned timestamp."""
+
+    snooze_until: str
+
+
+class EntityOutcomeResponse(BaseModel):
+    """Persisted entity outcome."""
+
+    id: str
+    user_id: str
+    entity_id: str
+    outcome_type: Literal["complete", "snooze", "dismiss"]
+    snooze_until: str | None = None
+    note: str | None = None
+    created_at: str
+
+
 class GmailThreadRow(BaseModel):
     """One Gmail-like conversation row grouped by Gmail thread id."""
 

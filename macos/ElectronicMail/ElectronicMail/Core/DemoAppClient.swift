@@ -7,6 +7,7 @@ public final class DemoAppClient: AppClient {
 
     private var sessionState: AppSessionResponse
     private var threads: [String: ThreadReaderResponse]
+    private var manualTasks: [String: TaskResponse] = [:]
 
     public init(baseURL: URL = AppConfiguration.defaultBackendURL) {
         self.baseURL = baseURL
@@ -87,6 +88,87 @@ public final class DemoAppClient: AppClient {
         return GmailThreadMutationResponse(threadID: threadID, action: .markRead)
     }
 
+    public func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        let title = request.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else {
+            throw APIError.httpStatus(422)
+        }
+
+        let id = "demo-manual-\(manualTasks.count + 1)"
+        let task = TaskResponse(
+            id: id,
+            userID: DemoAppFixtures.userID,
+            entityID: "manual-task:\(id)",
+            title: title,
+            notes: request.notes,
+            section: request.section ?? "today",
+            dueAt: request.dueAt,
+            status: "open",
+            createdAt: DemoAppFixtures.now,
+            updatedAt: DemoAppFixtures.now
+        )
+        manualTasks[id] = task
+        sessionState = sessionState.replacingDashboardFeed {
+            $0.appending(DemoAppFixtures.attentionItem(from: task), section: task.section)
+        }
+        return task
+    }
+
+    public func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse {
+        guard let current = manualTasks[taskID] else {
+            throw APIError.httpStatus(404)
+        }
+
+        let updated = TaskResponse(
+            id: current.id,
+            userID: current.userID,
+            entityID: current.entityID,
+            title: request.title ?? current.title,
+            notes: request.notes ?? current.notes,
+            section: request.section ?? current.section,
+            dueAt: request.dueAt ?? current.dueAt,
+            status: request.status ?? current.status,
+            createdAt: current.createdAt,
+            updatedAt: DemoAppFixtures.now
+        )
+        manualTasks[taskID] = updated
+        sessionState = sessionState.replacingDashboardFeed { feed in
+            let withoutCurrent = feed.removingEntity(current.entityID)
+            guard updated.status == "open" else {
+                return withoutCurrent
+            }
+            return withoutCurrent.appending(DemoAppFixtures.attentionItem(from: updated), section: updated.section)
+        }
+        return updated
+    }
+
+    public func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
+        if let task = manualTasks.values.first(where: { $0.entityID == entityID }) {
+            manualTasks[task.id] = TaskResponse(
+                id: task.id,
+                userID: task.userID,
+                entityID: task.entityID,
+                title: task.title,
+                notes: task.notes,
+                section: task.section,
+                dueAt: task.dueAt,
+                status: "done",
+                createdAt: task.createdAt,
+                updatedAt: DemoAppFixtures.now
+            )
+        }
+        sessionState = sessionState.replacingDashboardFeed { $0.removingEntity(entityID) }
+        return EntityOutcomeResponse(
+            id: "demo-outcome-\(entityID)",
+            userID: DemoAppFixtures.userID,
+            entityID: entityID,
+            outcomeType: "complete",
+            snoozeUntil: nil,
+            note: request.note,
+            createdAt: DemoAppFixtures.now
+        )
+    }
+
     private func markThreadReadLocally(_ threadID: String) {
         sessionState = sessionState.replacingMailboxRows { row in
             guard row.threadID == threadID else {
@@ -119,8 +201,80 @@ enum DemoAppFixtures {
         dashboard: DashboardResponse(
             auth: GoogleAuthState(available: true, connected: true, connectURL: nil),
             profile: DashboardProfile(email: "demo@example.com", displayName: "TestUser"),
-            briefing: DashboardBriefing(headline: "Inbox", brief: "Demo inbox is ready."),
-            feed: FeedResponse(now: [], today: [], worthKnowing: [])
+            briefing: DashboardBriefing(
+                headline: "Good morning, TestUser.",
+                brief: "You have 3 meetings, 2 tasks and 1 email to reply. One important thing: 📌 macOS review slot needs confirmation. You are mostly free after 4 pm.",
+                parts: [
+                    DashboardBriefingPart(type: "meetings", emoji: "📆", count: 3, text: "meetings"),
+                    DashboardBriefingPart(type: "tasks", emoji: "✅", count: 2, text: "tasks"),
+                    DashboardBriefingPart(type: "emails", emoji: "📨", count: 1, text: "emails to reply"),
+                ],
+                important: DashboardBriefingImportant(
+                    emoji: "📌",
+                    count: 1,
+                    text: "macOS review slot needs confirmation",
+                    mailGroupID: "demo-apple-today",
+                    actionType: "confirm"
+                ),
+                calendarAvailability: DashboardCalendarAvailability(
+                    emoji: "🌄",
+                    kind: "mostly_free_after",
+                    time: "4 pm",
+                    text: "mostly free after 4 pm"
+                )
+            ),
+            feed: FeedResponse(
+                now: [
+                    attentionItem(
+                        id: "demo-rsvp-now",
+                        entityID: "demo-apple-today",
+                        title: "RSVP within 72 hrs to confirm your macOS review slot",
+                        body: "Apple Developer needs one more screenshot before review can continue. Confirm the slot or move it out of today's work.",
+                        source: .gmail,
+                        sourceLabel: "3 emails from Apple Developer",
+                        timingBand: .now,
+                        gmailThreadID: "demo-apple-today",
+                        primaryAction: "confirm"
+                    ),
+                ],
+                today: [
+                    attentionItem(
+                        id: "demo-pycon-today",
+                        entityID: "demo-github-today",
+                        title: "GitHub Education benefits are ready",
+                        body: "Review the pack and activate anything useful before the renewal window closes.",
+                        source: .gmail,
+                        sourceLabel: "GitHub Education",
+                        timingBand: .today,
+                        gmailThreadID: "demo-github-today",
+                        primaryAction: "review"
+                    ),
+                    attentionItem(
+                        id: "demo-manual-seed",
+                        entityID: "manual-task:demo-manual-seed",
+                        title: "New to-do",
+                        body: "Notes",
+                        source: .manual,
+                        sourceLabel: "Manual",
+                        timingBand: .today,
+                        gmailThreadID: nil,
+                        primaryAction: "open"
+                    ),
+                ],
+                worthKnowing: [
+                    attentionItem(
+                        id: "demo-worth-knowing",
+                        entityID: "demo-rbi-today",
+                        title: "New Sovereign Gold Bond tranche opens today",
+                        body: "RBI Retail Direct has a new tranche open. Read only if you plan to place an order.",
+                        source: .gmail,
+                        sourceLabel: "RBI Retail Direct",
+                        timingBand: .later,
+                        gmailThreadID: "demo-rbi-today",
+                        primaryAction: "open"
+                    ),
+                ]
+            )
         ),
         mailbox: mailbox,
         sync: AppSessionSyncState(
@@ -186,6 +340,61 @@ enum DemoAppFixtures {
     static let threads: [String: ThreadReaderResponse] = Dictionary(uniqueKeysWithValues: sections.flatMap(\.rows).map { row in
         (row.threadID, thread(from: row))
     })
+
+    static func attentionItem(from task: TaskResponse) -> AttentionItem {
+        attentionItem(
+            id: "manual-task:\(task.id)",
+            entityID: task.entityID,
+            title: task.title,
+            body: task.notes?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? task.notes! : "Manual to-do.",
+            source: .manual,
+            sourceLabel: "Manual",
+            timingBand: TimingBand(rawValue: task.section) ?? .today,
+            gmailThreadID: nil,
+            primaryAction: "open"
+        )
+    }
+
+    static func attentionItem(
+        id: String,
+        entityID: String,
+        title: String,
+        body: String,
+        source: SourceType,
+        sourceLabel: String,
+        timingBand: TimingBand,
+        gmailThreadID: String?,
+        primaryAction: String
+    ) -> AttentionItem {
+        AttentionItem(
+            id: id,
+            entityID: entityID,
+            userID: userID,
+            needType: source == .manual ? .decision : .awareness,
+            actionType: primaryAction,
+            effortLevel: "quick",
+            timingBand: timingBand,
+            actionConfidence: "high",
+            primaryAction: primaryAction,
+            fallbackAction: "open",
+            title: title,
+            whyThisIsHere: body,
+            detail: AttentionItemDetail(
+                body: [body],
+                actionLabel: source == .manual ? "Mark done" : "Open source",
+                sourceLabel: sourceLabel
+            ),
+            dueAt: nil,
+            importanceLevel: "medium",
+            lifecycleState: "active",
+            currentState: .open,
+            source: source,
+            gmailThreadID: gmailThreadID,
+            gmailThreadAction: gmailThreadID == nil ? nil : .archive,
+            traceID: id,
+            createdAt: now
+        )
+    }
 
     private static func row(
         id: String,

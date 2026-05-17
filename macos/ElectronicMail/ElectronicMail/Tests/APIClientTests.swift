@@ -104,6 +104,55 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(response.action, .archive)
     }
 
+    func testCreateTaskUsesBackendEndpoint() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/tasks")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+            let task = TaskResponse(
+                id: "task-1",
+                userID: "user-1",
+                entityID: "manual-task:task-1",
+                title: "New to-do",
+                notes: "Notes",
+                section: "today",
+                dueAt: nil,
+                status: "open",
+                createdAt: "2026-05-16T09:30:00+05:30",
+                updatedAt: "2026-05-16T09:30:00+05:30"
+            )
+            let data = try JSONEncoder.backend.encode(task)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+        }
+
+        let response = try await client.createTask(TaskCreateRequest(title: "New to-do", notes: "Notes", section: "today", dueAt: nil))
+
+        XCTAssertEqual(response.entityID, "manual-task:task-1")
+    }
+
+    func testCompleteEntityUsesBackendEndpoint() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/entities/entity%2Fwith%20space/complete")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+            let outcome = EntityOutcomeResponse(
+                id: "outcome-1",
+                userID: "user-1",
+                entityID: "entity/with space",
+                outcomeType: "complete",
+                snoozeUntil: nil,
+                note: "Done",
+                createdAt: "2026-05-16T09:30:00+05:30"
+            )
+            let data = try JSONEncoder.backend.encode(outcome)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+        }
+
+        let response = try await client.completeEntity("entity/with space", request: EntityOutcomeRequest(note: "Done"))
+
+        XCTAssertEqual(response.outcomeType, "complete")
+    }
+
     func testNonSuccessStatusThrows() async {
         let client = makeClient { request in
             (HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!, Data())
