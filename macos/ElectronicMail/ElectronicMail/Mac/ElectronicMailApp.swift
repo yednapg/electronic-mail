@@ -152,8 +152,8 @@ private struct GoogleSignInView: View {
             ElectronicMailDesign.background(for: colorScheme)
                 .ignoresSafeArea()
 
-            VStack(spacing: 54) {
-                HStack(spacing: 28) {
+            VStack(spacing: 32) {
+                HStack(spacing: 16) {
                     Image(systemName: "envelope.open.fill")
                         .symbolRenderingMode(.palette)
                         .foregroundStyle(ElectronicMailDesign.selectedText(for: colorScheme), ElectronicMailDesign.appleBlue)
@@ -165,24 +165,19 @@ private struct GoogleSignInView: View {
                         .symbolRenderingMode(.palette)
                         .foregroundStyle(.white, Color.green)
                 }
-                .font(.system(size: 72, weight: .semibold, design: .rounded))
+                .font(ElectronicMailType.sectionTitle())
 
                 Text("Turn your emails into to-do's!")
-                    .font(.system(size: 44, weight: .bold, design: .rounded))
+                    .font(ElectronicMailType.sectionTitle())
                     .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                    .tracking(0.44)
+                    .tracking(ElectronicMailType.bodyTracking)
 
                 Button(action: onSignIn) {
-                    HStack(spacing: 20) {
-                        GoogleGlyph()
-                            .frame(width: 36, height: 36)
-
-                        Text(isSigningIn ? "Signing in ..." : "Sign in with Google")
-                            .font(.system(size: 32, weight: .regular, design: .rounded))
-                            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                    }
-                    .padding(.horizontal, 26)
-                    .frame(height: 72)
+                    Text(isSigningIn ? "Signing in ..." : "Sign in with Google")
+                        .font(ElectronicMailType.body())
+                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                        .padding(.horizontal, 20)
+                        .frame(height: 50)
                     .background(
                         RoundedRectangle(cornerRadius: 7, style: .continuous)
                             .fill(ElectronicMailDesign.controlFill(for: colorScheme))
@@ -198,7 +193,7 @@ private struct GoogleSignInView: View {
 
                 if let errorMessage {
                     Text(errorMessage)
-                        .font(.system(size: 16, weight: .regular, design: .rounded))
+                        .font(ElectronicMailType.small())
                         .foregroundStyle(Color.red.opacity(0.82))
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 560)
@@ -257,23 +252,12 @@ private struct WavyStatusText: View {
                     let opacity = 0.34 + (crest * crest * 0.66)
 
                     Text(String(character))
-                        .font(.system(size: 46, weight: .bold, design: .rounded))
+                        .font(ElectronicMailType.sectionTitle())
                         .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme).opacity(opacity))
                 }
             }
             .accessibilityLabel(text)
         }
-    }
-}
-
-private struct GoogleGlyph: View {
-    var body: some View {
-        ZStack {
-            Text("G")
-                .font(.system(size: 34, weight: .bold, design: .rounded))
-                .foregroundStyle(Color(red: 66.0 / 255.0, green: 133.0 / 255.0, blue: 244.0 / 255.0))
-        }
-        .accessibilityHidden(true)
     }
 }
 

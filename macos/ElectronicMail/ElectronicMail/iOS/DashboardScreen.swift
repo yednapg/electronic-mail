@@ -9,26 +9,7 @@ struct DashboardScreen: View {
     var body: some View {
         NavigationStack {
             content
-                .navigationTitle(selectedMode.title)
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button(action: onSignOut) {
-                            Image(systemName: "rectangle.portrait.and.arrow.right")
-                        }
-                        .accessibilityLabel("Sign out")
-                    }
-
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button {
-                            AppHaptics.lightImpact()
-                            Task { await store.triggerSyncAndRefresh() }
-                        } label: {
-                            Image(systemName: store.syncing ? "arrow.triangle.2.circlepath.circle.fill" : "arrow.clockwise")
-                        }
-                        .accessibilityLabel("Refresh dashboard")
-                    }
-                }
+                .toolbar(.hidden, for: .navigationBar)
                 .sheet(item: selectedThreadBinding) { thread in
                     ThreadDetailView(thread: thread)
                 }
@@ -60,7 +41,8 @@ struct DashboardScreen: View {
                     selectedMode: $selectedMode,
                     snapshot: snapshot,
                     inboxSnapshot: store.inboxSnapshot,
-                    store: store
+                    store: store,
+                    onSignOut: onSignOut
                 )
             } else {
                 ContentUnavailableView("Dashboard is empty", systemImage: "tray")
@@ -89,7 +71,7 @@ private enum DashboardMode: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .todo:
-            return "To-do"
+            return "To-do's"
         case .inbox:
             return "Inbox"
         }
@@ -110,23 +92,19 @@ private struct DashboardModeContainer: View {
     let snapshot: DashboardSnapshot
     let inboxSnapshot: MobileInboxSnapshot?
     @ObservedObject var store: DashboardStore
+    let onSignOut: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("Mode", selection: $selectedMode) {
-                ForEach(DashboardMode.allCases) { mode in
-                    Label(mode.title, systemImage: mode.iconName)
-                        .tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 16)
-            .padding(.top, 12)
-            .padding(.bottom, 10)
-            .background(Color(.systemBackground))
-            .onChange(of: selectedMode) { _, _ in
-                AppHaptics.selection()
-            }
+            DashboardTopBar(
+                selectedMode: $selectedMode,
+                syncing: store.syncing,
+                onRefresh: {
+                    AppHaptics.lightImpact()
+                    Task { await store.triggerSyncAndRefresh() }
+                },
+                onSignOut: onSignOut
+            )
 
             switch selectedMode {
             case .todo:
@@ -135,7 +113,88 @@ private struct DashboardModeContainer: View {
                 InboxContentView(snapshot: inboxSnapshot, store: store)
             }
         }
-        .background(Color(.systemBackground))
+        .background(IOSDashboardPalette.background.ignoresSafeArea())
+        .preferredColorScheme(.dark)
+    }
+}
+
+private enum IOSDashboardPalette {
+    static let background = Color.black
+    static let surface = Color.white.opacity(0.075)
+    static let line = Color.white.opacity(0.10)
+    static let primary = Color.white.opacity(0.92)
+    static let secondary = Color.white.opacity(0.58)
+    static let tertiary = Color.white.opacity(0.36)
+    static let green = Color(red: 0.24, green: 0.78, blue: 0.22)
+    static let blue = Color(red: 0.05, green: 0.44, blue: 1.0)
+}
+
+private struct DashboardTopBar: View {
+    @Binding var selectedMode: DashboardMode
+    let syncing: Bool
+    let onRefresh: () -> Void
+    let onSignOut: () -> Void
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Menu {
+                ForEach(DashboardMode.allCases) { mode in
+                    Button {
+                        guard selectedMode != mode else {
+                            return
+                        }
+                        AppHaptics.selection()
+                        selectedMode = mode
+                    } label: {
+                        Label(mode.title, systemImage: selectedMode == mode ? "checkmark" : mode.iconName)
+                    }
+                }
+
+                Divider()
+
+                Button(action: onRefresh) {
+                    Label("Refresh", systemImage: syncing ? "arrow.triangle.2.circlepath.circle.fill" : "arrow.clockwise")
+                }
+
+                Button(role: .destructive, action: onSignOut) {
+                    Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
+                }
+            } label: {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(IOSDashboardPalette.primary)
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel("Open navigation menu")
+
+            Text(selectedMode.title)
+                .font(.system(size: 29, weight: .bold, design: .rounded))
+                .foregroundStyle(IOSDashboardPalette.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.82)
+
+            Spacer(minLength: 12)
+
+            Button {
+                AppHaptics.lightImpact()
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(IOSDashboardPalette.primary)
+                    .frame(width: 40, height: 40)
+                    .background(IOSDashboardPalette.surface, in: Circle())
+                    .overlay(
+                        Circle()
+                            .stroke(IOSDashboardPalette.line, lineWidth: 1)
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Search \(selectedMode.title)")
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
     }
 }
 
@@ -145,10 +204,8 @@ private struct DashboardContentView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 24) {
-                DashboardSummaryBlock(snapshot: snapshot)
-
-                DashboardAgendaBlock(items: snapshot.agenda)
+            LazyVStack(alignment: .leading, spacing: 30) {
+                TodayStatusCard(snapshot: snapshot)
 
                 ForEach(snapshot.sections) { section in
                     DashboardSectionBlock(section: section, store: store)
@@ -156,12 +213,14 @@ private struct DashboardContentView: View {
 
                 if !snapshot.hasVisibleWork {
                     ContentUnavailableView("Nothing needs attention", systemImage: "checkmark.circle")
+                        .foregroundStyle(IOSDashboardPalette.secondary)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 30)
                 }
             }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 22)
+            .padding(.horizontal, 20)
+            .padding(.top, 14)
+            .padding(.bottom, 46)
         }
         .refreshable {
             AppHaptics.lightImpact()
@@ -179,7 +238,56 @@ private struct DashboardContentView: View {
             }
             .padding(.bottom, 14)
         }
-        .background(Color(.systemGroupedBackground))
+        .background(IOSDashboardPalette.background)
+    }
+}
+
+private struct TodayStatusCard: View {
+    let snapshot: DashboardSnapshot
+
+    private var availabilityText: String {
+        if let text = snapshot.summary.calendarAvailability?.text.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+            return text
+        }
+
+        if snapshot.agenda.isEmpty {
+            return "You're free today"
+        }
+
+        return "\(snapshot.agenda.count) calendar item\(snapshot.agenda.count == 1 ? "" : "s") today"
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "calendar")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(IOSDashboardPalette.green)
+                .frame(width: 22)
+
+            Text("Today")
+                .font(.system(size: 16, weight: .bold, design: .rounded))
+                .foregroundStyle(IOSDashboardPalette.green)
+
+            Text(availabilityText)
+                .font(.system(size: 16, weight: .semibold, design: .rounded))
+                .foregroundStyle(IOSDashboardPalette.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.82)
+
+            Spacer(minLength: 0)
+
+            Image(systemName: "chevron.right")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(IOSDashboardPalette.secondary)
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 64)
+        .frame(maxWidth: .infinity)
+        .background(IOSDashboardPalette.surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(IOSDashboardPalette.line, lineWidth: 1)
+        )
     }
 }
 
@@ -192,48 +300,72 @@ private struct InboxContentView: View {
             if let snapshot, !snapshot.isEmpty {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0, pinnedViews: []) {
-                        ForEach(snapshot.sections) { section in
-                            InboxSectionBlock(section: section, store: store)
+                        ForEach(Array(snapshot.sections.enumerated()), id: \.element.id) { index, section in
+                            InboxSectionBlock(section: section, store: store, isFirstSection: index == 0)
                         }
                     }
-                    .padding(.top, 16)
-                    .padding(.bottom, 32)
+                    .padding(.top, 6)
+                    .padding(.bottom, 104)
                 }
                 .refreshable {
                     AppHaptics.lightImpact()
                     await store.triggerSyncAndRefresh()
                 }
                 .overlay(alignment: .bottom) {
-                    if snapshot.fullImportRunning {
-                        StatusPill(text: "Importing older mail.")
-                            .padding(.bottom, 14)
+                    VStack(spacing: 12) {
+                        if snapshot.fullImportRunning {
+                            StatusPill(text: "Importing older mail.")
+                        }
+
+                        ComposeButton()
                     }
+                    .padding(.trailing, 18)
+                    .padding(.bottom, 18)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                 }
             } else {
                 ContentUnavailableView("Inbox is empty", systemImage: "tray")
+                    .foregroundStyle(IOSDashboardPalette.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color(.systemBackground))
+                    .background(IOSDashboardPalette.background)
             }
         }
-        .background(Color(.systemBackground))
+        .background(IOSDashboardPalette.background)
+    }
+}
+
+private struct ComposeButton: View {
+    var body: some View {
+        Button {
+            AppHaptics.lightImpact()
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 58, height: 58)
+                .background(IOSDashboardPalette.blue, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Compose")
     }
 }
 
 private struct InboxSectionBlock: View {
     let section: MobileInboxSectionViewModel
     @ObservedObject var store: DashboardStore
+    let isFirstSection: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(section.title)
-                .font(.system(size: 15, weight: .bold, design: .rounded))
-                .foregroundStyle(.secondary)
+                .font(.system(size: 18, weight: .bold, design: .rounded))
+                .foregroundStyle(IOSDashboardPalette.tertiary)
                 .padding(.horizontal, 20)
-                .padding(.top, section.id == "today" ? 0 : 26)
-                .padding(.bottom, 8)
+                .padding(.top, isFirstSection ? 0 : 22)
+                .padding(.bottom, 9)
 
             Rectangle()
-                .fill(Color(.separator).opacity(0.7))
+                .fill(IOSDashboardPalette.line)
                 .frame(height: 0.5)
                 .padding(.leading, 20)
 
@@ -256,118 +388,66 @@ private struct InboxRowView: View {
 
     var body: some View {
         Button(action: onOpen) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Image(systemName: row.grouped ? "chevron.right.circle" : "circle.fill")
-                    .font(.system(size: row.grouped ? 16 : 6, weight: .semibold))
-                    .foregroundStyle(row.grouped ? Color.accentColor : Color.clear)
-                    .frame(width: 20)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(alignment: .firstTextBaseline, spacing: 10) {
-                        Text(row.sender)
-                            .font(.system(size: 16, weight: row.unread ? .semibold : .regular, design: .rounded))
-                            .foregroundStyle(row.dimmed ? .secondary : .primary)
-                            .lineLimit(1)
-
-                        Spacer(minLength: 8)
-
-                        Text(row.timeLabel)
-                            .font(.system(size: 14, weight: row.unread ? .semibold : .regular, design: .rounded))
-                            .foregroundStyle(row.dimmed ? .tertiary : .secondary)
-                            .lineLimit(1)
-                    }
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(row.sender)
+                        .font(.system(size: 16, weight: row.unread ? .semibold : .medium, design: .rounded))
+                        .foregroundStyle(row.dimmed ? IOSDashboardPalette.tertiary : IOSDashboardPalette.primary)
+                        .lineLimit(1)
 
                     Text(row.subject)
-                        .font(.system(size: 16, weight: row.unread ? .semibold : .regular, design: .rounded))
-                        .foregroundStyle(row.dimmed ? .tertiary : .primary)
-                        .lineLimit(1)
+                        .font(.system(size: 15, weight: row.unread ? .medium : .regular, design: .rounded))
+                        .foregroundStyle(row.dimmed ? IOSDashboardPalette.tertiary : IOSDashboardPalette.secondary)
+                        .lineLimit(2)
+
+                    Text(previewText)
+                        .font(.system(size: 13, weight: .regular, design: .rounded))
+                        .foregroundStyle(IOSDashboardPalette.tertiary)
+                        .lineLimit(2)
                 }
+                .layoutPriority(1)
+
+                VStack(alignment: .trailing, spacing: 8) {
+                    Text(row.timeLabel)
+                        .font(.system(size: 13, weight: row.unread ? .medium : .regular, design: .rounded))
+                        .foregroundStyle(row.dimmed ? IOSDashboardPalette.tertiary : IOSDashboardPalette.secondary)
+                        .lineLimit(1)
+
+                    if row.grouped {
+                        ThreadIndicatorIcon()
+                    }
+                }
+                .frame(minWidth: 58, alignment: .trailing)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 9)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(Color(.systemBackground))
+        .background(IOSDashboardPalette.background)
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(Color(.separator).opacity(0.45))
+                .fill(IOSDashboardPalette.line)
                 .frame(height: 0.5)
-                .padding(.leading, 54)
+                .padding(.leading, 20)
         }
+    }
+
+    private var previewText: String {
+        let subject = row.subject.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !subject.isEmpty else {
+            return "Open this conversation to review the latest email and next step."
+        }
+        return "Latest message about \(subject). Open to review the details and next step."
     }
 }
 
-private struct DashboardSummaryBlock: View {
-    let snapshot: DashboardSnapshot
-
+private struct ThreadIndicatorIcon: View {
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text(snapshot.dateLabel)
-                Spacer()
-                Text(snapshot.timeLabel)
-            }
-            .font(.footnote)
-            .foregroundStyle(.secondary)
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text(snapshot.summary.headline)
-                    .font(.system(size: 34, weight: .bold, design: .rounded))
-                    .fixedSize(horizontal: false, vertical: true)
-
-                Text(snapshot.summary.brief)
-                    .font(.body)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-}
-
-private struct DashboardAgendaBlock: View {
-    let items: [DashboardAgendaItemViewModel]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Calendar")
-                .font(.headline)
-
-            if items.isEmpty {
-                Text("No calendar items right now.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            } else {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(items) { item in
-                        HStack(alignment: .firstTextBaseline, spacing: 12) {
-                            Text(item.time)
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(color(for: item.tone))
-                                .frame(width: 74, alignment: .leading)
-
-                            Text(item.title)
-                                .font(.subheadline)
-                                .foregroundStyle(.primary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func color(for tone: DashboardAgendaItemViewModel.Tone) -> Color {
-        switch tone {
-        case .blue:
-            return .blue
-        case .green:
-            return .green
-        case .teal:
-            return .teal
-        case .lime:
-            return .mint
-        }
+        Image(systemName: "chevron.right.circle")
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(IOSDashboardPalette.blue)
+            .accessibilityLabel("Grouped thread")
     }
 }
 
@@ -376,22 +456,46 @@ private struct DashboardSectionBlock: View {
     @ObservedObject var store: DashboardStore
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(section.title)
-                    .font(.title3.weight(.bold))
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .center, spacing: 9) {
+                Text(displayTitle)
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                    .foregroundStyle(IOSDashboardPalette.tertiary)
 
                 Text("\(section.items.count)")
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .foregroundStyle(IOSDashboardPalette.tertiary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(IOSDashboardPalette.surface, in: Capsule())
+
+                Spacer()
+
+                Button {
+                    AppHaptics.lightImpact()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundStyle(IOSDashboardPalette.primary)
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Add item to \(displayTitle)")
             }
+            .padding(.bottom, 9)
+
+            Rectangle()
+                .fill(IOSDashboardPalette.line)
+                .frame(height: 0.5)
 
             if section.items.isEmpty {
                 Text("Nothing here yet.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 15, weight: .regular, design: .rounded))
+                    .foregroundStyle(IOSDashboardPalette.tertiary)
+                    .padding(.top, 14)
             } else {
-                VStack(spacing: 10) {
+                VStack(spacing: 0) {
                     ForEach(section.items) { item in
                         DashboardItemRow(
                             item: item,
@@ -421,6 +525,10 @@ private struct DashboardSectionBlock: View {
             }
         }
     }
+
+    private var displayTitle: String {
+        section.id == "today" ? "Later Today" : section.title
+    }
 }
 
 private struct DashboardItemRow: View {
@@ -431,55 +539,45 @@ private struct DashboardItemRow: View {
     let onAction: (DashboardItemActionViewModel) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 12) {
-                Button(action: onDismiss) {
-                    Image(systemName: "circle")
-                        .font(.title3)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .accessibilityLabel("Mark done")
-
-                Button(action: onOpen) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(item.title)
-                            .font(.body.weight(.medium))
-                            .foregroundStyle(.primary)
-                            .fixedSize(horizontal: false, vertical: true)
-
-                        if let detail = item.detail {
-                            Text(detail.actionLabel)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.plain)
+        HStack(alignment: .top, spacing: 13) {
+            Button(action: onDismiss) {
+                Image(systemName: "circle")
+                    .font(.system(size: 21, weight: .regular))
+                    .foregroundStyle(IOSDashboardPalette.secondary)
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Mark done")
+
+            Button(action: onOpen) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(item.title)
+                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                        .foregroundStyle(IOSDashboardPalette.primary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 12)
+        .contentShape(Rectangle())
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(IOSDashboardPalette.line)
+                .frame(height: 0.5)
+                .padding(.leading, 34)
+        }
+        .contextMenu {
+            Button("Open", action: onOpen)
+            Button("Mark done", action: onDismiss)
 
             if let action = item.action, action.canRunOnBackend {
-                Button {
+                Button(actionLabel(for: action, state: actionState)) {
                     onAction(action)
-                } label: {
-                    HStack(spacing: 8) {
-                        if actionState == .loading {
-                            ProgressView()
-                        }
-                        Text(actionLabel(for: action, state: actionState))
-                            .font(.footnote.weight(.semibold))
-                    }
-                    .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.bordered)
-                .tint(action.tone == .blue ? .blue : .green)
-                .disabled(actionState == .loading || actionState == .done)
             }
         }
-        .padding(14)
-        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private func actionLabel(for action: DashboardItemActionViewModel, state: DashboardActionState) -> String {
