@@ -28,24 +28,28 @@ public struct SignedInShellView: View {
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            if !store.navigationPlaceholderVisible {
-                ShellHeader(
-                    title: selection == .todo ? nil : selection.title,
-                    colorScheme: colorScheme,
-                    navigationVisible: store.navigationPlaceholderVisible,
-                    onMenu: toggleNavigation
+            if !store.navigationPlaceholderVisible, let title = visibleHeaderTitle {
+                ShellHeaderTitle(
+                    title: title,
+                    colorScheme: colorScheme
                 )
-                .zIndex(5)
+                .transition(.opacity)
+                .zIndex(4)
             }
 
             if store.navigationPlaceholderVisible {
+                navigationBackdrop
+                    .transition(.opacity)
+                    .zIndex(1)
+
                 navigationDrawer
-                    .transition(.move(edge: .leading).combined(with: .opacity))
+                    .transition(.opacity)
                     .zIndex(2)
 
-                navigationDrawerHeader
-                    .zIndex(5)
             }
+
+            fixedMenuButton
+                .zIndex(6)
 
             if commandPaletteOpen {
                 CommandPaletteView(
@@ -65,7 +69,7 @@ public struct SignedInShellView: View {
             .opacity(0.01)
         }
         .background(ElectronicMailDesign.background(for: colorScheme))
-        .animation(.easeInOut(duration: 0.22), value: store.navigationPlaceholderVisible)
+        .animation(NavigationOverlayMotion.screen, value: store.navigationPlaceholderVisible)
         .onReceive(NotificationCenter.default.publisher(for: .electronicMailOpenCommandPalette)) { _ in
             openCommandPalette()
         }
@@ -85,6 +89,9 @@ public struct SignedInShellView: View {
         case .inbox:
             InboxView(store: store)
                 .transition(.opacity)
+        case .drafts, .sent, .spam:
+            MailboxPlaceholderView(title: selection.title, colorScheme: colorScheme)
+                .transition(.opacity)
         case .calendar:
             CalendarPlaceholderView(colorScheme: colorScheme)
                 .transition(.opacity)
@@ -92,7 +99,7 @@ public struct SignedInShellView: View {
     }
 
     private func toggleNavigation() {
-        withAnimation(.easeInOut(duration: 0.18)) {
+        withAnimation(NavigationOverlayMotion.screen) {
             store.toggleNavigationPlaceholder()
         }
     }
@@ -127,28 +134,46 @@ public struct SignedInShellView: View {
     private var navigationDrawer: some View {
         NavigationDrawer(
             selection: selection,
-            colorScheme: colorScheme,
+            colorScheme: .dark,
             onSelect: select
         )
         .frame(width: ElectronicMailShellMetrics.drawerWidth)
         .frame(maxHeight: .infinity)
-        .background(ElectronicMailDesign.background(for: colorScheme))
     }
 
-    private var navigationDrawerHeader: some View {
-        NavigationDrawerTopRow(
-            isSelected: selection == .inbox,
-            colorScheme: colorScheme,
-            onToggle: toggleNavigation,
-            onSelectInbox: { select(.inbox) }
+    private var navigationBackdrop: some View {
+        Color.black
+            .ignoresSafeArea()
+            .contentShape(Rectangle())
+            .onTapGesture {
+                toggleNavigation()
+            }
+    }
+
+    private var fixedMenuButton: some View {
+        ShellMenuButton(
+            colorScheme: store.navigationPlaceholderVisible ? .dark : colorScheme,
+            accessibilityLabel: store.navigationPlaceholderVisible ? "Hide navigation" : "Show navigation",
+            action: toggleNavigation
         )
         .padding(.top, ElectronicMailShellMetrics.navTop)
         .padding(.leading, ElectronicMailShellMetrics.navLeading)
-        .frame(width: ElectronicMailShellMetrics.drawerWidth, alignment: .leading)
+        .transaction { transaction in
+            transaction.animation = nil
+        }
+    }
+
+    private var visibleHeaderTitle: String? {
+        switch selection {
+        case .todo, .inbox:
+            nil
+        case .drafts, .sent, .spam, .calendar:
+            selection.title
+        }
     }
 
     private func select(_ destination: SignedInDestination) {
-        withAnimation(.easeInOut(duration: 0.18)) {
+        withAnimation(NavigationOverlayMotion.screen) {
             selection = destination
             store.navigationPlaceholderVisible = false
         }
@@ -157,6 +182,10 @@ public struct SignedInShellView: View {
 
 public extension Notification.Name {
     static let electronicMailOpenCommandPalette = Notification.Name("ElectronicMailOpenCommandPalette")
+}
+
+private enum NavigationOverlayMotion {
+    static let screen = Animation.easeInOut(duration: 0.15)
 }
 
 private enum CommandPaletteAction: Equatable {
@@ -224,6 +253,33 @@ private enum CommandPaletteBuilder {
                 priority: 24,
                 kind: .navigation,
                 action: .navigate(.inbox)
+            ),
+            CommandPaletteItem(
+                id: "nav:drafts",
+                title: "Drafts",
+                subtitle: "Open drafts",
+                keywords: ["draft", "drafts", "mail"],
+                priority: 25,
+                kind: .navigation,
+                action: .navigate(.drafts)
+            ),
+            CommandPaletteItem(
+                id: "nav:sent",
+                title: "Sent",
+                subtitle: "Open sent mail",
+                keywords: ["sent", "mail"],
+                priority: 26,
+                kind: .navigation,
+                action: .navigate(.sent)
+            ),
+            CommandPaletteItem(
+                id: "nav:spam",
+                title: "Spam",
+                subtitle: "Open spam",
+                keywords: ["spam", "junk", "mail"],
+                priority: 27,
+                kind: .navigation,
+                action: .navigate(.spam)
             ),
             CommandPaletteItem(
                 id: "nav:calendar",
@@ -417,14 +473,14 @@ private struct CommandPaletteView: View {
                     if query.isEmpty {
                         Text("Command + K")
                             .font(ElectronicMailType.title())
-                            .tracking(0.52)
+                            .tracking(ElectronicMailType.titleTracking)
                             .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                     }
 
                     TextField("", text: $query)
                         .textFieldStyle(.plain)
                         .font(ElectronicMailType.title())
-                        .tracking(0.52)
+                        .tracking(ElectronicMailType.titleTracking)
                         .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                         .focused($searchFocused)
                 }
@@ -684,6 +740,9 @@ private struct CommandPaletteNavigationCapture: NSViewRepresentable {
 private enum SignedInDestination {
     case todo
     case inbox
+    case drafts
+    case sent
+    case spam
     case calendar
 
     var title: String {
@@ -692,36 +751,30 @@ private enum SignedInDestination {
             return "To-do's"
         case .inbox:
             return "Inbox"
+        case .drafts:
+            return "Drafts"
+        case .sent:
+            return "Sent"
+        case .spam:
+            return "Spam"
         case .calendar:
             return "Calendar"
         }
     }
 }
 
-private struct ShellHeader: View {
-    let title: String?
+private struct ShellHeaderTitle: View {
+    let title: String
     let colorScheme: ColorScheme
-    let navigationVisible: Bool
-    let onMenu: () -> Void
 
     var body: some View {
-        HStack(spacing: ElectronicMailShellMetrics.navHeaderTitleGap) {
-            ShellMenuButton(
-                colorScheme: colorScheme,
-                accessibilityLabel: navigationVisible ? "Hide navigation" : "Show navigation",
-                action: onMenu
-            )
-
-            if let title {
-                Text(title)
-                    .font(ElectronicMailType.title())
-                    .tracking(0.52)
-                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                    .frame(height: ElectronicMailType.bodyLineHeight, alignment: .center)
-            }
-        }
-        .padding(.top, ElectronicMailShellMetrics.navTop)
-        .padding(.leading, ElectronicMailShellMetrics.navLeading)
+        Text(title)
+            .font(ElectronicMailType.headerTitle())
+            .tracking(ElectronicMailType.titleTracking)
+            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+            .frame(height: ElectronicMailType.bodyLineHeight, alignment: .center)
+            .padding(.top, ElectronicMailShellMetrics.navTop)
+            .padding(.leading, ElectronicMailShellMetrics.navLeading + ElectronicMailShellMetrics.navHitFrame + ElectronicMailShellMetrics.navHeaderTitleGap)
     }
 }
 
@@ -770,16 +823,65 @@ private struct CalendarPlaceholderView: View {
     }
 }
 
+private struct MailboxPlaceholderView: View {
+    let title: String
+    let colorScheme: ColorScheme
+
+    var body: some View {
+        ZStack {
+            ElectronicMailDesign.background(for: colorScheme)
+                .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 18) {
+                Text("\(title) view will live here.")
+                    .font(ElectronicMailType.body())
+                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+            }
+            .frame(maxWidth: 760, maxHeight: .infinity, alignment: .topLeading)
+            .padding(.top, ElectronicMailShellMetrics.contentTop)
+            .padding(.horizontal, ElectronicMailShellMetrics.navLeading)
+        }
+    }
+}
+
 private struct NavigationDrawer: View {
     let selection: SignedInDestination
     let colorScheme: ColorScheme
     let onSelect: (SignedInDestination) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            NavigationDrawerLabel(title: "Drafts", colorScheme: colorScheme)
-            NavigationDrawerLabel(title: "Sent", colorScheme: colorScheme)
-            NavigationDrawerLabel(title: "Trash", colorScheme: colorScheme)
+        VStack(alignment: .leading, spacing: 15) {
+            NavigationDrawerItem(
+                title: "Inbox",
+                isSelected: selection == .inbox,
+                colorScheme: colorScheme
+            ) {
+                onSelect(.inbox)
+            }
+
+            NavigationDrawerItem(
+                title: "Drafts",
+                isSelected: selection == .drafts,
+                colorScheme: colorScheme
+            ) {
+                onSelect(.drafts)
+            }
+
+            NavigationDrawerItem(
+                title: "Sent",
+                isSelected: selection == .sent,
+                colorScheme: colorScheme
+            ) {
+                onSelect(.sent)
+            }
+
+            NavigationDrawerItem(
+                title: "Spam",
+                isSelected: selection == .spam,
+                colorScheme: colorScheme
+            ) {
+                onSelect(.spam)
+            }
 
             NavigationDrawerItem(
                 title: "Calendar",
@@ -799,40 +901,10 @@ private struct NavigationDrawer: View {
 
             Spacer(minLength: 0)
         }
-        .padding(.top, ElectronicMailShellMetrics.navTop + ElectronicMailType.bodyLineHeight + 18)
+        .padding(.top, ElectronicMailShellMetrics.navTop)
         .padding(.leading, ElectronicMailShellMetrics.navLeading)
         .padding(.trailing, 28)
         .padding(.bottom, 28)
-    }
-}
-
-private struct NavigationDrawerTopRow: View {
-    let isSelected: Bool
-    let colorScheme: ColorScheme
-    let onToggle: () -> Void
-    let onSelectInbox: () -> Void
-
-    var body: some View {
-        HStack(spacing: ElectronicMailShellMetrics.navHeaderTitleGap) {
-            ShellMenuButton(
-                colorScheme: colorScheme,
-                accessibilityLabel: "Hide navigation",
-                action: onToggle
-            )
-
-            Button(action: onSelectInbox) {
-                Text("Inbox")
-                    .font(ElectronicMailType.title())
-                    .tracking(0.52)
-                    .foregroundStyle(isSelected ? ElectronicMailDesign.appleBlue : ElectronicMailDesign.primaryText(for: colorScheme))
-                    .frame(height: ElectronicMailType.bodyLineHeight, alignment: .center)
-                    .opacity(isSelected ? 1 : 0.94)
-            }
-            .buttonStyle(.plain)
-            .help("Inbox")
-            .accessibilityLabel("Inbox")
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

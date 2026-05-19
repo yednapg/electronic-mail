@@ -57,17 +57,7 @@ public struct InboxView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
                 if store.refreshFailed {
-                    VStack {
-                        Spacer()
-                        Text("Inbox could not refresh. Showing last saved state.")
-                            .font(.rounded(size: 13, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .background(.regularMaterial, in: Capsule())
-                            .padding(.bottom, 22)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    ElectronicMailRefreshFailureToast(message: "Inbox could not refresh. Showing last saved state.")
                 }
             }
         }
@@ -222,7 +212,7 @@ private struct InboxHeader: View {
             .frame(width: ElectronicMailShellMetrics.navIconFrame, height: ElectronicMailShellMetrics.navIconFrame)
 
             Text("Inbox")
-                .font(.rounded(size: ElectronicMailTypography.titleSize, weight: .bold))
+                .font(ElectronicMailType.headerTitle())
                 .tracking(ElectronicMailTypography.titleTracking)
                 .foregroundStyle(.primary)
                 .frame(height: ElectronicMailTypography.bodyLineHeight, alignment: .center)
@@ -269,7 +259,7 @@ private struct InboxSectionHeader: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
             Text(section.title)
-                .font(.rounded(size: ElectronicMailTypography.bodySize, weight: .regular))
+                .font(ElectronicMailType.sectionTitle())
                 .tracking(ElectronicMailTypography.bodyTracking)
                 .foregroundStyle(ElectronicMailDesign.sectionText(for: colorScheme))
                 .lineLimit(1)
@@ -310,7 +300,7 @@ private struct InboxRowView: View {
 
             if row.isGrouped {
                 Image(systemName: "chevron.right.circle")
-                    .font(.rounded(size: ElectronicMailTypography.iconSize, weight: .regular))
+                    .font(ElectronicMailType.icon())
                     .symbolRenderingMode(.monochrome)
                     .foregroundStyle(row.isSelected ? ElectronicMailDesign.selectedText(for: colorScheme) : ElectronicMailDesign.appleBlue)
                     .frame(width: 22, height: 22)
@@ -326,6 +316,7 @@ private struct InboxRowView: View {
                     height: ElectronicMailTypography.bodyLineHeight,
                     alignment: .leading
                 )
+                .clipped()
                 .offset(x: metrics.senderLeading)
 
             rowText(row.title, alignment: .leading)
@@ -334,6 +325,7 @@ private struct InboxRowView: View {
                     height: ElectronicMailTypography.bodyLineHeight,
                     alignment: .leading
                 )
+                .clipped()
                 .offset(x: metrics.subjectLeading)
 
             rowText(row.timeLabel, alignment: .trailing)
@@ -342,6 +334,7 @@ private struct InboxRowView: View {
                     height: ElectronicMailTypography.bodyLineHeight,
                     alignment: .trailing
                 )
+                .clipped()
                 .offset(x: metrics.timeLeading)
         }
         .frame(width: metrics.windowSize.width, height: ElectronicMailTypography.bodyLineHeight, alignment: .topLeading)
@@ -351,7 +344,7 @@ private struct InboxRowView: View {
 
     private func rowText(_ value: String, alignment: Alignment) -> some View {
         Text(value)
-            .font(.rounded(size: ElectronicMailTypography.bodySize, weight: .regular))
+            .font(ElectronicMailType.body())
             .tracking(ElectronicMailTypography.bodyTracking)
             .foregroundStyle(textColor)
             .lineLimit(1)
@@ -484,42 +477,69 @@ private struct InboxKeyboardEventCapture: NSViewRepresentable {
 private struct InboxScrollViewAccessor: NSViewRepresentable {
     let onResolve: (NSScrollView) -> Void
 
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
-        DispatchQueue.main.async {
-            resolve(from: view)
-        }
+    func makeNSView(context: Context) -> ResolverView {
+        let view = ResolverView(frame: .zero)
+        view.onResolve = onResolve
+        view.resolveIfNeeded()
         return view
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async {
-            resolve(from: nsView)
+    func updateNSView(_ nsView: ResolverView, context: Context) {
+        nsView.onResolve = onResolve
+        if !nsView.hasResolved {
+            nsView.resolveIfNeeded()
         }
     }
 
-    private func resolve(from view: NSView) {
-        guard let scrollView = view.enclosingScrollView else {
-            return
+    final class ResolverView: NSView {
+        var onResolve: ((NSScrollView) -> Void)?
+        private weak var lastResolvedScrollView: NSScrollView?
+
+        var hasResolved: Bool {
+            lastResolvedScrollView != nil
         }
 
-        onResolve(scrollView)
+        override func viewDidMoveToSuperview() {
+            super.viewDidMoveToSuperview()
+            resolveIfNeeded()
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            resolveIfNeeded()
+        }
+
+        func resolveIfNeeded() {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let scrollView = self.enclosingScrollView else {
+                    return
+                }
+
+                guard scrollView !== self.lastResolvedScrollView else {
+                    return
+                }
+
+                self.lastResolvedScrollView = scrollView
+                self.onResolve?(scrollView)
+            }
+        }
     }
 }
 
 private enum ElectronicMailTypography {
-    static let titleSize: CGFloat = 26
-    static let titleTracking: CGFloat = titleSize * 0.02
-    static let bodySize: CGFloat = 22
-    static let bodyTracking: CGFloat = bodySize * 0.015
-    static let bodyLineHeight: CGFloat = 40
-    static let iconSize: CGFloat = 22
+    static let titleSize = ElectronicMailType.titleSize
+    static let titleTracking = ElectronicMailType.titleTracking
+    static let bodySize = ElectronicMailType.bodySize
+    static let bodyTracking = ElectronicMailType.bodyTracking
+    static let bodyLineHeight = ElectronicMailType.bodyLineHeight
+    static let iconSize = ElectronicMailType.iconSize
 }
 
 private struct InboxLayoutMetrics {
     let windowSize: CGSize
 
     let timeWidth: CGFloat = 190
+    let senderSubjectGap: CGFloat = 24
 
     var headerTop: CGFloat {
         ElectronicMailShellMetrics.navTop
@@ -552,7 +572,7 @@ private struct InboxLayoutMetrics {
     }
 
     var subjectLeading: CGFloat {
-        senderLeading + senderWidth
+        senderLeading + senderWidth + senderSubjectGap
     }
 
     var timeLeading: CGFloat {
@@ -581,12 +601,6 @@ private struct InboxLayoutMetrics {
 
     func sectionHeaderHeight(for sectionID: String) -> CGFloat {
         sectionTopSpacing(for: sectionID) + ElectronicMailTypography.bodyLineHeight + 3
-    }
-}
-
-private extension Font {
-    static func rounded(size: CGFloat, weight: Font.Weight) -> Font {
-        .system(size: size, weight: weight, design: .rounded)
     }
 }
 
