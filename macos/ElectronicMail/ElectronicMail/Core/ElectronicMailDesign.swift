@@ -21,11 +21,11 @@ public enum ElectronicMailDesign {
     }
 
     public static func primaryText(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? .white : .black
+        colorScheme == .dark ? Color.white.opacity(0.90) : Color.black.opacity(0.90)
     }
 
     public static func secondaryText(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.58) : Color.black.opacity(0.56)
+        colorScheme == .dark ? Color.white.opacity(0.75) : Color.black.opacity(0.75)
     }
 
     public static func unreadText(for colorScheme: ColorScheme) -> Color {
@@ -33,11 +33,11 @@ public enum ElectronicMailDesign {
     }
 
     public static func readText(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.34) : Color.black.opacity(0.42)
+        colorScheme == .dark ? Color.white.opacity(0.50) : Color.black.opacity(0.50)
     }
 
     public static func tertiaryText(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.38) : Color.black.opacity(0.32)
+        readText(for: colorScheme)
     }
 
     public static func sectionText(for colorScheme: ColorScheme) -> Color {
@@ -58,19 +58,26 @@ public enum ElectronicMailDesign {
 
 public enum ElectronicMailType {
     public static let titleSize: CGFloat = 26
-    public static let summarySize: CGFloat = 30
-    public static let bodySize: CGFloat = 22
+    public static let sectionTitleSize: CGFloat = 22
+    public static let bodySize: CGFloat = 20
     public static let bodyLineHeight: CGFloat = 40
     public static let iconSize: CGFloat = 22
-    public static let smallSize: CGFloat = 15
+    public static let smallSize: CGFloat = 16
     public static let detailSize: CGFloat = 18
+    public static let statusSize: CGFloat = 13
+    public static let titleTracking: CGFloat = titleSize * 0.02
+    public static let bodyTracking: CGFloat = bodySize * 0.015
 
     public static func title(weight: Font.Weight = .bold) -> Font {
         .system(size: titleSize, weight: weight, design: .rounded)
     }
 
-    public static func summary(weight: Font.Weight = .regular) -> Font {
-        .system(size: summarySize, weight: weight, design: .rounded)
+    public static func headerTitle(weight: Font.Weight = .bold) -> Font {
+        title(weight: weight)
+    }
+
+    public static func sectionTitle(weight: Font.Weight = .semibold) -> Font {
+        .system(size: sectionTitleSize, weight: weight, design: .rounded)
     }
 
     public static func body(weight: Font.Weight = .regular) -> Font {
@@ -83,6 +90,10 @@ public enum ElectronicMailType {
 
     public static func small(weight: Font.Weight = .regular) -> Font {
         .system(size: smallSize, weight: weight, design: .rounded)
+    }
+
+    public static func status(weight: Font.Weight = .medium) -> Font {
+        .system(size: statusSize, weight: weight, design: .rounded)
     }
 
     public static func icon(weight: Font.Weight = .regular) -> Font {
@@ -120,5 +131,29 @@ public struct ElectronicMailHamburgerIcon: View {
             }
         }
         .aspectRatio(sourceWidth / sourceHeight, contentMode: .fit)
+    }
+}
+
+public struct ElectronicMailRefreshFailureToast: View {
+    private let message: String
+
+    public init(message: String) {
+        self.message = message
+    }
+
+    public var body: some View {
+        VStack {
+            Spacer()
+
+            Text(message)
+                .font(ElectronicMailType.status())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(.regularMaterial, in: Capsule())
+                .padding(.bottom, 22)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .allowsHitTesting(false)
     }
 }

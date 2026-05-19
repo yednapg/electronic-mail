@@ -226,6 +226,30 @@ enum DemoAppFixtures {
             feed: FeedResponse(
                 now: [
                     attentionItem(
+                        id: "demo-calendar-scrum",
+                        entityID: "calendar:demo-scrum",
+                        title: "Scrum meeting with Team",
+                        body: "Daily team scrum.",
+                        source: .calendar,
+                        sourceLabel: "Calendar",
+                        timingBand: .now,
+                        gmailThreadID: nil,
+                        primaryAction: "attend",
+                        dueAt: "2026-05-16T10:00:00+05:30"
+                    ),
+                    attentionItem(
+                        id: "demo-calendar-pairing",
+                        entityID: "calendar:demo-pairing",
+                        title: "Pair programming session with Sam",
+                        body: "Pair programming session with Sam.",
+                        source: .calendar,
+                        sourceLabel: "Calendar",
+                        timingBand: .now,
+                        gmailThreadID: nil,
+                        primaryAction: "attend",
+                        dueAt: "2026-05-16T12:00:00+05:30"
+                    ),
+                    attentionItem(
                         id: "demo-rsvp-now",
                         entityID: "demo-apple-today",
                         title: "RSVP within 72 hrs to confirm your macOS review slot",
@@ -238,6 +262,42 @@ enum DemoAppFixtures {
                     ),
                 ],
                 today: [
+                    attentionItem(
+                        id: "demo-calendar-lunch",
+                        entityID: "calendar:demo-lunch",
+                        title: "Lunch with Sara",
+                        body: "Lunch with Sara.",
+                        source: .calendar,
+                        sourceLabel: "Calendar",
+                        timingBand: .today,
+                        gmailThreadID: nil,
+                        primaryAction: "attend",
+                        dueAt: "2026-05-16T13:30:00+05:30"
+                    ),
+                    attentionItem(
+                        id: "demo-calendar-office-hours",
+                        entityID: "calendar:demo-office-hours",
+                        title: "a16z Office Hours with Ryan",
+                        body: "a16z Office Hours with Ryan.",
+                        source: .calendar,
+                        sourceLabel: "Calendar",
+                        timingBand: .now,
+                        gmailThreadID: nil,
+                        primaryAction: "attend",
+                        dueAt: "2026-05-16T14:45:00+05:30"
+                    ),
+                    attentionItem(
+                        id: "demo-calendar-update",
+                        entityID: "calendar:demo-update",
+                        title: "Post today's update on #engineering",
+                        body: "Post today's update on #engineering.",
+                        source: .calendar,
+                        sourceLabel: "Calendar",
+                        timingBand: .today,
+                        gmailThreadID: nil,
+                        primaryAction: "attend",
+                        dueAt: "2026-05-16T15:00:00+05:30"
+                    ),
                     attentionItem(
                         id: "demo-pycon-today",
                         entityID: "demo-github-today",
@@ -364,7 +424,8 @@ enum DemoAppFixtures {
         sourceLabel: String,
         timingBand: TimingBand,
         gmailThreadID: String?,
-        primaryAction: String
+        primaryAction: String,
+        dueAt: String? = nil
     ) -> AttentionItem {
         AttentionItem(
             id: id,
@@ -384,7 +445,7 @@ enum DemoAppFixtures {
                 actionLabel: source == .manual ? "Mark done" : "Open source",
                 sourceLabel: sourceLabel
             ),
-            dueAt: nil,
+            dueAt: dueAt,
             importanceLevel: "medium",
             lifecycleState: "active",
             currentState: .open,

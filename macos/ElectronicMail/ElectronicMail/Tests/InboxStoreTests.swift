@@ -109,9 +109,72 @@ final class InboxStoreTests: XCTestCase {
     func testTodoMapperSplitsDashboardFeedSections() {
         let snapshot = TodoHomeMapper.snapshot(from: DemoAppFixtures.appSession, now: Date(timeIntervalSince1970: 0))
 
-        XCTAssertEqual(snapshot.now.map(\.entityID), ["demo-apple-today"])
-        XCTAssertEqual(snapshot.today.map(\.entityID), ["demo-github-today", "manual-task:demo-manual-seed"])
-        XCTAssertEqual(snapshot.worthKnowing.map(\.entityID), ["demo-rbi-today"])
+        XCTAssertEqual(snapshot.now.rows.map(\.entityID), ["demo-apple-today"])
+        XCTAssertEqual(snapshot.laterToday.rows.map(\.entityID), ["demo-github-today", "manual-task:demo-manual-seed"])
+        XCTAssertEqual(snapshot.worthKnowing.rows.map(\.entityID), ["demo-rbi-today"])
+        XCTAssertEqual(snapshot.now.title, "Now")
+        XCTAssertEqual(snapshot.laterToday.title, "Later Today")
+        XCTAssertEqual(snapshot.worthKnowing.title, "Worth Knowing")
+        XCTAssertEqual(
+            snapshot.agenda.map(\.id),
+            [
+                "demo-calendar-scrum",
+                "demo-calendar-pairing",
+                "demo-calendar-lunch",
+                "demo-calendar-office-hours",
+                "demo-calendar-update",
+            ]
+        )
+        XCTAssertEqual(snapshot.agenda.map(\.time), ["10:00", "12:00", "13:30", "14:45", "15:00"])
+    }
+
+    func testTodoRowsUseInboxDerivedMetadata() async {
+        let store = InboxStore(client: DemoAppClient(), sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+
+        await store.load()
+        let snapshot = TodoHomeMapper.snapshot(from: DemoAppFixtures.appSession, inboxRows: store.flatRows, now: Date(timeIntervalSince1970: 0))
+
+        let nowRow = snapshot.now.rows.first
+        XCTAssertEqual(nowRow?.sender, "Apple Developer")
+        XCTAssertEqual(nowRow?.title, "App Review needs one more screenshot for macOS")
+        XCTAssertEqual(nowRow?.timeLabel, "12:46 PM")
+        XCTAssertEqual(nowRow?.detailText, "Apple Developer needs one more screenshot before review can continue. Confirm the slot or move it out of today's work.")
+        XCTAssertEqual(nowRow?.actionLabel, "Open source")
+        XCTAssertEqual(nowRow?.gmailThreadID, "demo-apple-today")
+
+        let manualRow = snapshot.laterToday.rows.first { $0.entityID == "manual-task:demo-manual-seed" }
+        XCTAssertEqual(manualRow?.sender, "Manual")
+        XCTAssertEqual(manualRow?.title, "New to-do")
+        XCTAssertEqual(manualRow?.timeLabel, "")
+        XCTAssertNil(manualRow?.gmailThreadID)
+    }
+
+    func testTodoRowsFallbackWhenInboxRowIsMissing() {
+        let snapshot = TodoHomeMapper.snapshot(from: DemoAppFixtures.appSession, inboxRows: [], now: Date(timeIntervalSince1970: 0))
+
+        let nowRow = snapshot.now.rows.first
+        XCTAssertEqual(nowRow?.sender, "3 emails from Apple Developer")
+        XCTAssertEqual(nowRow?.title, "RSVP within 72 hrs to confirm your macOS review slot")
+        XCTAssertEqual(nowRow?.timeLabel, "")
+        XCTAssertEqual(nowRow?.sourceLabel, "3 emails from Apple Developer")
+    }
+
+    func testTodoSnapshotKeepsThreeSectionsWhenFeedIsEmpty() {
+        let current = DemoAppFixtures.appSession
+        let emptySession = AppSessionResponse(
+            user: current.user,
+            readiness: current.readiness,
+            dashboard: current.dashboard.replacingFeed(FeedResponse(now: [], today: [], worthKnowing: [])),
+            mailbox: current.mailbox,
+            sync: current.sync
+        )
+
+        let snapshot = TodoHomeMapper.snapshot(from: emptySession, now: Date(timeIntervalSince1970: 0))
+
+        XCTAssertEqual([snapshot.now.title, snapshot.laterToday.title, snapshot.worthKnowing.title], ["Now", "Later Today", "Worth Knowing"])
+        XCTAssertTrue(snapshot.now.rows.isEmpty)
+        XCTAssertTrue(snapshot.laterToday.rows.isEmpty)
+        XCTAssertTrue(snapshot.worthKnowing.rows.isEmpty)
         XCTAssertTrue(snapshot.agenda.isEmpty)
     }
 
