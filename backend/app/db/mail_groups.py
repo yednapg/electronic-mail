@@ -28,6 +28,7 @@ class GmailMessageRecord:
     snippet: str | None
     raw_payload: dict[str, Any]
     html_body_sanitized: str | None
+    html_render_document: str | None
     text_body: str | None
     extracted_signals: dict[str, Any]
     body_hash: str
@@ -351,11 +352,11 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                     INSERT INTO gmail_messages (
                       user_id, message_id, gmail_thread_id, history_id, label_ids_json, internal_date,
                       subject, sender, recipients_json, headers_json, snippet, raw_payload_json,
-                      html_body_sanitized, text_body, extracted_signals_json, body_hash, created_at, updated_at
+                      html_body_sanitized, html_render_document, text_body, extracted_signals_json, body_hash, created_at, updated_at
                     ) VALUES (
                       :user_id, :message_id, :gmail_thread_id, :history_id, :label_ids_json, :internal_date,
                       :subject, :sender, :recipients_json, :headers_json, :snippet, :raw_payload_json,
-                      :html_body_sanitized, :text_body, :extracted_signals_json, :body_hash, now(), now()
+                      :html_body_sanitized, :html_render_document, :text_body, :extracted_signals_json, :body_hash, now(), now()
                     )
                     ON CONFLICT (user_id, message_id) DO UPDATE SET
                       gmail_thread_id = excluded.gmail_thread_id,
@@ -368,11 +369,12 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                       headers_json = excluded.headers_json,
                       snippet = excluded.snippet,
                       raw_payload_json = CASE
-                        WHEN excluded.html_body_sanitized IS NOT NULL OR excluded.text_body IS NOT NULL
+                        WHEN excluded.html_render_document IS NOT NULL OR excluded.html_body_sanitized IS NOT NULL OR excluded.text_body IS NOT NULL
                         THEN excluded.raw_payload_json
                         ELSE gmail_messages.raw_payload_json
                       END,
                       html_body_sanitized = COALESCE(excluded.html_body_sanitized, gmail_messages.html_body_sanitized),
+                      html_render_document = COALESCE(excluded.html_render_document, gmail_messages.html_render_document),
                       text_body = COALESCE(excluded.text_body, gmail_messages.text_body),
                       extracted_signals_json = excluded.extracted_signals_json,
                       body_hash = excluded.body_hash,
@@ -583,6 +585,7 @@ def list_messages_for_groups(database_url: str, *, user_id: str, group_ids: list
                   messages.snippet,
                   '{}' AS raw_payload_json,
                   NULL AS html_body_sanitized,
+                  NULL AS html_render_document,
                   NULL AS text_body,
                   messages.extracted_signals_json,
                   messages.body_hash,
@@ -1182,6 +1185,7 @@ def _message_params(message: GmailMessageRecord) -> dict[str, Any]:
         "snippet": message.snippet,
         "raw_payload_json": json.dumps(message.raw_payload, ensure_ascii=True),
         "html_body_sanitized": message.html_body_sanitized,
+        "html_render_document": message.html_render_document,
         "text_body": message.text_body,
         "extracted_signals_json": json.dumps(message.extracted_signals, ensure_ascii=True),
         "body_hash": message.body_hash,
@@ -1203,6 +1207,7 @@ def _message_from_row(row) -> GmailMessageRecord:
         snippet=str(row["snippet"]) if row["snippet"] is not None else None,
         raw_payload=json.loads(row["raw_payload_json"] or "{}"),
         html_body_sanitized=str(row["html_body_sanitized"]) if row["html_body_sanitized"] is not None else None,
+        html_render_document=str(row["html_render_document"]) if row["html_render_document"] is not None else None,
         text_body=str(row["text_body"]) if row["text_body"] is not None else None,
         extracted_signals=json.loads(row["extracted_signals_json"] or "{}"),
         body_hash=str(row["body_hash"]),

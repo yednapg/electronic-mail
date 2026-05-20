@@ -39,6 +39,7 @@ def sample_message(message_id: str = "msg-1") -> GmailMessageRecord:
         snippet="Please review this.",
         raw_payload={},
         html_body_sanitized=None,
+        html_render_document=None,
         text_body=None,
         extracted_signals={"sender_domain": "example.com", "normalized_subject": "action required"},
         body_hash="hash-1",

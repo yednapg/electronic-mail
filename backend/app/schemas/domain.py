@@ -391,6 +391,7 @@ class ThreadMessage(BaseModel):
     subject: str | None = None
     body: str
     html_body: str | None = None
+    html_render_document: str | None = None
     snippet: str | None = None
     label_ids: list[str] = Field(default_factory=list)
     received_at: str

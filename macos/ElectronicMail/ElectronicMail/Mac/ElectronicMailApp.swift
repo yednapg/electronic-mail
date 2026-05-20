@@ -1,4 +1,5 @@
 import ElectronicMailCore
+import AppKit
 import SwiftUI
 
 @main
@@ -9,6 +10,7 @@ struct ElectronicMailApp: App {
         WindowGroup {
             ElectronicMailRootView(store: store)
                 .frame(minWidth: 1100, minHeight: 680)
+                .background(WindowTrafficLightOffset())
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1440, height: 900)
@@ -21,6 +23,41 @@ struct ElectronicMailApp: App {
             }
         }
     }
+}
+
+private struct WindowTrafficLightOffset: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        DispatchQueue.main.async {
+            Self.apply(to: view.window)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            Self.apply(to: nsView.window)
+        }
+    }
+
+    private static func apply(to window: NSWindow?) {
+        guard let window, !WindowTrafficLightOffsetState.configured.contains(ObjectIdentifier(window)) else {
+            return
+        }
+
+        for buttonType in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            guard let button = window.standardWindowButton(buttonType) else {
+                continue
+            }
+            button.setFrameOrigin(NSPoint(x: button.frame.origin.x + 7, y: button.frame.origin.y - 7))
+        }
+
+        WindowTrafficLightOffsetState.configured.insert(ObjectIdentifier(window))
+    }
+}
+
+private enum WindowTrafficLightOffsetState {
+    static var configured: Set<ObjectIdentifier> = []
 }
 
 private enum AppLaunchStage {
@@ -37,7 +74,7 @@ private struct ElectronicMailRootView: View {
     @State private var signInInProgress = false
     @State private var signInError: String?
 
-    private let tokenStore = KeychainSessionTokenStore()
+    private let tokenStore = MacSessionTokenStore()
 
     var body: some View {
         ZStack {
@@ -138,6 +175,26 @@ private struct ElectronicMailRootView: View {
         }
         setupCompletionTimer = timer
         RunLoop.main.add(timer, forMode: .common)
+    }
+}
+
+private final class MacSessionTokenStore: SessionTokenStoring {
+    #if DEBUG
+    private let store = UserDefaultsSessionTokenStore()
+    #else
+    private let store = KeychainSessionTokenStore()
+    #endif
+
+    func load() -> String? {
+        store.load()
+    }
+
+    func save(_ token: String) throws {
+        try store.save(token)
+    }
+
+    func clear() {
+        store.clear()
     }
 }
 

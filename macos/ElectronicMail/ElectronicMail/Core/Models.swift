@@ -707,6 +707,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
     let subject: String?
     let body: String
     let htmlBody: String?
+    let htmlRenderDocument: String?
     let snippet: String?
     let labelIDs: [String]
     let receivedAt: String
@@ -722,6 +723,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         case subject
         case body
         case htmlBody = "html_body"
+        case htmlRenderDocument = "html_render_document"
         case snippet
         case labelIDs = "label_ids"
         case receivedAt = "received_at"

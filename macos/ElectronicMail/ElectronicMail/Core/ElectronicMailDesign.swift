@@ -57,7 +57,7 @@ public enum ElectronicMailDesign {
 }
 
 public enum ElectronicMailType {
-    public static let titleSize: CGFloat = 26
+    public static let titleSize: CGFloat = 22
     public static let sectionTitleSize: CGFloat = 22
     public static let bodySize: CGFloat = 20
     public static let bodyLineHeight: CGFloat = 40

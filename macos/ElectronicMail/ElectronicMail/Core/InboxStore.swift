@@ -47,6 +47,10 @@ public final class InboxStore: ObservableObject {
     @Published private(set) var refreshFailed = false
     @Published private(set) var selectedThreadID: String?
     @Published private(set) var activeThreadID: String?
+    @Published private(set) var readerThreadID: String?
+    @Published private(set) var readerThread: ThreadReaderResponse?
+    @Published private(set) var readerRow: InboxRowViewModel?
+    @Published private(set) var readerError: String?
     @Published private(set) var threadErrors: [String: String] = [:]
     @Published private(set) var openedThreads: [String: ThreadReaderResponse] = [:]
     @Published var navigationPlaceholderVisible = false
@@ -88,6 +92,10 @@ public final class InboxStore: ObservableObject {
             session = nil
             selectedThreadID = nil
             activeThreadID = nil
+            readerThreadID = nil
+            readerThread = nil
+            readerRow = nil
+            readerError = nil
             openedThreads = [:]
             threadErrors = [:]
             selectionPrefetchTask?.cancel()
@@ -186,6 +194,7 @@ public final class InboxStore: ObservableObject {
             refreshFailed = false
             phase = .loaded
             seedActiveSelectionIfNeeded()
+            refreshReaderRow()
             prefetchPriorityThreads()
         } catch is CancellationError {
             inFlightSessionRefresh = nil
@@ -217,9 +226,33 @@ public final class InboxStore: ObservableObject {
     public func openActiveSelection() {
         guard let activeThreadID else {
             seedActiveSelectionIfNeeded()
+            if let activeThreadID {
+                _ = openReader(threadID: activeThreadID)
+            }
             return
         }
-        select(threadID: activeThreadID)
+        _ = openReader(threadID: activeThreadID)
+    }
+
+    @discardableResult
+    public func openReader(threadID: String) -> Task<Void, Never> {
+        selectionPrefetchTask?.cancel()
+        selectionPrefetchTask = nil
+        selectedThreadID = threadID
+        activeThreadID = threadID
+        readerThreadID = threadID
+        readerThread = openedThreads[threadID]
+        readerRow = rowViewModel(threadID: threadID)
+        readerError = nil
+        threadErrors[threadID] = nil
+
+        return Task { [weak self] in
+            await self?.prefetchThread(threadID: threadID, force: false, silent: false)
+        }
+    }
+
+    public func closeReader() {
+        readerThreadID = nil
     }
 
     public func toggleNavigationPlaceholder() {
@@ -228,18 +261,31 @@ public final class InboxStore: ObservableObject {
 
     public func prefetchThread(threadID: String, force: Bool = false, silent: Bool = true) async {
         guard let userID = session?.user.id else {
+            if !silent {
+                let message = "Sign in with Google to load this email."
+                threadErrors[threadID] = message
+                if readerThreadID == threadID {
+                    readerError = message
+                }
+            }
             return
         }
-        if !force, let cached = threadCache.read(userID: userID, threadID: threadID) {
+        let cachedThread = force ? nil : threadCache.read(userID: userID, threadID: threadID)
+        if let cached = cachedThread {
             openedThreads[threadID] = cached
-            return
+            updateReader(threadID: threadID, thread: cached, error: nil)
+            if !cached.needsHTMLRenderDocumentRefresh {
+                return
+            }
         }
         if let inFlight = inFlightThreads[threadID] {
             do {
-                openedThreads[threadID] = try await inFlight.value
+                let thread = try await inFlight.value
+                openedThreads[threadID] = thread
+                updateReader(threadID: threadID, thread: thread, error: nil)
             } catch {
                 if !silent {
-                    threadErrors[threadID] = error.localizedDescription
+                    recordThreadError(error.localizedDescription, threadID: threadID)
                 }
             }
             return
@@ -255,10 +301,11 @@ public final class InboxStore: ObservableObject {
             openedThreads[threadID] = thread
             threadCache.write(thread, userID: userID, threadID: threadID)
             threadErrors[threadID] = nil
+            updateReader(threadID: threadID, thread: thread, error: nil)
         } catch {
             inFlightThreads[threadID] = nil
-            if !silent {
-                threadErrors[threadID] = error.localizedDescription
+            if cachedThread == nil, !silent {
+                recordThreadError(error.localizedDescription, threadID: threadID)
             }
         }
     }
@@ -328,6 +375,35 @@ public final class InboxStore: ObservableObject {
         }
     }
 
+    private func rowViewModel(threadID: String) -> InboxRowViewModel? {
+        flatRows.first { $0.threadID == threadID }
+    }
+
+    private func refreshReaderRow() {
+        guard let readerThreadID else {
+            return
+        }
+        readerRow = rowViewModel(threadID: readerThreadID)
+    }
+
+    private func updateReader(threadID: String, thread: ThreadReaderResponse, error: String?) {
+        guard readerThreadID == threadID else {
+            return
+        }
+        readerThread = thread
+        readerRow = rowViewModel(threadID: threadID)
+        readerError = error
+    }
+
+    private func recordThreadError(_ message: String, threadID: String) {
+        threadErrors[threadID] = message
+        guard readerThreadID == threadID else {
+            return
+        }
+        readerError = message
+        readerRow = rowViewModel(threadID: threadID)
+    }
+
     private func prefetchPriorityThreads() {
         let rows = flatRows
         let grouped = rows.filter(\.isGrouped)
@@ -352,6 +428,26 @@ private extension Array where Element: Hashable {
     func uniqued() -> [Element] {
         var seen = Set<Element>()
         return filter { seen.insert($0).inserted }
+    }
+}
+
+private extension ThreadReaderResponse {
+    var needsHTMLRenderDocumentRefresh: Bool {
+        messages.contains { $0.needsHTMLRenderDocumentRefresh }
+    }
+}
+
+private extension ThreadMessage {
+    var needsHTMLRenderDocumentRefresh: Bool {
+        hasNonEmptyHTMLBody && !hasNonEmptyHTMLRenderDocument
+    }
+
+    private var hasNonEmptyHTMLBody: Bool {
+        htmlBody?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    private var hasNonEmptyHTMLRenderDocument: Bool {
+        htmlRenderDocument?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 }
 

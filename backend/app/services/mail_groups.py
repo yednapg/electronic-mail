@@ -41,6 +41,7 @@ from app.db.mail_groups import (
     oldest_imported_message_at,
     replace_group_members,
     upsert_app_session_snapshot,
+    upsert_gmail_messages,
     upsert_mail_group,
     user_can_write_gmail,
 )
@@ -65,7 +66,15 @@ from app.schemas.domain import (
     ThreadMessage,
     ThreadReaderResponse,
 )
-from app.services.email_extraction import clean_ai_text, compact_text, sender_domain
+from app.services.email_extraction import (
+    clean_ai_text,
+    compact_text,
+    has_persisted_renderable_body,
+    html_body_for_reader,
+    html_render_document_for_reader,
+    parse_gmail_message,
+    sender_domain,
+)
 
 FIRST_BATCH_SIZE = 50
 BACKFILL_BATCH_SIZE = 30
@@ -962,16 +971,24 @@ def build_group_detail_response(settings: Settings, *, user_id: str, group_id: s
     detail = get_mail_group_detail(str(settings.database_path), user_id=user_id, group_id=group_id)
     if detail is None:
         return None
-    if any(not message.text_body and not message.html_body_sanitized for message in detail.messages):
-        enqueue_job(
-            str(settings.database_path),
-            kind="gmail_body_fetch",
-            queue="default",
-            user_id=user_id,
-            dedupe_key=f"gmail-body-fetch:{user_id}:{group_id}",
-            priority=30,
-            payload={"user_id": user_id, "group_id": group_id},
-        )
+    if _rebuild_missing_render_documents(settings, user_id=user_id, messages=detail.messages):
+        detail = get_mail_group_detail(str(settings.database_path), user_id=user_id, group_id=group_id) or detail
+    if any(_needs_body_fetch(message) for message in detail.messages):
+        try:
+            from app.services.gmail_importer import run_gmail_body_fetch
+
+            if run_gmail_body_fetch(settings, user_id=user_id, group_id=group_id):
+                detail = get_mail_group_detail(str(settings.database_path), user_id=user_id, group_id=group_id) or detail
+        except Exception:
+            enqueue_job(
+                str(settings.database_path),
+                kind="gmail_body_fetch",
+                queue="default",
+                user_id=user_id,
+                dedupe_key=f"gmail-body-fetch:{user_id}:{group_id}",
+                priority=30,
+                payload={"user_id": user_id, "group_id": group_id},
+            )
     messages = detail.messages[offset : offset + limit]
     return ThreadReaderResponse(
         entity_id=detail.group.id,
@@ -1627,10 +1644,34 @@ def _thread_message_from_gmail(message: GmailMessageRecord) -> ThreadMessage:
         bcc=message.recipients.get("bcc") if isinstance(message.recipients.get("bcc"), str) else None,
         subject=message.subject,
         body=message.text_body or message.snippet or "",
-        html_body=message.html_body_sanitized,
+        html_body=html_body_for_reader(message.html_body_sanitized),
+        html_render_document=html_render_document_for_reader(message.html_render_document),
         snippet=message.snippet,
         label_ids=message.label_ids,
         received_at=message.internal_date or message.updated_at,
+    )
+
+
+def _rebuild_missing_render_documents(settings: Settings, *, user_id: str, messages: list[GmailMessageRecord]) -> bool:
+    records: list[GmailMessageRecord] = []
+    for message in messages:
+        if message.html_render_document or not message.raw_payload:
+            continue
+        parsed = parse_gmail_message(message.raw_payload, user_id=user_id)
+        if parsed.get("html_render_document"):
+            records.append(GmailMessageRecord(created_at="", updated_at="", **parsed))
+    if not records:
+        return False
+    upsert_gmail_messages(str(settings.database_path), records)
+    return True
+
+
+def _needs_body_fetch(message: GmailMessageRecord) -> bool:
+    return not has_persisted_renderable_body(
+        text_body=message.text_body,
+        html_body=message.html_body_sanitized,
+        html_render_document=message.html_render_document,
+        raw_payload=message.raw_payload,
     )
 
 
