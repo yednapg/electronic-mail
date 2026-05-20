@@ -7,6 +7,35 @@ public protocol SessionTokenStoring: AnyObject {
     func clear()
 }
 
+public final class UserDefaultsSessionTokenStore: SessionTokenStoring {
+    private let defaults: UserDefaults
+    private let key: String
+
+    public init(
+        defaults: UserDefaults = .standard,
+        key: String = "ElectronicMail.debug.email_session"
+    ) {
+        self.defaults = defaults
+        self.key = key
+    }
+
+    public func load() -> String? {
+        guard let token = defaults.string(forKey: key)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty else {
+            return nil
+        }
+        return token
+    }
+
+    public func save(_ token: String) throws {
+        defaults.set(token, forKey: key)
+    }
+
+    public func clear() {
+        defaults.removeObject(forKey: key)
+    }
+}
+
 public final class KeychainSessionTokenStore: SessionTokenStoring {
     private let service = "ElectronicMail"
     private let account = "email_session"

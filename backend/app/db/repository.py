@@ -20,7 +20,7 @@ from app.db.models import (
 )
 
 DEFAULT_USER_ID = os.getenv("APP_USER_ID", "local-user").strip() or "local-user"
-ALEMBIC_BASELINE_REVISION = "20260516_0008"
+ALEMBIC_BASELINE_REVISION = "20260519_0009"
 POSTGRES_URL_PREFIXES = ("postgres://", "postgresql://")
 _ENGINES: dict[str, Engine] = {}
 

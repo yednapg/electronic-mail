@@ -529,6 +529,7 @@ enum DemoAppFixtures {
                     subject: update.subject,
                     body: update.summary ?? row.summary ?? "Demo message body.",
                     htmlBody: nil,
+                    htmlRenderDocument: nil,
                     snippet: update.summary,
                     labelIDs: row.labelIDs,
                     receivedAt: update.receivedAt

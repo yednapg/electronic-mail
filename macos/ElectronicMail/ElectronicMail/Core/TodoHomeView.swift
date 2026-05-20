@@ -497,7 +497,7 @@ private enum TodoTypography {
     }
 
     static func checkbox() -> Font {
-        .system(size: 17, weight: .regular, design: .rounded)
+        .system(size: 18, weight: .regular, design: .rounded)
     }
 }
 

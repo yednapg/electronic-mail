@@ -5,6 +5,7 @@ public struct InboxView: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var store: InboxStore
     @State private var scrollView: NSScrollView?
+    @State private var armedThreadID: String?
 
     public init(store: InboxStore) {
         self.store = store
@@ -18,43 +19,55 @@ public struct InboxView: View {
                 ElectronicMailDesign.background(for: colorScheme)
                     .ignoresSafeArea()
 
-                VStack(alignment: .leading, spacing: 0) {
-                    Spacer(minLength: 0)
-                        .frame(height: ElectronicMailShellMetrics.contentTop)
-
-                    ZStack(alignment: .topLeading) {
-                        ScrollView(.vertical, showsIndicators: false) {
-                            LazyVStack(alignment: .leading, spacing: 0) {
-                                ForEach(store.sections) { section in
-                                    InboxSectionView(
-                                        section: section,
-                                        metrics: metrics,
-                                        colorScheme: colorScheme,
-                                        onSelect: { threadID in
-                                            select(threadID: threadID)
-                                        }
-                                    )
-                                }
+                if let readerThreadID = store.readerThreadID {
+                    EmailReaderView(
+                        threadID: readerThreadID,
+                        thread: store.readerThread,
+                        row: store.readerRow,
+                        errorMessage: store.readerError,
+                        colorScheme: colorScheme,
+                        onClose: closeReader,
+                        onRetry: {
+                            Task {
+                                await store.prefetchThread(threadID: readerThreadID, force: true, silent: false)
                             }
-                            .padding(.bottom, ElectronicMailTypography.bodyLineHeight)
                         }
-                        .background(
-                            InboxScrollViewAccessor { scrollView in
-                                self.scrollView = scrollView
-                            }
-                        )
-
-                        InboxKeyboardEventCapture(
-                            onMove: { delta in
-                                moveSelection(delta: delta, metrics: metrics)
-                            },
-                            onOpen: { store.openActiveSelection() }
-                        )
-                        .frame(width: 1, height: 1)
-                        .opacity(0.01)
-                    }
+                    )
+                    .transition(.opacity)
+                } else {
+                    inboxList(metrics: metrics)
+                        .transition(.opacity)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+                if !store.navigationPlaceholderVisible {
+                    InboxScreenTitle(colorScheme: colorScheme)
+                        .zIndex(3)
+                }
+
+                InboxKeyboardEventCapture(
+                    onMove: { delta in
+                        guard store.readerThreadID == nil else {
+                            return
+                        }
+                        moveSelection(delta: delta, metrics: metrics)
+                    },
+                    onOpen: {
+                        guard store.readerThreadID == nil else {
+                            return
+                        }
+                        withAnimation(.easeInOut(duration: 0.16)) {
+                            store.openActiveSelection()
+                        }
+                    },
+                    onEscape: {
+                        guard store.readerThreadID != nil else {
+                            return
+                        }
+                        closeReader()
+                    }
+                )
+                .frame(width: 1, height: 1)
+                .opacity(0.01)
 
                 if store.refreshFailed {
                     ElectronicMailRefreshFailureToast(message: "Inbox could not refresh. Showing last saved state.")
@@ -73,6 +86,57 @@ public struct InboxView: View {
             store.stopLiveRefreshLoop()
         }
         .environment(\.font, .system(.body, design: .rounded))
+    }
+
+    private func inboxList(metrics: InboxLayoutMetrics) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Spacer(minLength: 0)
+                .frame(height: ElectronicMailShellMetrics.contentTop)
+
+            ZStack(alignment: .topLeading) {
+                ScrollView(.vertical, showsIndicators: false) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(store.sections) { section in
+                            InboxSectionView(
+                                section: section,
+                                metrics: metrics,
+                                colorScheme: colorScheme,
+                                onActivate: { threadID in
+                                    activate(threadID: threadID)
+                                }
+                            )
+                        }
+                    }
+                    .padding(.bottom, ElectronicMailTypography.bodyLineHeight)
+                }
+                .background(
+                    InboxScrollViewAccessor { scrollView in
+                        self.scrollView = scrollView
+                    }
+                )
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func activate(threadID: String) {
+        guard armedThreadID == threadID || store.selectedThreadID == threadID else {
+            armedThreadID = threadID
+            select(threadID: threadID)
+            return
+        }
+
+        armedThreadID = nil
+        withAnimation(.easeInOut(duration: 0.16)) {
+            _ = store.openReader(threadID: threadID)
+        }
+    }
+
+    private func closeReader() {
+        armedThreadID = nil
+        withAnimation(.easeInOut(duration: 0.16)) {
+            store.closeReader()
+        }
     }
 
     private func moveSelection(delta: Int, metrics: InboxLayoutMetrics) {
@@ -94,6 +158,7 @@ public struct InboxView: View {
         }
 
         let nextThreadID = rows[nextIndex].threadID
+        armedThreadID = nextThreadID
         select(threadID: nextThreadID)
         scrollThreadIntoKeyboardRange(
             threadID: nextThreadID,
@@ -195,32 +260,19 @@ private enum InboxKeyboardScroll {
     static let runwayBelow = ElectronicMailTypography.bodyLineHeight
 }
 
-private struct InboxHeader: View {
-    let metrics: InboxLayoutMetrics
-    let navigationPlaceholderVisible: Bool
-    let onMenu: () -> Void
+private struct InboxScreenTitle: View {
+    let colorScheme: ColorScheme
 
     var body: some View {
-        HStack(spacing: ElectronicMailShellMetrics.navTitleGap) {
-            Button(action: onMenu) {
-                ElectronicMailHamburgerIcon()
-                    .foregroundStyle(.primary)
-                    .frame(width: ElectronicMailShellMetrics.navIconFrame, height: ElectronicMailShellMetrics.navIconFrame)
-            }
-            .buttonStyle(.plain)
-            .help(navigationPlaceholderVisible ? "Hide navigation" : "Show navigation")
-            .frame(width: ElectronicMailShellMetrics.navIconFrame, height: ElectronicMailShellMetrics.navIconFrame)
-
-            Text("Inbox")
-                .font(ElectronicMailType.headerTitle())
-                .tracking(ElectronicMailTypography.titleTracking)
-                .foregroundStyle(.primary)
-                .frame(height: ElectronicMailTypography.bodyLineHeight, alignment: .center)
-        }
-        .opacity(navigationPlaceholderVisible ? 0 : 1)
-        .accessibilityHidden(navigationPlaceholderVisible)
-        .padding(.leading, ElectronicMailShellMetrics.navLeading)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        Text("Inbox")
+            .font(ElectronicMailType.headerTitle())
+            .tracking(ElectronicMailTypography.titleTracking)
+            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+            .frame(height: ElectronicMailTypography.bodyLineHeight, alignment: .center)
+            .padding(.top, ElectronicMailShellMetrics.navTop)
+            .padding(.leading, ElectronicMailShellMetrics.navLeading + ElectronicMailShellMetrics.navHitFrame + ElectronicMailShellMetrics.navHeaderTitleGap)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .allowsHitTesting(false)
     }
 }
 
@@ -228,7 +280,7 @@ private struct InboxSectionView: View {
     let section: InboxSectionViewModel
     let metrics: InboxLayoutMetrics
     let colorScheme: ColorScheme
-    let onSelect: (String) -> Void
+    let onActivate: (String) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -243,7 +295,7 @@ private struct InboxSectionView: View {
                     row: row,
                     metrics: metrics,
                     colorScheme: colorScheme,
-                    onSelect: { onSelect(row.threadID) }
+                    onSelect: { onActivate(row.threadID) }
                 )
                 .id(row.threadID)
             }
@@ -366,11 +418,13 @@ private struct InboxRowView: View {
 private struct InboxKeyboardEventCapture: NSViewRepresentable {
     let onMove: (Int) -> Void
     let onOpen: () -> Void
+    let onEscape: () -> Void
 
     func makeNSView(context: Context) -> KeyView {
         let view = KeyView()
         view.onMove = onMove
         view.onOpen = onOpen
+        view.onEscape = onEscape
         DispatchQueue.main.async {
             view.window?.makeFirstResponder(view)
         }
@@ -378,12 +432,13 @@ private struct InboxKeyboardEventCapture: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: KeyView, context: Context) {
-        nsView.updateHandlers(onMove: onMove, onOpen: onOpen)
+        nsView.updateHandlers(onMove: onMove, onOpen: onOpen, onEscape: onEscape)
     }
 
     final class KeyView: NSView {
         var onMove: ((Int) -> Void)?
         var onOpen: (() -> Void)?
+        var onEscape: (() -> Void)?
 
         override var acceptsFirstResponder: Bool {
             true
@@ -394,7 +449,8 @@ private struct InboxKeyboardEventCapture: NSViewRepresentable {
             KeyMonitor.install(
                 window: window,
                 onMove: onMove,
-                onOpen: onOpen
+                onOpen: onOpen,
+                onEscape: onEscape
             )
             DispatchQueue.main.async { [weak self] in
                 guard let self else {
@@ -404,26 +460,30 @@ private struct InboxKeyboardEventCapture: NSViewRepresentable {
             }
         }
 
-        func updateHandlers(onMove: @escaping (Int) -> Void, onOpen: @escaping () -> Void) {
+        func updateHandlers(onMove: @escaping (Int) -> Void, onOpen: @escaping () -> Void, onEscape: @escaping () -> Void) {
             self.onMove = onMove
             self.onOpen = onOpen
-            KeyMonitor.install(window: window, onMove: onMove, onOpen: onOpen)
+            self.onEscape = onEscape
+            KeyMonitor.install(window: window, onMove: onMove, onOpen: onOpen, onEscape: onEscape)
         }
 
         private enum KeyMonitor {
             static weak var window: NSWindow?
             static var onMove: ((Int) -> Void)?
             static var onOpen: (() -> Void)?
+            static var onEscape: (() -> Void)?
             static var monitor: Any?
 
             static func install(
                 window: NSWindow?,
                 onMove: ((Int) -> Void)?,
-                onOpen: (() -> Void)?
+                onOpen: (() -> Void)?,
+                onEscape: (() -> Void)?
             ) {
                 self.window = window
                 self.onMove = onMove
                 self.onOpen = onOpen
+                self.onEscape = onEscape
 
                 guard monitor == nil else {
                     return
@@ -452,6 +512,9 @@ private struct InboxKeyboardEventCapture: NSViewRepresentable {
                 case 36, 76:
                     onOpen?()
                     return nil
+                case 53:
+                    onEscape?()
+                    return nil
                 default:
                     return event
                 }
@@ -467,6 +530,8 @@ private struct InboxKeyboardEventCapture: NSViewRepresentable {
                 onMove?(-1)
             case 36, 76:
                 onOpen?()
+            case 53:
+                onEscape?()
             default:
                 super.keyDown(with: event)
             }
