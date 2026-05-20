@@ -483,6 +483,274 @@ Note:
 
 - Current onboarding duration may be 25 seconds. Do not claim it is 30-60 seconds unless the code actually does that.
 
+### 16. macOS Shell Navigation Alignment
+
+Failure:
+
+- Opening the hamburger navigation makes the active page title look like it slides up or down.
+- Drawer text starts from a different vertical baseline than the normal page title.
+- The drawer group starts from the top of the hamburger instead of the same title row used by Inbox/To-do.
+- Hamburger visual size changes the click target.
+- Window titlebar/control placement is changed while fixing in-app layout.
+
+Test:
+
+- Open Inbox.
+- Note the vertical center/baseline of the `Inbox` title next to the hamburger.
+- Click the hamburger.
+- Confirm the drawer `Inbox` item appears on the same title row/baseline as the previous page title.
+- Close and reopen the drawer from Inbox and To-do.
+- Confirm the title does not visually slide vertically when the drawer appears.
+- Confirm hamburger visible icon frame is 25 x 25.
+- Confirm hamburger hit/click target remains 44 x 44.
+- Confirm macOS red/yellow/green window controls are untouched.
+
+Pass:
+
+- Hamburger opens the drawer without a perceived title jump.
+- Drawer item text and normal page title share one vertical rhythm.
+- The hamburger is visually quieter at 25 x 25 while remaining easy to click.
+
+### 17. Inbox Selection And Open Behavior
+
+Failure:
+
+- Clicking a row opens it immediately, making the blue selection bar meaningless.
+- Clicking a selected row again does not open the email.
+- Selection state is based on stale store state instead of the visible selected row.
+- Arrow key selection or Enter open behavior regresses.
+
+Test:
+
+- Open Inbox.
+- Click an unselected email once.
+- Confirm only the blue selection bar moves to that email; the reader does not open.
+- Click the same highlighted email again.
+- Confirm the email reader opens.
+- Go back to Inbox.
+- Click a different email once.
+- Confirm the blue bar moves and the reader does not open.
+- Press Enter on the highlighted email.
+- Confirm the reader opens.
+- Use arrow keys if available and confirm they move the selected row without opening.
+
+Pass:
+
+- First click selects.
+- Second click on the selected row opens.
+- Enter opens the selected row.
+- The blue selection bar has a real purpose.
+
+### 18. Email Reader Width And Header Alignment
+
+Failure:
+
+- Email reader content is too wide compared with the To-do page.
+- Email title starts on a different horizontal lane from the page content.
+- Group/thread title is not aligned with the reader content.
+- Back chevron, title, metadata, and email body feel like separate grids.
+
+Test:
+
+- Open a single email.
+- Open a grouped/threaded email.
+- Compare reader content width with the To-do page width at the same window size.
+- Confirm the reader page uses the same centered/narrow column family as To-do.
+- Confirm reader title aligns horizontally with the body column.
+- Confirm long reader titles wrap without overlapping the hamburger/title area.
+- Confirm sender/date/actions sit within the same reader width.
+
+Pass:
+
+- Reader content width feels consistent with To-do, not oversized.
+- Header, metadata, and body read as one column system.
+
+### 19. HTML Email Rendering Mode
+
+Failure:
+
+- Rich HTML emails are restyled by the app instead of preserving sender HTML.
+- Sender CSS, tables, images, classes, inline styles, or layout attributes are stripped for visual rendering.
+- HTML emails are inserted into a generated app document that forces app typography.
+- Dark mode changes sender HTML colors.
+- App injects global `font-family`, `font-size`, `line-height`, text color, link color, table width, image sizing, or padding overrides.
+- Basic text/link-only Gmail messages render as a WKWebView instead of the plain text card.
+
+Test:
+
+- Open a basic text-only or simple text/link email.
+- Confirm it uses the native `EmailTextBodyCard`, not the HTML renderer.
+- Open a rich HTML email such as Cal State, HDFC, or Navigraph.
+- Confirm it uses the HTML renderer.
+- Confirm rich HTML renders in light mode even when the app shell is dark.
+- Confirm the sender's document/CSS controls font, size, line-height, image placement, table width, and spacing.
+- Confirm the app does not force SF/app font into the email document.
+- Confirm remote images and inline images render when available.
+- Confirm links remain visible and clickable.
+
+Pass:
+
+- Text/basic Gmail messages stay native text.
+- Rich HTML messages render as preserved light email documents.
+- The app shell does not restyle sender content.
+
+### 20. HTML Email Background And Border
+
+Failure:
+
+- The reader adds an artificial grey, peach, or white outer border around the email document.
+- Fixing the border by making the document transparent creates a different wrong background.
+- Sender document background is overwritten with `background-color: transparent !important`.
+- A SwiftUI wrapper background such as `Color.clear` hides the real email document surface.
+- The email body looks like it has an extra app-generated frame not present in Apple Mail.
+
+Test:
+
+- Open the HDFC email.
+- Compare the area around the HDFC logo/header with Apple Mail or the known reference screenshot.
+- Confirm there is no extra app-added grey/peach/white border around the sender document.
+- Confirm the sender document's own white/light page surface remains visible.
+- Confirm there is no transparent-background hack that lets the app's black shell show through the document.
+- Confirm the top, side, and bottom whitespace around the email belongs to the sender/mail-client document, not an extra rounded card.
+
+Pass:
+
+- The rendered email has a clean preserved document surface.
+- There is no extra app border, and no transparent hack.
+
+### 21. HTML Email Scroll Responsiveness
+
+Failure:
+
+- Scrolling works only when the cursor is outside the HTML email body.
+- Scrolling over the WKWebView freezes, stalls, or makes the app unresponsive.
+- A global scroll-wheel monitor forwards events re-entrantly and causes jank.
+- Links stop working because scroll handling swallows mouse events.
+
+Test:
+
+- Open a long rich HTML email.
+- Put the cursor over the rendered HTML body.
+- Scroll slowly, then quickly, using the trackpad or mouse wheel.
+- Move the cursor outside the HTML body and scroll again.
+- Repeat fast up/down scrolling for at least 10 seconds.
+- Click a link inside the HTML email if a safe link is visible.
+
+Pass:
+
+- Scrolling works over the HTML body and surrounding reader area.
+- The app does not freeze or lag under fast scroll.
+- Links remain clickable.
+
+### 22. Apple Mail-Like HTML Reference Checks
+
+Failure:
+
+- HDFC logo/header has wrong surrounding padding.
+- HDFC title, divider, paragraph spacing, and line wrapping do not resemble Apple Mail at the same width.
+- Cal State or Navigraph rich emails lose images or render as snippet text.
+- Font rendering falls back to Times/serif when the email expects sans-serif defaults.
+- Font rendering is forced to app-wide SF when sender CSS should win.
+
+Test:
+
+- Open HDFC in Apple Mail or use the stored reference screenshot.
+- Open HDFC in the macOS app at a similar window width.
+- Compare:
+  - logo/header position
+  - white/light page surface
+  - title font size/weight
+  - paragraph line-height
+  - divider position
+  - image width and inset
+  - document width
+- Open Cal State and Navigraph rich emails.
+- Confirm images render and the email does not fall back to snippet text.
+
+Pass:
+
+- The app preserves sender HTML enough that structure, spacing, and images are materially close to Apple Mail.
+- Remaining differences are explainable by sender HTML, WebKit behavior, blocked remote images, or unavailable inline assets, not app CSS overrides.
+
+### 23. Threaded Email Reader Layout
+
+Failure:
+
+- Grouped/threaded email view shows redundant subtitle text such as `3 emails from ...`.
+- It shows an extra `Thread` section header or plus button inside the reader.
+- It shows a bottom compact row style unrelated to the email conversation.
+- Every message looks like an inbox preview card.
+- Older messages show long snippets/body previews.
+- Latest message appears first or in the middle instead of last.
+- Latest message is collapsed by default.
+
+Test:
+
+- Open a grouped/threaded email.
+- Confirm there is only the reader title/header, then the message conversation.
+- Confirm there is no redundant group subtitle, `Thread` header, plus button, or unrelated bottom row.
+- Confirm messages are ordered oldest to newest.
+- Confirm the latest message is last and expanded by default.
+- Confirm older messages are collapsed compact headers.
+- Confirm collapsed older messages show only sender, subject, and date/time.
+- Click an older collapsed message.
+- Confirm it expands without changing the latest-message default behavior unexpectedly.
+
+Pass:
+
+- The page feels like an email thread reader, not a list of inbox preview cards.
+- The newest email is visible as the active expanded message at the bottom.
+
+### 24. Thread Text Decoding
+
+Failure:
+
+- Thread cards show raw HTML entities such as `You&#39;ve`.
+- Subject/body fallback text displays encoded entities.
+- Decoding changes rich HTML rendering instead of only native text surfaces.
+
+Test:
+
+- Open a thread whose preview text contains an apostrophe or encoded entity.
+- Confirm collapsed subject text displays `You've`, not `You&#39;ve`.
+- Confirm expanded plain-text fallback displays decoded text.
+- Confirm rich HTML body still renders through preserved HTML and is not converted into plain text.
+
+Pass:
+
+- Native SwiftUI text surfaces are decoded for display.
+- Preserved HTML rendering remains unchanged.
+
+### 25. macOS Typography Token Limits
+
+Failure:
+
+- macOS app UI introduces title/body sizes above the agreed maximum.
+- Email reader title or page title uses 26pt after the max was set to 22pt.
+- Checkbox size drifts from the agreed 18pt.
+- App UI font-size changes are made while trying to fix sender HTML font rendering.
+
+Test:
+
+- Inspect macOS UI tokens and visible UI.
+- Confirm maximum normal app UI size is 22pt.
+- Confirm:
+  - sectionTitleSize: 22
+  - bodySize: 20
+  - bodyLineHeight: 40
+  - iconSize: 22
+  - smallSize: 16
+  - detailSize: 18
+  - statusSize: 13
+  - reader title: 22
+  - checkbox: 18
+- Confirm sender HTML font rendering is not controlled by these app UI tokens.
+
+Pass:
+
+- App shell typography follows the agreed macOS tokens.
+- Sender HTML typography remains document-owned.
+
 ## Manual Visual QA Flow
 
 Run this full flow after any To-do or shared typography change:
@@ -507,6 +775,39 @@ Run this full flow after any To-do or shared typography change:
 
 Do not skip Inbox after a shared token change.
 
+## Manual Mail Reader QA Flow
+
+Run this flow after any Inbox, EmailReader, HTML rendering, navigation shell, or macOS typography change:
+
+1. Build the app.
+2. Relaunch the app.
+3. Open Inbox.
+4. Confirm hamburger visible frame is 25 x 25 and hit target is still easy to click.
+5. Open and close the hamburger drawer.
+6. Confirm drawer `Inbox` text aligns vertically with the normal Inbox page title and does not slide.
+7. Click an unselected Inbox row once.
+8. Confirm only the blue selection bar moves.
+9. Click the selected row again.
+10. Confirm the reader opens.
+11. Go back and press Enter on a selected row.
+12. Confirm the reader opens.
+13. Open a single plain-text/basic email.
+14. Confirm it uses the native text card.
+15. Open a rich HTML email.
+16. Confirm it renders as a light preserved document.
+17. Scroll over the HTML body repeatedly.
+18. Confirm no freeze, lag, or scroll lock.
+19. Open HDFC rich email.
+20. Compare document width, logo/header padding, title spacing, divider, and body text with the Apple Mail reference.
+21. Confirm no extra grey/peach/white app border and no transparent-background hack.
+22. Open Cal State or Navigraph rich email.
+23. Confirm images render and the body does not fall back to snippet text.
+24. Open a grouped/threaded email.
+25. Confirm latest message is last and expanded.
+26. Confirm older messages are compact rows with sender, subject, and date only.
+27. Confirm no raw entities like `&#39;` appear in native text labels.
+28. Confirm no redundant grouped subtitle, `Thread` header, plus button, or unrelated bottom row exists.
+
 ## Screenshot Review Checklist
 
 When reviewing a screenshot, inspect these exact edges and lines:
@@ -522,6 +823,15 @@ When reviewing a screenshot, inspect these exact edges and lines:
 - plus button right alignment
 - refresh warning toast position and style
 - row baseline alignment
+- hamburger icon visual bounds
+- drawer first item baseline
+- normal page title baseline
+- email reader title left edge
+- email reader body left edge
+- rich HTML document outer edge
+- rich HTML sender content edge
+- thread collapsed row sender/subject/date columns
+- latest expanded thread message position
 - gap between title and summary
 - gap between summary and action row
 - gap between section title/divider and first row

@@ -67,6 +67,68 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(store.selectedThreadID, "demo-google-today")
     }
 
+    func testOpenActiveSelectionSetsReaderThreadID() async {
+        let store = InboxStore(client: DemoAppClient(), sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+
+        await store.load()
+        store.select(threadID: "demo-rbi-today", prefetch: false)
+        store.openActiveSelection()
+
+        XCTAssertEqual(store.readerThreadID, "demo-rbi-today")
+        XCTAssertEqual(store.selectedThreadID, "demo-rbi-today")
+    }
+
+    func testOpenReaderLoadsSingleMessageThread() async {
+        let store = InboxStore(client: DemoAppClient(), sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+
+        await store.load()
+        let task = store.openReader(threadID: "demo-google-today")
+        await task.value
+
+        XCTAssertEqual(store.readerThreadID, "demo-google-today")
+        XCTAssertEqual(store.readerRow?.threadID, "demo-google-today")
+        XCTAssertEqual(store.readerThread?.messages.count, 1)
+        XCTAssertNil(store.readerError)
+    }
+
+    func testOpenReaderLoadsGroupedThread() async {
+        let store = InboxStore(client: DemoAppClient(), sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+
+        await store.load()
+        let task = store.openReader(threadID: "demo-apple-today")
+        await task.value
+
+        XCTAssertEqual(store.readerThreadID, "demo-apple-today")
+        XCTAssertEqual(store.readerRow?.isGrouped, true)
+        XCTAssertEqual(store.readerThread?.messages.count, 5)
+    }
+
+    func testCloseReaderPreservesSelection() async {
+        let store = InboxStore(client: DemoAppClient(), sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+
+        await store.load()
+        let task = store.openReader(threadID: "demo-rbi-today")
+        await task.value
+        store.closeReader()
+
+        XCTAssertNil(store.readerThreadID)
+        XCTAssertEqual(store.selectedThreadID, "demo-rbi-today")
+    }
+
+    func testOpenReaderFailureRecordsErrorAndKeepsInboxVisible() async {
+        let store = InboxStore(client: FailingThreadAppClient(), sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+
+        await store.load()
+        let task = store.openReader(threadID: "demo-google-today")
+        await task.value
+
+        XCTAssertEqual(store.readerThreadID, "demo-google-today")
+        XCTAssertNil(store.readerThread)
+        XCTAssertNotNil(store.readerError)
+        XCTAssertNotNil(store.threadErrors["demo-google-today"])
+        XCTAssertFalse(store.flatRows.isEmpty)
+    }
+
     func testFailedRefreshKeepsCachedInboxVisible() async {
         let defaults = UserDefaults.ephemeral()
         let cache = AppSessionCache(defaults: defaults)
@@ -218,6 +280,60 @@ private final class FailingAppClient: AppClient {
     func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse { throw APIError.httpStatus(503) }
     func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse { throw APIError.httpStatus(503) }
     func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse { throw APIError.httpStatus(503) }
+}
+
+private final class FailingThreadAppClient: AppClient {
+    var baseURL = AppConfiguration.defaultBackendURL
+    var sessionToken: String?
+    let mode: AppRunMode = .demo
+
+    func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
+        try await DemoAppClient().exchangeMobileSession(loginCode: loginCode)
+    }
+
+    func appSession() async throws -> AppSessionResponse {
+        DemoAppFixtures.appSession
+    }
+
+    func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
+        DemoAppFixtures.mailbox
+    }
+
+    func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
+        throw APIError.httpStatus(503)
+    }
+
+    func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
+        try await DemoAppClient().triggerMailboxSync()
+    }
+
+    func syncMailboxNow() async throws -> MailboxSyncTriggerResponse {
+        try await DemoAppClient().syncMailboxNow()
+    }
+
+    func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .archive)
+    }
+
+    func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .unarchive)
+    }
+
+    func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .markRead)
+    }
+
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        try await DemoAppClient().createTask(request)
+    }
+
+    func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse {
+        try await DemoAppClient().updateTask(taskID, request: request)
+    }
+
+    func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
+        try await DemoAppClient().completeEntity(entityID, request: request)
+    }
 }
 
 private final class SlowThreadAppClient: AppClient {

@@ -4,7 +4,7 @@ import SwiftUI
 enum ElectronicMailShellMetrics {
     static let navTop: CGFloat = 24
     static let navLeading: CGFloat = 56
-    static let navIconFrame: CGFloat = 30
+    static let navIconFrame: CGFloat = 25
     static let navHitFrame: CGFloat = 44
     static let navTitleGap: CGFloat = 16
     static let navHeaderTitleGap: CGFloat = 2
@@ -901,7 +901,7 @@ private struct NavigationDrawer: View {
 
             Spacer(minLength: 0)
         }
-        .padding(.top, ElectronicMailShellMetrics.navTop)
+        .padding(.top, ElectronicMailShellMetrics.navTop + ElectronicMailShellMetrics.navHitFrame / 2)
         .padding(.leading, ElectronicMailShellMetrics.navLeading)
         .padding(.trailing, 28)
         .padding(.bottom, 28)

@@ -22,7 +22,7 @@ from app.db.mail_groups import (
     upsert_gmail_messages,
     user_can_write_gmail,
 )
-from app.services.email_extraction import parse_gmail_message
+from app.services.email_extraction import has_persisted_renderable_body, parse_gmail_message
 from app.services.integrations.google import build_google_service, create_authorized_credentials
 from app.services.mail_groups import enqueue_projection_refresh, rebuild_touched_mail_groups
 
@@ -290,7 +290,7 @@ def run_gmail_body_fetch(settings: Settings, *, user_id: str, group_id: str) -> 
     if not user_can_write_gmail(database_url, user_id=user_id):
         return 0
     messages = list_group_messages(database_url, user_id=user_id, group_id=group_id)
-    missing = [message.message_id for message in messages if not message.text_body and not message.html_body_sanitized]
+    missing = [message.message_id for message in messages if not _has_body_for_reader(message)]
     if not missing:
         return 0
     credentials = create_authorized_credentials(settings, user_id=user_id)
@@ -299,13 +299,30 @@ def run_gmail_body_fetch(settings: Settings, *, user_id: str, group_id: str) -> 
     service = build_google_service("gmail", "v1", credentials)
     payloads = _batch_get_message_payloads(service, missing, format="full")
     parsed_messages = [
-        GmailMessageRecord(created_at="", updated_at="", **parse_gmail_message(payload, user_id=user_id))
+        GmailMessageRecord(
+            created_at="",
+            updated_at="",
+            **parse_gmail_message(
+                payload,
+                user_id=user_id,
+                inline_attachment_resolver=_inline_attachment_resolver(service),
+            ),
+        )
         for payload in payloads.values()
     ]
     upsert_gmail_messages(database_url, parsed_messages)
     rebuild_touched_mail_groups(settings, user_id=user_id, message_ids=[message.message_id for message in parsed_messages], use_ai=False)
     enqueue_projection_refresh(settings, user_id=user_id)
     return len(parsed_messages)
+
+
+def _has_body_for_reader(message: GmailMessageRecord) -> bool:
+    return has_persisted_renderable_body(
+        text_body=message.text_body,
+        html_body=message.html_body_sanitized,
+        html_render_document=message.html_render_document,
+        raw_payload=message.raw_payload,
+    )
 
 
 def _hydrate_first_run_recent_window(settings: Settings, *, user_id: str, batch_size: int) -> tuple[list[GmailMessageRecord], str | None, str | None]:
@@ -352,10 +369,36 @@ def _hydrate_messages(
         payload = payloads.get(message_id)
         if payload is None:
             continue
-        parsed = parse_gmail_message(payload, user_id=user_id)
+        parsed = parse_gmail_message(
+            payload,
+            user_id=user_id,
+            inline_attachment_resolver=_inline_attachment_resolver(service) if format == "full" else None,
+        )
         latest_history_id = _max_history_id(latest_history_id, parsed.get("history_id"))
         messages.append(GmailMessageRecord(created_at="", updated_at="", **parsed))
     return messages, latest_history_id
+
+
+def _inline_attachment_resolver(service: Any):
+    cache: dict[tuple[str, str], str | None] = {}
+
+    def resolve(message_id: str, attachment_id: str) -> str | None:
+        key = (message_id, attachment_id)
+        if key in cache:
+            return cache[key]
+        try:
+            response = service.users().messages().attachments().get(
+                userId="me",
+                messageId=message_id,
+                id=attachment_id,
+            ).execute()
+            data = response.get("data") if isinstance(response, dict) else None
+            cache[key] = data if isinstance(data, str) and data else None
+        except Exception:
+            cache[key] = None
+        return cache[key]
+
+    return resolve
 
 
 def _hydrate_message_ids(

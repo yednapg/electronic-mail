@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS gmail_messages (
   snippet TEXT,
   raw_payload_json TEXT NOT NULL,
   html_body_sanitized TEXT,
+  html_render_document TEXT,
   text_body TEXT,
   extracted_signals_json TEXT NOT NULL DEFAULT '{}',
   body_hash TEXT NOT NULL,

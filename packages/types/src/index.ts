@@ -416,6 +416,7 @@ export interface ThreadMessage {
   readonly subject?: string | null;
   readonly body: string;
   readonly html_body?: string | null;
+  readonly html_render_document?: string | null;
   readonly snippet?: string | null;
   readonly label_ids: string[];
   readonly received_at: string;

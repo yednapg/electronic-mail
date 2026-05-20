@@ -489,6 +489,7 @@ function threadFromRow(row: GmailThreadRow): ThreadReaderResponse {
       subject: update.subject,
       body: update.summary ?? row.summary ?? 'Demo message body.',
       html_body: null,
+      html_render_document: null,
       snippet: update.summary ?? row.snippet ?? null,
       label_ids: row.label_ids ?? ['INBOX'],
       received_at: update.received_at,
