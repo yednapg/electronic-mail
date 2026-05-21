@@ -42,7 +42,7 @@ class EmailExtractionTests(unittest.TestCase):
         self.assertIsNone(parsed["html_body_sanitized"])
         self.assertIn("example.com", parsed["extracted_signals"]["domains"])
 
-    def test_rich_html_is_preserved_for_reader_and_plain_html_is_not(self) -> None:
+    def test_html_is_preserved_for_reader_when_gmail_supplies_html(self) -> None:
         rich_html = """
         <html><head><style>.headline { font-family: Arial; font-size: 32px; }</style></head><body>
           <table style="width:100%"><tr><td style="font-size:42px">
@@ -90,9 +90,9 @@ class EmailExtractionTests(unittest.TestCase):
         self.assertIsNotNone(html_body_for_reader(html_body))
 
         simple_html = sanitize_email_html('<div>Hello<br><a href="https://example.com">Open link</a></div>')
-        self.assertIsNone(html_body_for_reader(simple_html))
+        self.assertEqual(html_body_for_reader(simple_html), simple_html)
 
-    def test_otp_text_link_html_is_not_rendered_as_rich_html(self) -> None:
+    def test_otp_text_link_html_preserves_original_html_for_reader(self) -> None:
         otp_html = """
         <!doctype html>
         <html>
@@ -121,14 +121,15 @@ class EmailExtractionTests(unittest.TestCase):
             user_id="user-1",
         )
 
-        self.assertIsNone(parsed["html_render_document"])
+        self.assertIsNotNone(parsed["html_render_document"])
         self.assertIsNone(parsed["html_body_sanitized"])
-        self.assertIsNone(html_render_document_for_reader(parsed["html_render_document"]))
+        self.assertEqual(html_render_document_for_reader(parsed["html_render_document"]), parsed["html_render_document"])
         self.assertIsNone(html_body_for_reader(parsed["html_body_sanitized"]))
+        self.assertIn("links.mcdonaldsapps.com/otp", parsed["html_render_document"] or "")
         self.assertIn("205759 is your one-time password", parsed["text_body"] or "")
         self.assertNotIn("sendgrid", parsed["text_body"] or "")
 
-    def test_single_presentation_table_with_tracking_pixel_is_text(self) -> None:
+    def test_single_presentation_table_with_tracking_pixel_preserves_original_html(self) -> None:
         html = """
         <!doctype html>
         <html><head>
@@ -158,8 +159,9 @@ class EmailExtractionTests(unittest.TestCase):
             user_id="user-1",
         )
 
-        self.assertIsNone(parsed["html_render_document"])
+        self.assertIsNotNone(parsed["html_render_document"])
         self.assertIsNone(parsed["html_body_sanitized"])
+        self.assertIn("go2.a16z.com/trk", parsed["html_render_document"] or "")
         self.assertIn("Looks like you started a speedrun application", parsed["text_body"] or "")
         self.assertNotIn("Just a few more fields", parsed["text_body"] or "")
         self.assertNotIn("go2.a16z.com/trk", parsed["text_body"] or "")

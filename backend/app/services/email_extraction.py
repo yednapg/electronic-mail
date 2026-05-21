@@ -168,27 +168,23 @@ def build_thread_message_reader(
 
 
 def html_body_for_reader(value: str | None) -> str | None:
-    """Return HTML only when it has email layout worth rendering as HTML."""
+    """Return sanitized HTML when it is available for the reader."""
     if not value:
         return None
     candidate = value.strip()
     if not candidate:
         return None
-    if _is_rich_email_html(candidate):
-        return candidate
-    return None
+    return candidate
 
 
 def html_render_document_for_reader(value: str | None) -> str | None:
-    """Return a preserved HTML document only when it has email layout worth rendering."""
+    """Return a preserved HTML document when Gmail supplied HTML."""
     if not value:
         return None
     candidate = value.strip()
     if not candidate:
         return None
-    if _is_rich_email_html(candidate):
-        return candidate
-    return None
+    return candidate
 
 
 def html_render_document(
@@ -198,9 +194,9 @@ def html_render_document(
     message_id: str,
     inline_attachment_resolver: InlineAttachmentResolver | None = None,
 ) -> str | None:
-    if not value or not _is_rich_email_html(value):
+    if not value or not value.strip():
         return None
-    cleaned = sanitize_email_render_document(value)
+    cleaned = sanitize_email_render_document(value.strip())
     if not cleaned:
         return None
     inline_images = _inline_image_data_urls(
