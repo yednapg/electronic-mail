@@ -304,36 +304,24 @@ private struct EmailBodyContent: View {
     let fallbackText: String
     let colorScheme: ColorScheme
 
-    @State private var showOriginalFormatting = false
-
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            if !markers.isEmpty {
-                EmailReaderMarkerRow(markers: markers, colorScheme: colorScheme)
-            }
-
-            EmailTextBodyView(
-                bodyText: bodyText,
-                colorScheme: colorScheme
-            )
-
-            EmailReaderDetailStack(message: message, colorScheme: colorScheme)
-
             if let htmlDocument {
-                EmailOriginalFormattingToggle(
-                    expanded: $showOriginalFormatting,
+                EmailOriginalBodyView(
+                    htmlDocument: htmlDocument,
+                    fallbackText: bodyText,
+                    threadID: threadID,
+                    messageID: message?.id
+                )
+            } else {
+                if !markers.isEmpty {
+                    EmailReaderMarkerRow(markers: markers, colorScheme: colorScheme)
+                }
+
+                EmailTextBodyView(
+                    bodyText: bodyText,
                     colorScheme: colorScheme
                 )
-
-                if showOriginalFormatting {
-                    EmailOriginalFormattingView(
-                        htmlDocument: htmlDocument,
-                        fallbackText: bodyText,
-                        threadID: threadID,
-                        messageID: message?.id
-                    )
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                }
             }
         }
     }
@@ -363,6 +351,23 @@ enum EmailReaderBodyKind: Equatable {
 
 enum EmailReaderBodyResolver {
     static func bodyKind(message: ThreadMessage?, fallbackText: String, threadID: String? = nil) -> EmailReaderBodyKind {
+        if let html = nonEmpty(message?.htmlRenderDocument) ?? nonEmpty(message?.htmlBody) {
+            let analysis = analyzeHTML(html)
+            let fallback = readableFallbackText(message: message, fallbackText: fallbackText, analysis: analysis)
+
+            logClassification(
+                threadID: threadID,
+                messageID: message?.id,
+                mode: "html",
+                visibleTextLength: analysis.visibleTextLength,
+                imageCount: analysis.imageCount,
+                tableCount: analysis.tableCount,
+                fallbackReason: nil
+            )
+
+            return .html(html, fallbackText: fallback)
+        }
+
         if let primaryText = nonEmpty(message?.reader?.primaryText) {
             logClassification(
                 threadID: threadID,
@@ -374,27 +379,6 @@ enum EmailReaderBodyResolver {
                 fallbackReason: nil
             )
             return .text(primaryText)
-        }
-
-        if let html = nonEmpty(message?.htmlRenderDocument) ?? nonEmpty(message?.htmlBody) {
-            let analysis = analyzeHTML(html)
-            let decision = htmlRenderingDecision(for: analysis)
-            let fallback = readableFallbackText(message: message, fallbackText: fallbackText, analysis: analysis)
-
-            logClassification(
-                threadID: threadID,
-                messageID: message?.id,
-                mode: decision.rendersHTML ? "html" : "text",
-                visibleTextLength: analysis.visibleTextLength,
-                imageCount: analysis.imageCount,
-                tableCount: analysis.tableCount,
-                fallbackReason: decision.fallbackReason
-            )
-
-            if decision.rendersHTML {
-                return .html(html, fallbackText: fallback)
-            }
-            return .text(fallback)
         }
 
         let bodyText = nonEmpty(message?.body).map { readableBodyText($0) }
@@ -414,11 +398,7 @@ enum EmailReaderBodyResolver {
     }
 
     static func renderableHTML(from message: ThreadMessage?) -> String? {
-        let value = nonEmpty(message?.htmlRenderDocument) ?? nonEmpty(message?.htmlBody)
-        guard let value, htmlRenderingDecision(for: analyzeHTML(value)).rendersHTML else {
-            return nil
-        }
-        return value
+        nonEmpty(message?.htmlRenderDocument) ?? nonEmpty(message?.htmlBody)
     }
 
     static func originalHTML(from message: ThreadMessage?) -> String? {
@@ -426,7 +406,7 @@ enum EmailReaderBodyResolver {
     }
 
     static func isRichEmailHTML(_ value: String) -> Bool {
-        htmlRenderingDecision(for: analyzeHTML(value)).rendersHTML
+        nonEmpty(value) != nil
     }
 
     private static func analyzeHTML(_ value: String) -> HTMLBodyAnalysis {
@@ -465,64 +445,6 @@ enum EmailReaderBodyResolver {
             classCount: count(pattern: #"\sclass\s*="#, in: value),
             hasPictureElement: contains(pattern: #"<\s*(picture|source)\b"#, in: value)
         )
-    }
-
-    private static func htmlRenderingDecision(for analysis: HTMLBodyAnalysis) -> HTMLRenderingDecision {
-        if analysis.visibleTextLength < 24 {
-            return HTMLRenderingDecision(rendersHTML: false, fallbackReason: "low-visible-content")
-        }
-
-        if analysis.imageCount > 0, analysis.visibleTextLength < 80 {
-            return HTMLRenderingDecision(rendersHTML: false, fallbackReason: "image-heavy-low-text")
-        }
-
-        if analysis.tableCount == 0,
-           analysis.substantiveImageCount == 0,
-           !analysis.hasPictureElement,
-           analysis.styleCount + analysis.classCount < 4 {
-            return HTMLRenderingDecision(rendersHTML: false, fallbackReason: "simple-html")
-        }
-
-        if analysis.imageCount > 0,
-           analysis.tableCount <= 1,
-           analysis.trackingImageCount == analysis.imageCount,
-           analysis.substantiveImageCount == 0 {
-            return HTMLRenderingDecision(rendersHTML: false, fallbackReason: "single-presentation-table")
-        }
-
-        if analysis.tableCount <= 1,
-           analysis.tableTagCount <= 6,
-           analysis.substantiveImageCount == 0,
-           analysis.hasPictureElement == false,
-           analysis.visibleTextLength < 180 {
-            return HTMLRenderingDecision(rendersHTML: false, fallbackReason: "single-presentation-table")
-        }
-
-        if analysis.tableCount > 0, analysis.visibleTextLength >= 180 {
-            return HTMLRenderingDecision(rendersHTML: true, fallbackReason: nil)
-        }
-
-        if analysis.styleCount + analysis.classCount >= 6, analysis.visibleTextLength >= 80 {
-            return HTMLRenderingDecision(rendersHTML: true, fallbackReason: nil)
-        }
-
-        let sourceIsDocumentSized = analysis.sourceLength > max(900, analysis.visibleTextLength * 2)
-        let hasDenseTableLayout = analysis.tableCount >= 2
-            && analysis.tableTagCount >= 6
-            && analysis.visibleTextLength >= 80
-            && sourceIsDocumentSized
-        let hasDesignedImages = analysis.substantiveImageCount > 0
-            && analysis.visibleTextLength >= 80
-            && (analysis.tableCount >= 2 || analysis.styleCount >= 6 || analysis.classCount >= 4 || analysis.hasPictureElement)
-        let hasStyledLayout = analysis.visibleTextLength >= 120
-            && (analysis.styleCount + analysis.classCount >= 10 || analysis.layoutTagCount >= 2)
-            && sourceIsDocumentSized
-
-        if hasDenseTableLayout || hasDesignedImages || hasStyledLayout {
-            return HTMLRenderingDecision(rendersHTML: true, fallbackReason: nil)
-        }
-
-        return HTMLRenderingDecision(rendersHTML: false, fallbackReason: "representable-as-text")
     }
 
     private static func readableFallbackText(
@@ -756,10 +678,6 @@ enum EmailReaderBodyResolver {
         let hasPictureElement: Bool
     }
 
-    private struct HTMLRenderingDecision {
-        let rendersHTML: Bool
-        let fallbackReason: String?
-    }
 }
 
 private struct EmailTextBodyView: View {
@@ -874,30 +792,7 @@ private struct EmailReaderDetailDisclosure: View {
     }
 }
 
-private struct EmailOriginalFormattingToggle: View {
-    @Binding var expanded: Bool
-    let colorScheme: ColorScheme
-
-    var body: some View {
-        Button {
-            withAnimation(.easeInOut(duration: 0.16)) {
-                expanded.toggle()
-            }
-        } label: {
-            HStack(spacing: 7) {
-                Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                    .font(.system(size: 11, weight: .semibold))
-                Text("Original formatting")
-                    .font(EmailReaderTypography.metadata(weight: .medium))
-            }
-            .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-        }
-        .buttonStyle(.plain)
-        .padding(.top, 2)
-    }
-}
-
-private struct EmailOriginalFormattingView: View {
+private struct EmailOriginalBodyView: View {
     let htmlDocument: String
     let fallbackText: String
     let threadID: String
