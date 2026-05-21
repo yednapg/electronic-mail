@@ -72,7 +72,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(archive.action, .archive)
     }
 
-    func testEmailBodyResolverRoutesBasicTextLinkHTMLToText() {
+    func testEmailBodyResolverRoutesBasicTextLinkHTMLToHTML() {
         let html = #"""
         <!doctype html>
         <html>
@@ -96,10 +96,14 @@ final class ModelDecodingTests: XCTestCase {
 
         let bodyKind = EmailReaderBodyResolver.bodyKind(message: message, fallbackText: "")
 
-        XCTAssertEqual(bodyKind, .text("Hello,\n\n205759 is your one-time password."))
+        guard case .html(let resolvedHTML, let fallbackText) = bodyKind else {
+            return XCTFail("Expected Gmail HTML to render as the primary body")
+        }
+        XCTAssertEqual(resolvedHTML, html)
+        XCTAssertEqual(fallbackText, "Hello,\n\n205759 is your one-time password.")
     }
 
-    func testEmailBodyResolverRoutesSinglePresentationTableWithTrackingPixelToText() {
+    func testEmailBodyResolverRoutesSinglePresentationTableWithTrackingPixelToHTML() {
         let html = #"""
         <!doctype html>
         <html>
@@ -128,13 +132,17 @@ final class ModelDecodingTests: XCTestCase {
 
         let bodyKind = EmailReaderBodyResolver.bodyKind(message: message, fallbackText: "")
 
+        guard case .html(let resolvedHTML, let fallbackText) = bodyKind else {
+            return XCTFail("Expected Gmail HTML to render as the primary body")
+        }
+        XCTAssertEqual(resolvedHTML, html)
         XCTAssertEqual(
-            bodyKind,
-            .text("Hey,\n\nLooks like you started a speedrun application but didn't hit submit.\n\nFinish your app here: SR007")
+            fallbackText,
+            "Hey,\n\nLooks like you started a speedrun application but didn't hit submit.\n\nFinish your app here: SR007"
         )
     }
 
-    func testEmailBodyResolverPreservesSimpleHTMLParagraphs() {
+    func testEmailBodyResolverRendersSimpleHTMLParagraphsAsHTML() {
         let html = #"""
         <html>
           <body>
@@ -152,9 +160,13 @@ final class ModelDecodingTests: XCTestCase {
 
         let bodyKind = EmailReaderBodyResolver.bodyKind(message: message, fallbackText: "")
 
+        guard case .html(let resolvedHTML, let fallbackText) = bodyKind else {
+            return XCTFail("Expected Gmail HTML to render as the primary body")
+        }
+        XCTAssertEqual(resolvedHTML, html)
         XCTAssertEqual(
-            bodyKind,
-            .text("First paragraph with normal email copy.\n\nSecond paragraph keeps its own readable break.")
+            fallbackText,
+            "First paragraph with normal email copy.\n\nSecond paragraph keeps its own readable break."
         )
     }
 
@@ -188,7 +200,7 @@ final class ModelDecodingTests: XCTestCase {
         )
     }
 
-    func testEmailBodyResolverRoutesImageOnlyHTMLToTextFallback() {
+    func testEmailBodyResolverRoutesImageOnlyHTMLToHTML() {
         let html = #"""
         <html>
           <body>
@@ -217,7 +229,11 @@ final class ModelDecodingTests: XCTestCase {
 
         let bodyKind = EmailReaderBodyResolver.bodyKind(message: message, fallbackText: "")
 
-        XCTAssertEqual(bodyKind, .text(body))
+        guard case .html(let resolvedHTML, let fallbackText) = bodyKind else {
+            return XCTFail("Expected Gmail HTML to render as the primary body")
+        }
+        XCTAssertEqual(resolvedHTML, html)
+        XCTAssertEqual(fallbackText, body)
     }
 
     func testEmailBodyResolverKeepsStructuredLongHTMLInHTMLRenderer() {
@@ -320,7 +336,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(EmailReaderBodyResolver.originalHTML(from: message), richHTML)
     }
 
-    func testEmailBodyResolverPrefersCleanReaderTextOverHTML() {
+    func testEmailBodyResolverPrefersHTMLOverCleanReaderText() {
         let html = #"<html><body><table><tr><td style="background:#fff;color:#000">Noisy HTML</td></tr></table></body></html>"#
         let reader = ThreadMessageReader(
             primaryText: "Clean body only.",
@@ -341,7 +357,7 @@ final class ModelDecodingTests: XCTestCase {
 
         XCTAssertEqual(
             EmailReaderBodyResolver.bodyKind(message: message, fallbackText: ""),
-            .text("Clean body only.")
+            .html(html, fallbackText: "Noisy HTML")
         )
         XCTAssertEqual(EmailReaderBodyResolver.originalHTML(from: message), html)
     }
