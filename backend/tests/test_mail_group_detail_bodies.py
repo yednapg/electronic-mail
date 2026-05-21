@@ -94,6 +94,9 @@ class MailGroupDetailBodyTests(unittest.TestCase):
         self.assertEqual(response.messages[0].body, "Full application email")
         self.assertEqual(response.messages[0].html_body, RICH_APPLICATION_HTML)
         self.assertEqual(response.messages[0].html_render_document, RICH_APPLICATION_HTML)
+        self.assertIsNotNone(response.messages[0].reader)
+        self.assertEqual(response.messages[0].reader.primary_text, "Full application email")
+        self.assertTrue(response.messages[0].reader.original_html_available)
 
 
 if __name__ == "__main__":

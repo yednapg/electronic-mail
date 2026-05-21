@@ -45,6 +45,19 @@ HTML_DOCUMENT_RE = re.compile(r"(?is)<\s*(?:!doctype\s+html|html)\b")
 HTML_ATTR_RE = re.compile(r"""(?is)\b([a-z0-9_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))""")
 CSS_DIMENSION_RE = re.compile(r"(?is)\b(width|height)\s*:\s*([0-9.]+)\s*px")
 TRACKING_IMAGE_RE = re.compile(r"(?is)(/wf/open|[?&]open=|/open[?/]?|/track|tracking|pixel|beacon)")
+ANCHOR_RE = re.compile(r"""(?is)<a\b[^>]*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))[^>]*>(.*?)</a>""")
+QUOTE_BLOCK_RE = re.compile(r"(?is)<blockquote\b[^>]*>")
+QUOTE_BLOCK_CLOSE_RE = re.compile(r"(?is)</blockquote\s*>")
+BLOCK_CLOSE_RE = re.compile(r"(?is)</\s*(div|p|tr|table|li|h[1-6]|section|article)\s*>")
+BR_RE = re.compile(r"(?is)<\s*br\s*/?\s*>")
+EXTERNAL_WARNING_RE = re.compile(r"(?i)\bexternal\s+email\b|be\s+very\s+careful\s+before\s+clicking")
+CLASSIFICATION_RE = re.compile(r"(?i)^classification\s*[-:]\s*(.+)$")
+QUOTE_START_RE = re.compile(r"(?i)^(?:>+\s*)?(on\s+.{1,180}\bwrote:|from:\s+.+\bsent:\s+.+\bto:\s+.+|from:\s+.+)$")
+OUTLOOK_HEADER_RE = re.compile(r"(?i)^(from|sent|to|cc|subject):\s+")
+SIGNATURE_START_RE = re.compile(r"(?i)^(best|best regards|regards|thanks|thank you|sincerely|cheers),?$")
+FOOTER_START_RE = re.compile(
+    r"(?i)^(important communication update|disclaimer:|regd\.?\s+office:|official email domains:|for your security,|.*confidential and intended|.*not responsible for.*viruses)"
+)
 InlineAttachmentResolver = Callable[[str, str], str | None]
 
 
@@ -122,6 +135,36 @@ def html_to_text(value: str) -> str:
     readable = HIDDEN_HTML_BLOCK_RE.sub(" ", HTML_COMMENT_RE.sub(" ", SCRIPT_STYLE_RE.sub(" ", value)))
     without_tags = TAG_RE.sub(" ", readable)
     return compact_text(html.unescape(without_tags))
+
+
+def build_thread_message_reader(
+    *,
+    html_render_document: str | None,
+    html_body: str | None,
+    text_body: str | None,
+    snippet: str | None,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build the clean reader payload used by native clients.
+
+    Raw HTML stays available through the existing fields; this payload is only
+    the product-reader projection of a message body.
+    """
+
+    html_source = html_render_document or html_body
+    source_text = _reader_text_from_html(html_source) if html_source else _reader_text_from_plain(text_body or snippet or "")
+    parts = _split_reader_text(source_text)
+    primary_text = parts["primary_text"] or _reader_text_from_plain(text_body or snippet or "")
+    primary_text = primary_text or compact_text(snippet)
+
+    return {
+        "primary_text": primary_text or "Loading email...",
+        "markers": parts["markers"],
+        "signature_text": parts["signature_text"] or None,
+        "quoted_text": parts["quoted_text"] or None,
+        "footer_text": parts["footer_text"] or None,
+        "original_html_available": bool((html_render_document or "").strip() or (html_body or "").strip()),
+    }
 
 
 def html_body_for_reader(value: str | None) -> str | None:
@@ -218,6 +261,152 @@ def clean_ai_text(value: str | None, *, max_chars: int = 8000) -> str:
     value = re.sub(r"(?im)^>.*$", " ", value)
     value = re.sub(r"(?is)\bon .{0,120}wrote:\s.*$", " ", value)
     return SPACE_RE.sub(" ", value).strip()[:max_chars]
+
+
+def _reader_text_from_html(value: str | None) -> str:
+    if not value:
+        return ""
+    readable = HIDDEN_HTML_BLOCK_RE.sub(" ", HTML_COMMENT_RE.sub(" ", SCRIPT_STYLE_RE.sub(" ", value)))
+    readable = QUOTE_BLOCK_RE.sub("\n\n__QUOTE_START__\n", readable)
+    readable = QUOTE_BLOCK_CLOSE_RE.sub("\n__QUOTE_END__\n\n", readable)
+    readable = ANCHOR_RE.sub(_reader_anchor_text, readable)
+    readable = BR_RE.sub("\n", readable)
+    readable = BLOCK_CLOSE_RE.sub("\n\n", readable)
+    readable = TAG_RE.sub(" ", readable)
+    return _normalize_reader_text(html.unescape(readable))
+
+
+def _reader_anchor_text(match: re.Match[str]) -> str:
+    href = next((group for group in match.groups()[:3] if group), "")
+    label = compact_text(TAG_RE.sub(" ", match.group(4)))
+    if not label:
+        return href
+    normalized_href = href.removeprefix("mailto:")
+    if normalized_href.lower() == label.lower() or href.lower().startswith("mailto:"):
+        return label
+    if href.lower().startswith(("http://", "https://")):
+        return f"{label} ({href})"
+    return label
+
+
+def _reader_text_from_plain(value: str | None) -> str:
+    return _normalize_reader_text(value or "")
+
+
+def _normalize_reader_text(value: str) -> str:
+    value = ZERO_WIDTH_RE.sub("", html.unescape(value))
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [" ".join(line.split()) for line in value.split("\n")]
+    output: list[str] = []
+    pending_blank = False
+    for line in lines:
+        if not line:
+            pending_blank = bool(output)
+            continue
+        if pending_blank and output[-1] != "":
+            output.append("")
+        output.append(line)
+        pending_blank = False
+    return "\n".join(output).strip()
+
+
+def _split_reader_text(value: str) -> dict[str, Any]:
+    lines = [line.strip() for line in _normalize_reader_text(value).split("\n")]
+    primary: list[str] = []
+    signature: list[str] = []
+    quoted: list[str] = []
+    footer: list[str] = []
+    markers: list[dict[str, str]] = []
+    mode = "primary"
+    outlook_header_run = 0
+
+    for line in lines:
+        if not line:
+            _append_blank_for_mode(mode, primary, signature, quoted, footer)
+            continue
+        if line == "__QUOTE_START__":
+            mode = "quoted"
+            continue
+        if line == "__QUOTE_END__":
+            mode = "primary"
+            continue
+
+        marker = _reader_marker(line)
+        if marker:
+            _append_marker(markers, marker)
+            continue
+
+        if FOOTER_START_RE.search(line):
+            mode = "footer"
+
+        if mode != "footer" and (_is_quote_start(line) or _starts_outlook_header_quote(line, outlook_header_run)):
+            mode = "quoted"
+
+        if mode == "primary" and primary and SIGNATURE_START_RE.match(line):
+            mode = "signature"
+
+        if mode == "primary":
+            primary.append(line)
+        elif mode == "signature":
+            signature.append(line)
+        elif mode == "quoted":
+            quoted.append(line)
+        elif mode == "footer":
+            footer.append(line)
+
+        outlook_header_run = outlook_header_run + 1 if OUTLOOK_HEADER_RE.match(line) else 0
+
+    return {
+        "primary_text": _join_reader_lines(primary),
+        "markers": markers,
+        "signature_text": _join_reader_lines(signature),
+        "quoted_text": _join_reader_lines(quoted),
+        "footer_text": _join_reader_lines(footer),
+    }
+
+
+def _append_blank_for_mode(mode: str, primary: list[str], signature: list[str], quoted: list[str], footer: list[str]) -> None:
+    target = {"primary": primary, "signature": signature, "quoted": quoted, "footer": footer}.get(mode, primary)
+    if target and target[-1] != "":
+        target.append("")
+
+
+def _reader_marker(line: str) -> dict[str, str] | None:
+    classification = CLASSIFICATION_RE.match(line)
+    if classification:
+        label = classification.group(1).strip() or "Classification"
+        return {"kind": "classification", "label": label, "text": line}
+    if EXTERNAL_WARNING_RE.search(line):
+        return {"kind": "external_warning", "label": "External", "text": line}
+    return None
+
+
+def _append_marker(markers: list[dict[str, str]], marker: dict[str, str]) -> None:
+    key = (marker["kind"], marker["label"].lower(), marker["text"].lower())
+    existing = {(item["kind"], item["label"].lower(), item["text"].lower()) for item in markers}
+    if key not in existing:
+        markers.append(marker)
+
+
+def _is_quote_start(line: str) -> bool:
+    return bool(QUOTE_START_RE.match(line) or (line.startswith(">") and len(line) > 1))
+
+
+def _starts_outlook_header_quote(line: str, previous_header_count: int) -> bool:
+    return previous_header_count >= 1 and bool(OUTLOOK_HEADER_RE.match(line))
+
+
+def _join_reader_lines(lines: list[str]) -> str:
+    output: list[str] = []
+    for line in lines:
+        if not line:
+            if output and output[-1] != "":
+                output.append("")
+            continue
+        output.append(line)
+    while output and output[-1] == "":
+        output.pop()
+    return "\n".join(output).strip()
 
 
 def _is_rich_email_html(value: str) -> bool:

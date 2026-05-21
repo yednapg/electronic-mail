@@ -7,7 +7,7 @@ public final class ThreadCache {
 
     public init(defaults: UserDefaults = .standard, namespace: String = "live") {
         self.defaults = defaults
-        self.storagePrefix = "electronic-mail-thread:\(namespace):v3:"
+        self.storagePrefix = "electronic-mail-thread:\(namespace):v4:"
     }
 
     func read(userID: String, threadID: String) -> ThreadReaderResponse? {

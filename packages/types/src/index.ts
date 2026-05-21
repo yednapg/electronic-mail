@@ -405,6 +405,23 @@ export interface MailboxSyncTriggerResponse {
   readonly queued_at?: string | null;
 }
 
+export type ThreadMessageReaderMarkerKind = 'external_warning' | 'classification';
+
+export interface ThreadMessageReaderMarker {
+  readonly kind: ThreadMessageReaderMarkerKind;
+  readonly label: string;
+  readonly text: string;
+}
+
+export interface ThreadMessageReader {
+  readonly primary_text: string;
+  readonly markers: ThreadMessageReaderMarker[];
+  readonly signature_text?: string | null;
+  readonly quoted_text?: string | null;
+  readonly footer_text?: string | null;
+  readonly original_html_available: boolean;
+}
+
 export interface ThreadMessage {
   readonly id: string;
   readonly source: SourceType;
@@ -417,6 +434,7 @@ export interface ThreadMessage {
   readonly body: string;
   readonly html_body?: string | null;
   readonly html_render_document?: string | null;
+  readonly reader?: ThreadMessageReader | null;
   readonly snippet?: string | null;
   readonly label_ids: string[];
   readonly received_at: string;
