@@ -19,6 +19,14 @@
       "bcc": null,
       "subject": "HDFC credit card statement due today",
       "body": "Your card statement is due today. Autopay is not enabled. Pay before 5 PM to avoid late fees.",
+      "reader": {
+        "primary_text": "Your card statement is due today. Autopay is not enabled. Pay before 5 PM to avoid late fees.",
+        "markers": [],
+        "signature_text": null,
+        "quoted_text": null,
+        "footer_text": null,
+        "original_html_available": false
+      },
       "snippet": "Autopay is not enabled for this card. Please pay before 5 PM.",
       "label_ids": [
         "INBOX",

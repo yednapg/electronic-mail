@@ -18,6 +18,7 @@ EntityCurrentState = Literal["open", "waiting", "done"]
 GmailThreadAction = Literal["archive", "unarchive", "mark_read"]
 MailboxLabel = Literal["inbox", "sent", "drafts", "trash", "archive", "all"]
 JobStatus = Literal["queued", "running", "succeeded", "failed"]
+ThreadMessageReaderMarkerKind = Literal["external_warning", "classification"]
 
 class SourceRecord(BaseModel):
     """Normalized source record entering the backend pipeline."""
@@ -378,6 +379,25 @@ class MailboxSyncTriggerResponse(BaseModel):
     queued_at: str | None = None
 
 
+class ThreadMessageReaderMarker(BaseModel):
+    """Compact reader metadata extracted from noisy email body chrome."""
+
+    kind: ThreadMessageReaderMarkerKind
+    label: str
+    text: str
+
+
+class ThreadMessageReader(BaseModel):
+    """Clean reader projection for native thread detail views."""
+
+    primary_text: str
+    markers: list[ThreadMessageReaderMarker] = Field(default_factory=list)
+    signature_text: str | None = None
+    quoted_text: str | None = None
+    footer_text: str | None = None
+    original_html_available: bool = False
+
+
 class ThreadMessage(BaseModel):
     """One message inside a mail group detail timeline."""
 
@@ -392,6 +412,7 @@ class ThreadMessage(BaseModel):
     body: str
     html_body: str | None = None
     html_render_document: str | None = None
+    reader: ThreadMessageReader | None = None
     snippet: str | None = None
     label_ids: list[str] = Field(default_factory=list)
     received_at: str
