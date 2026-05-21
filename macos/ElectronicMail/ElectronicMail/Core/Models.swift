@@ -708,6 +708,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
     let body: String
     let htmlBody: String?
     let htmlRenderDocument: String?
+    let reader: ThreadMessageReader?
     let snippet: String?
     let labelIDs: [String]
     let receivedAt: String
@@ -724,9 +725,72 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         case body
         case htmlBody = "html_body"
         case htmlRenderDocument = "html_render_document"
+        case reader
         case snippet
         case labelIDs = "label_ids"
         case receivedAt = "received_at"
+    }
+
+    init(
+        id: String,
+        source: SourceType,
+        threadID: String?,
+        fromAddress: String?,
+        to: String?,
+        cc: String?,
+        bcc: String?,
+        subject: String?,
+        body: String,
+        htmlBody: String?,
+        htmlRenderDocument: String?,
+        reader: ThreadMessageReader? = nil,
+        snippet: String?,
+        labelIDs: [String],
+        receivedAt: String
+    ) {
+        self.id = id
+        self.source = source
+        self.threadID = threadID
+        self.fromAddress = fromAddress
+        self.to = to
+        self.cc = cc
+        self.bcc = bcc
+        self.subject = subject
+        self.body = body
+        self.htmlBody = htmlBody
+        self.htmlRenderDocument = htmlRenderDocument
+        self.reader = reader
+        self.snippet = snippet
+        self.labelIDs = labelIDs
+        self.receivedAt = receivedAt
+    }
+}
+
+public struct ThreadMessageReader: Codable, Equatable {
+    let primaryText: String
+    let markers: [ThreadMessageReaderMarker]
+    let signatureText: String?
+    let quotedText: String?
+    let footerText: String?
+    let originalHTMLAvailable: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case primaryText = "primary_text"
+        case markers
+        case signatureText = "signature_text"
+        case quotedText = "quoted_text"
+        case footerText = "footer_text"
+        case originalHTMLAvailable = "original_html_available"
+    }
+}
+
+public struct ThreadMessageReaderMarker: Codable, Equatable, Hashable, Identifiable {
+    let kind: String
+    let label: String
+    let text: String
+
+    public var id: String {
+        "\(kind)::\(label)::\(text)"
     }
 }
 

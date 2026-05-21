@@ -67,6 +67,7 @@ from app.schemas.domain import (
     ThreadReaderResponse,
 )
 from app.services.email_extraction import (
+    build_thread_message_reader,
     clean_ai_text,
     compact_text,
     has_persisted_renderable_body,
@@ -1634,6 +1635,8 @@ def _participants(messages: list[GmailMessageRecord]) -> list[str]:
 
 
 def _thread_message_from_gmail(message: GmailMessageRecord) -> ThreadMessage:
+    html_body = html_body_for_reader(message.html_body_sanitized)
+    html_render_document = html_render_document_for_reader(message.html_render_document)
     return ThreadMessage(
         id=message.message_id,
         source="gmail",
@@ -1644,8 +1647,15 @@ def _thread_message_from_gmail(message: GmailMessageRecord) -> ThreadMessage:
         bcc=message.recipients.get("bcc") if isinstance(message.recipients.get("bcc"), str) else None,
         subject=message.subject,
         body=message.text_body or message.snippet or "",
-        html_body=html_body_for_reader(message.html_body_sanitized),
-        html_render_document=html_render_document_for_reader(message.html_render_document),
+        html_body=html_body,
+        html_render_document=html_render_document,
+        reader=build_thread_message_reader(
+            html_render_document=html_render_document,
+            html_body=html_body,
+            text_body=message.text_body,
+            snippet=message.snippet,
+            headers=message.headers,
+        ),
         snippet=message.snippet,
         label_ids=message.label_ids,
         received_at=message.internal_date or message.updated_at,

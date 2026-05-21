@@ -4,6 +4,7 @@ from base64 import urlsafe_b64encode
 import unittest
 
 from app.services.email_extraction import (
+    build_thread_message_reader,
     has_persisted_renderable_body,
     html_body_for_reader,
     html_render_document_for_reader,
@@ -232,6 +233,60 @@ class EmailExtractionTests(unittest.TestCase):
                 },
             )
         )
+
+    def test_thread_message_reader_splits_outlook_thread_chrome(self) -> None:
+        outlook_html = """
+        <html><body>
+          <div>Classification - Internal</div>
+          <div>Hi</div>
+          <div>Kindly confirm once the account is funded to set limit of $10,000</div>
+          <div>Please mark your relationship manager in all mails.</div>
+          <div>Best Regards,</div>
+          <div>Test User</div>
+          <div>Northstar Bank</div>
+          <div>Contacts:</div>
+          <div>Providing Rate for CCIL deal - Test Person on 123 4567890</div>
+          <div>From: TestUser &lt;demo@example.test&gt; Sent: Tuesday, May 12, 2026 10:18 AM To: NorthstarFXclearretail &lt;northstarfx@northstar.example&gt; Subject: Re: Regarding trading limit request</div>
+          <div><b>(Warning) -This is an External Email: Be very careful before clicking on any Links/ Sharing data / Downloading attachments.</b></div>
+          <blockquote>
+            <div>Hi,</div>
+            <div>Please enable/increase the limit for FX Retail transactions on my account.</div>
+          </blockquote>
+          <div>IMPORTANT COMMUNICATION UPDATE</div>
+          <div>Official email domains: @northstar.example | @northstarbank.example</div>
+          <div>Disclaimer: This message is confidential and intended only for the recipient.</div>
+        </body></html>
+        """
+
+        reader = build_thread_message_reader(
+            html_render_document=outlook_html,
+            html_body=outlook_html,
+            text_body=None,
+            snippet=None,
+            headers={},
+        )
+
+        self.assertEqual(
+            reader["primary_text"],
+            "Hi\n\nKindly confirm once the account is funded to set limit of $10,000\n\nPlease mark your relationship manager in all mails.",
+        )
+        self.assertEqual(
+            reader["markers"],
+            [
+                {"kind": "classification", "label": "Internal", "text": "Classification - Internal"},
+                {
+                    "kind": "external_warning",
+                    "label": "External",
+                    "text": "(Warning) -This is an External Email: Be very careful before clicking on any Links/ Sharing data / Downloading attachments.",
+                },
+            ],
+        )
+        self.assertIn("Best Regards", reader["signature_text"] or "")
+        self.assertIn("From: TestUser", reader["quoted_text"] or "")
+        self.assertIn("Please enable/increase the limit", reader["quoted_text"] or "")
+        self.assertIn("IMPORTANT COMMUNICATION UPDATE", reader["footer_text"] or "")
+        self.assertIn("Disclaimer:", reader["footer_text"] or "")
+        self.assertTrue(reader["original_html_available"])
 
 
 if __name__ == "__main__":
