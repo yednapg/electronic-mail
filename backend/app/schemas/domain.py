@@ -15,8 +15,10 @@ TimingBand = Literal["now", "today", "later", "hidden"]
 ActionConfidence = Literal["high", "medium", "low"]
 LifecycleState = Literal["active", "scheduled", "resolved", "suppressed"]
 EntityCurrentState = Literal["open", "waiting", "done"]
-GmailThreadAction = Literal["archive", "unarchive", "mark_read"]
-MailboxLabel = Literal["inbox", "sent", "drafts", "trash", "archive", "all"]
+GmailThreadAction = Literal["archive", "unarchive", "mark_read", "move_trash", "delete_forever"]
+QueuedThreadActionState = Literal["queued", "applying", "applied", "failed"]
+MailSendState = Literal["queued", "sending", "sent", "failed", "reauth_required"]
+MailboxLabel = Literal["inbox", "sent", "drafts", "spam", "trash", "archive", "all"]
 JobStatus = Literal["queued", "running", "succeeded", "failed"]
 ThreadMessageReaderMarkerKind = Literal["external_warning", "classification"]
 
@@ -106,6 +108,8 @@ class GoogleAuthState(BaseModel):
     available: bool
     connected: bool
     connect_url: str | None = None
+    can_send_mail: bool = False
+    missing_scopes: list[str] = Field(default_factory=list)
 
 
 class AuthUserResponse(BaseModel):
@@ -238,6 +242,69 @@ class GmailThreadMutationResponse(BaseModel):
     action: GmailThreadAction
 
 
+class QueuedThreadActionRequest(BaseModel):
+    """Client-generated mailbox action that can be queued and replayed."""
+
+    client_action_id: str
+    mailbox_thread_id: str
+    target_message_id: str | None = None
+    action: GmailThreadAction
+    created_at: str
+
+
+class QueuedThreadActionResponse(BaseModel):
+    """Queued/applied state for an offline-capable mailbox action."""
+
+    client_action_id: str
+    server_action_id: str
+    mailbox_thread_id: str
+    target_message_id: str | None = None
+    action: GmailThreadAction
+    state: QueuedThreadActionState
+    queued_at: str
+    applied_at: str | None = None
+    error: str | None = None
+
+
+class MailComposeRequest(BaseModel):
+    """Native compose payload sent through Gmail."""
+
+    client_send_id: str
+    to: list[str] = Field(default_factory=list)
+    cc: list[str] = Field(default_factory=list)
+    bcc: list[str] = Field(default_factory=list)
+    subject: str
+    body_text: str
+    body_html: str | None = None
+    created_at: str
+
+
+class MailReplyRequest(BaseModel):
+    """Native reply payload for an existing mailbox conversation."""
+
+    client_send_id: str
+    cc: list[str] = Field(default_factory=list)
+    bcc: list[str] = Field(default_factory=list)
+    body_text: str
+    body_html: str | None = None
+    created_at: str
+
+
+class MailSendResponse(BaseModel):
+    """Durable send status returned to native compose/reply UI."""
+
+    client_send_id: str
+    server_send_id: str | None = None
+    mailbox_thread_id: str | None = None
+    gmail_thread_id: str | None = None
+    gmail_message_id: str | None = None
+    state: MailSendState
+    queued_at: str | None = None
+    sent_at: str | None = None
+    error: str | None = None
+    reauth_url: str | None = None
+
+
 class TaskCreateRequest(BaseModel):
     """Create a backend-owned manual task."""
 
@@ -312,6 +379,9 @@ class GmailThreadRow(BaseModel):
     participants: list[str] = Field(default_factory=list)
     message_count: int
     summary: str | None = None
+    ai_group_id: str | None = None
+    ai_title: str | None = None
+    ai_summary: str | None = None
     snippet: str | None = None
     label_ids: list[str] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
@@ -325,7 +395,25 @@ class GmailThreadRow(BaseModel):
     lifecycle_state: LifecycleState | None = None
     outcome_type: Literal["complete", "snooze", "dismiss"] | None = None
     lifecycle_updates: list[GmailThreadUpdate] = Field(default_factory=list)
+    children: list["GmailThreadChildRow"] = Field(default_factory=list)
     enrichment_status: Literal["pending", "ready", "failed"] = "ready"
+    presentation_status: Literal["ai_ready", "ai_pending", "fallback"] = "ai_ready"
+    pending_action: GmailThreadAction | None = None
+
+
+class GmailThreadChildRow(BaseModel):
+    """Lightweight source message row shown under an expanded mailbox thread."""
+
+    message_id: str
+    gmail_thread_id: str | None = None
+    sender: str | None = None
+    subject: str | None = None
+    ai_title: str | None = None
+    snippet: str | None = None
+    received_at: str
+    label_ids: list[str] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list)
+    unread: bool = False
 
 
 class GmailThreadSection(BaseModel):
@@ -349,6 +437,8 @@ class MailboxResponse(BaseModel):
     label: MailboxLabel
     total_threads: int
     next_cursor: str | None = None
+    loaded_threads: int = 0
+    window_days: int | None = None
     sections: list[GmailThreadSection] = Field(default_factory=list)
     ready_count: int = 0
     pending_count: int = 0
@@ -367,7 +457,19 @@ class MailboxSyncStateResponse(BaseModel):
     last_sync_started_at: str | None = None
     last_sync_completed_at: str | None = None
     last_sync_error: str | None = None
+    watch_status: str | None = None
+    last_delta_sync_at: str | None = None
+    last_poll_at: str | None = None
+    poller_online: bool | None = None
+    mailbox_revision: str | None = None
     total_threads: int = 0
+    full_import_running: bool = False
+    full_import_completed: bool = False
+    full_import_completed_at: str | None = None
+    pending_action_count: int = 0
+    last_action_sync_at: str | None = None
+    last_action_error: str | None = None
+    last_ai_error: str | None = None
 
 
 class MailboxSyncTriggerResponse(BaseModel):
@@ -460,6 +562,8 @@ class OpsHealthResponse(BaseModel):
     stale_running_jobs: int = 0
     oldest_queued_age_seconds: int | None = None
     workers: list[dict[str, Any]] = Field(default_factory=list)
+    worker_online: bool = False
+    required_queues_ready: bool = False
 
 
 class AppSessionUser(BaseModel):
@@ -481,6 +585,11 @@ class AppSessionSyncState(BaseModel):
     oldest_imported_at: str | None = None
     full_import_running: bool = False
     full_import_completed: bool = False
+    full_import_completed_at: str | None = None
+    pending_action_count: int = 0
+    last_action_sync_at: str | None = None
+    last_action_error: str | None = None
+    last_ai_error: str | None = None
 
 
 class AppSessionResponse(BaseModel):

@@ -7,30 +7,38 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr
 import hashlib
 import json
+import logging
 import re
 from typing import Any
 
 from app.core.config import Settings
-from app.db.jobs import count_active_jobs, enqueue_job
+from app.db.jobs import count_active_jobs, enqueue_job, get_queue_health
 from app.db.mail_groups import (
     EntityOutcomeRecord,
     GmailMessageRecord,
     MailGroupRecord,
     ManualTaskRecord,
     append_group_members,
+    count_mailbox_threads,
     count_mail_groups,
     count_mail_groups_by_enrichment_status,
     count_dashboard_mail_groups,
+    count_pending_thread_actions,
     count_ready_mail_groups_since,
     get_app_session_snapshot,
     get_import_state,
     get_latest_entity_outcomes,
+    latest_mail_group_ai_error,
+    latest_gmail_mailbox_revision,
     get_mail_group_by_key,
     get_mail_group_detail,
     list_dashboard_mail_groups,
     list_group_messages,
+    list_mailbox_thread_page,
+    list_mail_groups_for_gmail_threads,
     list_mail_groups,
     list_messages_by_ids,
+    list_messages_for_gmail_thread,
     list_messages_for_groups,
     list_open_manual_tasks,
     list_pending_mail_groups,
@@ -40,6 +48,7 @@ from app.db.mail_groups import (
     mark_import_error,
     oldest_imported_message_at,
     replace_group_members,
+    update_gmail_message_ai_titles,
     upsert_app_session_snapshot,
     upsert_gmail_messages,
     upsert_mail_group,
@@ -56,6 +65,7 @@ from app.schemas.domain import (
     DashboardProfile,
     DashboardResponse,
     FeedResponse,
+    GmailThreadChildRow,
     GmailThreadRow,
     GmailThreadSection,
     GoogleAuthState,
@@ -76,20 +86,25 @@ from app.services.email_extraction import (
     parse_gmail_message,
     sender_domain,
 )
+from app.services.integrations.google import GMAIL_SEND_SCOPE, missing_google_scopes
 
 FIRST_BATCH_SIZE = 50
 BACKFILL_BATCH_SIZE = 30
 MAILBOX_REBUILD_LIMIT = 5000
-MAIL_GROUP_ENRICH_BATCH_SIZE = 10
-FIRST_RUN_AI_MAX_GROUPS = 12
-FIRST_RUN_AI_CANDIDATE_LIMIT = 25
+MAIL_GROUP_ENRICH_BATCH_SIZE = 25
+FIRST_RUN_AI_MAX_GROUPS = 40
+FIRST_RUN_AI_CANDIDATE_LIMIT = 90
 DASHBOARD_DAYS = 14
-RECENT_VISIBLE_DAYS = 30
+RECENT_VISIBLE_DAYS = 90
+BODY_WARMUP_GROUP_LIMIT = 24
+MAILBOX_WINDOW_DAYS = 90
+APP_SESSION_PROJECTION_VERSION = "20260529_full_gmail_backfill_v1"
 ACTION_WORD_RE = re.compile(r"(?i)\b(reply|respond|confirm|approve|review|pay|payment failed|due|overdue|urgent|action required|scheduled|interview|check.?in|delivered|out for delivery|ticket|case|invoice|receipt)\b")
 LIFECYCLE_WORD_RE = re.compile(r"(?i)\b(order|shipped|delivered|tracking|invoice|payment|booking|flight|application|ticket|case|request|approved|received|account|created|profile|welcome)\b")
 ALLOWED_ACTION_TYPES = {"pay", "reply", "confirm", "track", "review", "open", "none"}
 ALLOWED_TIMING_BANDS = {"now", "today", "later", "hidden"}
 GENERIC_SENDER_SLUGS = {"alert", "alerts", "info", "mail", "no-reply", "noreply", "notification", "notifications", "support", "team"}
+logger = logging.getLogger(__name__)
 TOPIC_STOP_WORDS = {
     "account",
     "application",
@@ -109,6 +124,18 @@ TOPIC_STOP_WORDS = {
     "welcome",
     "your",
 }
+
+
+def _google_auth_state(settings: Settings, *, user_id: str) -> GoogleAuthState:
+    connected = user_can_write_gmail(str(settings.database_path), user_id=user_id)
+    missing_scopes = missing_google_scopes(settings, user_id=user_id, required_scopes=[GMAIL_SEND_SCOPE]) if connected else []
+    return GoogleAuthState(
+        available=settings.google_configured,
+        connected=connected,
+        connect_url=None if connected else f"{settings.backend_origin}/auth/google",
+        can_send_mail=connected and not missing_scopes,
+        missing_scopes=missing_scopes,
+    )
 
 
 def enqueue_first_run(settings: Settings, *, user_id: str) -> str:
@@ -157,8 +184,30 @@ def ensure_background_import_work(settings: Settings, *, user_id: str) -> None:
     if not user_can_write_gmail(database_url, user_id=user_id):
         return
     state = get_import_state(database_url, user_id=user_id)
+    if state is None or not state.first_batch_imported_at:
+        enqueue_job(
+            database_url,
+            kind="gmail_import_batch",
+            queue="critical",
+            user_id=user_id,
+            dedupe_key=f"first-run:{user_id}",
+            priority=100,
+            payload={"user_id": user_id, "batch_size": FIRST_BATCH_SIZE, "first_run": True},
+        )
+    elif not state.first_groups_ready_at:
+        enqueue_job(
+            database_url,
+            kind="first_run_ai_grouping",
+            queue="critical",
+            user_id=user_id,
+            dedupe_key=f"first-run-ai-grouping:{user_id}",
+            priority=95,
+            payload={"user_id": user_id, "batch_size": FIRST_BATCH_SIZE},
+        )
     active_backfills = count_active_jobs(database_url, user_id=user_id, kinds=["gmail_backfill"])
-    if state is not None and state.full_backfill_cursor and not active_backfills:
+    full_backfill_completed_at = getattr(state, "full_backfill_completed_at", None) if state is not None else None
+    full_backfill_needed = bool(state and state.first_batch_imported_at and not full_backfill_completed_at)
+    if full_backfill_needed and not active_backfills:
         enqueue_job(
             database_url,
             kind="gmail_backfill",
@@ -179,18 +228,37 @@ def ensure_background_import_work(settings: Settings, *, user_id: str) -> None:
             priority=40,
             payload={"user_id": user_id},
         )
+        enqueue_projection_refresh(settings, user_id=user_id, priority=20)
 
 
 def build_app_session_response(settings: Settings, *, user) -> AppSessionResponse:
     """Read the prepared app-session snapshot shared by dashboard and Gmail."""
     database_url = str(settings.database_path)
-    auth = GoogleAuthState(available=settings.google_configured, connected=user_can_write_gmail(database_url, user_id=user.id))
+    auth = _google_auth_state(settings, user_id=user.id)
+    if auth.connected:
+        ensure_background_import_work(settings, user_id=user.id)
     snapshot = get_app_session_snapshot(database_url, user_id=user.id) if auth.connected else None
     if snapshot is None:
         return _empty_app_session_response(settings, user=user, auth=auth)
+    if str(snapshot.sync.get("projection_version") or "") != APP_SESSION_PROJECTION_VERSION:
+        refreshed = refresh_app_session_snapshot(settings, user_id=user.id)
+        if refreshed is not None:
+            return refreshed
     dashboard = DashboardResponse.model_validate(snapshot.dashboard)
     mailbox = MailboxResponse.model_validate(snapshot.mailbox)
     sync = AppSessionSyncState.model_validate(snapshot.sync)
+    status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user.id)
+    last_ai_error = latest_mail_group_ai_error(database_url, user_id=user.id)
+    live_runtime = _mail_runtime_status(database_url, status_counts=status_counts, last_ai_error=last_ai_error)
+    dashboard.runtime_status = {**dashboard.runtime_status, **live_runtime}
+    sync = sync.model_copy(
+        update={
+            "enrichment_pending_count": status_counts.get("pending", 0),
+            "ready_group_count": status_counts.get("ready", 0),
+            "last_ai_error": last_ai_error,
+            "last_error": sync.last_error or (last_ai_error if status_counts.get("ready", 0) == 0 else None),
+        }
+    )
     readiness = _readiness_from_snapshot(settings, user=user, dashboard=dashboard, mailbox=mailbox, sync=sync)
     return AppSessionResponse(
         user=AppSessionUser(
@@ -246,7 +314,7 @@ def _readiness_from_snapshot(
     has_prior_product = bool((state and state.first_groups_ready_at) or sync.ready_group_count)
     mode = "returning" if has_prior_product else "first_time"
     mailbox_ready = mailbox.total_threads > 0 or sync.ready_group_count > 0
-    dashboard_ready = bool((state and state.first_dashboard_ready_at) or sync.ready_group_count > 0)
+    dashboard_ready = bool(ready_dashboard_count > 0 and ((state and state.first_dashboard_ready_at) or sync.ready_group_count > 0))
     if mode == "returning":
         ready_to_enter = mailbox_ready and dashboard_ready
     else:
@@ -290,26 +358,32 @@ def refresh_app_session_snapshot(settings: Settings, *, user_id: str) -> AppSess
         return None
     user = CurrentUser(id=stored.id, email=stored.email, display_name=stored.display_name)
     database_url = str(settings.database_path)
-    auth = GoogleAuthState(available=settings.google_configured, connected=user_can_write_gmail(database_url, user_id=user.id))
+    auth = _google_auth_state(settings, user_id=user.id)
     dashboard = build_dashboard_response(settings, user_id=user.id, auth=auth, profile=user.profile)
-    mailbox = build_mailbox_response(settings, user_id=user.id, label="inbox", limit=1000)
+    mailbox = build_mailbox_response(settings, user_id=user.id, label="inbox", limit=100)
+    _enqueue_body_fetch_for_mailbox_rows(settings, user_id=user.id, mailbox=mailbox, limit=BODY_WARMUP_GROUP_LIMIT, priority=70)
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user.id)
+    last_ai_error = latest_mail_group_ai_error(database_url, user_id=user.id)
     state = get_import_state(database_url, user_id=user.id)
+    full_backfill_completed_at = getattr(state, "full_backfill_completed_at", None) if state is not None else None
     sync = AppSessionSyncState(
         last_sync_at=state.last_import_completed_at if state else None,
-        last_error=state.last_sync_error if state else None,
+        last_error=(state.last_sync_error if state else None) or (last_ai_error if status_counts.get("ready", 0) == 0 else None),
         enrichment_pending_count=status_counts.get("pending", 0),
         ready_group_count=status_counts.get("ready", 0),
         oldest_imported_at=oldest_imported_message_at(database_url, user_id=user.id),
         full_import_running=mailbox.full_import_running,
-        full_import_completed=mailbox.full_import_completed,
+        full_import_completed=bool(full_backfill_completed_at),
+        full_import_completed_at=full_backfill_completed_at,
+        pending_action_count=count_pending_thread_actions(database_url, user_id=user.id),
+        last_ai_error=last_ai_error,
     )
     upsert_app_session_snapshot(
         database_url,
         user_id=user.id,
         dashboard=dashboard.model_dump(mode="json"),
         mailbox=mailbox.model_dump(mode="json"),
-        sync=sync.model_dump(mode="json"),
+        sync={**sync.model_dump(mode="json"), "projection_version": APP_SESSION_PROJECTION_VERSION},
     )
     return build_app_session_response(settings, user=user)
 
@@ -327,6 +401,24 @@ def enqueue_projection_refresh(settings: Settings, *, user_id: str, priority: in
     return job.id
 
 
+def _mail_runtime_status(database_url: str, *, status_counts: dict[str, int], last_ai_error: str | None) -> dict[str, Any]:
+    queue_health = get_queue_health(database_url)
+    ready_count = status_counts.get("ready", 0)
+    pending_count = status_counts.get("pending", 0)
+    failed_count = status_counts.get("failed", 0)
+    return {
+        "canonical_ready": bool(ready_count),
+        "ai_groups_ready": bool(ready_count),
+        "pending_group_count": pending_count,
+        "ready_group_count": ready_count,
+        "failed_group_count": failed_count,
+        "worker_online": queue_health.worker_online,
+        "required_queues_ready": queue_health.required_queues_ready,
+        "queue_depth": queue_health.queue_depth,
+        "last_ai_error": last_ai_error,
+    }
+
+
 def build_post_login_readiness_response(
     settings: Settings,
     *,
@@ -336,7 +428,7 @@ def build_post_login_readiness_response(
 ) -> PostLoginReadinessResponse:
     database_url = str(settings.database_path)
     state = get_import_state(database_url, user_id=user.id)
-    recent_since = (datetime.now(timezone.utc) - timedelta(days=RECENT_VISIBLE_DAYS)).isoformat()
+    recent_since = (datetime.now(timezone.utc) - timedelta(days=_recent_visible_days(settings))).isoformat()
     dashboard_since = (datetime.now(timezone.utc) - timedelta(days=DASHBOARD_DAYS)).isoformat()
     ready_mail_group_count = count_mail_groups(database_url, user_id=user.id)
     recent_ready_count = count_ready_mail_groups_since(database_url, user_id=user.id, since_iso=recent_since)
@@ -351,12 +443,13 @@ def build_post_login_readiness_response(
         user_id=user.id,
         kinds=["gmail_import_batch", "first_run_ai_grouping", "mail_group_enrich"],
     )
-    full_import_running = bool(active_backfill_jobs) or bool(state and state.full_backfill_cursor)
-    full_import_completed = bool(state and state.first_batch_imported_at and not full_import_running)
+    full_backfill_completed_at = getattr(state, "full_backfill_completed_at", None) if state is not None else None
+    full_import_running = bool(state and state.first_batch_imported_at and not full_backfill_completed_at and (active_backfill_jobs or state.full_backfill_cursor))
+    full_import_completed = bool(full_backfill_completed_at)
     has_prior_product = bool((state and state.first_groups_ready_at) or ready_mail_group_count)
     mode = "returning" if has_prior_product else "first_time"
     mailbox_ready = (mailbox.total_threads > 0 if mailbox is not None else recent_ready_count > 0) or ready_mail_group_count > 0
-    dashboard_ready = bool((state and state.first_dashboard_ready_at) or ready_mail_group_count > 0)
+    dashboard_ready = bool(ready_dashboard_count > 0 and ((state and state.first_dashboard_ready_at) or ready_mail_group_count > 0))
     if mode == "returning":
         ready_to_enter = mailbox_ready and dashboard_ready
     else:
@@ -487,6 +580,8 @@ def rebuild_mail_groups(
             group_id=group.id,
             members=[(message, _member_reason(message), 0.9) for message in grouped_messages],
         )
+        if ai_ready:
+            _persist_message_ai_titles(database_url, user_id=user_id, enrichment=enrichment, messages=grouped_messages, generated_at=generated_at)
         touched += 1
     return touched
 
@@ -580,15 +675,23 @@ def rebuild_touched_mail_groups(
             group_id=group.id,
             members=[(message, _member_reason(message), 0.9) for message in candidate_messages],
         )
+        if ai_ready:
+            _persist_message_ai_titles(database_url, user_id=user_id, enrichment=enrichment, messages=candidate_messages, generated_at=generated_at)
         touched += 1
     return touched
 
 
-def enrich_pending_mail_groups(settings: Settings, *, user_id: str, limit: int = MAIL_GROUP_ENRICH_BATCH_SIZE) -> int:
+def enrich_pending_mail_groups(
+    settings: Settings,
+    *,
+    user_id: str,
+    limit: int = MAIL_GROUP_ENRICH_BATCH_SIZE,
+    preferred_group_ids: list[str] | None = None,
+) -> int:
     database_url = str(settings.database_path)
     if not user_can_write_gmail(database_url, user_id=user_id):
         return 0
-    groups = list_pending_mail_groups(database_url, user_id=user_id, limit=limit)
+    groups = list_pending_mail_groups(database_url, user_id=user_id, limit=limit, preferred_group_ids=preferred_group_ids)
     touched = 0
     for group in groups:
         messages = list_group_messages(database_url, user_id=user_id, group_id=group.id)
@@ -604,6 +707,7 @@ def enrich_pending_mail_groups(settings: Settings, *, user_id: str, limit: int =
             use_ai=True,
         )
         ai_ready = bool(enrichment.get("_ai_ready"))
+        ai_error = str(enrichment.get("_ai_error"))[:1000] if enrichment.get("_ai_error") else None
         upsert_mail_group(
             database_url,
             user_id=user_id,
@@ -621,10 +725,10 @@ def enrich_pending_mail_groups(settings: Settings, *, user_id: str, limit: int =
             latest_message_id=latest.message_id,
             generated_from_hash=group_hash,
             generated_at=datetime.now(timezone.utc).isoformat() if ai_ready else None,
-            enrichment_status="ready" if ai_ready else "pending",
+            enrichment_status="ready" if ai_ready else "failed" if ai_error else "pending",
             membership_source=group.membership_source,
             ai_model=settings.openai_model if ai_ready else None,
-            ai_error=str(enrichment.get("_ai_error"))[:1000] if enrichment.get("_ai_error") else None,
+            ai_error=ai_error,
             ai_generated_at=datetime.now(timezone.utc).isoformat() if ai_ready else None,
         )
         replace_group_members(
@@ -633,6 +737,14 @@ def enrich_pending_mail_groups(settings: Settings, *, user_id: str, limit: int =
             group_id=group.id,
             members=[(message, group.membership_source, 0.9) for message in messages],
         )
+        if ai_ready:
+            _persist_message_ai_titles(
+                database_url,
+                user_id=user_id,
+                enrichment=enrichment,
+                messages=messages,
+                generated_at=datetime.now(timezone.utc).isoformat(),
+            )
         touched += 1
     return touched
 
@@ -642,8 +754,13 @@ def run_first_run_ai_grouping(settings: Settings, *, user_id: str, limit: int = 
     if not user_can_write_gmail(database_url, user_id=user_id):
         mark_import_error(database_url, user_id=user_id, error="Gmail is disconnected or data deletion is active.")
         raise RuntimeError("Gmail is disconnected or data deletion is active.")
-    recent_since = (datetime.now(timezone.utc) - timedelta(days=RECENT_VISIBLE_DAYS)).isoformat()
-    all_messages = list_recent_messages_since(database_url, user_id=user_id, since_iso=recent_since, limit=max(limit, FIRST_BATCH_SIZE))
+    recent_since = (datetime.now(timezone.utc) - timedelta(days=_recent_visible_days(settings))).isoformat()
+    all_messages = list_recent_messages_since(
+        database_url,
+        user_id=user_id,
+        since_iso=recent_since,
+        limit=max(limit, FIRST_BATCH_SIZE, FIRST_RUN_AI_CANDIDATE_LIMIT * 3),
+    )
     if not all_messages:
         all_messages = list_recent_messages(database_url, user_id=user_id, limit=limit)
     candidate_messages = _first_run_candidate_messages(all_messages)
@@ -697,6 +814,7 @@ def build_dashboard_response(settings: Settings, *, user_id: str | None, auth: G
     group_messages = list_messages_for_groups(database_url, user_id=user_id, group_ids=[group.id for group in groups])
     groups = _dedupe_groups_by_messages(groups, group_messages)
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user_id)
+    last_ai_error = latest_mail_group_ai_error(database_url, user_id=user_id)
     feed = FeedResponse()
     for group in groups:
         _append_feed_item(feed, _attention_item_from_group(group))
@@ -710,19 +828,20 @@ def build_dashboard_response(settings: Settings, *, user_id: str | None, auth: G
         feed=feed,
         runtime_status={
             "feed_source": "ai_mail_groups" if groups else "manual_tasks" if manual_tasks else "empty",
-            "canonical_ready": bool(status_counts.get("ready", 0)),
-            "ai_groups_ready": bool(status_counts.get("ready", 0)),
-            "pending_group_count": status_counts.get("pending", 0),
-            "ready_group_count": status_counts.get("ready", 0),
             "last_mailbox_sync_at": None,
             "queue_lag_seconds": None,
             "stale_reason": None,
+            **_mail_runtime_status(database_url, status_counts=status_counts, last_ai_error=last_ai_error),
         },
     )
 
 
 def _first_run_candidate_messages(messages: list[GmailMessageRecord]) -> list[GmailMessageRecord]:
     return sorted(messages, key=_first_run_message_score, reverse=True)[:FIRST_RUN_AI_CANDIDATE_LIMIT]
+
+
+def _recent_visible_days(settings: Settings) -> int:
+    return max(1, int(getattr(settings, "gmail_recent_days", RECENT_VISIBLE_DAYS) or RECENT_VISIBLE_DAYS))
 
 
 def _first_run_message_score(message: GmailMessageRecord) -> tuple[int, str]:
@@ -926,70 +1045,189 @@ def _first_name(profile: DashboardProfile | None) -> str | None:
 
 def build_mailbox_response(settings: Settings, *, user_id: str, label: str = "inbox", limit: int = 150, cursor: str | None = None) -> MailboxResponse:
     database_url = str(settings.database_path)
+    ensure_background_import_work(settings, user_id=user_id)
     state = get_import_state(database_url, user_id=user_id)
-    full_import_running = bool(state and state.full_backfill_cursor)
-    groups = list_mail_groups(database_url, user_id=user_id, limit=limit, include_pending=True)
-    outcomes = get_latest_entity_outcomes(database_url, user_id=user_id, entity_ids=[group.id for group in groups])
-    groups = [group for group in groups if not _outcome_suppresses(outcomes.get(group.id))]
-    group_messages = list_messages_for_groups(database_url, user_id=user_id, group_ids=[group.id for group in groups])
-    groups = _dedupe_groups_by_messages(groups, group_messages)
+    active_backfill_jobs = count_active_jobs(database_url, user_id=user_id, kinds=["gmail_backfill"])
+    full_backfill_completed_at = getattr(state, "full_backfill_completed_at", None) if state is not None else None
+    full_import_running = bool(state and state.first_batch_imported_at and not full_backfill_completed_at and (state.full_backfill_cursor or active_backfill_jobs))
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user_id)
     mailbox_label = _mailbox_label(label)
-    rows = [
-        _gmail_row_from_group(group, group_messages.get(group.id, []))
-        for group in groups
-        if _group_matches_label(group, mailbox_label)
-    ]
+    page = list_mailbox_thread_page(
+        database_url,
+        user_id=user_id,
+        label=mailbox_label,
+        limit=limit,
+        cursor=cursor,
+        since_iso=None,
+    )
+    threads = page.threads
+    ai_groups = list_mail_groups_for_gmail_threads(
+        database_url,
+        user_id=user_id,
+        gmail_thread_ids=[thread_id for thread_id, _ in threads],
+    )
+    group_ids = list(dict.fromkeys(group.id for group in ai_groups.values()))
+    group_messages = list_messages_for_groups(database_url, user_id=user_id, group_ids=group_ids)
+    rows: list[GmailThreadRow] = []
+    rendered_group_ids: set[str] = set()
+    rendered_message_ids: set[str] = set()
+    for thread_id, messages in threads:
+        if not messages:
+            continue
+        ai_group = ai_groups.get(thread_id)
+        if ai_group is None:
+            message_ids = {message.message_id for message in messages}
+            if message_ids & rendered_message_ids:
+                continue
+            rendered_message_ids.update(message_ids)
+            rows.append(_gmail_row_from_canonical_thread(thread_id, messages, mailbox_label, None))
+            continue
+        if ai_group.id in rendered_group_ids:
+            continue
+        canonical_messages = group_messages.get(ai_group.id) or messages
+        message_ids = {message.message_id for message in canonical_messages}
+        if message_ids & rendered_message_ids:
+            continue
+        rendered_group_ids.add(ai_group.id)
+        rendered_message_ids.update(message_ids)
+        rows.append(
+            _gmail_row_from_canonical_thread(
+                ai_group.id,
+                canonical_messages,
+                mailbox_label,
+                ai_group,
+            )
+        )
+    _enqueue_visible_enrichment(settings, user_id=user_id, rows=rows)
     return MailboxResponse(
         label=mailbox_label,
-        total_threads=len(rows),
-        next_cursor=None,
+        total_threads=count_mailbox_threads(database_url, user_id=user_id, label=mailbox_label, since_iso=None),
+        next_cursor=page.next_cursor,
+        loaded_threads=page.loaded_threads,
+        window_days=None,
         sections=_bucket_rows(rows),
         ready_count=status_counts.get("ready", 0),
         pending_count=status_counts.get("pending", 0),
         oldest_imported_at=oldest_imported_message_at(database_url, user_id=user_id),
         full_import_running=full_import_running,
-        full_import_completed=bool(state and state.first_batch_imported_at and not full_import_running),
+        full_import_completed=bool(full_backfill_completed_at),
     )
 
 
+def _enqueue_visible_enrichment(settings: Settings, *, user_id: str, rows: list[GmailThreadRow]) -> None:
+    preferred_group_ids = [
+        row.ai_group_id
+        for row in rows[:100]
+        if row.ai_group_id
+        and (
+            row.presentation_status == "ai_pending"
+            or any(child.ai_title is None for child in row.children)
+        )
+    ]
+    if not preferred_group_ids:
+        return
+    try:
+        enqueue_job(
+            str(settings.database_path),
+            kind="mail_group_enrich",
+            queue="default",
+            user_id=user_id,
+            dedupe_key=f"visible-mail-group-enrich:{user_id}",
+            priority=75,
+            payload={"user_id": user_id, "preferred_group_ids": list(dict.fromkeys(preferred_group_ids))[:MAIL_GROUP_ENRICH_BATCH_SIZE]},
+        )
+    except Exception as exc:  # pragma: no cover - background work should not break mailbox reads.
+        logger.warning("Failed to enqueue visible mail-group enrichment for user %s: %s", user_id, exc)
+
+
 def build_mailbox_sync_state(settings: Settings, *, user_id: str) -> MailboxSyncStateResponse:
-    state = get_import_state(str(settings.database_path), user_id=user_id)
-    connected = user_can_write_gmail(str(settings.database_path), user_id=user_id)
+    database_url = str(settings.database_path)
+    state = get_import_state(database_url, user_id=user_id)
+    connected = user_can_write_gmail(database_url, user_id=user_id)
+    if connected:
+        ensure_background_import_work(settings, user_id=user_id)
+    status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user_id)
+    last_ai_error = latest_mail_group_ai_error(database_url, user_id=user_id)
+    queue_health = get_queue_health(database_url)
+    poller_workers = [
+        worker
+        for worker in queue_health.workers
+        if worker.get("fresh") and "gmail_poll" in {str(queue) for queue in worker.get("queues", [])}
+    ]
+    watch_error = getattr(state, "gmail_watch_error", None) if state else None
+    watch_expiration = getattr(state, "gmail_watch_expiration_at", None) if state else None
+    watch_started = getattr(state, "gmail_watch_started_at", None) if state else None
+    if not settings.gmail_pubsub_topic:
+        watch_status = "not_configured"
+    elif watch_error:
+        watch_status = "error"
+    elif watch_expiration:
+        watch_status = "active"
+    elif watch_started:
+        watch_status = "starting"
+    else:
+        watch_status = "not_started"
     return MailboxSyncStateResponse(
         connected=connected,
         last_history_id=state.last_history_id if state else None,
         last_full_sync_at=state.last_import_completed_at if state else None,
-        watch_expiration_at=getattr(state, "gmail_watch_expiration_at", None) if state else None,
+        watch_expiration_at=watch_expiration,
         last_sync_started_at=state.last_import_started_at if state else None,
         last_sync_completed_at=state.last_import_completed_at if state else None,
-        last_sync_error=(state.last_sync_error or getattr(state, "gmail_watch_error", None)) if state else None,
-        total_threads=count_mail_groups(str(settings.database_path), user_id=user_id),
+        watch_status=watch_status,
+        last_delta_sync_at=state.last_import_completed_at if state else None,
+        last_poll_at=str(poller_workers[0].get("last_seen_at")) if poller_workers else None,
+        poller_online=bool(poller_workers),
+        mailbox_revision=latest_gmail_mailbox_revision(database_url, user_id=user_id),
+        last_sync_error=((state.last_sync_error or getattr(state, "gmail_watch_error", None)) if state else None) or (last_ai_error if status_counts.get("ready", 0) == 0 else None),
+        total_threads=count_mailbox_threads(database_url, user_id=user_id, label="all"),
+        full_import_running=bool(state and state.first_batch_imported_at and not getattr(state, "full_backfill_completed_at", None) and (state.full_backfill_cursor or count_active_jobs(database_url, user_id=user_id, kinds=["gmail_backfill"]))),
+        full_import_completed=bool(getattr(state, "full_backfill_completed_at", None)) if state else False,
+        full_import_completed_at=getattr(state, "full_backfill_completed_at", None) if state else None,
+        pending_action_count=count_pending_thread_actions(database_url, user_id=user_id),
+        last_ai_error=last_ai_error,
     )
 
 
 def build_group_detail_response(settings: Settings, *, user_id: str, group_id: str, limit: int = 50, offset: int = 0) -> ThreadReaderResponse | None:
-    detail = get_mail_group_detail(str(settings.database_path), user_id=user_id, group_id=group_id)
+    database_url = str(settings.database_path)
+    canonical_messages = list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=group_id)
+    if canonical_messages:
+        ai_group = list_mail_groups_for_gmail_threads(database_url, user_id=user_id, gmail_thread_ids=[group_id]).get(group_id)
+        if _rebuild_missing_render_documents(settings, user_id=user_id, messages=canonical_messages):
+            canonical_messages = list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=group_id) or canonical_messages
+        if any(_needs_body_fetch(message) for message in canonical_messages):
+            if _fetch_body_for_reader_now(settings, user_id=user_id, gmail_thread_id=group_id):
+                canonical_messages = list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=group_id) or canonical_messages
+            if any(_needs_body_fetch(message) for message in canonical_messages):
+                _enqueue_body_fetch_for_gmail_thread(settings, user_id=user_id, gmail_thread_id=group_id, priority=90)
+        messages = canonical_messages[offset : offset + limit]
+        latest_message = max(canonical_messages, key=lambda item: item.internal_date or item.updated_at)
+        return ThreadReaderResponse(
+            entity_id=ai_group.id if ai_group else group_id,
+            user_id=user_id,
+            source="gmail",
+            gmail_thread_id=group_id,
+            subject=latest_message.subject,
+            title=(ai_group.ai_title if ai_group else None) or latest_message.subject,
+            summary=ai_group.ai_summary if ai_group else None,
+            total_messages=len(canonical_messages),
+            limit=limit,
+            offset=offset,
+            has_more=offset + len(messages) < len(canonical_messages),
+            messages=[_thread_message_from_gmail(message) for message in messages],
+        )
+
+    detail = get_mail_group_detail(database_url, user_id=user_id, group_id=group_id)
     if detail is None:
         return None
     if _rebuild_missing_render_documents(settings, user_id=user_id, messages=detail.messages):
-        detail = get_mail_group_detail(str(settings.database_path), user_id=user_id, group_id=group_id) or detail
+        detail = get_mail_group_detail(database_url, user_id=user_id, group_id=group_id) or detail
     if any(_needs_body_fetch(message) for message in detail.messages):
-        try:
-            from app.services.gmail_importer import run_gmail_body_fetch
-
-            if run_gmail_body_fetch(settings, user_id=user_id, group_id=group_id):
-                detail = get_mail_group_detail(str(settings.database_path), user_id=user_id, group_id=group_id) or detail
-        except Exception:
-            enqueue_job(
-                str(settings.database_path),
-                kind="gmail_body_fetch",
-                queue="default",
-                user_id=user_id,
-                dedupe_key=f"gmail-body-fetch:{user_id}:{group_id}",
-                priority=30,
-                payload={"user_id": user_id, "group_id": group_id},
-            )
+        if _fetch_body_for_reader_now(settings, user_id=user_id, group_id=group_id):
+            detail = get_mail_group_detail(database_url, user_id=user_id, group_id=group_id) or detail
+        if any(_needs_body_fetch(message) for message in detail.messages):
+            _enqueue_body_fetch_for_group(settings, user_id=user_id, group_id=group_id, priority=90)
     messages = detail.messages[offset : offset + limit]
     return ThreadReaderResponse(
         entity_id=detail.group.id,
@@ -997,6 +1235,8 @@ def build_group_detail_response(settings: Settings, *, user_id: str, group_id: s
         source="gmail",
         gmail_thread_id=detail.group.id,
         subject=detail.group.ai_title,
+        title=detail.group.ai_title,
+        summary=detail.group.ai_summary,
         total_messages=len(detail.messages),
         limit=limit,
         offset=offset,
@@ -1027,13 +1267,15 @@ def enrich_group(
                 "Do not mark newsletters, event ads, or marketing as action_needed unless the user clearly must act.",
                 "Do not invent pay, reply, or confirm actions from boilerplate words.",
                 "Return a concise human title, not an email subject with Re/Fwd prefixes.",
+                "Return concise human titles for individual emails too; do not just copy raw subjects.",
                 "Return a summary that explains what happened and what the user should know.",
             ],
-            "required_json_fields": ["group_type", "ai_title", "ai_summary", "labels", "action_needed", "action_type", "priority", "timing_band", "dashboard_visible"],
+            "required_json_fields": ["group_type", "ai_title", "ai_summary", "labels", "action_needed", "action_type", "priority", "timing_band", "dashboard_visible", "message_titles"],
             "allowed_action_type": sorted(ALLOWED_ACTION_TYPES),
             "allowed_timing_band": sorted(ALLOWED_TIMING_BANDS),
             "messages": [
                 {
+                    "message_id": message.message_id,
                     "subject": message.subject,
                     "sender": message.sender,
                     "date": message.internal_date,
@@ -1043,6 +1285,7 @@ def enrich_group(
                 }
                 for message in messages[:12]
             ],
+            "message_titles_schema": [{"message_id": "existing gmail message id", "ai_title": "individual email title"}],
         }
         response = client.responses.create(
             model=settings.openai_model,
@@ -1074,12 +1317,13 @@ def _ai_batch_group_messages(settings: Settings, *, messages: list[GmailMessageR
     prompt = {
         "task": "Create product-visible mail groups from recent Gmail messages.",
         "rules": [
-            "You are creating product-visible mail groups, not summarizing individual emails.",
+            "Create product-visible mail groups and lightweight titles for the individual emails inside them.",
             "Group emails by the real-life thing they represent.",
             "Use Gmail threadId as one signal, not the final grouping.",
             "Do not mark newsletters, event ads, or marketing as action_needed unless the user clearly must act.",
             "Do not invent pay, reply, or confirm actions from boilerplate words.",
             "Return concise human titles, not email subjects with Re/Fwd prefixes.",
+            "Also return a concise title for each individual email that appears in a group.",
             "Return summaries that explain what happened and what the user should know.",
             "A message can appear in only one output group.",
             f"Return at most {FIRST_RUN_AI_MAX_GROUPS} groups for first paint.",
@@ -1106,6 +1350,7 @@ def _ai_batch_group_messages(settings: Settings, *, messages: list[GmailMessageR
                     "timing_band": "now | today | later | hidden",
                     "dashboard_visible": False,
                     "member_message_ids": ["gmail-message-id"],
+                    "message_titles": [{"message_id": "gmail-message-id", "ai_title": "individual email title"}],
                 }
             ]
         },
@@ -1197,6 +1442,13 @@ def _store_ai_batch_groups(
             group_id=group.id,
             members=[(message, "ai_batch", 0.95) for message in members],
         )
+        _persist_message_ai_titles(
+            database_url,
+            user_id=user_id,
+            enrichment={"message_titles": output.get("message_titles")},
+            messages=members,
+            generated_at=datetime.now(timezone.utc).isoformat(),
+        )
         created += 1
         if dashboard_visible:
             visible_created += 1
@@ -1216,6 +1468,41 @@ def _message_for_ai(message: GmailMessageRecord) -> dict[str, Any]:
         "signals": message.extracted_signals,
         "labels": message.label_ids,
     }
+
+
+def _persist_message_ai_titles(
+    database_url: str,
+    *,
+    user_id: str,
+    enrichment: dict[str, Any],
+    messages: list[GmailMessageRecord],
+    generated_at: str | None,
+) -> None:
+    if not generated_at:
+        return
+    titles = _message_title_map(enrichment.get("message_titles"), messages)
+    if titles:
+        update_gmail_message_ai_titles(database_url, user_id=user_id, titles=titles, generated_at=generated_at)
+
+
+def _message_title_map(raw_titles: Any, messages: list[GmailMessageRecord]) -> dict[str, str]:
+    allowed = {message.message_id for message in messages}
+    titles: dict[str, str] = {}
+    if isinstance(raw_titles, dict):
+        items = raw_titles.items()
+    elif isinstance(raw_titles, list):
+        items = []
+        for item in raw_titles:
+            if isinstance(item, dict):
+                items.append((item.get("message_id"), item.get("ai_title") or item.get("title")))
+    else:
+        items = []
+    for raw_message_id, raw_title in items:
+        message_id = str(raw_message_id or "")
+        title = compact_text(str(raw_title or ""))
+        if message_id in allowed and title:
+            titles[message_id] = title[:180]
+    return titles
 
 
 def _candidate_context_for_ai(messages: list[GmailMessageRecord]) -> dict[str, Any]:
@@ -1281,6 +1568,7 @@ def _enrichment_from_existing(group: MailGroupRecord) -> dict[str, Any]:
         "priority": group.priority,
         "timing_band": group.timing_band,
         "dashboard_visible": group.dashboard_visible,
+        "message_titles": {},
     }
 
 
@@ -1298,6 +1586,10 @@ def _candidate_groups(messages: list[GmailMessageRecord]) -> dict[str, list[Gmai
             lifecycle_key = _entity_lifecycle_group_key(message, domain=domain)
             if lifecycle_key:
                 groups[lifecycle_key].append(message)
+            elif reference_key := _conversation_reference_group_key(message, domain=domain):
+                groups[reference_key].append(message)
+            elif subject_key := _cross_thread_subject_group_key(message, domain=domain):
+                groups[subject_key].append(message)
             elif message.gmail_thread_id:
                 groups[f"gmail-thread:{message.gmail_thread_id}"].append(message)
             else:
@@ -1327,6 +1619,31 @@ def _entity_lifecycle_group_key(message: GmailMessageRecord, *, domain: str) -> 
     if not topic_slug:
         return None
     return f"entity-lifecycle:{domain}:{identity_slug}:{topic_slug}"
+
+
+def _conversation_reference_group_key(message: GmailMessageRecord, *, domain: str) -> str | None:
+    references = " ".join(
+        str(message.headers.get(key) or "")
+        for key in ["references", "References", "in-reply-to", "In-Reply-To"]
+    )
+    ids = re.findall(r"<([^>]+)>", references)
+    if not ids:
+        return None
+    return f"mail-reference:{domain}:{hashlib.sha1(ids[-1].encode('utf-8')).hexdigest()[:24]}"
+
+
+def _cross_thread_subject_group_key(message: GmailMessageRecord, *, domain: str) -> str | None:
+    subject = str(message.extracted_signals.get("normalized_subject") or message.subject or "").strip()
+    if not subject:
+        return None
+    labels = {label.upper() for label in message.label_ids}
+    text = " ".join([subject, message.snippet or "", message.text_body or ""])
+    if "SENT" not in labels and not (ACTION_WORD_RE.search(text) or LIFECYCLE_WORD_RE.search(text)):
+        return None
+    topic = _topic_slug(subject, sender_slug=_sender_slug(message.sender), domain_slug=_domain_slug(domain))
+    if not topic:
+        return None
+    return f"subject-domain:{domain}:{topic}"
 
 
 def _sender_slug(sender: str | None) -> str:
@@ -1378,6 +1695,7 @@ def _fallback_enrichment(messages: list[GmailMessageRecord], group_key: str) -> 
         "priority": 80 if action else 30 if lifecycle else 10,
         "timing_band": "now" if action and "UNREAD" in latest.label_ids else "today" if action else "later",
         "dashboard_visible": action or lifecycle,
+        "message_titles": {},
     }
 
 
@@ -1398,6 +1716,7 @@ def _normalize_enrichment(parsed: dict[str, Any], fallback: dict[str, Any]) -> d
         "priority": _normalize_priority(parsed.get("priority"), fallback["priority"]),
         "timing_band": timing,
         "dashboard_visible": bool(parsed.get("dashboard_visible", fallback["dashboard_visible"])),
+        "message_titles": parsed.get("message_titles", fallback.get("message_titles", {})),
     }
 
 
@@ -1593,8 +1912,114 @@ def _gmail_row_from_group(group: MailGroupRecord, messages: list[GmailMessageRec
             }
             for message in messages[-3:]
         ],
+        children=[_gmail_child_row_from_message(message) for message in messages],
         enrichment_status=group.enrichment_status,
     )
+
+
+def _gmail_row_from_canonical_thread(
+    thread_id: str,
+    messages: list[GmailMessageRecord],
+    mailbox_label: str,
+    ai_group: MailGroupRecord | None,
+) -> GmailThreadRow:
+    matching_messages = [message for message in messages if _message_matches_mailbox_label(message, mailbox_label)]
+    row_messages = matching_messages or messages
+    latest_message = max(row_messages, key=lambda item: item.internal_date or item.updated_at)
+    participants = _participants(row_messages)
+    labels = sorted({label for message in row_messages for label in message.label_ids})
+    action_type = "none"
+    if ai_group is not None and ai_group.action_type in {"pay", "reply", "confirm", "track", "review", "open", "none"}:
+        action_type = ai_group.action_type
+    presentation_status = _presentation_status(ai_group)
+    title = (ai_group.ai_title if ai_group is not None else None) or latest_message.subject
+    summary = (ai_group.ai_summary if ai_group is not None else None) or latest_message.snippet
+    return GmailThreadRow(
+        thread_id=thread_id,
+        entity_id=ai_group.id if ai_group is not None else thread_id,
+        title=title,
+        href=f"/v1/mailbox/threads/{thread_id}",
+        latest_source_record_id=latest_message.message_id,
+        latest_received_at=latest_message.internal_date or latest_message.updated_at,
+        latest_message_at=latest_message.internal_date or latest_message.updated_at,
+        latest_subject=latest_message.subject,
+        latest_sender=latest_message.sender,
+        sender=latest_message.sender,
+        participants=participants,
+        message_count=max(1, len(row_messages)),
+        summary=summary,
+        ai_group_id=ai_group.id if ai_group is not None else None,
+        ai_title=ai_group.ai_title if ai_group is not None else None,
+        ai_summary=ai_group.ai_summary if ai_group is not None else None,
+        snippet=latest_message.snippet,
+        label_ids=labels,
+        labels=labels,
+        unread="UNREAD" in {label.upper() for label in labels},
+        action_needed=bool(ai_group and ai_group.action_needed),
+        action_type=action_type,  # type: ignore[arg-type]
+        action_type_key=action_type,  # type: ignore[arg-type]
+        priority=ai_group.priority if ai_group is not None else 0,
+        dashboard_visible=bool(ai_group and ai_group.dashboard_visible),
+        current_state="open" if ai_group is not None and ai_group.action_needed else "waiting",
+        lifecycle_state="active" if ai_group is not None and ai_group.action_needed else "scheduled",
+        lifecycle_updates=[
+            {
+                "source_record_id": message.message_id,
+                "received_at": message.internal_date or message.updated_at,
+                "subject": message.subject or title,
+                "sender": message.sender,
+                "summary": message.snippet,
+            }
+            for message in row_messages[-3:]
+        ],
+        children=[_gmail_child_row_from_message(message) for message in row_messages],
+        enrichment_status=ai_group.enrichment_status if ai_group is not None else "ready",
+        presentation_status=presentation_status,  # type: ignore[arg-type]
+    )
+
+
+def _gmail_child_row_from_message(message: GmailMessageRecord) -> GmailThreadChildRow:
+    return GmailThreadChildRow(
+        message_id=message.message_id,
+        gmail_thread_id=message.gmail_thread_id,
+        sender=message.sender,
+        subject=message.subject,
+        ai_title=message.ai_title,
+        snippet=message.snippet,
+        received_at=message.internal_date or message.updated_at,
+        label_ids=message.label_ids,
+        labels=message.label_ids,
+        unread="UNREAD" in {label.upper() for label in message.label_ids},
+    )
+
+
+def _presentation_status(ai_group: MailGroupRecord | None) -> str:
+    if ai_group is None:
+        return "fallback"
+    if ai_group.enrichment_status == "pending":
+        return "ai_pending"
+    if ai_group.enrichment_status == "ready" and ai_group.ai_title and ai_group.ai_summary:
+        return "ai_ready"
+    return "fallback"
+
+
+def _message_matches_mailbox_label(message: GmailMessageRecord, label: str) -> bool:
+    labels = {item.upper() for item in message.label_ids}
+    if label == "all":
+        return True
+    if label == "inbox":
+        return "INBOX" in labels
+    if label == "sent":
+        return "SENT" in labels
+    if label == "drafts":
+        return "DRAFT" in labels
+    if label == "spam":
+        return "SPAM" in labels
+    if label == "trash":
+        return "TRASH" in labels
+    if label == "archive":
+        return not ({"INBOX", "SENT", "DRAFT", "SPAM", "TRASH"} & labels)
+    return True
 
 
 def _dedupe_groups_by_messages(
@@ -1685,6 +2110,95 @@ def _needs_body_fetch(message: GmailMessageRecord) -> bool:
     )
 
 
+def _fetch_body_for_reader_now(
+    settings: Settings,
+    *,
+    user_id: str,
+    group_id: str = "",
+    gmail_thread_id: str = "",
+) -> bool:
+    try:
+        from app.services.gmail_importer import run_gmail_body_fetch
+
+        return run_gmail_body_fetch(
+            settings,
+            user_id=user_id,
+            group_id=group_id,
+            gmail_thread_id=gmail_thread_id,
+        ) > 0
+    except Exception:
+        return False
+
+
+def _group_needs_body_warmup(messages: list[GmailMessageRecord]) -> bool:
+    return any((message.body_fetch_status or "missing") != "fetched" for message in messages)
+
+
+def _enqueue_body_fetch_for_groups(
+    settings: Settings,
+    *,
+    user_id: str,
+    group_ids: list[str],
+    priority: int,
+    limit: int,
+) -> None:
+    for group_id in list(dict.fromkeys([item for item in group_ids if item]))[:limit]:
+        _enqueue_body_fetch_for_group(settings, user_id=user_id, group_id=group_id, priority=priority)
+
+
+def _enqueue_body_fetch_for_mailbox_rows(
+    settings: Settings,
+    *,
+    user_id: str,
+    mailbox: MailboxResponse,
+    limit: int,
+    priority: int,
+) -> None:
+    group_ids: list[str] = []
+    thread_ids: list[str] = []
+    for section in mailbox.sections:
+        for row in section.rows:
+            if row.ai_group_id:
+                group_ids.append(row.ai_group_id)
+            elif row.thread_id:
+                thread_ids.append(row.thread_id)
+            if len(group_ids) + len(thread_ids) >= limit:
+                break
+        if len(group_ids) + len(thread_ids) >= limit:
+            break
+    for group_id in list(dict.fromkeys(group_ids))[:limit]:
+        _enqueue_body_fetch_for_group(settings, user_id=user_id, group_id=group_id, priority=priority)
+    remaining = max(0, limit - len(set(group_ids)))
+    for thread_id in list(dict.fromkeys(thread_ids))[:remaining]:
+        _enqueue_body_fetch_for_gmail_thread(settings, user_id=user_id, gmail_thread_id=thread_id, priority=priority)
+
+
+def _enqueue_body_fetch_for_group(settings: Settings, *, user_id: str, group_id: str, priority: int) -> str:
+    job = enqueue_job(
+        str(settings.database_path),
+        kind="gmail_body_fetch",
+        queue="reader",
+        user_id=user_id,
+        dedupe_key=f"gmail-body-fetch:{user_id}:{group_id}",
+        priority=priority,
+        payload={"user_id": user_id, "group_id": group_id},
+    )
+    return job.id
+
+
+def _enqueue_body_fetch_for_gmail_thread(settings: Settings, *, user_id: str, gmail_thread_id: str, priority: int) -> str:
+    job = enqueue_job(
+        str(settings.database_path),
+        kind="gmail_body_fetch",
+        queue="reader",
+        user_id=user_id,
+        dedupe_key=f"gmail-body-fetch-thread:{user_id}:{gmail_thread_id}",
+        priority=priority,
+        payload={"user_id": user_id, "gmail_thread_id": gmail_thread_id},
+    )
+    return job.id
+
+
 def _bucket_rows(rows: list[GmailThreadRow]) -> list[GmailThreadSection]:
     reference = datetime.now().astimezone().date()
     buckets: OrderedDict[str, tuple[str, list[GmailThreadRow]]] = OrderedDict()
@@ -1715,7 +2229,7 @@ def _parse_date(value: str) -> datetime:
 
 def _mailbox_label(label: str) -> MailboxLabel:
     normalized = label.strip().lower()
-    return normalized if normalized in {"inbox", "sent", "drafts", "trash", "archive", "all"} else "inbox"  # type: ignore[return-value]
+    return normalized if normalized in {"inbox", "sent", "drafts", "spam", "trash", "archive", "all"} else "inbox"  # type: ignore[return-value]
 
 
 def _group_matches_label(group: MailGroupRecord, label: str) -> bool:
@@ -1730,6 +2244,8 @@ def _group_matches_label(group: MailGroupRecord, label: str) -> bool:
         return "TRASH" in labels
     if label == "drafts":
         return "DRAFT" in labels
+    if label == "spam":
+        return "SPAM" in labels
     if label == "archive":
-        return "INBOX" not in labels and "TRASH" not in labels
+        return not ({"INBOX", "SENT", "DRAFT", "SPAM", "TRASH"} & labels)
     return True

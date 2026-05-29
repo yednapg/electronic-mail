@@ -66,31 +66,75 @@ def sample_group() -> MailGroupRecord:
 
 
 class MailGroupDetailBodyTests(unittest.TestCase):
-    def test_reader_fetches_full_body_when_cached_body_is_only_metadata_snippet(self) -> None:
+    def test_reader_fetches_full_body_immediately_when_cached_body_is_only_metadata_snippet(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
         group = sample_group()
         metadata_only = sample_message()
-        hydrated = replace(
-            metadata_only,
-            raw_payload={
-                "payload": {
-                    "mimeType": "text/html",
-                    "body": {"data": "PGh0bWw-PGJvZHk-PHRhYmxlIHN0eWxlPSJ3aWR0aDoxMDAlIj48dHI-PHRkPjxpbWcgc3JjPSJodHRwczovL2V4YW1wbGUuY29tL2xvZ28ucG5nIj5GdWxsIGFwcGxpY2F0aW9uIGVtYWlsPC90ZD48L3RyPjwvdGFibGU-PC9ib2R5PjwvaHRtbD4"},
-                }
-            },
-            html_body_sanitized=RICH_APPLICATION_HTML,
-            html_render_document=RICH_APPLICATION_HTML,
-            text_body="Full application email",
-        )
+        hydrated = replace(metadata_only, html_body_sanitized=RICH_APPLICATION_HTML, html_render_document=RICH_APPLICATION_HTML, text_body="Full application email")
 
         with patch(
             "app.services.mail_groups.get_mail_group_detail",
-            side_effect=[MailGroupDetail(group=group, messages=[metadata_only]), MailGroupDetail(group=group, messages=[hydrated])],
-        ), patch("app.services.gmail_importer.run_gmail_body_fetch", return_value=1) as body_fetch:
+            side_effect=[
+                MailGroupDetail(group=group, messages=[metadata_only]),
+                MailGroupDetail(group=group, messages=[hydrated]),
+            ],
+        ), patch("app.services.mail_groups.list_messages_for_gmail_thread", return_value=[]), patch("app.services.mail_groups.enqueue_job") as enqueue_job, patch("app.services.gmail_importer.run_gmail_body_fetch") as body_fetch:
+            body_fetch.return_value = 1
             response = build_group_detail_response(settings, user_id="user-1", group_id="group-1")
 
         self.assertIsNotNone(response)
-        self.assertEqual(body_fetch.call_count, 1)
+        body_fetch.assert_called_once_with(settings, user_id="user-1", group_id="group-1", gmail_thread_id="")
+        enqueue_job.assert_not_called()
+        self.assertEqual(response.messages[0].body, "Full application email")
+        self.assertEqual(response.messages[0].html_body, RICH_APPLICATION_HTML)
+        self.assertEqual(response.messages[0].html_render_document, RICH_APPLICATION_HTML)
+        self.assertIsNotNone(response.messages[0].reader)
+        self.assertTrue(response.messages[0].reader.original_html_available)
+
+    def test_reader_enqueues_full_body_fetch_when_immediate_fetch_fails(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        group = sample_group()
+        metadata_only = sample_message()
+
+        with patch(
+            "app.services.mail_groups.get_mail_group_detail",
+            return_value=MailGroupDetail(group=group, messages=[metadata_only]),
+        ), patch("app.services.mail_groups.list_messages_for_gmail_thread", return_value=[]), patch("app.services.mail_groups.enqueue_job") as enqueue_job, patch("app.services.gmail_importer.run_gmail_body_fetch") as body_fetch:
+            body_fetch.side_effect = RuntimeError("gmail timeout")
+            enqueue_job.return_value = SimpleNamespace(id="job-1")
+            response = build_group_detail_response(settings, user_id="user-1", group_id="group-1")
+
+        self.assertIsNotNone(response)
+        body_fetch.assert_called_once_with(settings, user_id="user-1", group_id="group-1", gmail_thread_id="")
+        enqueue_job.assert_called_once_with(
+            "postgresql://example/db",
+            kind="gmail_body_fetch",
+            queue="reader",
+            user_id="user-1",
+            dedupe_key="gmail-body-fetch:user-1:group-1",
+            priority=90,
+            payload={"user_id": "user-1", "group_id": "group-1"},
+        )
+        self.assertEqual(response.messages[0].body, "TestUser, Thank you for choosing the California State University.")
+        self.assertIsNone(response.messages[0].html_body)
+        self.assertIsNone(response.messages[0].html_render_document)
+        self.assertIsNotNone(response.messages[0].reader)
+        self.assertFalse(response.messages[0].reader.original_html_available)
+
+    def test_reader_returns_cached_html_without_enqueuing_body_fetch(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        group = sample_group()
+        hydrated = replace(sample_message(), html_body_sanitized=RICH_APPLICATION_HTML, html_render_document=RICH_APPLICATION_HTML, text_body="Full application email")
+
+        with patch(
+            "app.services.mail_groups.get_mail_group_detail",
+            return_value=MailGroupDetail(group=group, messages=[hydrated]),
+        ), patch("app.services.mail_groups.list_messages_for_gmail_thread", return_value=[]), patch("app.services.mail_groups.enqueue_job") as enqueue_job, patch("app.services.gmail_importer.run_gmail_body_fetch") as body_fetch:
+            response = build_group_detail_response(settings, user_id="user-1", group_id="group-1")
+
+        self.assertIsNotNone(response)
+        body_fetch.assert_not_called()
+        enqueue_job.assert_not_called()
         self.assertEqual(response.messages[0].body, "Full application email")
         self.assertEqual(response.messages[0].html_body, RICH_APPLICATION_HTML)
         self.assertEqual(response.messages[0].html_render_document, RICH_APPLICATION_HTML)

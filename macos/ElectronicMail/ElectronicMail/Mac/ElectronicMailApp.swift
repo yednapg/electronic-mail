@@ -4,7 +4,17 @@ import SwiftUI
 
 @main
 struct ElectronicMailApp: App {
-    @StateObject private var store = InboxStore(client: AppClientFactory.makeDefaultClient())
+    @StateObject private var store: InboxStore
+
+    init() {
+        let localMailStore = AppClientFactory.makeLocalMailStore()
+        _store = StateObject(
+            wrappedValue: InboxStore(
+                client: AppClientFactory.makeDefaultClient(localMailStore: localMailStore),
+                localMailStore: localMailStore
+            )
+        )
+    }
 
     var body: some Scene {
         WindowGroup {
@@ -20,6 +30,11 @@ struct ElectronicMailApp: App {
                     NotificationCenter.default.post(name: .electronicMailOpenCommandPalette, object: nil)
                 }
                 .keyboardShortcut("k", modifiers: [.command])
+
+                Button("New Message") {
+                    NotificationCenter.default.post(name: .electronicMailOpenComposer, object: nil)
+                }
+                .keyboardShortcut("n", modifiers: [.command])
             }
         }
     }
@@ -69,8 +84,8 @@ private enum AppLaunchStage {
 private struct ElectronicMailRootView: View {
     @ObservedObject var store: InboxStore
     @State private var stage: AppLaunchStage = .signIn
-    @State private var setupCompletionTimer: Timer?
     @State private var setupStartedAt = Date()
+    @State private var setupError: String?
     @State private var signInInProgress = false
     @State private var signInError: String?
 
@@ -88,18 +103,26 @@ private struct ElectronicMailRootView: View {
                 }
                 .transition(.opacity)
             case .setup:
-                SetupAnimationView(startedAt: setupStartedAt)
+                SetupAnimationView(
+                    startedAt: setupStartedAt,
+                    readiness: store.currentReadiness,
+                    errorMessage: setupError
+                ) {
+                    Task { await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 60) }
+                }
                 .transition(.opacity)
             case .app:
-                SignedInShellView(store: store)
+                SignedInShellView(store: store) {
+                    try await performGoogleReauthorization()
+                }
                     .transition(.opacity)
             }
         }
-        .onDisappear {
-            setupCompletionTimer?.invalidate()
-        }
         .task {
             await restoreExistingSessionIfAvailable()
+        }
+        .onOpenURL { url in
+            GoogleOAuthService.handleCallbackURL(url)
         }
     }
 
@@ -119,9 +142,14 @@ private struct ElectronicMailRootView: View {
             return
         }
 
-        withAnimation(.easeInOut(duration: 0.35)) {
-            stage = .app
+        if store.isReadyForMainInterface || store.canEnterWithBuildingDashboard {
+            withAnimation(.easeInOut(duration: 0.35)) {
+                stage = .app
+            }
+            return
         }
+
+        await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 60)
     }
 
     @MainActor
@@ -146,7 +174,7 @@ private struct ElectronicMailRootView: View {
                 throw RuntimeError(message)
             }
 
-            startSetupFlow()
+            await startSetupFlow(minimumDisplaySeconds: 30, maximumWaitSeconds: 60)
         } catch {
             tokenStore.clear()
             store.setSessionToken(nil)
@@ -157,24 +185,63 @@ private struct ElectronicMailRootView: View {
     }
 
     @MainActor
-    private func startSetupFlow() {
-        setupCompletionTimer?.invalidate()
+    private func performGoogleReauthorization() async throws {
+        let loginCode = try await GoogleOAuthService().startGoogleAuthentication(
+            baseURL: store.backendURL,
+            authRedirectURI: AppConfiguration.authRedirectURI
+        )
+        let session = try await store.exchangeMobileSession(loginCode: loginCode)
+        try tokenStore.save(session.sessionToken)
+        await store.load()
+    }
+
+    @MainActor
+    private func startSetupFlow(minimumDisplaySeconds: TimeInterval, maximumWaitSeconds: TimeInterval) async {
         setupStartedAt = Date()
+        setupError = nil
 
         withAnimation(.easeInOut(duration: 0.35)) {
             stage = .setup
         }
 
-        let timer = Timer(timeInterval: 25, repeats: false) { _ in
-            guard stage == .setup else {
-                return
-            }
-            withAnimation(.easeInOut(duration: 0.45)) {
-                stage = .app
-            }
+        let ready = await PostLoginCoordinator(store: store).waitForReadiness(
+            minimumDisplaySeconds: minimumDisplaySeconds,
+            maximumWaitSeconds: maximumWaitSeconds
+        )
+
+        guard ready else {
+            setupError = store.currentReadiness?.errorMessage ?? "Still syncing Gmail. Try again in a moment."
+            return
         }
-        setupCompletionTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
+
+        guard stage == .setup else {
+            return
+        }
+        withAnimation(.easeInOut(duration: 0.45)) {
+            stage = .app
+        }
+    }
+}
+
+@MainActor
+private struct PostLoginCoordinator {
+    let store: InboxStore
+
+    func waitForReadiness(minimumDisplaySeconds: TimeInterval, maximumWaitSeconds: TimeInterval) async -> Bool {
+        let startedAt = Date()
+        while !Task.isCancelled {
+            await store.refreshForReadiness()
+            let elapsed = Date().timeIntervalSince(startedAt)
+            if elapsed >= minimumDisplaySeconds, store.isReadyForMainInterface {
+                return true
+            }
+            if elapsed >= maximumWaitSeconds, store.canEnterWithBuildingDashboard {
+                return true
+            }
+            let sleepSeconds = max(0.25, min(2, minimumDisplaySeconds - elapsed > 0 ? minimumDisplaySeconds - elapsed : 2))
+            try? await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
+        }
+        return false
     }
 }
 
@@ -266,6 +333,9 @@ private struct SetupAnimationView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     let startedAt: Date
+    let readiness: PostLoginReadinessResponse?
+    let errorMessage: String?
+    let onRetry: () -> Void
 
     private let steps = [
         "Importing emails ...",
@@ -284,13 +354,48 @@ private struct SetupAnimationView: View {
                 let elapsed = max(0, timeline.date.timeIntervalSince(startedAt))
                 let step = min(Int(elapsed / 5.0), steps.count - 1)
 
-                WavyStatusText(text: steps[step])
-                    .id(step)
-                    .transition(.opacity.combined(with: .scale(scale: 0.985)))
-                    .animation(.easeInOut(duration: 0.35), value: step)
+                VStack(spacing: 18) {
+                    WavyStatusText(text: statusText(fallbackStep: step))
+                        .id(statusText(fallbackStep: step))
+                        .transition(.opacity.combined(with: .scale(scale: 0.985)))
+                        .animation(.easeInOut(duration: 0.35), value: statusText(fallbackStep: step))
+
+                    if let errorMessage {
+                        VStack(spacing: 12) {
+                            Text(errorMessage)
+                                .font(ElectronicMailType.body())
+                                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                            Button("Retry") {
+                                onRetry()
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(ElectronicMailDesign.appleBlue)
+                        }
+                    }
+                }
             }
         }
         .environment(\.font, .system(.body, design: .rounded))
+    }
+
+    private func statusText(fallbackStep: Int) -> String {
+        guard let readiness else {
+            return steps[fallbackStep]
+        }
+        switch readiness.stage {
+        case "starting_full_import", "importing_recent_gmail":
+            return "Importing 90 days of email ..."
+        case "grouping_threads":
+            return "Grouping related emails ..."
+        case "writing_titles":
+            return "Writing useful titles ..."
+        case "building_dashboard":
+            return "Building dashboard ..."
+        case "ready", "welcome_back":
+            return "Almost ready!"
+        default:
+            return steps[fallbackStep]
+        }
     }
 }
 
@@ -319,8 +424,15 @@ private struct WavyStatusText: View {
 }
 
 private enum AppClientFactory {
-    static func makeDefaultClient() -> AppClient {
-        return LiveBackendAppClient(baseURL: AppConfiguration.defaultBackendURL)
+    static func makeDefaultClient(localMailStore: LocalMailStore) -> AppClient {
+        return OfflineFirstAppClient(
+            backend: LiveBackendAppClient(baseURL: AppConfiguration.defaultBackendURL),
+            localMailStore: localMailStore
+        )
+    }
+
+    static func makeLocalMailStore() -> LocalMailStore {
+        SQLiteLocalMailStore() ?? NoopLocalMailStore()
     }
 }
 
