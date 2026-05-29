@@ -11,6 +11,66 @@ public enum AppRunMode: String, Equatable {
     case localBackend
 }
 
+public struct MailboxServerEvent: Equatable {
+    public let id: String?
+    public let event: String
+    public let data: String
+}
+
+public struct ServerSentEventParser {
+    private var id: String?
+    private var event: String?
+    private var dataLines: [String] = []
+
+    public init() {}
+
+    public mutating func feed(line: String) -> MailboxServerEvent? {
+        if line.isEmpty {
+            return dispatch()
+        }
+        if line.hasPrefix(":") {
+            return nil
+        }
+        let parts = line.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        let field = String(parts.first ?? "")
+        var value = parts.count > 1 ? String(parts[1]) : ""
+        if value.hasPrefix(" ") {
+            value.removeFirst()
+        }
+        switch field {
+        case "id":
+            id = value
+        case "event":
+            event = value
+        case "data":
+            dataLines.append(value)
+        default:
+            break
+        }
+        return nil
+    }
+
+    private mutating func dispatch() -> MailboxServerEvent? {
+        guard id != nil || event != nil || !dataLines.isEmpty else {
+            reset()
+            return nil
+        }
+        let output = MailboxServerEvent(
+            id: id,
+            event: event ?? "message",
+            data: dataLines.joined(separator: "\n")
+        )
+        reset()
+        return output
+    }
+
+    private mutating func reset() {
+        id = nil
+        event = nil
+        dataLines = []
+    }
+}
+
 public protocol AppClient: AnyObject {
     var baseURL: URL { get set }
     var sessionToken: String? { get set }
@@ -25,9 +85,22 @@ public protocol AppClient: AnyObject {
     func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse
     func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse
     func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse
+    func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse
+    func sendCompose(_ request: MailComposeRequest) async throws -> MailSendResponse
+    func sendReply(threadID: String, request: MailReplyRequest) async throws -> MailSendResponse
     func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse
     func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse
     func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse
+}
+
+public extension AppClient {
+    func sendCompose(_ request: MailComposeRequest) async throws -> MailSendResponse {
+        throw APIError.httpStatus(501)
+    }
+
+    func sendReply(threadID: String, request: MailReplyRequest) async throws -> MailSendResponse {
+        throw APIError.httpStatus(501)
+    }
 }
 
 public final class LiveBackendAppClient: AppClient {
@@ -93,6 +166,21 @@ public final class LiveBackendAppClient: AppClient {
 
     public func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
         try await request(path: "/v1/gmail/threads/\(threadID.urlPathEncoded)/mark-read", method: "POST")
+    }
+
+    public func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
+        let body = try JSONEncoder.backend.encode(request)
+        return try await self.request(path: "/v1/mailbox/thread-actions", method: "POST", body: body)
+    }
+
+    public func sendCompose(_ request: MailComposeRequest) async throws -> MailSendResponse {
+        let body = try JSONEncoder.backend.encode(request)
+        return try await self.request(path: "/v1/mailbox/compose", method: "POST", body: body)
+    }
+
+    public func sendReply(threadID: String, request: MailReplyRequest) async throws -> MailSendResponse {
+        let body = try JSONEncoder.backend.encode(request)
+        return try await self.request(path: "/v1/mailbox/threads/\(threadID.urlPathEncoded)/reply", method: "POST", body: body)
     }
 
     public func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {

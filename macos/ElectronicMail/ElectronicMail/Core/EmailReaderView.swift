@@ -5,12 +5,13 @@ import WebKit
 
 struct EmailReaderView: View {
     let threadID: String
+    let focusedMessageID: String?
     let thread: ThreadReaderResponse?
     let row: InboxRowViewModel?
     let errorMessage: String?
     let colorScheme: ColorScheme
-    let onClose: () -> Void
     let onRetry: () -> Void
+    let onReply: () -> Void
 
     @State private var expandedMessageKeys: Set<String> = []
 
@@ -24,36 +25,46 @@ struct EmailReaderView: View {
                 )
             )
 
-            ScrollView(.vertical, showsIndicators: true) {
-                EmailReaderChrome(contentWidth: contentWidth) {
-                    if resolvedMessageCount <= 1 {
-                        SingleEmailContent(
-                            threadID: threadID,
-                            title: readerTitle,
-                            message: thread?.messages.first,
-                            row: row,
-                            errorMessage: errorMessage,
-                            colorScheme: colorScheme,
-                            onClose: onClose,
-                            onRetry: onRetry
-                        )
-                    } else {
-                        GroupedEmailContent(
-                            threadID: threadID,
-                            title: readerTitle,
-                            messages: thread?.messages ?? [],
-                            expectedMessageCount: resolvedMessageCount,
-                            errorMessage: errorMessage,
-                            colorScheme: colorScheme,
-                            expandedMessageKeys: $expandedMessageKeys,
-                            onClose: onClose,
-                            onRetry: onRetry
-                        )
+            ScrollViewReader { scrollProxy in
+                ScrollView(.vertical, showsIndicators: true) {
+                    EmailReaderChrome(contentWidth: contentWidth) {
+                        if resolvedMessageCount <= 1 {
+                            SingleEmailContent(
+                                threadID: threadID,
+                                title: readerTitle,
+                                summary: readerSummary,
+                                message: thread?.messages.first,
+                                row: row,
+                                errorMessage: errorMessage,
+                                colorScheme: colorScheme,
+                                onRetry: onRetry,
+                                onReply: onReply
+                            )
+                        } else {
+                            GroupedEmailContent(
+                                threadID: threadID,
+                                title: readerTitle,
+                                summary: readerSummary,
+                                messages: thread?.messages ?? [],
+                                expectedMessageCount: resolvedMessageCount,
+                                focusedMessageID: focusedMessageID,
+                                errorMessage: errorMessage,
+                                colorScheme: colorScheme,
+                                expandedMessageKeys: $expandedMessageKeys,
+                                onRetry: onRetry,
+                                onReply: onReply,
+                                onFocusedMessageKey: { messageKey in
+                                    withAnimation(.easeInOut(duration: 0.16)) {
+                                        scrollProxy.scrollTo(messageKey, anchor: .center)
+                                    }
+                                }
+                            )
+                        }
                     }
+                    .padding(.top, EmailReaderMetrics.contentTop)
+                    .padding(.bottom, 88)
+                    .frame(maxWidth: .infinity)
                 }
-                .padding(.top, EmailReaderMetrics.contentTop)
-                .padding(.bottom, 88)
-                .frame(maxWidth: .infinity)
             }
         }
         .environment(\.font, .system(.body))
@@ -68,6 +79,14 @@ struct EmailReaderView: View {
             ?? nonEmpty(thread?.subject)
             ?? nonEmpty(row?.title)
             ?? "Email"
+    }
+
+    private var readerSummary: String? {
+        let value = nonEmpty(thread?.summary) ?? nonEmpty(row?.summary)
+        guard value != readerTitle else {
+            return nil
+        }
+        return value
     }
 
     private func nonEmpty(_ value: String?) -> String? {
@@ -97,19 +116,20 @@ private struct EmailReaderChrome<Content: View>: View {
 private struct SingleEmailContent: View {
     let threadID: String
     let title: String
+    let summary: String?
     let message: ThreadMessage?
     let row: InboxRowViewModel?
     let errorMessage: String?
     let colorScheme: ColorScheme
-    let onClose: () -> Void
     let onRetry: () -> Void
+    let onReply: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             EmailReaderTitleHeader(
                 title: title,
-                colorScheme: colorScheme,
-                onClose: onClose
+                summary: summary,
+                colorScheme: colorScheme
             )
 
             HStack(alignment: .bottom, spacing: 28) {
@@ -127,7 +147,7 @@ private struct SingleEmailContent: View {
 
                 Spacer(minLength: 24)
 
-                EmailActionRow(colorScheme: colorScheme)
+                EmailActionRow(colorScheme: colorScheme, onReply: onReply)
             }
             .padding(.top, 44)
 
@@ -170,28 +190,37 @@ private struct SingleEmailContent: View {
 
     private var bodyText: String {
         let value = message?.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        return value?.isEmpty == false ? value! : "Loading email..."
+        return value?.isEmpty == false ? value! : EmailReaderText.loadingFullEmail
     }
 }
 
 private struct GroupedEmailContent: View {
     let threadID: String
     let title: String
+    let summary: String?
     let messages: [ThreadMessage]
     let expectedMessageCount: Int
+    let focusedMessageID: String?
     let errorMessage: String?
     let colorScheme: ColorScheme
     @Binding var expandedMessageKeys: Set<String>
-    let onClose: () -> Void
     let onRetry: () -> Void
+    let onReply: () -> Void
+    let onFocusedMessageKey: (String) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             EmailReaderTitleHeader(
                 title: title,
-                colorScheme: colorScheme,
-                onClose: onClose
+                summary: summary,
+                colorScheme: colorScheme
             )
+
+            HStack {
+                Spacer()
+                EmailActionRow(colorScheme: colorScheme, onReply: onReply)
+            }
+            .padding(.top, 30)
 
             if let errorMessage {
                 EmailReaderErrorView(
@@ -218,11 +247,19 @@ private struct GroupedEmailContent: View {
                         ) {
                             toggle(item.id)
                         }
+                        .id(item.id)
                     }
                 }
                 .padding(.top, 52)
                 .animation(.easeInOut(duration: 0.16), value: expandedMessageKeys)
             }
+        }
+        .onAppear(perform: focusRequestedMessage)
+        .onChange(of: focusedMessageID) { _ in
+            focusRequestedMessage()
+        }
+        .onChange(of: messages) { _ in
+            focusRequestedMessage()
         }
     }
 
@@ -249,7 +286,7 @@ private struct GroupedEmailContent: View {
                     }
                     .frame(height: 152)
                     .overlay(alignment: .topLeading) {
-                        Text("Loading email...")
+                        Text(EmailReaderText.loadingFullEmail)
                             .font(EmailReaderTypography.body())
                             .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                             .padding(.top, 30)
@@ -269,31 +306,41 @@ private struct GroupedEmailContent: View {
             expandedMessageKeys.insert(messageKey)
         }
     }
+
+    private func focusRequestedMessage() {
+        guard let focusedMessageID,
+              let item = presentationItems.first(where: { $0.message.id == focusedMessageID }) else {
+            return
+        }
+        if item.id != latestMessageKey {
+            expandedMessageKeys.insert(item.id)
+        }
+        DispatchQueue.main.async {
+            onFocusedMessageKey(item.id)
+        }
+    }
 }
 
 private struct EmailReaderTitleHeader: View {
     let title: String
+    let summary: String?
     let colorScheme: ColorScheme
-    let onClose: () -> Void
 
     var body: some View {
-        ZStack(alignment: .leading) {
-            Button(action: onClose) {
-                Image(systemName: "chevron.backward")
-                    .font(EmailReaderTypography.backIcon())
-                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                    .frame(width: EmailReaderMetrics.backHitSize, height: EmailReaderMetrics.backHitSize)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .offset(x: -EmailReaderMetrics.backOffset)
-            .accessibilityLabel("Back")
-
+        VStack(alignment: .leading, spacing: 10) {
             Text(title)
                 .font(EmailReaderTypography.title())
                 .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if let summary {
+                Text(summary)
+                    .font(EmailReaderTypography.subtitle())
+                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }
@@ -383,7 +430,7 @@ enum EmailReaderBodyResolver {
 
         let bodyText = nonEmpty(message?.body).map { readableBodyText($0) }
             ?? nonEmpty(fallbackText)
-            ?? "Loading email..."
+            ?? EmailReaderText.loadingFullEmail
         let visibleTextLength = bodyText.components(separatedBy: .whitespacesAndNewlines).joined().count
         logClassification(
             threadID: threadID,
@@ -456,7 +503,7 @@ enum EmailReaderBodyResolver {
             ?? nonEmpty(message?.body).map { readableBodyText($0) }
             ?? nonEmpty(message?.snippet).map { EmailReaderText.decodingHTML($0) }
             ?? nonEmpty(fallbackText).map { readableBodyText($0) }
-            ?? "Loading email..."
+            ?? EmailReaderText.loadingFullEmail
     }
 
     private static func readableBodyText(_ value: String) -> String {
@@ -806,13 +853,8 @@ private struct EmailOriginalBodyView: View {
             messageID: messageID,
             colorScheme: .light
         )
-        .padding(16)
         .background(Color.white)
-        .clipShape(RoundedRectangle(cornerRadius: EmailReaderMetrics.cardRadius, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: EmailReaderMetrics.cardRadius, style: .continuous)
-                .stroke(Color.black.opacity(0.10), lineWidth: 1)
-        }
+        .padding(16)
     }
 }
 
@@ -824,24 +866,33 @@ private struct EmailHTMLBodyView: View {
     let colorScheme: ColorScheme
 
     @State private var contentHeight: CGFloat = EmailReaderMetrics.htmlBodyMinHeight
-    @State private var fallbackHTML: String?
+    @State private var runtimeFallbackReason: String?
 
     var body: some View {
-        if fallbackHTML == htmlDocument {
-            EmailTextBodyView(bodyText: fallbackText, colorScheme: colorScheme)
-        } else {
-            EmailHTMLWebView(
-                html: EmailHTMLDocument.renderableDocument(from: htmlDocument, colorScheme: colorScheme),
-                contentHeight: $contentHeight
-            ) { result in
-                guard result.needsTextFallback, !fallbackText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    return
+        Group {
+            if runtimeFallbackReason != nil {
+                EmailTextBodyView(
+                    bodyText: fallbackText,
+                    colorScheme: colorScheme,
+                    minHeight: 120
+                )
+            } else {
+                EmailHTMLWebView(
+                    html: EmailHTMLDocument.renderableDocument(from: htmlDocument, colorScheme: colorScheme),
+                    contentHeight: $contentHeight
+                ) { result in
+                    if result.fallbackReason != nil {
+                        logRuntimeFallback(result)
+                        runtimeFallbackReason = result.fallbackReason
+                    }
                 }
-                logRuntimeFallback(result)
-                fallbackHTML = htmlDocument
+                .frame(maxWidth: .infinity)
+                .frame(height: max(EmailReaderMetrics.htmlBodyMinHeight, min(contentHeight, EmailReaderMetrics.htmlBodyMaxHeight)))
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: max(EmailReaderMetrics.htmlBodyMinHeight, min(contentHeight, EmailReaderMetrics.htmlBodyMaxHeight)))
+        }
+        .onChange(of: htmlDocument) { _, _ in
+            runtimeFallbackReason = nil
+            contentHeight = EmailReaderMetrics.htmlBodyMinHeight
         }
     }
 
@@ -992,10 +1043,6 @@ private struct EmailHTMLRenderResult {
         height = Self.cgFloatValue(values["height"])
     }
 
-    var needsTextFallback: Bool {
-        fallbackReason != nil
-    }
-
     var fallbackReason: String? {
         if visibleTextLength < 12, imageCount == 0 {
             return "runtime-blank-html"
@@ -1063,9 +1110,9 @@ enum EmailThreadPresentation {
             let rhsDate = EmailReaderText.date(from: rhs.element.receivedAt)
             switch (lhsDate, rhsDate) {
             case let (lhsDate?, rhsDate?) where lhsDate != rhsDate:
-                return lhsDate < rhsDate
+                return lhsDate > rhsDate
             case (nil, nil) where lhs.element.receivedAt != rhs.element.receivedAt:
-                return lhs.element.receivedAt < rhs.element.receivedAt
+                return lhs.element.receivedAt > rhs.element.receivedAt
             default:
                 return lhs.offset < rhs.offset
             }
@@ -1073,7 +1120,7 @@ enum EmailThreadPresentation {
     }
 
     static func latestMessageID(in orderedMessages: [ThreadMessage]) -> String? {
-        orderedMessages.last?.id
+        orderedMessages.first?.id
     }
 
     static func items(from orderedMessages: [ThreadMessage]) -> [EmailThreadPresentationItem] {
@@ -1083,7 +1130,7 @@ enum EmailThreadPresentation {
     }
 
     static func latestMessageKey(in items: [EmailThreadPresentationItem]) -> String? {
-        items.last?.id
+        items.first?.id
     }
 
     static func isExpanded(
@@ -1396,7 +1443,8 @@ private struct EmailMessageCard: View {
     }
 
     private var displayBody: String {
-        EmailReaderText.decodingHTML(message.body)
+        let body = EmailReaderText.decodingHTML(message.body).trimmingCharacters(in: .whitespacesAndNewlines)
+        return body.isEmpty ? EmailReaderText.loadingFullEmail : body
     }
 
     private var htmlDocument: String? {
@@ -1407,6 +1455,7 @@ private struct EmailMessageCard: View {
 
 private struct EmailActionRow: View {
     let colorScheme: ColorScheme
+    let onReply: () -> Void
 
     private let symbols = [
         "arrowshape.turn.up.left",
@@ -1418,13 +1467,19 @@ private struct EmailActionRow: View {
     var body: some View {
         HStack(spacing: 28) {
             ForEach(symbols, id: \.self) { symbol in
-                Button(action: {}) {
+                Button {
+                    if symbol == "arrowshape.turn.up.left" {
+                        onReply()
+                    }
+                } label: {
                     Image(systemName: symbol)
                         .font(EmailReaderTypography.actionIcon())
                         .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                         .frame(width: 28, height: 28)
                 }
                 .buttonStyle(.plain)
+                .help(symbol == "arrowshape.turn.up.left" ? "Reply" : "Coming soon")
+                .disabled(symbol != "arrowshape.turn.up.left")
             }
         }
     }
@@ -1468,8 +1523,6 @@ private enum EmailReaderMetrics {
     static let cardRadius: CGFloat = 7
     static let htmlBodyMinHeight: CGFloat = 360
     static let htmlBodyMaxHeight: CGFloat = 6000
-    static let backHitSize: CGFloat = 44
-    static let backOffset: CGFloat = 58
 }
 
 private enum EmailReaderTypography {
@@ -1505,12 +1558,11 @@ private enum EmailReaderTypography {
         .system(size: 18, weight: weight)
     }
 
-    static func backIcon() -> Font {
-        .system(size: 19, weight: .semibold)
-    }
 }
 
 private enum EmailReaderText {
+    static let loadingFullEmail = "Loading full email..."
+
     static func senderName(_ rawValue: String?) -> String? {
         guard let rawValue else {
             return nil
@@ -1638,12 +1690,13 @@ private extension Array where Element: Hashable {
 #Preview("Single Email") {
     EmailReaderView(
         threadID: "demo-google-today",
+        focusedMessageID: nil,
         thread: DemoAppFixtures.threads["demo-google-today"],
         row: nil,
         errorMessage: nil,
         colorScheme: .dark,
-        onClose: {},
-        onRetry: {}
+        onRetry: {},
+        onReply: {}
     )
     .frame(width: 1440, height: 900)
 }

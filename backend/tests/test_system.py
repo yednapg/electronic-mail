@@ -74,6 +74,28 @@ class SystemRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["database"], "postgres")
+        self.assertEqual(response.json()["schema_head"], system_routes.ALEMBIC_HEAD_REVISION)
+
+    def test_ready_rejects_old_migration_revision(self) -> None:
+        settings = SimpleNamespace(
+            app_env="local",
+            database_path="postgresql://example/db",
+            database_backend="postgres",
+            google_configured=True,
+            openai_configured=True,
+            openai_model="gpt-5.4-mini",
+            openai_reasoning_effort="medium",
+            readiness_errors=lambda: [],
+        )
+
+        with (
+            patch.object(system_routes, "settings", settings),
+            patch.object(system_routes, "get_engine", return_value=FakeEngine(revision="20260519_0009")),
+        ):
+            response = self.client.get("/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn(system_routes.ALEMBIC_HEAD_REVISION, response.json()["detail"]["errors"][0])
 
 
 class FakeResult:
@@ -85,6 +107,9 @@ class FakeResult:
 
 
 class FakeConnection:
+    def __init__(self, revision: str | None = None) -> None:
+        self.revision = revision or system_routes.ALEMBIC_HEAD_REVISION
+
     def __enter__(self) -> "FakeConnection":
         return self
 
@@ -93,13 +118,16 @@ class FakeConnection:
 
     def exec_driver_sql(self, sql: str) -> FakeResult:
         if "alembic_version" in sql:
-            return FakeResult(system_routes.ALEMBIC_BASELINE_REVISION)
+            return FakeResult(self.revision)
         return FakeResult()
 
 
 class FakeEngine:
+    def __init__(self, revision: str | None = None) -> None:
+        self.revision = revision
+
     def connect(self) -> FakeConnection:
-        return FakeConnection()
+        return FakeConnection(self.revision)
 
 
 if __name__ == "__main__":

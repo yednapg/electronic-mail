@@ -7,6 +7,7 @@ let portableCoreSources: SourceFilesList = [
     "ElectronicMail/Core/AppSessionMapping.swift",
     "ElectronicMail/Core/DemoAppClient.swift",
     "ElectronicMail/Core/InboxStore.swift",
+    "ElectronicMail/Core/LocalMailStore.swift",
     "ElectronicMail/Core/Models.swift",
     "ElectronicMail/Core/SessionTokenStore.swift",
     "ElectronicMail/Core/ThreadCache.swift",
@@ -34,7 +35,9 @@ let project = Project(
             deploymentTargets: .macOS("14.0"),
             infoPlist: .default,
             sources: ["ElectronicMail/Core/**"],
-            dependencies: []
+            dependencies: [
+                .sdk(name: "sqlite3", type: .library)
+            ]
         ),
         .target(
             name: "ElectronicMail",

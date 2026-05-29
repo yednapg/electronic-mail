@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Postgres repositories for Gmail messages, mail groups, import state, and deletion guards."""
 
+import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -34,6 +35,12 @@ class GmailMessageRecord:
     body_hash: str
     created_at: str
     updated_at: str
+    body_fetch_status: str | None = None
+    body_fetched_at: str | None = None
+    body_fetch_error: str | None = None
+    render_doc_bytes: int = 0
+    ai_title: str | None = None
+    ai_title_generated_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +78,17 @@ class MailGroupDetail:
 
 
 @dataclass(frozen=True)
+class MailboxThreadPage:
+    threads: list[tuple[str, list[GmailMessageRecord]]]
+    next_cursor: str | None
+    loaded_threads: int
+
+
+class MailboxCursorError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
 class ManualTaskRecord:
     id: str
     user_id: str
@@ -96,10 +114,22 @@ class EntityOutcomeRecord:
 
 
 @dataclass(frozen=True)
+class MailboxEventRecord:
+    id: int
+    user_id: str
+    event_type: str
+    mailbox_label: str | None
+    payload: dict[str, Any]
+    created_at: str
+
+
+@dataclass(frozen=True)
 class GmailImportState:
     user_id: str
     last_history_id: str | None
     full_backfill_cursor: str | None
+    full_backfill_started_at: str | None
+    full_backfill_completed_at: str | None
     first_batch_imported_at: str | None
     first_groups_ready_at: str | None
     first_dashboard_ready_at: str | None
@@ -122,6 +152,46 @@ class AppSessionSnapshotRecord:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class PendingThreadActionRecord:
+    server_action_id: str
+    client_action_id: str
+    user_id: str
+    mailbox_thread_id: str
+    target_message_id: str | None
+    action: str
+    state: str
+    created_at: str
+    queued_at: str
+    applied_at: str | None
+    error: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class PendingSendRecord:
+    server_send_id: str
+    client_send_id: str
+    user_id: str
+    send_type: str
+    mailbox_thread_id: str | None
+    gmail_thread_id: str | None
+    to: list[str]
+    cc: list[str]
+    bcc: list[str]
+    subject: str
+    body_text: str
+    body_html: str | None
+    headers: dict[str, Any]
+    state: str
+    created_at: str
+    queued_at: str
+    sent_at: str | None
+    gmail_message_id: str | None
+    error: str | None
+    updated_at: str
+
+
 def user_can_write_gmail(database_url: str, *, user_id: str) -> bool:
     with get_engine(database_url).connect() as connection:
         row = connection.execute(
@@ -140,6 +210,25 @@ def user_can_write_gmail(database_url: str, *, user_id: str) -> bool:
             {"user_id": user_id},
         ).first()
     return row is not None
+
+
+def list_connected_gmail_user_ids(database_url: str) -> list[str]:
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT users.id
+                FROM users
+                JOIN google_oauth_tokens tokens ON tokens.user_id = users.id
+                WHERE users.access_enabled = TRUE
+                  AND users.google_disconnected_at IS NULL
+                  AND users.google_data_delete_requested_at IS NULL
+                  AND users.google_data_deleted_at IS NULL
+                ORDER BY users.updated_at DESC
+                """
+            )
+        ).mappings().all()
+    return [str(row["id"]) for row in rows]
 
 
 def clear_google_guard_state(database_url: str, *, user_id: str) -> None:
@@ -235,16 +324,21 @@ def mark_import_completed(
     last_history_id: str | None = None,
     full_backfill_cursor: str | None = None,
     clear_full_backfill_cursor: bool = False,
+    full_backfill_started: bool = False,
+    full_backfill_completed: bool = False,
 ) -> None:
     with get_engine(database_url).begin() as connection:
         connection.execute(
             text(
                 """
                 INSERT INTO gmail_import_state (
-                  user_id, last_history_id, full_backfill_cursor, first_batch_imported_at,
+                  user_id, last_history_id, full_backfill_cursor, full_backfill_started_at,
+                  full_backfill_completed_at, first_batch_imported_at,
                   first_groups_ready_at, first_dashboard_ready_at, last_import_completed_at, updated_at
                 ) VALUES (
                   :user_id, :last_history_id, :full_backfill_cursor,
+                  CASE WHEN :full_backfill_started THEN now() ELSE NULL END,
+                  CASE WHEN :full_backfill_completed THEN now() ELSE NULL END,
                   CASE WHEN :first_batch THEN now() ELSE NULL END,
                   CASE WHEN :groups_ready THEN now() ELSE NULL END,
                   CASE WHEN :dashboard_ready THEN now() ELSE NULL END,
@@ -255,6 +349,12 @@ def mark_import_completed(
                   full_backfill_cursor = CASE
                     WHEN :clear_full_backfill_cursor THEN NULL
                     ELSE COALESCE(excluded.full_backfill_cursor, gmail_import_state.full_backfill_cursor)
+                  END,
+                  full_backfill_started_at = COALESCE(gmail_import_state.full_backfill_started_at, excluded.full_backfill_started_at),
+                  full_backfill_completed_at = CASE
+                    WHEN :full_backfill_completed THEN COALESCE(excluded.full_backfill_completed_at, now())
+                    WHEN excluded.full_backfill_cursor IS NOT NULL THEN NULL
+                    ELSE gmail_import_state.full_backfill_completed_at
                   END,
                   first_batch_imported_at = COALESCE(gmail_import_state.first_batch_imported_at, excluded.first_batch_imported_at),
                   first_groups_ready_at = COALESCE(gmail_import_state.first_groups_ready_at, excluded.first_groups_ready_at),
@@ -269,6 +369,8 @@ def mark_import_completed(
                 "last_history_id": last_history_id,
                 "full_backfill_cursor": full_backfill_cursor,
                 "clear_full_backfill_cursor": clear_full_backfill_cursor,
+                "full_backfill_started": full_backfill_started,
+                "full_backfill_completed": full_backfill_completed,
                 "first_batch": first_batch,
                 "groups_ready": groups_ready,
                 "dashboard_ready": dashboard_ready,
@@ -340,6 +442,25 @@ def get_import_state(database_url: str, *, user_id: str) -> GmailImportState | N
     return _state_from_row(row) if row is not None else None
 
 
+def existing_gmail_message_ids(database_url: str, *, user_id: str, message_ids: list[str]) -> set[str]:
+    unique_message_ids = list(dict.fromkeys([message_id for message_id in message_ids if message_id]))
+    if not unique_message_ids:
+        return set()
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT message_id
+                FROM gmail_messages
+                WHERE user_id = :user_id
+                  AND message_id = ANY(:message_ids)
+                """
+            ),
+            {"user_id": user_id, "message_ids": unique_message_ids},
+        ).mappings().all()
+    return {str(row["message_id"]) for row in rows}
+
+
 def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageRecord]) -> int:
     rows = list(messages)
     if not rows:
@@ -352,11 +473,15 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                     INSERT INTO gmail_messages (
                       user_id, message_id, gmail_thread_id, history_id, label_ids_json, internal_date,
                       subject, sender, recipients_json, headers_json, snippet, raw_payload_json,
-                      html_body_sanitized, html_render_document, text_body, extracted_signals_json, body_hash, created_at, updated_at
+                      html_body_sanitized, html_render_document, text_body, extracted_signals_json, body_hash,
+                      body_fetch_status, body_fetched_at, body_fetch_error, render_doc_bytes,
+                      ai_title, ai_title_generated_at, created_at, updated_at
                     ) VALUES (
                       :user_id, :message_id, :gmail_thread_id, :history_id, :label_ids_json, :internal_date,
                       :subject, :sender, :recipients_json, :headers_json, :snippet, :raw_payload_json,
-                      :html_body_sanitized, :html_render_document, :text_body, :extracted_signals_json, :body_hash, now(), now()
+                      :html_body_sanitized, :html_render_document, :text_body, :extracted_signals_json, :body_hash,
+                      :body_fetch_status, :body_fetched_at, :body_fetch_error, :render_doc_bytes,
+                      :ai_title, :ai_title_generated_at, now(), now()
                     )
                     ON CONFLICT (user_id, message_id) DO UPDATE SET
                       gmail_thread_id = excluded.gmail_thread_id,
@@ -378,12 +503,425 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                       text_body = COALESCE(excluded.text_body, gmail_messages.text_body),
                       extracted_signals_json = excluded.extracted_signals_json,
                       body_hash = excluded.body_hash,
+                      body_fetch_status = CASE
+                        WHEN excluded.body_fetch_status = 'fetched' THEN 'fetched'
+                        WHEN gmail_messages.body_fetch_status = 'fetched' THEN gmail_messages.body_fetch_status
+                        ELSE excluded.body_fetch_status
+                      END,
+                      body_fetched_at = CASE
+                        WHEN excluded.body_fetch_status = 'fetched' THEN COALESCE(excluded.body_fetched_at, now())
+                        ELSE gmail_messages.body_fetched_at
+                      END,
+                      body_fetch_error = CASE
+                        WHEN excluded.body_fetch_status = 'fetched' THEN NULL
+                        WHEN excluded.body_fetch_status = 'failed' THEN excluded.body_fetch_error
+                        ELSE gmail_messages.body_fetch_error
+                      END,
+                      render_doc_bytes = GREATEST(gmail_messages.render_doc_bytes, excluded.render_doc_bytes),
+                      ai_title = COALESCE(gmail_messages.ai_title, excluded.ai_title),
+                      ai_title_generated_at = COALESCE(gmail_messages.ai_title_generated_at, excluded.ai_title_generated_at),
                       updated_at = now()
                     """
                 ),
                 _message_params(message),
             )
     return len(rows)
+
+
+def update_gmail_message_ai_titles(database_url: str, *, user_id: str, titles: dict[str, str], generated_at: str) -> int:
+    clean_titles = {
+        str(message_id): str(title).strip()[:180]
+        for message_id, title in titles.items()
+        if str(message_id).strip() and str(title).strip()
+    }
+    if not clean_titles:
+        return 0
+    rows = [{"message_id": message_id, "ai_title": title} for message_id, title in clean_titles.items()]
+    with get_engine(database_url).begin() as connection:
+        result = connection.execute(
+            text(
+                """
+                WITH input_titles AS (
+                  SELECT *
+                  FROM jsonb_to_recordset(CAST(:titles_json AS jsonb))
+                    AS title_rows(message_id text, ai_title text)
+                )
+                UPDATE gmail_messages AS messages
+                SET
+                  ai_title = input_titles.ai_title,
+                  ai_title_generated_at = CAST(:generated_at AS timestamptz),
+                  updated_at = now()
+                FROM input_titles
+                WHERE messages.user_id = :user_id
+                  AND messages.message_id = input_titles.message_id
+                """
+            ),
+            {"user_id": user_id, "titles_json": json.dumps(rows, ensure_ascii=True), "generated_at": generated_at},
+        )
+    return int(result.rowcount or 0)
+
+
+def mark_gmail_messages_body_fetch_state(
+    database_url: str,
+    *,
+    user_id: str,
+    message_ids: list[str],
+    status: str,
+    error: str | None = None,
+) -> int:
+    unique_message_ids = list(dict.fromkeys([message_id for message_id in message_ids if message_id]))
+    if not unique_message_ids:
+        return 0
+    with get_engine(database_url).begin() as connection:
+        result = connection.execute(
+            text(
+                """
+                UPDATE gmail_messages
+                SET
+                  body_fetch_status = :status,
+                  body_fetched_at = CASE WHEN :status = 'fetched' THEN now() ELSE body_fetched_at END,
+                  body_fetch_error = :error,
+                  updated_at = now()
+                WHERE user_id = :user_id
+                  AND message_id = ANY(:message_ids)
+                """
+            ),
+            {
+                "user_id": user_id,
+                "message_ids": unique_message_ids,
+                "status": status,
+                "error": error[:4000] if error else None,
+            },
+        )
+    return int(result.rowcount or 0)
+
+
+def upsert_pending_thread_action(
+    database_url: str,
+    *,
+    user_id: str,
+    client_action_id: str,
+    mailbox_thread_id: str,
+    target_message_id: str | None = None,
+    action: str,
+    created_at: str,
+) -> PendingThreadActionRecord:
+    server_action_id = str(uuid4())
+    with get_engine(database_url).begin() as connection:
+        row = connection.execute(
+            text(
+                """
+                INSERT INTO gmail_pending_thread_actions (
+                  server_action_id, client_action_id, user_id, mailbox_thread_id, target_message_id, action,
+                  state, created_at, queued_at, updated_at
+                ) VALUES (
+                  :server_action_id, :client_action_id, :user_id, :mailbox_thread_id, :target_message_id, :action,
+                  'queued', :created_at, now(), now()
+                )
+                ON CONFLICT (user_id, client_action_id) DO UPDATE SET updated_at = gmail_pending_thread_actions.updated_at
+                RETURNING *
+                """
+            ),
+            {
+                "server_action_id": server_action_id,
+                "client_action_id": client_action_id,
+                "user_id": user_id,
+                "mailbox_thread_id": mailbox_thread_id,
+                "target_message_id": target_message_id,
+                "action": action,
+                "created_at": created_at,
+            },
+        ).mappings().first()
+    if row is None:
+        raise RuntimeError("Failed to enqueue Gmail thread action")
+    return _pending_thread_action_from_row(row)
+
+
+def get_pending_thread_action(database_url: str, *, user_id: str, server_action_id: str) -> PendingThreadActionRecord | None:
+    with get_engine(database_url).connect() as connection:
+        row = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM gmail_pending_thread_actions
+                WHERE user_id = :user_id
+                  AND server_action_id = :server_action_id
+                """
+            ),
+            {"user_id": user_id, "server_action_id": server_action_id},
+        ).mappings().first()
+    return _pending_thread_action_from_row(row) if row is not None else None
+
+
+def count_pending_thread_actions(database_url: str, *, user_id: str) -> int:
+    with get_engine(database_url).connect() as connection:
+        value = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM gmail_pending_thread_actions
+                WHERE user_id = :user_id
+                  AND state IN ('queued', 'applying')
+                """
+            ),
+            {"user_id": user_id},
+        ).scalar_one()
+    return int(value)
+
+
+def insert_mailbox_event(
+    database_url: str,
+    *,
+    user_id: str,
+    event_type: str,
+    mailbox_label: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> MailboxEventRecord:
+    with get_engine(database_url).begin() as connection:
+        row = connection.execute(
+            text(
+                """
+                INSERT INTO mailbox_events (
+                  user_id, event_type, mailbox_label, payload_json, created_at
+                ) VALUES (
+                  :user_id, :event_type, :mailbox_label, CAST(:payload_json AS JSONB), now()
+                )
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": user_id,
+                "event_type": event_type,
+                "mailbox_label": mailbox_label,
+                "payload_json": json.dumps(payload or {}, ensure_ascii=True),
+            },
+        ).mappings().first()
+    if row is None:
+        raise RuntimeError("Failed to insert mailbox event")
+    return _mailbox_event_from_row(row)
+
+
+def list_mailbox_events_after(
+    database_url: str,
+    *,
+    user_id: str,
+    after_id: int | None = None,
+    limit: int = 100,
+) -> list[MailboxEventRecord]:
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM mailbox_events
+                WHERE user_id = :user_id
+                  AND id > :after_id
+                ORDER BY id ASC
+                LIMIT :limit
+                """
+            ),
+            {"user_id": user_id, "after_id": int(after_id or 0), "limit": max(1, min(limit, 500))},
+        ).mappings().all()
+    return [_mailbox_event_from_row(row) for row in rows]
+
+
+def upsert_pending_send(
+    database_url: str,
+    *,
+    user_id: str,
+    client_send_id: str,
+    send_type: str,
+    mailbox_thread_id: str | None,
+    gmail_thread_id: str | None,
+    to: list[str],
+    cc: list[str],
+    bcc: list[str],
+    subject: str,
+    body_text: str,
+    body_html: str | None,
+    headers: dict[str, Any],
+    created_at: str,
+) -> PendingSendRecord:
+    server_send_id = str(uuid4())
+    with get_engine(database_url).begin() as connection:
+        row = connection.execute(
+            text(
+                """
+                INSERT INTO gmail_pending_sends (
+                  server_send_id, client_send_id, user_id, send_type, mailbox_thread_id,
+                  gmail_thread_id, to_json, cc_json, bcc_json, subject, body_text,
+                  body_html, headers_json, state, created_at, queued_at, updated_at
+                ) VALUES (
+                  :server_send_id, :client_send_id, :user_id, :send_type, :mailbox_thread_id,
+                  :gmail_thread_id, :to_json, :cc_json, :bcc_json, :subject, :body_text,
+                  :body_html, :headers_json, 'queued', :created_at, now(), now()
+                )
+                ON CONFLICT (user_id, client_send_id) DO UPDATE SET updated_at = gmail_pending_sends.updated_at
+                RETURNING *
+                """
+            ),
+            {
+                "server_send_id": server_send_id,
+                "client_send_id": client_send_id,
+                "user_id": user_id,
+                "send_type": send_type,
+                "mailbox_thread_id": mailbox_thread_id,
+                "gmail_thread_id": gmail_thread_id,
+                "to_json": json.dumps(to, ensure_ascii=True),
+                "cc_json": json.dumps(cc, ensure_ascii=True),
+                "bcc_json": json.dumps(bcc, ensure_ascii=True),
+                "subject": subject,
+                "body_text": body_text,
+                "body_html": body_html,
+                "headers_json": json.dumps(headers, ensure_ascii=True),
+                "created_at": created_at,
+            },
+        ).mappings().first()
+    if row is None:
+        raise RuntimeError("Failed to enqueue Gmail send")
+    return _pending_send_from_row(row)
+
+
+def get_pending_send(database_url: str, *, user_id: str, server_send_id: str) -> PendingSendRecord | None:
+    with get_engine(database_url).connect() as connection:
+        row = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM gmail_pending_sends
+                WHERE user_id = :user_id
+                  AND server_send_id = :server_send_id
+                """
+            ),
+            {"user_id": user_id, "server_send_id": server_send_id},
+        ).mappings().first()
+    return _pending_send_from_row(row) if row is not None else None
+
+
+def mark_pending_send_sending(database_url: str, *, user_id: str, server_send_id: str) -> PendingSendRecord | None:
+    return _update_pending_send_state(database_url, user_id=user_id, server_send_id=server_send_id, state="sending")
+
+
+def mark_pending_send_sent(
+    database_url: str,
+    *,
+    user_id: str,
+    server_send_id: str,
+    gmail_message_id: str | None,
+    gmail_thread_id: str | None,
+) -> PendingSendRecord | None:
+    with get_engine(database_url).begin() as connection:
+        row = connection.execute(
+            text(
+                """
+                UPDATE gmail_pending_sends
+                SET
+                  state = 'sent',
+                  gmail_message_id = :gmail_message_id,
+                  gmail_thread_id = COALESCE(:gmail_thread_id, gmail_thread_id),
+                  sent_at = now(),
+                  error = NULL,
+                  updated_at = now()
+                WHERE user_id = :user_id
+                  AND server_send_id = :server_send_id
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": user_id,
+                "server_send_id": server_send_id,
+                "gmail_message_id": gmail_message_id,
+                "gmail_thread_id": gmail_thread_id,
+            },
+        ).mappings().first()
+    return _pending_send_from_row(row) if row is not None else None
+
+
+def mark_pending_send_failed(database_url: str, *, user_id: str, server_send_id: str, error: str) -> PendingSendRecord | None:
+    return _update_pending_send_state(
+        database_url,
+        user_id=user_id,
+        server_send_id=server_send_id,
+        state="failed",
+        error=error[:4000],
+    )
+
+
+def _update_pending_send_state(
+    database_url: str,
+    *,
+    user_id: str,
+    server_send_id: str,
+    state: str,
+    error: str | None = None,
+) -> PendingSendRecord | None:
+    with get_engine(database_url).begin() as connection:
+        row = connection.execute(
+            text(
+                """
+                UPDATE gmail_pending_sends
+                SET state = :state, error = :error, updated_at = now()
+                WHERE user_id = :user_id
+                  AND server_send_id = :server_send_id
+                RETURNING *
+                """
+            ),
+            {"user_id": user_id, "server_send_id": server_send_id, "state": state, "error": error},
+        ).mappings().first()
+    return _pending_send_from_row(row) if row is not None else None
+
+
+def mark_pending_thread_action_applying(database_url: str, *, user_id: str, server_action_id: str) -> None:
+    _update_pending_thread_action_state(database_url, user_id=user_id, server_action_id=server_action_id, state="applying")
+
+
+def mark_pending_thread_action_applied(database_url: str, *, user_id: str, server_action_id: str) -> PendingThreadActionRecord | None:
+    return _update_pending_thread_action_state(database_url, user_id=user_id, server_action_id=server_action_id, state="applied", applied=True)
+
+
+def mark_pending_thread_action_failed(database_url: str, *, user_id: str, server_action_id: str, error: str) -> PendingThreadActionRecord | None:
+    return _update_pending_thread_action_state(
+        database_url,
+        user_id=user_id,
+        server_action_id=server_action_id,
+        state="failed",
+        error=error[:4000],
+    )
+
+
+def _update_pending_thread_action_state(
+    database_url: str,
+    *,
+    user_id: str,
+    server_action_id: str,
+    state: str,
+    applied: bool = False,
+    error: str | None = None,
+) -> PendingThreadActionRecord | None:
+    with get_engine(database_url).begin() as connection:
+        row = connection.execute(
+            text(
+                """
+                UPDATE gmail_pending_thread_actions
+                SET
+                  state = :state,
+                  applied_at = CASE WHEN :applied THEN now() ELSE applied_at END,
+                  error = :error,
+                  updated_at = now()
+                WHERE user_id = :user_id
+                  AND server_action_id = :server_action_id
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": user_id,
+                "server_action_id": server_action_id,
+                "state": state,
+                "applied": applied,
+                "error": error,
+            },
+        ).mappings().first()
+    return _pending_thread_action_from_row(row) if row is not None else None
 
 
 def delete_gmail_messages(database_url: str, *, user_id: str, message_ids: list[str]) -> list[str]:
@@ -563,6 +1101,235 @@ def list_group_messages(database_url: str, *, user_id: str, group_id: str) -> li
     return [_message_from_row(row) for row in rows]
 
 
+def list_messages_for_gmail_thread(database_url: str, *, user_id: str, gmail_thread_id: str) -> list[GmailMessageRecord]:
+    thread_id = gmail_thread_id.strip()
+    if not thread_id:
+        return []
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM gmail_messages
+                WHERE user_id = :user_id
+                  AND COALESCE(NULLIF(gmail_thread_id, ''), message_id) = :gmail_thread_id
+                ORDER BY internal_date ASC NULLS LAST, created_at ASC
+                """
+            ),
+            {"user_id": user_id, "gmail_thread_id": thread_id},
+        ).mappings().all()
+    return [_message_from_row(row) for row in rows]
+
+
+def list_mailbox_thread_messages(
+    database_url: str,
+    *,
+    user_id: str,
+    label: str,
+    limit: int = 150,
+    since_iso: str | None = None,
+) -> list[tuple[str, list[GmailMessageRecord]]]:
+    return list_mailbox_thread_page(
+        database_url,
+        user_id=user_id,
+        label=label,
+        limit=limit,
+        since_iso=since_iso,
+    ).threads
+
+
+def list_mailbox_thread_page(
+    database_url: str,
+    *,
+    user_id: str,
+    label: str,
+    limit: int = 150,
+    cursor: str | None = None,
+    since_iso: str | None = None,
+) -> MailboxThreadPage:
+    mailbox_label = _normalized_mailbox_label(label)
+    label_clause = _mailbox_label_clause("messages", mailbox_label)
+    cursor_latest_at: str | None = None
+    cursor_thread_key: str | None = None
+    if cursor:
+        cursor_latest_at, cursor_thread_key = decode_mailbox_cursor(cursor)
+    filters = [f"messages.user_id = :user_id", label_clause]
+    params: dict[str, Any] = {"user_id": user_id, "limit": max(1, limit) + 1}
+    if since_iso:
+        filters.append("COALESCE(messages.internal_date, messages.updated_at) >= :since_iso")
+        params["since_iso"] = since_iso
+    cursor_clause = ""
+    if cursor_latest_at and cursor_thread_key:
+        cursor_clause = """
+                  WHERE (matching_threads.latest_matching_at, matching_threads.thread_key)
+                        < (CAST(:cursor_latest_at AS timestamptz), :cursor_thread_key)
+        """
+        params["cursor_latest_at"] = cursor_latest_at
+        params["cursor_thread_key"] = cursor_thread_key
+    where_clause = "\n                    AND ".join(filters)
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                f"""
+                WITH matching_threads AS (
+                  SELECT
+                    COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) AS thread_key,
+                    MAX(COALESCE(messages.internal_date, messages.updated_at)) AS latest_matching_at
+                  FROM gmail_messages AS messages
+                  WHERE {where_clause}
+                  GROUP BY thread_key
+                ),
+                page_threads AS (
+                  SELECT thread_key, latest_matching_at
+                  FROM matching_threads
+                  {cursor_clause}
+                  ORDER BY latest_matching_at DESC, thread_key DESC
+                  LIMIT :limit
+                )
+                SELECT
+                  page_threads.thread_key AS mailbox_thread_id,
+                  page_threads.latest_matching_at AS mailbox_latest_matching_at,
+                  messages.*
+                FROM page_threads
+                JOIN gmail_messages AS messages
+                  ON messages.user_id = :user_id
+                 AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = page_threads.thread_key
+                ORDER BY page_threads.latest_matching_at DESC,
+                         page_threads.thread_key DESC,
+                         messages.internal_date ASC NULLS LAST,
+                         messages.created_at ASC
+                """
+            ),
+            params,
+        ).mappings().all()
+    grouped: dict[str, list[GmailMessageRecord]] = {}
+    order: list[str] = []
+    latest_by_thread: dict[str, str] = {}
+    for row in rows:
+        thread_key = str(row["mailbox_thread_id"])
+        if thread_key not in grouped:
+            grouped[thread_key] = []
+            order.append(thread_key)
+            latest_by_thread[thread_key] = _iso(row["mailbox_latest_matching_at"])
+        grouped[thread_key].append(_message_from_row(row))
+    page_size = max(1, limit)
+    visible_order = order[:page_size]
+    next_cursor = None
+    if len(order) > page_size and visible_order:
+        last_thread = visible_order[-1]
+        next_cursor = encode_mailbox_cursor(latest_by_thread[last_thread], last_thread)
+    return MailboxThreadPage(
+        threads=[(thread_key, grouped[thread_key]) for thread_key in visible_order],
+        next_cursor=next_cursor,
+        loaded_threads=len(visible_order),
+    )
+
+
+def count_mailbox_threads(database_url: str, *, user_id: str, label: str, since_iso: str | None = None) -> int:
+    mailbox_label = _normalized_mailbox_label(label)
+    label_clause = _mailbox_label_clause("messages", mailbox_label)
+    filters = ["messages.user_id = :user_id", label_clause]
+    params: dict[str, Any] = {"user_id": user_id}
+    if since_iso:
+        filters.append("COALESCE(messages.internal_date, messages.updated_at) >= :since_iso")
+        params["since_iso"] = since_iso
+    where_clause = "\n                    AND ".join(filters)
+    with get_engine(database_url).connect() as connection:
+        value = connection.execute(
+            text(
+                f"""
+                SELECT COUNT(*)
+                FROM (
+                  SELECT COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) AS thread_key
+                  FROM gmail_messages AS messages
+                  WHERE {where_clause}
+                  GROUP BY thread_key
+                ) AS mailbox_threads
+                """
+            ),
+            params,
+        ).scalar_one()
+    return int(value)
+
+
+def encode_mailbox_cursor(latest_at: str, thread_key: str) -> str:
+    payload = json.dumps({"latest_at": latest_at, "thread_key": thread_key}, separators=(",", ":"), ensure_ascii=True)
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decode_mailbox_cursor(cursor: str) -> tuple[str, str]:
+    try:
+        padded = cursor + ("=" * (-len(cursor) % 4))
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+        latest_at = str(payload["latest_at"])
+        thread_key = str(payload["thread_key"])
+        parsed = datetime.fromisoformat(latest_at.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+    except Exception as exc:
+        raise MailboxCursorError("Invalid mailbox cursor") from exc
+    if not latest_at or not thread_key:
+        raise MailboxCursorError("Invalid mailbox cursor")
+    return parsed.isoformat(), thread_key
+
+
+def list_mail_groups_for_gmail_threads(database_url: str, *, user_id: str, gmail_thread_ids: list[str]) -> dict[str, MailGroupRecord]:
+    thread_ids = list(dict.fromkeys([thread_id for thread_id in gmail_thread_ids if thread_id]))
+    if not thread_ids:
+        return {}
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                WITH requested_threads AS (
+                  SELECT unnest(CAST(:thread_ids AS text[])) AS thread_key
+                )
+                SELECT DISTINCT ON (requested_threads.thread_key)
+                  requested_threads.thread_key AS mailbox_thread_id,
+                  groups.*
+                FROM requested_threads
+                JOIN gmail_messages AS messages
+                  ON messages.user_id = :user_id
+                 AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = requested_threads.thread_key
+                JOIN mail_group_members AS members
+                  ON members.user_id = messages.user_id
+                 AND members.gmail_message_id = messages.message_id
+                JOIN mail_groups AS groups
+                  ON groups.user_id = members.user_id
+                 AND groups.id = members.group_id
+                 AND groups.status = 'active'
+                ORDER BY requested_threads.thread_key,
+                         CASE
+                           WHEN groups.membership_source = 'ai_batch' THEN 0
+                           WHEN groups.group_key NOT LIKE 'gmail-thread:%' THEN 1
+                           ELSE 2
+                         END,
+                         CASE WHEN groups.enrichment_status = 'ready' THEN 0 ELSE 1 END,
+                         groups.latest_message_at DESC NULLS LAST,
+                         groups.updated_at DESC
+                """
+            ),
+            {"user_id": user_id, "thread_ids": thread_ids},
+        ).mappings().all()
+    return {str(row["mailbox_thread_id"]): _group_from_row(row) for row in rows}
+
+
+def latest_gmail_mailbox_revision(database_url: str, *, user_id: str) -> str | None:
+    with get_engine(database_url).connect() as connection:
+        value = connection.execute(
+            text(
+                """
+                SELECT MAX(updated_at)
+                FROM gmail_messages
+                WHERE user_id = :user_id
+                """
+            ),
+            {"user_id": user_id},
+        ).scalar_one_or_none()
+    return _iso(value) if value is not None else None
+
+
 def list_messages_for_groups(database_url: str, *, user_id: str, group_ids: list[str]) -> dict[str, list[GmailMessageRecord]]:
     if not group_ids:
         return {}
@@ -579,6 +1346,8 @@ def list_messages_for_groups(database_url: str, *, user_id: str, group_ids: list
                   messages.label_ids_json,
                   messages.internal_date,
                   messages.subject,
+                  messages.ai_title,
+                  messages.ai_title_generated_at,
                   messages.sender,
                   messages.recipients_json,
                   messages.headers_json,
@@ -589,6 +1358,10 @@ def list_messages_for_groups(database_url: str, *, user_id: str, group_ids: list
                   NULL AS text_body,
                   messages.extracted_signals_json,
                   messages.body_hash,
+                  messages.body_fetch_status,
+                  messages.body_fetched_at,
+                  messages.body_fetch_error,
+                  messages.render_doc_bytes,
                   messages.created_at,
                   messages.updated_at
                 FROM mail_group_members members
@@ -978,21 +1751,42 @@ def list_mail_groups(database_url: str, *, user_id: str, limit: int = 150, inclu
     return [_group_from_row(row) for row in rows]
 
 
-def list_pending_mail_groups(database_url: str, *, user_id: str, limit: int = 10) -> list[MailGroupRecord]:
+def list_pending_mail_groups(database_url: str, *, user_id: str, limit: int = 10, preferred_group_ids: list[str] | None = None) -> list[MailGroupRecord]:
+    preferred = list(dict.fromkeys([group_id for group_id in (preferred_group_ids or []) if group_id]))
     with get_engine(database_url).connect() as connection:
         rows = connection.execute(
             text(
                 """
                 SELECT *
-                FROM mail_groups
-                WHERE user_id = :user_id
-                  AND status = 'active'
-                  AND enrichment_status = 'pending'
-                ORDER BY latest_message_at DESC NULLS LAST, priority DESC, updated_at ASC
+                FROM mail_groups AS groups
+                WHERE groups.user_id = :user_id
+                  AND groups.status = 'active'
+                  AND (
+                    groups.enrichment_status = 'pending'
+                    OR (
+                      groups.enrichment_status = 'ready'
+                      AND groups.id = ANY(:preferred_group_ids)
+                      AND EXISTS (
+                        SELECT 1
+                        FROM mail_group_members AS members
+                        JOIN gmail_messages AS messages
+                          ON messages.user_id = members.user_id
+                         AND messages.message_id = members.gmail_message_id
+                        WHERE members.user_id = groups.user_id
+                          AND members.group_id = groups.id
+                          AND messages.ai_title IS NULL
+                      )
+                    )
+                  )
+                ORDER BY
+                  CASE WHEN groups.id = ANY(:preferred_group_ids) THEN 0 ELSE 1 END,
+                  groups.latest_message_at DESC NULLS LAST,
+                  groups.priority DESC,
+                  groups.updated_at ASC
                 LIMIT :limit
                 """
             ),
-            {"user_id": user_id, "limit": limit},
+            {"user_id": user_id, "limit": limit, "preferred_group_ids": preferred},
         ).mappings().all()
     return [_group_from_row(row) for row in rows]
 
@@ -1108,6 +1902,26 @@ def count_mail_groups_by_enrichment_status(database_url: str, *, user_id: str) -
     return {str(row["enrichment_status"]): int(row["count"]) for row in rows}
 
 
+def latest_mail_group_ai_error(database_url: str, *, user_id: str) -> str | None:
+    with get_engine(database_url).connect() as connection:
+        value = connection.execute(
+            text(
+                """
+                SELECT ai_error
+                FROM mail_groups
+                WHERE user_id = :user_id
+                  AND status = 'active'
+                  AND ai_error IS NOT NULL
+                  AND ai_error <> ''
+                ORDER BY ai_generated_at DESC NULLS LAST, updated_at DESC
+                LIMIT 1
+                """
+            ),
+            {"user_id": user_id},
+        ).scalar()
+    return str(value) if value else None
+
+
 def oldest_imported_message_at(database_url: str, *, user_id: str) -> str | None:
     with get_engine(database_url).connect() as connection:
         value = connection.execute(
@@ -1170,7 +1984,41 @@ def upsert_app_session_snapshot(
         )
 
 
+def _normalized_mailbox_label(label: str) -> str:
+    normalized = label.strip().lower()
+    return normalized if normalized in {"inbox", "sent", "drafts", "spam", "trash", "archive", "all"} else "inbox"
+
+
+def _mailbox_label_clause(alias: str, label: str) -> str:
+    label_json = f"{alias}.label_ids_json::jsonb"
+    if label == "all":
+        return "TRUE"
+    if label == "inbox":
+        return f"{label_json} ? 'INBOX'"
+    if label == "sent":
+        return f"{label_json} ? 'SENT'"
+    if label == "drafts":
+        return f"{label_json} ? 'DRAFT'"
+    if label == "spam":
+        return f"{label_json} ? 'SPAM'"
+    if label == "trash":
+        return f"{label_json} ? 'TRASH'"
+    if label == "archive":
+        return (
+            f"NOT ({label_json} ? 'INBOX') "
+            f"AND NOT ({label_json} ? 'SENT') "
+            f"AND NOT ({label_json} ? 'DRAFT') "
+            f"AND NOT ({label_json} ? 'SPAM') "
+            f"AND NOT ({label_json} ? 'TRASH')"
+        )
+    return "TRUE"
+
+
 def _message_params(message: GmailMessageRecord) -> dict[str, Any]:
+    body_fetch_status = message.body_fetch_status or _body_fetch_status_for_message(message)
+    body_fetched_at = message.body_fetched_at
+    if body_fetch_status == "fetched" and body_fetched_at is None:
+        body_fetched_at = datetime.now(timezone.utc).isoformat()
     return {
         "user_id": message.user_id,
         "message_id": message.message_id,
@@ -1189,6 +2037,12 @@ def _message_params(message: GmailMessageRecord) -> dict[str, Any]:
         "text_body": message.text_body,
         "extracted_signals_json": json.dumps(message.extracted_signals, ensure_ascii=True),
         "body_hash": message.body_hash,
+        "body_fetch_status": body_fetch_status,
+        "body_fetched_at": body_fetched_at,
+        "body_fetch_error": message.body_fetch_error,
+        "render_doc_bytes": message.render_doc_bytes or len(message.html_render_document or ""),
+        "ai_title": message.ai_title,
+        "ai_title_generated_at": message.ai_title_generated_at,
     }
 
 
@@ -1201,6 +2055,8 @@ def _message_from_row(row) -> GmailMessageRecord:
         label_ids=json.loads(row["label_ids_json"] or "[]"),
         internal_date=_iso(row["internal_date"]) if row["internal_date"] is not None else None,
         subject=str(row["subject"]) if row["subject"] is not None else None,
+        ai_title=str(row["ai_title"]) if "ai_title" in row and row["ai_title"] is not None else None,
+        ai_title_generated_at=_iso(row["ai_title_generated_at"]) if "ai_title_generated_at" in row and row["ai_title_generated_at"] is not None else None,
         sender=str(row["sender"]) if row["sender"] is not None else None,
         recipients=json.loads(row["recipients_json"] or "{}"),
         headers=json.loads(row["headers_json"] or "{}"),
@@ -1213,7 +2069,92 @@ def _message_from_row(row) -> GmailMessageRecord:
         body_hash=str(row["body_hash"]),
         created_at=_iso(row["created_at"]),
         updated_at=_iso(row["updated_at"]),
+        body_fetch_status=str(row["body_fetch_status"]) if row.get("body_fetch_status") is not None else None,
+        body_fetched_at=_iso(row["body_fetched_at"]) if row.get("body_fetched_at") is not None else None,
+        body_fetch_error=str(row["body_fetch_error"]) if row.get("body_fetch_error") is not None else None,
+        render_doc_bytes=int(row["render_doc_bytes"] or 0) if row.get("render_doc_bytes") is not None else 0,
     )
+
+
+def _body_fetch_status_for_message(message: GmailMessageRecord) -> str:
+    if _payload_has_body_data(message.raw_payload) or message.html_render_document or message.html_body_sanitized:
+        return "fetched"
+    return "missing"
+
+
+def _payload_has_body_data(payload: dict[str, Any]) -> bool:
+    def visit(part: Any) -> bool:
+        if not isinstance(part, dict):
+            return False
+        body = part.get("body")
+        if isinstance(body, dict) and isinstance(body.get("data"), str) and body.get("data"):
+            return True
+        parts = part.get("parts")
+        if isinstance(parts, list):
+            return any(visit(item) for item in parts)
+        return False
+
+    return visit(payload.get("payload") if isinstance(payload, dict) else payload)
+
+
+def _pending_thread_action_from_row(row) -> PendingThreadActionRecord:
+    return PendingThreadActionRecord(
+        server_action_id=str(row["server_action_id"]),
+        client_action_id=str(row["client_action_id"]),
+        user_id=str(row["user_id"]),
+        mailbox_thread_id=str(row["mailbox_thread_id"]),
+        target_message_id=str(row["target_message_id"]) if row.get("target_message_id") is not None else None,
+        action=str(row["action"]),
+        state=str(row["state"]),
+        created_at=_iso(row["created_at"]),
+        queued_at=_iso(row["queued_at"]),
+        applied_at=_iso(row["applied_at"]) if row["applied_at"] is not None else None,
+        error=str(row["error"]) if row["error"] is not None else None,
+        updated_at=_iso(row["updated_at"]),
+    )
+
+
+def _pending_send_from_row(row) -> PendingSendRecord:
+    return PendingSendRecord(
+        server_send_id=str(row["server_send_id"]),
+        client_send_id=str(row["client_send_id"]),
+        user_id=str(row["user_id"]),
+        send_type=str(row["send_type"]),
+        mailbox_thread_id=str(row["mailbox_thread_id"]) if row["mailbox_thread_id"] is not None else None,
+        gmail_thread_id=str(row["gmail_thread_id"]) if row["gmail_thread_id"] is not None else None,
+        to=_json_list(row["to_json"]),
+        cc=_json_list(row["cc_json"]),
+        bcc=_json_list(row["bcc_json"]),
+        subject=str(row["subject"]),
+        body_text=str(row["body_text"]),
+        body_html=str(row["body_html"]) if row["body_html"] is not None else None,
+        headers=_json_dict(row["headers_json"]),
+        state=str(row["state"]),
+        created_at=_iso(row["created_at"]),
+        queued_at=_iso(row["queued_at"]),
+        sent_at=_iso(row["sent_at"]) if row["sent_at"] is not None else None,
+        gmail_message_id=str(row["gmail_message_id"]) if row["gmail_message_id"] is not None else None,
+        error=str(row["error"]) if row["error"] is not None else None,
+        updated_at=_iso(row["updated_at"]),
+    )
+
+
+def _json_list(value: Any) -> list[str]:
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if str(item).strip()]
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _group_from_row(row) -> MailGroupRecord:
@@ -1272,11 +2213,34 @@ def _entity_outcome_from_row(row) -> EntityOutcomeRecord:
     )
 
 
+def _mailbox_event_from_row(row) -> MailboxEventRecord:
+    payload = row["payload_json"]
+    if isinstance(payload, str):
+        try:
+            payload_value = json.loads(payload)
+        except json.JSONDecodeError:
+            payload_value = {}
+    elif isinstance(payload, dict):
+        payload_value = payload
+    else:
+        payload_value = {}
+    return MailboxEventRecord(
+        id=int(row["id"]),
+        user_id=str(row["user_id"]),
+        event_type=str(row["event_type"]),
+        mailbox_label=str(row["mailbox_label"]) if row["mailbox_label"] is not None else None,
+        payload=payload_value,
+        created_at=_iso(row["created_at"]),
+    )
+
+
 def _state_from_row(row) -> GmailImportState:
     return GmailImportState(
         user_id=str(row["user_id"]),
         last_history_id=str(row["last_history_id"]) if row["last_history_id"] is not None else None,
         full_backfill_cursor=str(row["full_backfill_cursor"]) if row["full_backfill_cursor"] is not None else None,
+        full_backfill_started_at=_iso(row["full_backfill_started_at"]) if "full_backfill_started_at" in row and row["full_backfill_started_at"] is not None else None,
+        full_backfill_completed_at=_iso(row["full_backfill_completed_at"]) if "full_backfill_completed_at" in row and row["full_backfill_completed_at"] is not None else None,
         first_batch_imported_at=_iso(row["first_batch_imported_at"]) if row["first_batch_imported_at"] is not None else None,
         first_groups_ready_at=_iso(row["first_groups_ready_at"]) if row["first_groups_ready_at"] is not None else None,
         first_dashboard_ready_at=_iso(row["first_dashboard_ready_at"]) if row["first_dashboard_ready_at"] is not None else None,

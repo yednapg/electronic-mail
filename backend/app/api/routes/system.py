@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, status
 
 from app.core.config import load_settings
-from app.db.repository import ALEMBIC_BASELINE_REVISION, get_engine
+from app.db.repository import ALEMBIC_HEAD_REVISION, get_engine
 
 
 router = APIRouter()
@@ -30,13 +30,15 @@ def ready() -> dict[str, object]:
         try:
             with get_engine(str(settings.database_path)).connect() as connection:
                 revision = connection.exec_driver_sql("SELECT version_num FROM alembic_version LIMIT 1").scalar()
-                if revision != ALEMBIC_BASELINE_REVISION:
+                if revision != ALEMBIC_HEAD_REVISION:
                     errors.append(
-                        f"Database migration revision is {revision or 'missing'}, expected {ALEMBIC_BASELINE_REVISION}"
+                        f"Database migration revision is {revision or 'missing'}, expected {ALEMBIC_HEAD_REVISION}"
                     )
                 connection.exec_driver_sql("SELECT 1 FROM gmail_messages LIMIT 1")
                 connection.exec_driver_sql("SELECT 1 FROM mail_groups LIMIT 1")
                 connection.exec_driver_sql("SELECT 1 FROM app_session_snapshots LIMIT 1")
+                connection.exec_driver_sql("SELECT body_fetch_status, render_doc_bytes FROM gmail_messages LIMIT 1")
+                connection.exec_driver_sql("SELECT 1 FROM gmail_pending_thread_actions LIMIT 1")
         except Exception as exc:
             errors.append(f"Postgres readiness check failed: {exc}")
 
@@ -58,6 +60,8 @@ def ready() -> dict[str, object]:
         "openai_configured": settings.openai_configured,
         "openai_model": settings.openai_model,
         "openai_reasoning_effort": settings.openai_reasoning_effort,
+        "schema_revision": ALEMBIC_HEAD_REVISION,
+        "schema_head": ALEMBIC_HEAD_REVISION,
     }
 
 

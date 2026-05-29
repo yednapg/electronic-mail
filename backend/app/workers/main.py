@@ -16,6 +16,9 @@ from app.db.jobs import claim_job, cleanup_old_jobs, complete_job, enqueue_job, 
 from app.db.repository import get_user_by_email
 from app.services.gmail_importer import run_gmail_backfill, run_gmail_delta_sync, run_gmail_import_batch
 from app.services.gmail_watch import ensure_gmail_watch
+from app.services.mailbox_events import DASHBOARD_CHANGED, emit_mailbox_event
+from app.services.mailbox_actions import run_pending_thread_action
+from app.services.mailbox_sends import run_pending_send
 from app.services.mail_groups import (
     FIRST_BATCH_SIZE,
     MAILBOX_REBUILD_LIMIT,
@@ -103,7 +106,22 @@ def _run_job(settings, job) -> None:
             raise RuntimeError("gmail_body_fetch missing user_id")
         from app.services.gmail_importer import run_gmail_body_fetch
 
-        run_gmail_body_fetch(settings, user_id=user_id, group_id=str(payload.get("group_id") or ""))
+        run_gmail_body_fetch(
+            settings,
+            user_id=user_id,
+            group_id=str(payload.get("group_id") or ""),
+            gmail_thread_id=str(payload.get("gmail_thread_id") or ""),
+        )
+        return
+    if job.kind == "gmail_thread_action":
+        if not isinstance(user_id, str):
+            raise RuntimeError("gmail_thread_action missing user_id")
+        run_pending_thread_action(settings, user_id=user_id, server_action_id=str(payload.get("server_action_id") or ""))
+        return
+    if job.kind == "gmail_send_message":
+        if not isinstance(user_id, str):
+            raise RuntimeError("gmail_send_message missing user_id")
+        run_pending_send(settings, user_id=user_id, server_send_id=str(payload.get("server_send_id") or ""))
         return
     if job.kind == "mail_group_candidates":
         if not isinstance(user_id, str):
@@ -123,7 +141,13 @@ def _run_job(settings, job) -> None:
     if job.kind == "mail_group_enrich":
         if not isinstance(user_id, str):
             raise RuntimeError(f"{job.kind} missing user_id")
-        touched = enrich_pending_mail_groups(settings, user_id=user_id, limit=MAIL_GROUP_ENRICH_BATCH_SIZE)
+        preferred_group_ids = payload.get("preferred_group_ids")
+        touched = enrich_pending_mail_groups(
+            settings,
+            user_id=user_id,
+            limit=MAIL_GROUP_ENRICH_BATCH_SIZE,
+            preferred_group_ids=[str(group_id) for group_id in preferred_group_ids] if isinstance(preferred_group_ids, list) else None,
+        )
         enqueue_projection_refresh(settings, user_id=user_id, priority=20)
         if touched >= MAIL_GROUP_ENRICH_BATCH_SIZE:
             enqueue_job(
@@ -140,11 +164,13 @@ def _run_job(settings, job) -> None:
         if not isinstance(user_id, str):
             raise RuntimeError("first_run_ai_grouping missing user_id")
         run_first_run_ai_grouping(settings, user_id=user_id, limit=int(payload.get("batch_size") or FIRST_BATCH_SIZE))
+        emit_mailbox_event(settings, user_id=user_id, event_type=DASHBOARD_CHANGED, payload={"source": "first_run_ai_grouping"})
         return
     if job.kind == "first_run_ready_check":
         if not isinstance(user_id, str):
             raise RuntimeError("first_run_ready_check missing user_id")
         run_first_run_ai_grouping(settings, user_id=user_id, limit=int(payload.get("batch_size") or FIRST_BATCH_SIZE))
+        emit_mailbox_event(settings, user_id=user_id, event_type=DASHBOARD_CHANGED, payload={"source": "first_run_ready_check"})
         return
     if job.kind == "gmail_pubsub_sync":
         resolved_user_id = _user_id_from_pubsub(settings, payload) or user_id
@@ -157,6 +183,7 @@ def _run_job(settings, job) -> None:
             target_history_id=str(payload.get("history_id") or "") or None,
         )
         refresh_app_session_snapshot(settings, user_id=resolved_user_id)
+        emit_mailbox_event(settings, user_id=resolved_user_id, event_type=DASHBOARD_CHANGED, payload={"source": "gmail_pubsub_sync"})
         return
     if job.kind == "gmail_watch_renewal":
         if not isinstance(user_id, str):
@@ -167,6 +194,7 @@ def _run_job(settings, job) -> None:
         if not isinstance(user_id, str):
             raise RuntimeError("projection_refresh missing user_id")
         refresh_app_session_snapshot(settings, user_id=user_id)
+        emit_mailbox_event(settings, user_id=user_id, event_type=DASHBOARD_CHANGED, payload={"source": "projection_refresh"})
         return
     if job.kind == "job_retention_cleanup":
         cleanup_old_jobs(str(settings.database_path))

@@ -26,7 +26,7 @@ from app.db.repository import (
     upsert_user,
 )
 from app.schemas.domain import DashboardProfile, GoogleAuthState
-from app.services.integrations.google import has_stored_google_tokens, load_google_account_profile
+from app.services.integrations.google import GMAIL_SEND_SCOPE, has_stored_google_tokens, load_google_account_profile, missing_google_scopes
 from app.services.token_crypto import decrypt_json, encrypt_json
 
 
@@ -94,13 +94,16 @@ def auth_state_for_request(settings: Settings, request: Request) -> GoogleAuthSt
         return GoogleAuthState(available=True, connected=False, connect_url=f"{settings.backend_origin}/auth/google")
 
     if user.legacy_local:
-        return GoogleAuthState(available=True, connected=True, connect_url=None)
+        return GoogleAuthState(available=True, connected=True, connect_url=None, can_send_mail=True)
 
     has_token = get_google_oauth_token(str(settings.database_path), user_id=user.id) is not None
+    missing_scopes = missing_google_scopes(settings, user_id=user.id, required_scopes=[GMAIL_SEND_SCOPE]) if has_token else [GMAIL_SEND_SCOPE]
     return GoogleAuthState(
         available=True,
         connected=has_token,
         connect_url=None if has_token else f"{settings.backend_origin}/auth/google",
+        can_send_mail=has_token and not missing_scopes,
+        missing_scopes=missing_scopes if has_token else [],
     )
 
 

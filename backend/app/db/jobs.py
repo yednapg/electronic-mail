@@ -13,6 +13,8 @@ from sqlalchemy import text
 from app.db.repository import get_engine
 
 ACTIVE_STATUSES = {"queued", "running"}
+REQUIRED_RUNTIME_QUEUES = ("critical", "reader", "default", "slow")
+FRESH_WORKER_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,8 @@ class QueueHealth:
     stale_running_jobs: int
     oldest_queued_age_seconds: int | None
     workers: list[dict[str, Any]]
+    worker_online: bool
+    required_queues_ready: bool
 
 
 def enqueue_job(
@@ -319,22 +323,44 @@ def get_queue_health(database_url: str) -> QueueHealth:
             text("SELECT EXTRACT(EPOCH FROM (now() - MIN(created_at))) FROM background_jobs WHERE status = 'queued'")
         ).scalar()
         workers = connection.execute(
-            text("SELECT worker_id, queues_json, current_job_id, last_seen_at FROM worker_heartbeats ORDER BY last_seen_at DESC")
+            text(
+                """
+                SELECT
+                  worker_id,
+                  queues_json,
+                  current_job_id,
+                  last_seen_at,
+                  EXTRACT(EPOCH FROM (now() - last_seen_at)) AS age_seconds
+                FROM worker_heartbeats
+                ORDER BY last_seen_at DESC
+                """
+            )
         ).mappings().all()
+    worker_payloads = [
+        {
+            "worker_id": row["worker_id"],
+            "queues": json.loads(row["queues_json"] or "[]"),
+            "current_job_id": row["current_job_id"],
+            "last_seen_at": _iso(row["last_seen_at"]),
+            "age_seconds": int(row["age_seconds"] or 0),
+            "fresh": int(row["age_seconds"] or 0) <= FRESH_WORKER_SECONDS,
+        }
+        for row in workers
+    ]
+    fresh_queues = {
+        queue
+        for worker in worker_payloads
+        if worker["fresh"]
+        for queue in worker["queues"]
+    }
     return QueueHealth(
         queue_depth={str(row["queue"]): int(row["count"]) for row in depths},
         dead_jobs=int(dead_jobs or 0),
         stale_running_jobs=int(stale_running or 0),
         oldest_queued_age_seconds=int(oldest_age) if oldest_age is not None else None,
-        workers=[
-            {
-                "worker_id": row["worker_id"],
-                "queues": json.loads(row["queues_json"] or "[]"),
-                "current_job_id": row["current_job_id"],
-                "last_seen_at": _iso(row["last_seen_at"]),
-            }
-            for row in workers
-        ],
+        workers=worker_payloads,
+        worker_online=bool(fresh_queues),
+        required_queues_ready=all(queue in fresh_queues for queue in REQUIRED_RUNTIME_QUEUES),
     )
 
 

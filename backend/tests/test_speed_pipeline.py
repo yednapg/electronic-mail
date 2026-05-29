@@ -9,15 +9,17 @@ from googleapiclient.errors import HttpError
 from httplib2 import Response
 
 from app.db.jobs import renew_heartbeat
-from app.db.mail_groups import AppSessionSnapshotRecord, GmailMessageRecord, MailGroupRecord
+from app.db.mail_groups import AppSessionSnapshotRecord, GmailMessageRecord, MailboxCursorError, MailboxThreadPage, MailGroupRecord, decode_mailbox_cursor, encode_mailbox_cursor
 from app.services.auth import CurrentUser
-from app.services.gmail_importer import run_gmail_backfill, run_gmail_delta_sync, run_gmail_import_batch
+from app.services.gmail_importer import _encode_full_mailbox_cursor, run_gmail_backfill, run_gmail_delta_sync, run_gmail_import_batch
 from app.services.gmail_watch import ensure_gmail_watch
 from app.services.mail_groups import (
+    APP_SESSION_PROJECTION_VERSION,
     _candidate_groups,
     build_app_session_response,
     build_mailbox_response,
     enqueue_mailbox_sync,
+    ensure_background_import_work,
     rebuild_touched_mail_groups,
     run_first_run_ai_grouping,
 )
@@ -85,7 +87,14 @@ class SpeedPipelineTests(unittest.TestCase):
             openai_model="gpt-5.4-mini",
             gmail_pubsub_topic="projects/example/topics/gmail",
             gmail_watch_renewal_hours=24,
+            gmail_recent_days=90,
         )
+        self.importer_event_patch = patch("app.services.gmail_importer.emit_mailbox_event")
+        self.worker_event_patch = patch("app.workers.main.emit_mailbox_event")
+        self.mock_importer_event = self.importer_event_patch.start()
+        self.mock_worker_event = self.worker_event_patch.start()
+        self.addCleanup(self.importer_event_patch.stop)
+        self.addCleanup(self.worker_event_patch.stop)
 
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
     @patch("app.services.gmail_importer.enqueue_job")
@@ -93,6 +102,7 @@ class SpeedPipelineTests(unittest.TestCase):
     @patch("app.services.gmail_importer.rebuild_touched_mail_groups", return_value=1)
     @patch("app.services.gmail_importer.upsert_gmail_messages", return_value=1)
     @patch("app.services.gmail_importer._hydrate_messages")
+    @patch("app.services.gmail_importer._list_draft_messages")
     @patch("app.services.gmail_importer._list_messages")
     @patch("app.services.gmail_importer.mark_import_started")
     @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
@@ -101,6 +111,7 @@ class SpeedPipelineTests(unittest.TestCase):
         _mock_can_write: Mock,
         _mock_started: Mock,
         mock_list: Mock,
+        mock_draft_list: Mock,
         mock_hydrate: Mock,
         _mock_upsert: Mock,
         mock_rebuild_touched: Mock,
@@ -109,21 +120,76 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_projection: Mock,
     ) -> None:
         message = sample_message()
+        draft = replace(sample_message("draft-1"), gmail_thread_id="thread-draft", label_ids=["DRAFT"])
         mock_list.return_value = {"messages": [{"id": message.message_id}], "nextPageToken": "next"}
-        mock_hydrate.return_value = ([message], "10")
+        mock_draft_list.return_value = {"messages": [{"id": draft.message_id}]}
+        mock_hydrate.return_value = ([message, draft], "10")
 
         touched = run_gmail_import_batch(self.settings, user_id="user-1", batch_size=30, first_run=False)
 
         self.assertEqual(touched, 1)
         mock_hydrate.assert_called_once()
+        self.assertEqual(mock_hydrate.call_args.kwargs["listed"]["messages"], [{"id": "msg-1"}, {"id": "draft-1"}])
         self.assertEqual(mock_hydrate.call_args.kwargs["format"], "metadata")
         mock_rebuild_touched.assert_called_once_with(
             self.settings,
             user_id="user-1",
-            message_ids=["msg-1"],
+            message_ids=["msg-1", "draft-1"],
             use_ai=False,
         )
         mock_projection.assert_called_once_with(self.settings, user_id="user-1", priority=20)
+
+    @patch("app.services.gmail_importer._hydrate_thread_metadata_for_messages")
+    @patch("app.services.gmail_importer.enqueue_job")
+    @patch("app.services.gmail_importer.mark_import_completed")
+    @patch("app.services.gmail_importer.upsert_gmail_messages")
+    @patch("app.services.gmail_importer._hydrate_messages")
+    @patch("app.services.gmail_importer._list_draft_messages")
+    @patch("app.services.gmail_importer._list_messages")
+    @patch("app.services.gmail_importer.mark_import_started")
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_first_run_import_uses_90_day_mailbox_seeds_and_thread_history(
+        self,
+        _mock_can_write: Mock,
+        _mock_started: Mock,
+        mock_list: Mock,
+        mock_draft_list: Mock,
+        mock_hydrate: Mock,
+        mock_upsert: Mock,
+        mock_completed: Mock,
+        mock_enqueue: Mock,
+        mock_thread_history: Mock,
+    ) -> None:
+        inbox = sample_message("inbox-1")
+        sent = replace(sample_message("sent-1"), gmail_thread_id="thread-2", label_ids=["SENT"])
+        draft = replace(sample_message("draft-1"), gmail_thread_id="thread-3", label_ids=["DRAFT"])
+        spam = replace(sample_message("spam-1"), gmail_thread_id="thread-4", label_ids=["SPAM"])
+        trash = replace(sample_message("trash-1"), gmail_thread_id="thread-5", label_ids=["TRASH"])
+        archived = replace(sample_message("archived-1"), gmail_thread_id="thread-6", label_ids=["IMPORTANT"])
+        history = replace(sample_message("history-1"), gmail_thread_id="thread-1", label_ids=["SENT"])
+        mock_list.side_effect = [
+            {"messages": [{"id": "inbox-1"}]},
+            {"messages": [{"id": "sent-1"}]},
+            {"messages": [{"id": "spam-1"}]},
+            {"messages": [{"id": "trash-1"}]},
+            {"messages": [{"id": "archived-1"}]},
+        ]
+        mock_draft_list.return_value = {"messages": [{"id": "draft-1"}]}
+        mock_hydrate.side_effect = [([inbox], "10"), ([sent], "11"), ([draft], "12"), ([spam], "13"), ([trash], "14"), ([archived], "15")]
+        mock_thread_history.return_value = ([history], "12")
+
+        imported = run_gmail_import_batch(self.settings, user_id="user-1", batch_size=500, first_run=True)
+
+        self.assertEqual(imported, 7)
+        self.assertEqual([call.kwargs["label_ids"] for call in mock_list.call_args_list], [["INBOX"], ["SENT"], ["SPAM"], ["TRASH"], None])
+        mock_draft_list.assert_called_once_with(self.settings, user_id="user-1", batch_size=500, page_token=None)
+        mock_thread_history.assert_called_once()
+        self.assertEqual(mock_upsert.call_args.args[1], [inbox, sent, draft, spam, trash, archived, history])
+        self.assertIsNotNone(mock_completed.call_args.kwargs["full_backfill_cursor"])
+        self.assertFalse(mock_completed.call_args.kwargs["clear_full_backfill_cursor"])
+        self.assertTrue(mock_completed.call_args.kwargs["full_backfill_started"])
+        self.assertTrue(any(call.kwargs.get("kind") == "gmail_backfill" for call in mock_enqueue.call_args_list))
+        self.assertTrue(any(call.kwargs.get("kind") == "first_run_ai_grouping" for call in mock_enqueue.call_args_list))
 
     @patch("app.services.gmail_importer._list_messages")
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
@@ -420,6 +486,7 @@ class SpeedPipelineTests(unittest.TestCase):
         created = run_first_run_ai_grouping(self.settings, user_id="user-1", limit=50)
 
         self.assertEqual(created, 3)
+        self.assertGreaterEqual(mock_recent.call_args.kwargs["limit"], 270)
         mock_rebuild_touched.assert_called_once_with(self.settings, user_id="user-1", message_ids=["msg-2"], use_ai=False)
         self.assertTrue(any(call.kwargs.get("kind") == "mail_group_enrich" for call in mock_enqueue.call_args_list))
 
@@ -491,39 +558,349 @@ class SpeedPipelineTests(unittest.TestCase):
         )
         mock_projection.assert_called_once_with(self.settings, user_id="user-1", priority=1)
 
+    @patch("app.services.gmail_importer.enqueue_projection_refresh")
+    @patch("app.services.gmail_importer.enqueue_job")
+    @patch("app.services.gmail_importer.mark_import_completed")
+    @patch("app.services.gmail_importer.rebuild_touched_mail_groups", return_value=1)
+    @patch("app.services.gmail_importer.upsert_gmail_messages", return_value=1)
+    @patch("app.services.gmail_importer._hydrate_messages")
+    @patch("app.services.gmail_importer.existing_gmail_message_ids", return_value={"existing-1"})
+    @patch("app.services.gmail_importer._list_draft_messages")
+    @patch("app.services.gmail_importer._list_messages")
+    @patch("app.services.gmail_importer.mark_import_started")
+    @patch("app.services.gmail_importer.get_import_state")
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_full_backfill_starts_after_recent_window_and_skips_existing_messages(
+        self,
+        _mock_can_write: Mock,
+        mock_state: Mock,
+        _mock_started: Mock,
+        mock_list: Mock,
+        mock_drafts: Mock,
+        mock_existing: Mock,
+        mock_hydrate: Mock,
+        _mock_upsert: Mock,
+        mock_rebuild_touched: Mock,
+        mock_completed: Mock,
+        mock_enqueue: Mock,
+        _mock_projection: Mock,
+    ) -> None:
+        message = sample_message("older-1")
+        mock_state.return_value = SimpleNamespace(
+            first_batch_imported_at="2026-05-15T12:00:00+00:00",
+            full_backfill_cursor=None,
+            full_backfill_completed_at=None,
+        )
+        mock_list.return_value = {"messages": [{"id": "existing-1"}, {"id": "older-1"}], "nextPageToken": "next-full"}
+        mock_drafts.return_value = {"messages": []}
+        mock_hydrate.return_value = ([message], "20")
+
+        touched = run_gmail_backfill(self.settings, user_id="user-1", batch_size=100)
+
+        self.assertEqual(touched, 1)
+        mock_existing.assert_called_once_with(self.settings.database_path, user_id="user-1", message_ids=["existing-1", "older-1"])
+        self.assertEqual(mock_hydrate.call_args.kwargs["listed"]["messages"], [{"id": "older-1"}])
+        mock_rebuild_touched.assert_called_once_with(self.settings, user_id="user-1", message_ids=["older-1"], use_ai=False)
+        self.assertTrue(mock_completed.call_args.kwargs["full_backfill_started"])
+        self.assertFalse(mock_completed.call_args.kwargs["full_backfill_completed"])
+        self.assertIsNotNone(mock_completed.call_args.kwargs["full_backfill_cursor"])
+        self.assertTrue(any(call.kwargs.get("kind") == "gmail_backfill" for call in mock_enqueue.call_args_list))
+
+    @patch("app.services.gmail_importer.enqueue_projection_refresh")
+    @patch("app.services.gmail_importer.enqueue_job")
+    @patch("app.services.gmail_importer.mark_import_completed")
+    @patch("app.services.gmail_importer.rebuild_touched_mail_groups", return_value=1)
+    @patch("app.services.gmail_importer.upsert_gmail_messages", return_value=1)
+    @patch("app.services.gmail_importer._hydrate_messages")
+    @patch("app.services.gmail_importer.existing_gmail_message_ids", return_value=set())
+    @patch("app.services.gmail_importer._list_draft_messages")
+    @patch("app.services.gmail_importer._list_messages")
+    @patch("app.services.gmail_importer.mark_import_started")
+    @patch("app.services.gmail_importer.get_import_state")
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_full_backfill_draft_cursor_does_not_restart_completed_all_mail(
+        self,
+        _mock_can_write: Mock,
+        mock_state: Mock,
+        _mock_started: Mock,
+        mock_list: Mock,
+        mock_drafts: Mock,
+        _mock_existing: Mock,
+        mock_hydrate: Mock,
+        _mock_upsert: Mock,
+        _mock_rebuild_touched: Mock,
+        mock_completed: Mock,
+        _mock_enqueue: Mock,
+        _mock_projection: Mock,
+    ) -> None:
+        draft = replace(sample_message("draft-2"), gmail_thread_id="thread-draft", label_ids=["DRAFT"])
+        mock_state.return_value = SimpleNamespace(
+            first_batch_imported_at="2026-05-15T12:00:00+00:00",
+            full_backfill_cursor=_encode_full_mailbox_cursor(
+                all_mail_completed=True,
+                draft_page_token="draft-page-2",
+                drafts_completed=False,
+            ),
+            full_backfill_completed_at=None,
+        )
+        mock_drafts.return_value = {"messages": [{"id": "draft-2"}]}
+        mock_hydrate.return_value = ([draft], "22")
+
+        touched = run_gmail_backfill(self.settings, user_id="user-1", batch_size=100)
+
+        self.assertEqual(touched, 1)
+        mock_list.assert_not_called()
+        mock_drafts.assert_called_once_with(self.settings, user_id="user-1", batch_size=100, page_token="draft-page-2")
+        self.assertIsNone(mock_completed.call_args.kwargs["full_backfill_cursor"])
+        self.assertTrue(mock_completed.call_args.kwargs["full_backfill_completed"])
+
+    @patch("app.services.mail_groups.ensure_background_import_work")
     @patch("app.services.mail_groups.oldest_imported_message_at", return_value=None)
+    @patch("app.services.mail_groups.count_mailbox_threads", return_value=0)
+    @patch("app.services.mail_groups.list_mail_groups_for_gmail_threads", return_value={})
+    @patch("app.services.mail_groups.list_mailbox_thread_page", return_value=MailboxThreadPage(threads=[], next_cursor="cursor-2", loaded_threads=100))
     @patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 2, "pending": 9})
-    @patch("app.services.mail_groups.list_messages_for_groups", return_value={})
-    @patch("app.services.mail_groups.list_mail_groups", return_value=[])
+    @patch("app.services.mail_groups.count_active_jobs", return_value=0)
     @patch("app.services.mail_groups.get_import_state", return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None))
     def test_mailbox_includes_pending_groups_for_fast_arrival(
         self,
         _mock_state: Mock,
-        mock_list_groups: Mock,
-        _mock_group_messages: Mock,
+        _mock_active_jobs: Mock,
         _mock_counts: Mock,
+        mock_thread_page: Mock,
+        _mock_ai_groups: Mock,
+        mock_count_threads: Mock,
         _mock_oldest: Mock,
+        _mock_recovery: Mock,
     ) -> None:
         mailbox = build_mailbox_response(self.settings, user_id="user-1")
 
         self.assertEqual(mailbox.pending_count, 9)
-        mock_list_groups.assert_called_once_with(
+        self.assertEqual(mailbox.next_cursor, "cursor-2")
+        self.assertEqual(mailbox.loaded_threads, 100)
+        self.assertIsNone(mailbox.window_days)
+        mock_thread_page.assert_called_once()
+        self.assertEqual(mock_thread_page.call_args.kwargs["user_id"], "user-1")
+        self.assertEqual(mock_thread_page.call_args.kwargs["label"], "inbox")
+        self.assertEqual(mock_thread_page.call_args.kwargs["limit"], 150)
+        self.assertIsNone(mock_thread_page.call_args.kwargs["since_iso"])
+        mock_count_threads.assert_called_once_with(
             self.settings.database_path,
             user_id="user-1",
-            limit=150,
-            include_pending=True,
+            label="inbox",
+            since_iso=None,
         )
 
+    def test_mailbox_cursor_round_trips_and_rejects_invalid_values(self) -> None:
+        cursor = encode_mailbox_cursor("2026-05-15T12:00:00+00:00", "thread-1")
+
+        latest_at, thread_key = decode_mailbox_cursor(cursor)
+
+        self.assertEqual(latest_at, "2026-05-15T12:00:00+00:00")
+        self.assertEqual(thread_key, "thread-1")
+        with self.assertRaises(MailboxCursorError):
+            decode_mailbox_cursor("not-a-valid-cursor")
+
+    def test_mailbox_uses_ai_group_rows_titles_and_summaries(self) -> None:
+        first = replace(
+            sample_message("msg-1"),
+            gmail_thread_id="thread-1",
+            internal_date="2026-05-15T12:00:00+00:00",
+            subject="Raw first subject",
+            snippet="Raw first snippet",
+            ai_title="Clean first title",
+        )
+        second = replace(
+            sample_message("msg-2"),
+            gmail_thread_id="thread-2",
+            internal_date="2026-05-15T13:00:00+00:00",
+            subject="Raw second subject",
+            snippet="Raw second snippet",
+            ai_title="Clean second title",
+        )
+        group = replace(sample_group(), ai_title="AI grouped title", ai_summary="AI grouped summary")
+
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 1, "pending": 0}), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            return_value=MailboxThreadPage(threads=[("thread-1", [first]), ("thread-2", [second])], next_cursor=None, loaded_threads=2),
+        ), patch(
+            "app.services.mail_groups.list_mail_groups_for_gmail_threads",
+            return_value={"thread-1": group, "thread-2": group},
+        ), patch("app.services.mail_groups.list_messages_for_groups", return_value={"group-1": [first, second]}), patch(
+            "app.services.mail_groups.count_mailbox_threads",
+            return_value=2,
+        ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.count_active_jobs", return_value=0
+        ):
+            mailbox = build_mailbox_response(self.settings, user_id="user-1")
+
+        rows = [row for section in mailbox.sections for row in section.rows]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].thread_id, "group-1")
+        self.assertEqual(rows[0].title, "AI grouped title")
+        self.assertEqual(rows[0].summary, "AI grouped summary")
+        self.assertEqual(rows[0].ai_title, "AI grouped title")
+        self.assertEqual(rows[0].ai_summary, "AI grouped summary")
+        self.assertEqual(rows[0].latest_subject, "Raw second subject")
+        self.assertEqual(rows[0].message_count, 2)
+        self.assertEqual([child.message_id for child in rows[0].children], ["msg-1", "msg-2"])
+        self.assertEqual(rows[0].children[0].subject, "Raw first subject")
+        self.assertEqual(rows[0].children[0].ai_title, "Clean first title")
+        self.assertEqual(rows[0].children[1].subject, "Raw second subject")
+        self.assertEqual(rows[0].children[1].ai_title, "Clean second title")
+
+    def test_mailbox_row_uses_only_messages_matching_requested_label(self) -> None:
+        inbox = replace(
+            sample_message("inbox-1"),
+            gmail_thread_id="thread-1",
+            label_ids=["INBOX", "UNREAD"],
+            internal_date="2026-05-15T12:00:00+00:00",
+            subject="Inbox copy",
+            sender="Sender <sender@example.com>",
+        )
+        sent = replace(
+            sample_message("sent-1"),
+            gmail_thread_id="thread-1",
+            label_ids=["SENT"],
+            internal_date="2026-05-15T13:00:00+00:00",
+            subject="Sent reply",
+            sender="Me <me@example.com>",
+        )
+        group = replace(sample_group(), ai_title="AI thread", ai_summary="AI summary")
+
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 1, "pending": 0}), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            return_value=MailboxThreadPage(threads=[("thread-1", [inbox, sent])], next_cursor=None, loaded_threads=1),
+        ), patch(
+            "app.services.mail_groups.list_mail_groups_for_gmail_threads",
+            return_value={"thread-1": group},
+        ), patch("app.services.mail_groups.list_messages_for_groups", return_value={"group-1": [inbox, sent]}), patch(
+            "app.services.mail_groups.count_mailbox_threads",
+            return_value=1,
+        ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.count_active_jobs", return_value=0
+        ):
+            inbox_mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
+            sent_mailbox = build_mailbox_response(self.settings, user_id="user-1", label="sent")
+
+        inbox_row = [row for section in inbox_mailbox.sections for row in section.rows][0]
+        sent_row = [row for section in sent_mailbox.sections for row in section.rows][0]
+        self.assertEqual(inbox_row.message_count, 1)
+        self.assertEqual(inbox_row.latest_subject, "Inbox copy")
+        self.assertEqual(inbox_row.label_ids, ["INBOX", "UNREAD"])
+        self.assertEqual(inbox_row.participants, ["Sender"])
+        self.assertEqual([child.message_id for child in inbox_row.children], ["inbox-1"])
+        self.assertEqual(inbox_row.children[0].label_ids, ["INBOX", "UNREAD"])
+        self.assertEqual(sent_row.message_count, 1)
+        self.assertEqual(sent_row.latest_subject, "Sent reply")
+        self.assertEqual(sent_row.label_ids, ["SENT"])
+        self.assertEqual(sent_row.participants, ["Me"])
+        self.assertEqual([child.message_id for child in sent_row.children], ["sent-1"])
+        self.assertEqual(sent_row.children[0].label_ids, ["SENT"])
+
+    def test_mailbox_skips_overlapping_group_rows(self) -> None:
+        first = replace(
+            sample_message("msg-1"),
+            gmail_thread_id="thread-1",
+            internal_date="2026-05-15T12:00:00+00:00",
+            subject="Raw first subject",
+        )
+        second = replace(
+            sample_message("msg-2"),
+            gmail_thread_id="thread-2",
+            internal_date="2026-05-15T13:00:00+00:00",
+            subject="Raw second subject",
+        )
+        ai_group = replace(
+            sample_group(),
+            id="group-ai",
+            membership_source="ai_batch",
+            ai_title="AI conversation",
+            ai_summary="AI summary",
+        )
+        lower_priority_group = replace(
+            sample_group(),
+            id="group-raw",
+            group_key="gmail-thread:thread-2",
+            membership_source="gmail_thread",
+            ai_title="Raw overlap",
+            ai_summary="Raw summary",
+        )
+
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 2, "pending": 0}), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            return_value=MailboxThreadPage(threads=[("thread-1", [first]), ("thread-2", [second])], next_cursor=None, loaded_threads=2),
+        ), patch(
+            "app.services.mail_groups.list_mail_groups_for_gmail_threads",
+            return_value={"thread-1": ai_group, "thread-2": lower_priority_group},
+        ), patch(
+            "app.services.mail_groups.list_messages_for_groups",
+            return_value={"group-ai": [first, second], "group-raw": [second]},
+        ), patch(
+            "app.services.mail_groups.count_mailbox_threads",
+            return_value=2,
+        ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.count_active_jobs", return_value=0
+        ):
+            mailbox = build_mailbox_response(self.settings, user_id="user-1")
+
+        rows = [row for section in mailbox.sections for row in section.rows]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].thread_id, "group-ai")
+        self.assertEqual(rows[0].title, "AI conversation")
+        self.assertEqual(rows[0].message_count, 2)
+
+    @patch("app.services.mail_groups.enqueue_projection_refresh")
+    @patch("app.services.mail_groups.enqueue_job")
+    @patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"pending": 4, "ready": 0})
+    @patch("app.services.mail_groups.count_active_jobs", return_value=0)
+    @patch("app.services.mail_groups.get_import_state", return_value=SimpleNamespace(first_batch_imported_at=None, first_groups_ready_at=None, full_backfill_cursor=None))
+    @patch("app.services.mail_groups.user_can_write_gmail", return_value=True)
+    def test_recovery_enqueues_first_run_and_enrichment_work(
+        self,
+        _mock_can_write: Mock,
+        _mock_state: Mock,
+        _mock_active_jobs: Mock,
+        _mock_counts: Mock,
+        mock_enqueue: Mock,
+        mock_projection: Mock,
+    ) -> None:
+        ensure_background_import_work(self.settings, user_id="user-1")
+
+        kinds = [call.kwargs.get("kind") for call in mock_enqueue.call_args_list]
+        self.assertIn("gmail_import_batch", kinds)
+        self.assertIn("mail_group_enrich", kinds)
+        mock_projection.assert_called_once_with(self.settings, user_id="user-1", priority=20)
+
+    @patch("app.services.mail_groups.get_queue_health", return_value=SimpleNamespace(queue_depth={}, worker_online=False, required_queues_ready=False))
+    @patch("app.services.mail_groups.latest_mail_group_ai_error", return_value=None)
+    @patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 0, "pending": 0})
+    @patch("app.services.mail_groups.ensure_background_import_work")
     @patch("app.services.mail_groups.get_import_state", return_value=None)
     @patch("app.services.mail_groups.get_app_session_snapshot")
+    @patch("app.services.mail_groups.missing_google_scopes", return_value=[])
     @patch("app.services.mail_groups.user_can_write_gmail", return_value=True)
     @patch("app.services.mail_groups.build_dashboard_response")
     def test_app_session_reads_snapshot_without_live_dashboard_rebuild(
         self,
         mock_live_dashboard: Mock,
         _mock_can_write: Mock,
+        _mock_missing_scopes: Mock,
         mock_snapshot: Mock,
         _mock_state: Mock,
+        _mock_recovery: Mock,
+        _mock_counts: Mock,
+        _mock_ai_error: Mock,
+        _mock_health: Mock,
     ) -> None:
         mock_snapshot.return_value = AppSessionSnapshotRecord(
             user_id="user-1",
@@ -537,6 +914,7 @@ class SpeedPipelineTests(unittest.TestCase):
                 "oldest_imported_at": None,
                 "full_import_running": False,
                 "full_import_completed": False,
+                "projection_version": APP_SESSION_PROJECTION_VERSION,
             },
             updated_at="2026-05-15T12:00:00+00:00",
         )
@@ -545,6 +923,8 @@ class SpeedPipelineTests(unittest.TestCase):
         session = build_app_session_response(self.settings, user=user)
 
         self.assertEqual(session.user.email, "me@example.com")
+        self.assertFalse(session.readiness.ready_to_enter)
+        self.assertFalse(session.readiness.dashboard_ready)
         mock_live_dashboard.assert_not_called()
 
     def test_heartbeat_renews_running_job_lease(self) -> None:
