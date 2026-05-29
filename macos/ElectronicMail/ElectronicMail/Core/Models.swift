@@ -23,6 +23,16 @@ public enum GmailThreadAction: String, Codable, Equatable {
     case archive
     case unarchive
     case markRead = "mark_read"
+    case moveTrash = "move_trash"
+    case deleteForever = "delete_forever"
+}
+
+public enum MailSendState: String, Codable, Equatable {
+    case queued
+    case sending
+    case sent
+    case failed
+    case reauthRequired = "reauth_required"
 }
 
 public enum NeedType: String, Codable, Equatable {
@@ -34,11 +44,38 @@ public struct GoogleAuthState: Codable, Equatable {
     let available: Bool
     let connected: Bool
     let connectURL: String?
+    let canSendMail: Bool
+    let missingScopes: [String]
+
+    init(
+        available: Bool,
+        connected: Bool,
+        connectURL: String?,
+        canSendMail: Bool = false,
+        missingScopes: [String] = []
+    ) {
+        self.available = available
+        self.connected = connected
+        self.connectURL = connectURL
+        self.canSendMail = canSendMail
+        self.missingScopes = missingScopes
+    }
 
     enum CodingKeys: String, CodingKey {
         case available
         case connected
         case connectURL = "connect_url"
+        case canSendMail = "can_send_mail"
+        case missingScopes = "missing_scopes"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        available = try container.decode(Bool.self, forKey: .available)
+        connected = try container.decode(Bool.self, forKey: .connected)
+        connectURL = try container.decodeIfPresent(String.self, forKey: .connectURL)
+        canSendMail = try container.decodeIfPresent(Bool.self, forKey: .canSendMail) ?? false
+        missingScopes = try container.decodeIfPresent([String].self, forKey: .missingScopes) ?? []
     }
 }
 
@@ -175,6 +212,11 @@ public struct AppSessionSyncState: Codable, Equatable {
     let oldestImportedAt: String?
     let fullImportRunning: Bool
     let fullImportCompleted: Bool
+    var fullImportCompletedAt: String? = nil
+    var pendingActionCount: Int? = nil
+    var lastActionSyncAt: String? = nil
+    var lastActionError: String? = nil
+    var lastAIError: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case lastSyncAt = "last_sync_at"
@@ -184,21 +226,26 @@ public struct AppSessionSyncState: Codable, Equatable {
         case oldestImportedAt = "oldest_imported_at"
         case fullImportRunning = "full_import_running"
         case fullImportCompleted = "full_import_completed"
+        case fullImportCompletedAt = "full_import_completed_at"
+        case pendingActionCount = "pending_action_count"
+        case lastActionSyncAt = "last_action_sync_at"
+        case lastActionError = "last_action_error"
+        case lastAIError = "last_ai_error"
     }
 }
 
 public struct PostLoginReadinessResponse: Codable, Equatable {
-    let mode: String
-    let stage: String
-    let readyToEnter: Bool
-    let dashboardReady: Bool
-    let mailboxReady: Bool
-    let readyDashboardCount: Int
-    let readyMailGroupCount: Int
-    let fullImportRunning: Bool
-    let fullImportCompleted: Bool
-    let userDisplayName: String?
-    let errorMessage: String?
+    public let mode: String
+    public let stage: String
+    public let readyToEnter: Bool
+    public let dashboardReady: Bool
+    public let mailboxReady: Bool
+    public let readyDashboardCount: Int
+    public let readyMailGroupCount: Int
+    public let fullImportRunning: Bool
+    public let fullImportCompleted: Bool
+    public let userDisplayName: String?
+    public let errorMessage: String?
 
     enum CodingKeys: String, CodingKey {
         case mode
@@ -305,8 +352,13 @@ public struct AttentionItem: Codable, Equatable, Identifiable, Hashable {
     }
 }
 
-public enum MailboxLabel: String, Codable, Equatable {
+public enum MailboxLabel: String, Codable, Equatable, Hashable {
     case inbox
+    case sent
+    case drafts
+    case spam
+    case trash
+    case archive
     case all
 }
 
@@ -328,6 +380,50 @@ public struct GmailThreadUpdate: Codable, Equatable, Identifiable, Hashable {
     }
 }
 
+public struct GmailThreadChildRow: Codable, Equatable, Identifiable, Hashable {
+    public var id: String { messageID }
+
+    let messageID: String
+    let gmailThreadID: String?
+    let sender: String?
+    let subject: String?
+    var aiTitle: String? = nil
+    let snippet: String?
+    let receivedAt: String
+    let labelIDs: [String]
+    let labels: [String]
+    let unread: Bool
+
+    var displaySender: String {
+        cleanSender(sender ?? "Unknown")
+    }
+
+    var displayTitle: String {
+        aiTitle ?? subject ?? snippet ?? "Untitled"
+    }
+
+    var isUnread: Bool {
+        unread || labelIDs.contains("UNREAD") || labels.contains("UNREAD")
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case messageID = "message_id"
+        case gmailThreadID = "gmail_thread_id"
+        case sender
+        case subject
+        case aiTitle = "ai_title"
+        case snippet
+        case receivedAt = "received_at"
+        case labelIDs = "label_ids"
+        case labels
+        case unread
+    }
+
+    private func cleanSender(_ value: String) -> String {
+        value.split(separator: "<", maxSplits: 1).first.map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) } ?? value
+    }
+}
+
 public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
     public var id: String { threadID }
 
@@ -344,6 +440,9 @@ public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
     let participants: [String]
     let messageCount: Int
     let summary: String?
+    var aiGroupID: String? = nil
+    var aiTitle: String? = nil
+    var aiSummary: String? = nil
     let snippet: String?
     let labelIDs: [String]
     let labels: [String]
@@ -357,18 +456,32 @@ public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
     let lifecycleState: String?
     let outcomeType: String?
     let lifecycleUpdates: [GmailThreadUpdate]
+    var children: [GmailThreadChildRow]? = nil
     let enrichmentStatus: String?
+    var presentationStatus: String? = nil
+    var pendingAction: GmailThreadAction? = nil
 
     var displaySender: String {
         cleanSender(sender ?? latestSender ?? participants.first ?? "Unknown")
     }
 
     var displayTitle: String {
-        title ?? latestSubject ?? summary ?? snippet ?? "Untitled"
+        if presentationStatus == "ai_pending", aiTitle == nil {
+            return "Building title... \(title ?? latestSubject ?? summary ?? snippet ?? "Email")"
+        }
+        return aiTitle ?? title ?? latestSubject ?? summary ?? snippet ?? "Untitled"
+    }
+
+    var displaySummary: String? {
+        aiSummary ?? summary ?? snippet
     }
 
     var isGrouped: Bool {
-        messageCount > 1 || lifecycleUpdates.count > 1
+        messageCount > 1 || lifecycleUpdates.count > 1 || childRows.count > 1
+    }
+
+    var childRows: [GmailThreadChildRow] {
+        children ?? []
     }
 
     var isUnread: Bool {
@@ -389,6 +502,9 @@ public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
         case participants
         case messageCount = "message_count"
         case summary
+        case aiGroupID = "ai_group_id"
+        case aiTitle = "ai_title"
+        case aiSummary = "ai_summary"
         case snippet
         case labelIDs = "label_ids"
         case labels
@@ -402,7 +518,10 @@ public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
         case lifecycleState = "lifecycle_state"
         case outcomeType = "outcome_type"
         case lifecycleUpdates = "lifecycle_updates"
+        case children
         case enrichmentStatus = "enrichment_status"
+        case presentationStatus = "presentation_status"
+        case pendingAction = "pending_action"
     }
 
     private static func cleanSender(_ value: String) -> String {
@@ -424,6 +543,8 @@ public struct MailboxResponse: Codable, Equatable {
     let label: MailboxLabel
     let totalThreads: Int
     let nextCursor: String?
+    let loadedThreads: Int?
+    let windowDays: Int?
     let sections: [GmailThreadSection]
     let readyCount: Int?
     let pendingCount: Int?
@@ -435,10 +556,38 @@ public struct MailboxResponse: Codable, Equatable {
         totalThreads == 0 || sections.allSatisfy { $0.rows.isEmpty }
     }
 
+    init(
+        label: MailboxLabel,
+        totalThreads: Int,
+        nextCursor: String? = nil,
+        loadedThreads: Int? = nil,
+        windowDays: Int? = nil,
+        sections: [GmailThreadSection] = [],
+        readyCount: Int? = nil,
+        pendingCount: Int? = nil,
+        oldestImportedAt: String? = nil,
+        fullImportRunning: Bool? = nil,
+        fullImportCompleted: Bool? = nil
+    ) {
+        self.label = label
+        self.totalThreads = totalThreads
+        self.nextCursor = nextCursor
+        self.loadedThreads = loadedThreads
+        self.windowDays = windowDays
+        self.sections = sections
+        self.readyCount = readyCount
+        self.pendingCount = pendingCount
+        self.oldestImportedAt = oldestImportedAt
+        self.fullImportRunning = fullImportRunning
+        self.fullImportCompleted = fullImportCompleted
+    }
+
     enum CodingKeys: String, CodingKey {
         case label
         case totalThreads = "total_threads"
         case nextCursor = "next_cursor"
+        case loadedThreads = "loaded_threads"
+        case windowDays = "window_days"
         case sections
         case readyCount = "ready_count"
         case pendingCount = "pending_count"
@@ -456,7 +605,19 @@ public struct MailboxSyncStateResponse: Codable, Equatable {
     let lastSyncStartedAt: String?
     let lastSyncCompletedAt: String?
     let lastSyncError: String?
+    var watchStatus: String? = nil
+    var lastDeltaSyncAt: String? = nil
+    var lastPollAt: String? = nil
+    var pollerOnline: Bool? = nil
+    var mailboxRevision: String? = nil
     let totalThreads: Int
+    var fullImportRunning: Bool? = nil
+    var fullImportCompleted: Bool? = nil
+    var fullImportCompletedAt: String? = nil
+    var pendingActionCount: Int? = nil
+    var lastActionSyncAt: String? = nil
+    var lastActionError: String? = nil
+    var lastAIError: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case connected
@@ -466,7 +627,19 @@ public struct MailboxSyncStateResponse: Codable, Equatable {
         case lastSyncStartedAt = "last_sync_started_at"
         case lastSyncCompletedAt = "last_sync_completed_at"
         case lastSyncError = "last_sync_error"
+        case watchStatus = "watch_status"
+        case lastDeltaSyncAt = "last_delta_sync_at"
+        case lastPollAt = "last_poll_at"
+        case pollerOnline = "poller_online"
+        case mailboxRevision = "mailbox_revision"
         case totalThreads = "total_threads"
+        case fullImportRunning = "full_import_running"
+        case fullImportCompleted = "full_import_completed"
+        case fullImportCompletedAt = "full_import_completed_at"
+        case pendingActionCount = "pending_action_count"
+        case lastActionSyncAt = "last_action_sync_at"
+        case lastActionError = "last_action_error"
+        case lastAIError = "last_ai_error"
     }
 }
 
@@ -491,6 +664,119 @@ public struct GmailThreadMutationResponse: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case threadID = "thread_id"
         case action
+    }
+}
+
+public struct QueuedThreadActionRequest: Codable, Equatable {
+    let clientActionID: String
+    let mailboxThreadID: String
+    let targetMessageID: String?
+    let action: GmailThreadAction
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case clientActionID = "client_action_id"
+        case mailboxThreadID = "mailbox_thread_id"
+        case targetMessageID = "target_message_id"
+        case action
+        case createdAt = "created_at"
+    }
+}
+
+public enum QueuedThreadActionState: String, Codable, Equatable {
+    case queued
+    case applying
+    case applied
+    case failed
+}
+
+public struct QueuedThreadActionResponse: Codable, Equatable {
+    let clientActionID: String
+    let serverActionID: String
+    let mailboxThreadID: String
+    let targetMessageID: String?
+    let action: GmailThreadAction
+    let state: QueuedThreadActionState
+    let queuedAt: String
+    let appliedAt: String?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case clientActionID = "client_action_id"
+        case serverActionID = "server_action_id"
+        case mailboxThreadID = "mailbox_thread_id"
+        case targetMessageID = "target_message_id"
+        case action
+        case state
+        case queuedAt = "queued_at"
+        case appliedAt = "applied_at"
+        case error
+    }
+}
+
+public struct MailComposeRequest: Codable, Equatable {
+    let clientSendID: String
+    let to: [String]
+    let cc: [String]
+    let bcc: [String]
+    let subject: String
+    let bodyText: String
+    let bodyHTML: String?
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case clientSendID = "client_send_id"
+        case to
+        case cc
+        case bcc
+        case subject
+        case bodyText = "body_text"
+        case bodyHTML = "body_html"
+        case createdAt = "created_at"
+    }
+}
+
+public struct MailReplyRequest: Codable, Equatable {
+    let clientSendID: String
+    let cc: [String]
+    let bcc: [String]
+    let bodyText: String
+    let bodyHTML: String?
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case clientSendID = "client_send_id"
+        case cc
+        case bcc
+        case bodyText = "body_text"
+        case bodyHTML = "body_html"
+        case createdAt = "created_at"
+    }
+}
+
+public struct MailSendResponse: Codable, Equatable {
+    let clientSendID: String
+    let serverSendID: String?
+    let mailboxThreadID: String?
+    let gmailThreadID: String?
+    let gmailMessageID: String?
+    let state: MailSendState
+    let queuedAt: String?
+    let sentAt: String?
+    let error: String?
+    let reauthURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case clientSendID = "client_send_id"
+        case serverSendID = "server_send_id"
+        case mailboxThreadID = "mailbox_thread_id"
+        case gmailThreadID = "gmail_thread_id"
+        case gmailMessageID = "gmail_message_id"
+        case state
+        case queuedAt = "queued_at"
+        case sentAt = "sent_at"
+        case error
+        case reauthURL = "reauth_url"
     }
 }
 

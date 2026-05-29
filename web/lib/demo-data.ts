@@ -343,6 +343,7 @@ const demoSession: AppSessionStateResponse = {
     oldest_imported_at: mailbox.oldest_imported_at,
     full_import_running: false,
     full_import_completed: true,
+    full_import_completed_at: DEMO_NOW,
   },
 };
 

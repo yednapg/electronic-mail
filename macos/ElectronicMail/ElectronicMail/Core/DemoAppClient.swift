@@ -88,6 +88,53 @@ public final class DemoAppClient: AppClient {
         return GmailThreadMutationResponse(threadID: threadID, action: .markRead)
     }
 
+    public func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
+        if request.action == .archive || request.action == .markRead {
+            markThreadReadLocally(request.mailboxThreadID)
+        }
+        return QueuedThreadActionResponse(
+            clientActionID: request.clientActionID,
+            serverActionID: "demo-\(request.clientActionID)",
+            mailboxThreadID: request.mailboxThreadID,
+            targetMessageID: request.targetMessageID,
+            action: request.action,
+            state: .applied,
+            queuedAt: request.createdAt,
+            appliedAt: request.createdAt,
+            error: nil
+        )
+    }
+
+    public func sendCompose(_ request: MailComposeRequest) async throws -> MailSendResponse {
+        MailSendResponse(
+            clientSendID: request.clientSendID,
+            serverSendID: "demo-\(request.clientSendID)",
+            mailboxThreadID: nil,
+            gmailThreadID: "demo-sent-\(request.clientSendID)",
+            gmailMessageID: "demo-message-\(request.clientSendID)",
+            state: .sent,
+            queuedAt: request.createdAt,
+            sentAt: request.createdAt,
+            error: nil,
+            reauthURL: nil
+        )
+    }
+
+    public func sendReply(threadID: String, request: MailReplyRequest) async throws -> MailSendResponse {
+        MailSendResponse(
+            clientSendID: request.clientSendID,
+            serverSendID: "demo-\(request.clientSendID)",
+            mailboxThreadID: threadID,
+            gmailThreadID: threadID,
+            gmailMessageID: "demo-message-\(request.clientSendID)",
+            state: .sent,
+            queuedAt: request.createdAt,
+            sentAt: request.createdAt,
+            error: nil,
+            reauthURL: nil
+        )
+    }
+
     public func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
         let title = request.title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else {

@@ -7,6 +7,7 @@ let portableCoreSources: SourceFilesList = [
     "ElectronicMail/Core/AppSessionMapping.swift",
     "ElectronicMail/Core/DemoAppClient.swift",
     "ElectronicMail/Core/InboxStore.swift",
+    "ElectronicMail/Core/LocalMailStore.swift",
     "ElectronicMail/Core/Models.swift",
     "ElectronicMail/Core/SessionTokenStore.swift",
     "ElectronicMail/Core/ThreadCache.swift",
@@ -20,7 +21,7 @@ let project = Project(
             name: "ElectronicMailShared",
             destinations: [.iPhone, .mac],
             product: .framework,
-            bundleId: "com.rameshpandey.ElectronicMailShared",
+            bundleId: "app.electronicmail.shared",
             deploymentTargets: .multiplatform(iOS: "17.0", macOS: "14.0"),
             infoPlist: .default,
             sources: portableCoreSources,
@@ -30,17 +31,19 @@ let project = Project(
             name: "ElectronicMailCore",
             destinations: .macOS,
             product: .framework,
-            bundleId: "com.rameshpandey.ElectronicMailCore",
+            bundleId: "app.electronicmail.core",
             deploymentTargets: .macOS("14.0"),
             infoPlist: .default,
             sources: ["ElectronicMail/Core/**"],
-            dependencies: []
+            dependencies: [
+                .sdk(name: "sqlite3", type: .library)
+            ]
         ),
         .target(
             name: "ElectronicMail",
             destinations: .macOS,
             product: .app,
-            bundleId: "com.rameshpandey.ElectronicMail",
+            bundleId: "app.electronicmail.mac",
             deploymentTargets: .macOS("14.0"),
             infoPlist: .extendingDefault(with: [
                 "CFBundleDisplayName": "Electronic Mail",
@@ -48,7 +51,7 @@ let project = Project(
                 "LSMinimumSystemVersion": "14.0",
                 "CFBundleURLTypes": [
                     [
-                        "CFBundleURLName": "com.rameshpandey.ElectronicMail",
+                        "CFBundleURLName": "app.electronicmail.mac",
                         "CFBundleURLSchemes": ["electronicmail"]
                     ]
                 ],
@@ -66,7 +69,7 @@ let project = Project(
             name: "ElectronicMailTests",
             destinations: .macOS,
             product: .unitTests,
-            bundleId: "com.rameshpandey.ElectronicMailTests",
+            bundleId: "app.electronicmail.tests",
             deploymentTargets: .macOS("14.0"),
             infoPlist: .default,
             sources: ["ElectronicMail/Tests/**"],
@@ -78,14 +81,14 @@ let project = Project(
             name: "ElectronicMailiOS",
             destinations: [.iPhone],
             product: .app,
-            bundleId: "com.rameshpandey.ElectronicMail.iOS",
+            bundleId: "app.electronicmail.ios",
             deploymentTargets: .iOS("17.0"),
             infoPlist: .extendingDefault(with: [
                 "CFBundleDisplayName": "Electronic Mail",
                 "CFBundleName": "Electronic Mail",
                 "CFBundleURLTypes": [
                     [
-                        "CFBundleURLName": "com.rameshpandey.ElectronicMail.iOS",
+                        "CFBundleURLName": "app.electronicmail.ios",
                         "CFBundleURLSchemes": ["electronicmail"]
                     ]
                 ],
@@ -109,7 +112,7 @@ let project = Project(
             name: "ElectronicMailSharedTests",
             destinations: .macOS,
             product: .unitTests,
-            bundleId: "com.rameshpandey.ElectronicMailSharedTests",
+            bundleId: "app.electronicmail.shared.tests",
             deploymentTargets: .macOS("14.0"),
             infoPlist: .default,
             sources: ["ElectronicMail/SharedTests/**"],

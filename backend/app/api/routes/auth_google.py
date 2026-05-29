@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Google OAuth endpoints used to bootstrap local Gmail/Calendar sync."""
 
+from html import escape
 from time import time
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -148,7 +149,8 @@ def auth_mobile_exchange(request: MobileSessionExchangeRequest) -> MobileSession
 def auth_mobile_complete(handoff_id: str) -> HTMLResponse:
     """Browser landing page after a successful local macOS OAuth handoff."""
     _drop_expired_mobile_handoffs()
-    if handoff_id not in _mobile_handoffs:
+    handoff = _mobile_handoffs.get(handoff_id)
+    if handoff is None:
         return HTMLResponse(
             """
             <!doctype html>
@@ -165,16 +167,25 @@ def auth_mobile_complete(handoff_id: str) -> HTMLResponse:
             status_code=410,
         )
 
+    login_code, _expires_at = handoff
+    app_callback_url = f"{settings.mobile_redirect_uri}?{urlencode({'login_code': login_code})}"
+    escaped_app_callback_url = escape(app_callback_url, quote=True)
     return HTMLResponse(
-        """
+        f"""
         <!doctype html>
         <html>
-          <head><title>Electronic Mail</title></head>
+          <head>
+            <title>Electronic Mail</title>
+            <meta name="color-scheme" content="dark light">
+          </head>
           <body style="font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #111; color: #eee; display: grid; min-height: 100vh; place-items: center;">
             <main style="text-align: center;">
-              <h1>Electronic Mail is signed in</h1>
-              <p>You can return to the app. This tab can be closed.</p>
+              <h1>Connected. Returning to Electronic Mail...</h1>
+              <p>If the app does not open, return to Electronic Mail and it will finish signing in.</p>
             </main>
+            <script>
+              window.location.href = "{escaped_app_callback_url}";
+            </script>
           </body>
         </html>
         """

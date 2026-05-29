@@ -35,6 +35,8 @@ class Settings:
     gmail_recent_days: int
     gmail_pubsub_topic: str
     gmail_pubsub_subscription: str
+    gmail_pubsub_push_audience: str
+    gmail_pubsub_push_service_account_email: str
     gmail_watch_renewal_hours: int
     google_client_id: str
     google_client_secret: str
@@ -70,6 +72,10 @@ class Settings:
     @property
     def database_backend(self) -> Literal["postgres", "sqlite"]:
         return "postgres" if self.database_url.strip().startswith(POSTGRES_URL_PREFIXES) else "sqlite"
+
+    @property
+    def resolved_gmail_pubsub_push_audience(self) -> str:
+        return self.gmail_pubsub_push_audience or f"{self.backend_origin}/v1/mailbox/pubsub"
 
     @property
     def sqlite_database_path(self) -> Path | None:
@@ -161,9 +167,11 @@ def load_settings() -> Settings:
         allowed_emails=_parse_email_list(os.getenv("ALLOWED_EMAILS", "")),
         gmail_sync_scope=os.getenv("GMAIL_SYNC_SCOPE", "recent").strip().lower() or "recent",
         gmail_recent_days=int(os.getenv("GMAIL_RECENT_DAYS", "90")),
-        gmail_pubsub_topic=os.getenv("GMAIL_PUBSUB_TOPIC", "").strip().strip("\"'"),
-        gmail_pubsub_subscription=os.getenv("GMAIL_PUBSUB_SUBSCRIPTION", "").strip().strip("\"'"),
-        gmail_watch_renewal_hours=int(os.getenv("GMAIL_WATCH_RENEWAL_HOURS", "24")),
+            gmail_pubsub_topic=os.getenv("GMAIL_PUBSUB_TOPIC", "").strip().strip("\"'"),
+            gmail_pubsub_subscription=os.getenv("GMAIL_PUBSUB_SUBSCRIPTION", "").strip().strip("\"'"),
+            gmail_pubsub_push_audience=os.getenv("GMAIL_PUBSUB_PUSH_AUDIENCE", "").strip().strip("\"'"),
+            gmail_pubsub_push_service_account_email=os.getenv("GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL", "").strip().strip("\"'").lower(),
+            gmail_watch_renewal_hours=int(os.getenv("GMAIL_WATCH_RENEWAL_HOURS", "24")),
         google_client_id=os.getenv("GOOGLE_CLIENT_ID", "").strip().strip("\"'"),
         google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET", "").strip().strip("\"'"),
         google_redirect_uri=os.getenv(

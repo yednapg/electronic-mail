@@ -12,10 +12,16 @@ public struct TodoHomeView: View {
     @State private var creatingTask = false
     @State private var expandedItemID: String?
 
+    private let onCompose: () -> Void
     private let onOpenSource: (String) -> Void
 
-    public init(store: InboxStore, onOpenSource: @escaping (String) -> Void = { _ in }) {
+    public init(
+        store: InboxStore,
+        onCompose: @escaping () -> Void = {},
+        onOpenSource: @escaping (String) -> Void = { _ in }
+    ) {
         self.store = store
+        self.onCompose = onCompose
         self.onOpenSource = onOpenSource
     }
 
@@ -69,43 +75,51 @@ public struct TodoHomeView: View {
                     VStack(alignment: .leading, spacing: 48) {
                         header(snapshot: snapshot)
 
-                        agendaPanel(snapshot.agenda)
+                        if let aiBuildStatus = snapshot.aiBuildStatus {
+                            aiBuildStatusPanel(aiBuildStatus)
+                        }
 
-                        TodoSectionView(
-                            section: snapshot.now,
-                            metrics: metrics,
-                            colorScheme: colorScheme,
-                            completingEntityIDs: completingEntityIDs,
-                            expandedItemID: $expandedItemID,
-                            trailingButton: AnyView(addButton(for: snapshot.now, scrollProxy: scrollProxy)),
-                            footer: AnyView(composer(for: snapshot.now)),
-                            onComplete: complete,
-                            onOpenSource: onOpenSource
-                        )
+                        if let dashboardBuildStatus = snapshot.dashboardBuildStatus {
+                            aiBuildStatusPanel(dashboardBuildStatus)
+                        } else {
+                            agendaPanel(snapshot.agenda)
 
-                        TodoSectionView(
-                            section: snapshot.laterToday,
-                            metrics: metrics,
-                            colorScheme: colorScheme,
-                            completingEntityIDs: completingEntityIDs,
-                            expandedItemID: $expandedItemID,
-                            trailingButton: AnyView(addButton(for: snapshot.laterToday, scrollProxy: scrollProxy)),
-                            footer: AnyView(composer(for: snapshot.laterToday)),
-                            onComplete: complete,
-                            onOpenSource: onOpenSource
-                        )
+                            TodoSectionView(
+                                section: snapshot.now,
+                                metrics: metrics,
+                                colorScheme: colorScheme,
+                                completingEntityIDs: completingEntityIDs,
+                                expandedItemID: $expandedItemID,
+                                trailingButton: AnyView(addButton(for: snapshot.now, scrollProxy: scrollProxy)),
+                                footer: AnyView(composer(for: snapshot.now)),
+                                onComplete: complete,
+                                onOpenSource: onOpenSource
+                            )
 
-                        TodoSectionView(
-                            section: snapshot.worthKnowing,
-                            metrics: metrics,
-                            colorScheme: colorScheme,
-                            completingEntityIDs: completingEntityIDs,
-                            expandedItemID: $expandedItemID,
-                            trailingButton: AnyView(addButton(for: snapshot.worthKnowing, scrollProxy: scrollProxy)),
-                            footer: AnyView(composer(for: snapshot.worthKnowing)),
-                            onComplete: complete,
-                            onOpenSource: onOpenSource
-                        )
+                            TodoSectionView(
+                                section: snapshot.laterToday,
+                                metrics: metrics,
+                                colorScheme: colorScheme,
+                                completingEntityIDs: completingEntityIDs,
+                                expandedItemID: $expandedItemID,
+                                trailingButton: AnyView(addButton(for: snapshot.laterToday, scrollProxy: scrollProxy)),
+                                footer: AnyView(composer(for: snapshot.laterToday)),
+                                onComplete: complete,
+                                onOpenSource: onOpenSource
+                            )
+
+                            TodoSectionView(
+                                section: snapshot.worthKnowing,
+                                metrics: metrics,
+                                colorScheme: colorScheme,
+                                completingEntityIDs: completingEntityIDs,
+                                expandedItemID: $expandedItemID,
+                                trailingButton: AnyView(addButton(for: snapshot.worthKnowing, scrollProxy: scrollProxy)),
+                                footer: AnyView(composer(for: snapshot.worthKnowing)),
+                                onComplete: complete,
+                                onOpenSource: onOpenSource
+                            )
+                        }
                     }
                     .frame(width: contentWidth, alignment: .leading)
                     .padding(.top, TodoTypography.contentTop)
@@ -130,6 +144,17 @@ public struct TodoHomeView: View {
                 Text(snapshot.headerContextLabel)
                     .font(TodoTypography.normal(weight: .regular))
                     .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+
+                Button(action: onCompose) {
+                    Image(systemName: "square.and.pencil")
+                        .font(TodoTypography.normal(weight: .semibold))
+                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                        .frame(width: 30, height: 30)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Compose email")
+                .accessibilityLabel("Compose email")
             }
 
         }
@@ -279,6 +304,30 @@ public struct TodoHomeView: View {
                 }
                 .frame(height: TodoTypography.lineHeight)
             }
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(ElectronicMailDesign.panelFill(for: colorScheme))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .stroke(ElectronicMailDesign.panelBorder(for: colorScheme), lineWidth: 1)
+        )
+    }
+
+    private func aiBuildStatusPanel(_ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 22)
+
+            Text(text)
+                .font(TodoTypography.normal())
+                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                .lineLimit(2)
         }
         .padding(.horizontal, 22)
         .padding(.vertical, 16)
@@ -817,44 +866,72 @@ private struct TodoItemRow: View {
                 .lineSpacing(4)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(width: metrics.detailWidth, alignment: .leading)
+                .offset(x: metrics.subjectLeading)
 
             actionRow
-                .frame(width: metrics.detailWidth, alignment: .leading)
         }
-        .offset(x: metrics.subjectLeading)
+        .frame(width: metrics.contentWidth, alignment: .leading)
     }
 
     private var actionRow: some View {
-        HStack(spacing: 16) {
-            Text(row.actionLabel)
-                .font(TodoTypography.small(weight: .semibold))
-                .foregroundStyle(ElectronicMailDesign.green)
-
-            if row.gmailThreadID != nil {
-                Text("|")
-                    .font(TodoTypography.small())
-                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-
-                Button("Open source") {
-                    onOpenSource()
-                }
-                .buttonStyle(.plain)
-                .font(TodoTypography.small(weight: .semibold))
-                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-            }
-
-            Spacer(minLength: 24)
-
-            HStack(spacing: 6) {
-                Image(systemName: row.gmailThreadID == nil ? "square.and.pencil" : "tray.full")
-                    .font(TodoTypography.extraSmall())
-                Text("Source: \(row.sourceLabel)")
-                    .font(TodoTypography.extraSmall())
+        ZStack(alignment: .leading) {
+            HStack(spacing: 14) {
+                Text(row.actionLabel)
+                    .font(TodoTypography.small(weight: .semibold))
+                    .foregroundStyle(ElectronicMailDesign.green)
                     .lineLimit(1)
-                    .truncationMode(.tail)
+                    .fixedSize(horizontal: true, vertical: false)
+
+                if row.gmailThreadID != nil {
+                    Rectangle()
+                        .fill(ElectronicMailDesign.secondaryText(for: colorScheme).opacity(0.65))
+                        .frame(width: 1, height: 18)
+
+                    Button("Open source") {
+                        onOpenSource()
+                    }
+                    .buttonStyle(.plain)
+                    .font(TodoTypography.small(weight: .semibold))
+                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                }
             }
-            .foregroundStyle(ElectronicMailDesign.readText(for: colorScheme))
+            .frame(width: metrics.footerActionWidth, alignment: .leading)
+            .clipped()
+            .offset(x: metrics.subjectLeading)
+
+            Image(systemName: sourceIconName)
+                .font(TodoTypography.small(weight: .semibold))
+                .foregroundStyle(ElectronicMailDesign.readText(for: colorScheme))
+                .frame(width: metrics.footerSourceFrameWidth, alignment: .trailing)
+                .accessibilityLabel(sourceAccessibilityLabel)
+                .zIndex(1)
         }
+        .frame(width: metrics.contentWidth, height: TodoTypography.lineHeight, alignment: .leading)
+    }
+
+    private var sourceIconName: String {
+        row.gmailThreadID == nil ? "square.and.pencil" : "tray.full"
+    }
+
+    private var sourceAccessibilityLabel: String {
+        "Source: \(sourceDisplayLabel)"
+    }
+
+    private var sourceDisplayLabel: String {
+        if row.gmailThreadID != nil {
+            return "Gmail"
+        }
+
+        let trimmed = row.sourceLabel
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            return trimmed
+        }
+        return "Manual"
     }
 
     private func rowHeader(
@@ -936,6 +1013,8 @@ struct TodoHomeSnapshot: Equatable {
     let laterToday: TodoSectionModel
     let worthKnowing: TodoSectionModel
     let refreshWarning: String?
+    let aiBuildStatus: String?
+    let dashboardBuildStatus: String?
 }
 
 struct TodoSummary: Equatable {
@@ -1022,6 +1101,14 @@ struct TodoLayoutMetrics: Equatable {
         max(0, expandedCardWidth - subjectLeading - expandedHorizontalInset)
     }
 
+    var footerSourceFrameWidth: CGFloat {
+        max(0, expandedCardWidth - subjectLeading)
+    }
+
+    var footerActionWidth: CGFloat {
+        max(0, expandedCardWidth - subjectLeading - 230)
+    }
+
     var expandedCardLeading: CGFloat {
         0
     }
@@ -1086,7 +1173,9 @@ enum TodoHomeMapper {
                 title: "Worth Knowing",
                 rows: todoRows(from: feed.worthKnowing, inboxRowsByThreadID: inboxRowsByThreadID, hiddenEntityIDs: hiddenEntityIDs)
             ),
-            refreshWarning: refreshWarning
+            refreshWarning: refreshWarning,
+            aiBuildStatus: aiBuildStatus(from: session),
+            dashboardBuildStatus: dashboardBuildStatus(from: session)
         )
     }
 
@@ -1127,6 +1216,41 @@ enum TodoHomeMapper {
             important: briefing.important,
             calendarAvailability: briefing.calendarAvailability
         )
+    }
+
+    private static func aiBuildStatus(from session: AppSessionResponse) -> String? {
+        if let error = session.sync.lastAIError?.trimmingCharacters(in: .whitespacesAndNewlines), !error.isEmpty, session.sync.readyGroupCount == 0 {
+            return "AI summaries need attention. \(error)"
+        }
+        guard session.sync.enrichmentPendingCount > 0, session.sync.readyGroupCount == 0 else {
+            return nil
+        }
+        return "Building AI summaries from your inbox"
+    }
+
+    private static func dashboardBuildStatus(from session: AppSessionResponse) -> String? {
+        let feed = session.dashboard.feed
+        let feedCount = feed.now.count + feed.today.count + feed.worthKnowing.count
+        guard feedCount == 0 else {
+            return nil
+        }
+        let readiness = session.readiness
+        let importOrDashboardWorkActive = !readiness.readyToEnter
+            || !readiness.dashboardReady
+            || readiness.fullImportRunning
+            || session.mailbox.fullImportRunning == true
+            || session.sync.enrichmentPendingCount > 0
+        guard importOrDashboardWorkActive else {
+            return nil
+        }
+        switch readiness.stage {
+        case "starting_full_import", "importing_recent_gmail":
+            return "Syncing Gmail to build your dashboard"
+        case "grouping_threads", "writing_titles":
+            return "Grouping your inbox into useful work"
+        default:
+            return "Building your dashboard"
+        }
     }
 
     private static func todoRows(

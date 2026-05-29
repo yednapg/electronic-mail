@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		043C55ECC28A6165147139CD /* ElectronicMailShared.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 12A865E23955430580FFD02C /* ElectronicMailShared.framework */; };
+		0603554E13C11B17E013197A /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 3D3D61B9C225A66A5F6D9FAF /* libsqlite3.tbd */; };
 		0767FCCA198DEB06D906F8E4 /* ElectronicMailShared.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 12A865E23955430580FFD02C /* ElectronicMailShared.framework */; };
 		0906C070D57C3F9538FDD697 /* ElectronicMailiOSRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3E279E99C5A2401814A085C /* ElectronicMailiOSRootView.swift */; };
 		099D4835441FACE42D1B3A9F /* InboxStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D17382F2DECC14A57EC0403 /* InboxStore.swift */; };
@@ -21,6 +22,7 @@
 		44F11154D52AC0E19A462409 /* DashboardViewModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3E23CEC3BF04A0C374FE7AF /* DashboardViewModels.swift */; };
 		450DF872F290F5105277BAFD /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4B0DA2215CE7CF473AE431B /* Models.swift */; };
 		4A90C425C83E253DE4697898 /* AppConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51A82E6E83CB2F01653310C9 /* AppConfiguration.swift */; };
+		54DFBE2A0077AFAAE24BA36C /* LocalMailStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 312841A2440897390E5606AE /* LocalMailStore.swift */; };
 		5B9CB4C7A88FF38FC9BA197A /* SignedInShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54F56B91356DB66565F5138F /* SignedInShellView.swift */; };
 		623B2C8D6E927A9B2BF7C378 /* InboxViewModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 942CBD31879339E0CDAE5995 /* InboxViewModels.swift */; };
 		651BB7C33CC24DEE38C5B627 /* AppClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1139801E4AE9E09FEFCADE0 /* AppClient.swift */; };
@@ -35,10 +37,13 @@
 		990981521EBE4C811C8F7692 /* AppConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51A82E6E83CB2F01653310C9 /* AppConfiguration.swift */; };
 		9CE3077210497D6B468695F8 /* InboxStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D17382F2DECC14A57EC0403 /* InboxStore.swift */; };
 		A241E5F8B9718F4773A019D9 /* DemoAppClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73C32468817FF1F83CFB3464 /* DemoAppClient.swift */; };
+		A9AFF2D31F81A3CD0EBABD2C /* LocalMailStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 312841A2440897390E5606AE /* LocalMailStore.swift */; };
 		B3CB9CB1DB57C9E21455E52E /* ThreadCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8FE689D2E289C4C3F63FF8C /* ThreadCache.swift */; };
 		BE1F6B1BE413185277F42DA7 /* AppClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1139801E4AE9E09FEFCADE0 /* AppClient.swift */; };
+		C3DF33FD21568EF121376DC6 /* OfflineFirstAppClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A855B4C53D956DB6F002D1E /* OfflineFirstAppClient.swift */; };
 		C98D334B8B820CCACD131F38 /* AppSessionCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9A1D426A580DEF065947EE2 /* AppSessionCache.swift */; };
 		CE62C8779126D9002A2FA43D /* AppSessionMapping.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22CC350DC44E46D561DAFA71 /* AppSessionMapping.swift */; };
+		D2FD3733F80614E5E6BE2650 /* SQLiteLocalMailStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66C3D0D7E0829B5401C6DF4A /* SQLiteLocalMailStore.swift */; };
 		DA05008C672E0548839441C0 /* AppSessionMapping.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22CC350DC44E46D561DAFA71 /* AppSessionMapping.swift */; };
 		DAA5DA20FA65EF694CFF0EE0 /* IOSGoogleOAuthService.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7EE5BEA17BC2ECC7B4F475B /* IOSGoogleOAuthService.swift */; };
 		DE8C7E79CC0215E5B95E1ACA /* ElectronicMailCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 15E3C181BB57958668D88D57 /* ElectronicMailCore.framework */; };
@@ -158,11 +163,14 @@
 		15E3C181BB57958668D88D57 /* ElectronicMailCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = ElectronicMailCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		1C5DDD1365FADF33AA1EC1DA /* ElectronicMailSharedTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ElectronicMailSharedTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		22CC350DC44E46D561DAFA71 /* AppSessionMapping.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSessionMapping.swift; sourceTree = "<group>"; };
+		312841A2440897390E5606AE /* LocalMailStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalMailStore.swift; sourceTree = "<group>"; };
+		3D3D61B9C225A66A5F6D9FAF /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib/libsqlite3.tbd; sourceTree = DEVELOPER_DIR; };
 		43A3E049DE45CDAA7CC199EA /* ElectronicMailTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ElectronicMailTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		45C5A000FE76CCA615285F09 /* ElectronicMail-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMail-Info.plist"; sourceTree = "<group>"; };
 		51A82E6E83CB2F01653310C9 /* AppConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfiguration.swift; sourceTree = "<group>"; };
 		54F56B91356DB66565F5138F /* SignedInShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignedInShellView.swift; sourceTree = "<group>"; };
 		5C72F421B0EAAA68C237A376 /* ElectronicMailiOS-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMailiOS-Info.plist"; sourceTree = "<group>"; };
+		66C3D0D7E0829B5401C6DF4A /* SQLiteLocalMailStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SQLiteLocalMailStore.swift; sourceTree = "<group>"; };
 		6D17382F2DECC14A57EC0403 /* InboxStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxStore.swift; sourceTree = "<group>"; };
 		70934CFC827A51900D954C83 /* MobileAuthFlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileAuthFlow.swift; sourceTree = "<group>"; };
 		73C32468817FF1F83CFB3464 /* DemoAppClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DemoAppClient.swift; sourceTree = "<group>"; };
@@ -175,6 +183,7 @@
 		95F1402204821AD28FD21C68 /* OAuthService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OAuthService.swift; sourceTree = "<group>"; };
 		9840DAA09904CBD17DD1AB9C /* ElectronicMailiOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ElectronicMailiOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		98E41167B98D870A2F18DC05 /* InboxView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxView.swift; sourceTree = "<group>"; };
+		9A855B4C53D956DB6F002D1E /* OfflineFirstAppClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineFirstAppClient.swift; sourceTree = "<group>"; };
 		A89D2A08606ADBA921590EED /* ElectronicMailCore-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMailCore-Info.plist"; sourceTree = "<group>"; };
 		AFB79EFC32537484EE3D6FBE /* ModelDecodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDecodingTests.swift; sourceTree = "<group>"; };
 		B3E279E99C5A2401814A085C /* ElectronicMailiOSRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElectronicMailiOSRootView.swift; sourceTree = "<group>"; };
@@ -205,6 +214,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				0603554E13C11B17E013197A /* libsqlite3.tbd in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -310,7 +320,16 @@
 			children = (
 				95EAB96B33F91D42E9B6B295 /* Products */,
 				D53665B0CA5644FE09F3896F /* Project */,
+				ADCF1C31588201C43124F50F /* Frameworks */,
 			);
+			sourceTree = "<group>";
+		};
+		ADCF1C31588201C43124F50F /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				3D3D61B9C225A66A5F6D9FAF /* libsqlite3.tbd */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 		CE84899C63AAE657DCD3A6D0 /* Shared */ = {
@@ -368,10 +387,13 @@
 				83E10CE3510246DF51DBD5AE /* EmailReaderView.swift */,
 				6D17382F2DECC14A57EC0403 /* InboxStore.swift */,
 				98E41167B98D870A2F18DC05 /* InboxView.swift */,
+				312841A2440897390E5606AE /* LocalMailStore.swift */,
 				C4B0DA2215CE7CF473AE431B /* Models.swift */,
 				95F1402204821AD28FD21C68 /* OAuthService.swift */,
+				9A855B4C53D956DB6F002D1E /* OfflineFirstAppClient.swift */,
 				86C22B47DC30CD35E982D179 /* SessionTokenStore.swift */,
 				54F56B91356DB66565F5138F /* SignedInShellView.swift */,
+				66C3D0D7E0829B5401C6DF4A /* SQLiteLocalMailStore.swift */,
 				D8FE689D2E289C4C3F63FF8C /* ThreadCache.swift */,
 				92D2884BBE64513E0F521850 /* TodoHomeView.swift */,
 			);
@@ -594,6 +616,7 @@
 				DA05008C672E0548839441C0 /* AppSessionMapping.swift in Sources */,
 				E1B743566A6BE1A98D3DB500 /* DemoAppClient.swift in Sources */,
 				099D4835441FACE42D1B3A9F /* InboxStore.swift in Sources */,
+				54DFBE2A0077AFAAE24BA36C /* LocalMailStore.swift in Sources */,
 				450DF872F290F5105277BAFD /* Models.swift in Sources */,
 				ED6C61D0FE66A5B81D6398CD /* SessionTokenStore.swift in Sources */,
 				B3CB9CB1DB57C9E21455E52E /* ThreadCache.swift in Sources */,
@@ -635,8 +658,11 @@
 				66486AF9E5CDA9EC58FABB98 /* EmailReaderView.swift in Sources */,
 				9CE3077210497D6B468695F8 /* InboxStore.swift in Sources */,
 				986F65AF29012E65ECBD6FD1 /* InboxView.swift in Sources */,
+				A9AFF2D31F81A3CD0EBABD2C /* LocalMailStore.swift in Sources */,
 				85C4B68C65C7EFD1F92F2CA0 /* Models.swift in Sources */,
 				1D98A43F420A4A228816E31E /* OAuthService.swift in Sources */,
+				C3DF33FD21568EF121376DC6 /* OfflineFirstAppClient.swift in Sources */,
+				D2FD3733F80614E5E6BE2650 /* SQLiteLocalMailStore.swift in Sources */,
 				F844A9085964F93CD2953825 /* SessionTokenStore.swift in Sources */,
 				5B9CB4C7A88FF38FC9BA197A /* SignedInShellView.swift in Sources */,
 				8295184470A5D6D34BBD8F55 /* ThreadCache.swift in Sources */,
@@ -720,7 +746,7 @@
 					"$(inherited)",
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMailShared;
+				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.shared;
 				PRODUCT_NAME = ElectronicMailShared;
 				SDKROOT = auto;
 				SKIP_INSTALL = YES;
@@ -755,7 +781,7 @@
 					"$(inherited)",
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMail;
+				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.mac;
 				PRODUCT_NAME = ElectronicMail;
 				SDKROOT = macosx;
 				SWIFT_COMPILATION_MODE = wholemodule;
@@ -782,7 +808,7 @@
 					"$(inherited)",
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMail;
+				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.mac;
 				PRODUCT_NAME = ElectronicMail;
 				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = (
@@ -810,7 +836,7 @@
 					"$(inherited)",
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMailTests;
+				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.tests;
 				PRODUCT_NAME = ElectronicMailTests;
 				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = (
@@ -849,7 +875,7 @@
 					"$(inherited)",
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMailShared;
+				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.shared;
 				PRODUCT_NAME = ElectronicMailShared;
 				SDKROOT = auto;
 				SKIP_INSTALL = YES;
@@ -942,7 +968,7 @@
 					"$(inherited)",
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMail.iOS;
+				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.ios;
 				PRODUCT_NAME = ElectronicMailiOS;
 				SDKROOT = iphoneos;
 				SUPPORTS_MACCATALYST = NO;
@@ -970,7 +996,7 @@
 					"$(inherited)",
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMailTests;
+				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.tests;
 				PRODUCT_NAME = ElectronicMailTests;
 				SDKROOT = macosx;
 				SWIFT_COMPILATION_MODE = wholemodule;
@@ -1002,7 +1028,7 @@
 					"$(inherited)",
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMailCore;
+				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.core;
 				PRODUCT_NAME = ElectronicMailCore;
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
@@ -1037,7 +1063,7 @@
 					"$(inherited)",
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMail.iOS;
+				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.ios;
 				PRODUCT_NAME = ElectronicMailiOS;
 				SDKROOT = iphoneos;
 				SUPPORTS_MACCATALYST = NO;
@@ -1069,7 +1095,7 @@
 					"$(inherited)",
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMailSharedTests;
+				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.shared.tests;
 				PRODUCT_NAME = ElectronicMailSharedTests;
 				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = (
@@ -1105,7 +1131,7 @@
 					"$(inherited)",
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMailCore;
+				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.core;
 				PRODUCT_NAME = ElectronicMailCore;
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
@@ -1191,7 +1217,7 @@
 					"$(inherited)",
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.rameshpandey.ElectronicMailSharedTests;
+				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.shared.tests;
 				PRODUCT_NAME = ElectronicMailSharedTests;
 				SDKROOT = macosx;
 				SWIFT_COMPILATION_MODE = wholemodule;

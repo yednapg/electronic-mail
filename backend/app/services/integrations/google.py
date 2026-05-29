@@ -29,9 +29,10 @@ from app.services.token_crypto import decrypt_json, encrypt_json
 
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_WRITE_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 GOOGLE_PROFILE_SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"]
-GOOGLE_SCOPES = [*GOOGLE_PROFILE_SCOPES, GMAIL_SCOPE, GMAIL_WRITE_SCOPE, CALENDAR_SCOPE]
+GOOGLE_SCOPES = [*GOOGLE_PROFILE_SCOPES, GMAIL_SCOPE, GMAIL_WRITE_SCOPE, GMAIL_SEND_SCOPE, CALENDAR_SCOPE]
 GOOGLE_API_TIMEOUT_SECONDS = 20
 GMAIL_INBOX_LABEL = "INBOX"
 GMAIL_UNREAD_LABEL = "UNREAD"
@@ -182,16 +183,36 @@ def create_gmail_service(settings: Settings, *, user_id: str | None = None):
     return build_google_service("gmail", "v1", credentials)
 
 
+def missing_google_scopes(settings: Settings, *, user_id: str, required_scopes: list[str] | None = None) -> list[str]:
+    """Return OAuth scopes absent from the persisted token payload."""
+    required = required_scopes or [GMAIL_SEND_SCOPE]
+    token_row = get_google_oauth_token(str(settings.database_path), user_id=user_id)
+    if token_row is None:
+        return required
+    try:
+        tokens = decrypt_json(settings, token_row.token_json_encrypted)
+    except Exception:
+        return required
+    scopes_value = tokens.get("scopes") or []
+    if isinstance(scopes_value, str):
+        scopes = set(scopes_value.split())
+    elif isinstance(scopes_value, list):
+        scopes = {str(scope) for scope in scopes_value}
+    else:
+        scopes = set()
+    return [scope for scope in required if scope not in scopes]
+
+
+def user_can_send_gmail(settings: Settings, *, user_id: str) -> bool:
+    return not missing_google_scopes(settings, user_id=user_id, required_scopes=[GMAIL_SEND_SCOPE])
+
+
 def start_gmail_watch(settings: Settings, *, user_id: str) -> dict[str, object]:
     """Ask Gmail to push future mailbox changes to the configured Pub/Sub topic."""
     if not settings.gmail_pubsub_topic:
         raise RuntimeError("GMAIL_PUBSUB_TOPIC is not configured")
     gmail_service = create_gmail_service(settings, user_id=user_id)
-    body = {
-        "topicName": settings.gmail_pubsub_topic,
-        "labelIds": [GMAIL_INBOX_LABEL],
-        "labelFilterBehavior": "include",
-    }
+    body = {"topicName": settings.gmail_pubsub_topic}
     return gmail_service.users().watch(userId="me", body=body).execute()
 
 
@@ -205,6 +226,30 @@ def unarchive_gmail_thread(settings: Settings, thread_id: str, *, user_id: str |
 
 def mark_gmail_thread_read(settings: Settings, thread_id: str, *, user_id: str | None = None) -> dict[str, object]:
     return modify_gmail_thread_labels(settings, thread_id, user_id=user_id, remove_label_ids=[GMAIL_UNREAD_LABEL])
+
+
+def mark_gmail_message_read(settings: Settings, message_id: str, *, user_id: str | None = None) -> dict[str, object]:
+    return modify_gmail_message_labels(settings, message_id, user_id=user_id, remove_label_ids=[GMAIL_UNREAD_LABEL])
+
+
+def move_gmail_thread_to_trash(settings: Settings, thread_id: str, *, user_id: str | None = None) -> dict[str, object]:
+    gmail_service = create_gmail_service(settings, user_id=user_id)
+    return gmail_service.users().threads().trash(userId="me", id=thread_id).execute()
+
+
+def delete_gmail_thread_forever(settings: Settings, thread_id: str, *, user_id: str | None = None) -> None:
+    gmail_service = create_gmail_service(settings, user_id=user_id)
+    gmail_service.users().threads().delete(userId="me", id=thread_id).execute()
+
+
+def move_gmail_message_to_trash(settings: Settings, message_id: str, *, user_id: str | None = None) -> dict[str, object]:
+    gmail_service = create_gmail_service(settings, user_id=user_id)
+    return gmail_service.users().messages().trash(userId="me", id=message_id).execute()
+
+
+def delete_gmail_message_forever(settings: Settings, message_id: str, *, user_id: str | None = None) -> None:
+    gmail_service = create_gmail_service(settings, user_id=user_id)
+    gmail_service.users().messages().delete(userId="me", id=message_id).execute()
 
 
 def modify_gmail_thread_labels(
@@ -225,6 +270,45 @@ def modify_gmail_thread_labels(
         return gmail_service.users().threads().modify(userId="me", id=thread_id, body=body).execute()
     except HttpError:
         raise
+
+
+def modify_gmail_message_labels(
+    settings: Settings,
+    message_id: str,
+    *,
+    user_id: str | None = None,
+    add_label_ids: list[str] | None = None,
+    remove_label_ids: list[str] | None = None,
+) -> dict[str, object]:
+    gmail_service = create_gmail_service(settings, user_id=user_id)
+    body: dict[str, object] = {}
+    if add_label_ids:
+        body["addLabelIds"] = add_label_ids
+    if remove_label_ids:
+        body["removeLabelIds"] = remove_label_ids
+    try:
+        return gmail_service.users().messages().modify(userId="me", id=message_id, body=body).execute()
+    except HttpError:
+        raise
+
+
+def send_gmail_raw_message(
+    settings: Settings,
+    *,
+    user_id: str,
+    raw_message: str,
+    gmail_thread_id: str | None = None,
+) -> dict[str, object]:
+    gmail_service = create_gmail_service(settings, user_id=user_id)
+    body: dict[str, object] = {"raw": raw_message}
+    if gmail_thread_id:
+        body["threadId"] = gmail_thread_id
+    return gmail_service.users().messages().send(userId="me", body=body).execute()
+
+
+def fetch_gmail_message(settings: Settings, *, user_id: str, message_id: str, format: str = "full") -> dict[str, object]:
+    gmail_service = create_gmail_service(settings, user_id=user_id)
+    return gmail_service.users().messages().get(userId="me", id=message_id, format=format).execute()
 
 
 def token_payload_from_credentials(credentials: Credentials) -> dict[str, object]:
@@ -287,6 +371,7 @@ def get_google_auth_state(settings: Settings) -> GoogleAuthState:
         available=True,
         connected=connected,
         connect_url=None if connected else f"{settings.backend_origin}/auth/google",
+        can_send_mail=connected,
     )
 
 

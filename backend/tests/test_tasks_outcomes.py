@@ -14,6 +14,14 @@ from app.schemas.domain import DashboardProfile, GoogleAuthState
 from app.services.mail_groups import build_dashboard_response
 
 
+def queue_health() -> SimpleNamespace:
+    return SimpleNamespace(
+        queue_depth={},
+        worker_online=False,
+        required_queues_ready=False,
+    )
+
+
 def sample_task(status: str = "open") -> ManualTaskRecord:
     return ManualTaskRecord(
         id="task-1",
@@ -45,6 +53,8 @@ class DashboardManualTaskTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = SimpleNamespace(database_path="postgresql://example/db")
 
+    @patch("app.services.mail_groups.get_queue_health", return_value=queue_health())
+    @patch("app.services.mail_groups.latest_mail_group_ai_error", return_value=None)
     @patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 0, "pending": 0})
     @patch("app.services.mail_groups.list_messages_for_groups", return_value={})
     @patch("app.services.mail_groups.get_latest_entity_outcomes", return_value={})
@@ -57,6 +67,8 @@ class DashboardManualTaskTests(unittest.TestCase):
         _mock_outcomes: Mock,
         _mock_messages: Mock,
         _mock_counts: Mock,
+        _mock_ai_error: Mock,
+        _mock_health: Mock,
     ) -> None:
         dashboard = build_dashboard_response(
             self.settings,
@@ -69,6 +81,8 @@ class DashboardManualTaskTests(unittest.TestCase):
         self.assertEqual(dashboard.feed.today[0].source, "manual")
         self.assertEqual(dashboard.runtime_status["feed_source"], "manual_tasks")
 
+    @patch("app.services.mail_groups.get_queue_health", return_value=queue_health())
+    @patch("app.services.mail_groups.latest_mail_group_ai_error", return_value=None)
     @patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 0, "pending": 0})
     @patch("app.services.mail_groups.list_messages_for_groups", return_value={})
     @patch("app.services.mail_groups.get_latest_entity_outcomes", return_value={"manual-task:task-1": sample_outcome()})
@@ -81,6 +95,8 @@ class DashboardManualTaskTests(unittest.TestCase):
         _mock_outcomes: Mock,
         _mock_messages: Mock,
         _mock_counts: Mock,
+        _mock_ai_error: Mock,
+        _mock_health: Mock,
     ) -> None:
         dashboard = build_dashboard_response(
             self.settings,

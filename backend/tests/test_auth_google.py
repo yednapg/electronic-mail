@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from time import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -13,6 +14,8 @@ from app.main import app
 class GoogleAuthRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(app)
+        auth_routes._mobile_handoffs.clear()
+        self.addCleanup(auth_routes._mobile_handoffs.clear)
         self.settings = SimpleNamespace(
             google_configured=True,
             cors_origin="http://localhost:5173",
@@ -85,6 +88,19 @@ class GoogleAuthRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 307)
         self.assertEqual(response.headers["location"], "/auth/google")
+
+    def test_mobile_complete_opens_registered_app_callback(self) -> None:
+        auth_routes._mobile_handoffs["handoff-1"] = ("login-1", time() + 60)
+
+        response = self.client.get(
+            "/auth/mobile/complete",
+            params={"handoff_id": "handoff-1"},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Connected. Returning to Electronic Mail", response.text)
+        self.assertIn("decisionpipeline://auth/callback?login_code=login-1", response.text)
 
 
 if __name__ == "__main__":

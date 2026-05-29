@@ -13,7 +13,7 @@ export type LifecycleState = 'active' | 'scheduled' | 'resolved' | 'suppressed';
 export type EntityCurrentState = 'open' | 'waiting' | 'done';
 
 export type SourceType = 'gmail' | 'calendar' | 'manual';
-export type GmailThreadAction = 'archive' | 'unarchive' | 'mark_read';
+export type GmailThreadAction = 'archive' | 'unarchive' | 'mark_read' | 'move_trash' | 'delete_forever';
 export type MailboxLabel = 'inbox' | 'sent' | 'drafts' | 'trash' | 'archive' | 'all';
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed';
 
@@ -289,6 +289,9 @@ export interface GmailThreadRow {
   readonly participants: string[];
   readonly message_count: number;
   readonly summary?: string | null;
+  readonly ai_group_id?: string | null;
+  readonly ai_title?: string | null;
+  readonly ai_summary?: string | null;
   readonly snippet?: string | null;
   readonly label_ids?: string[];
   readonly labels?: string[];
@@ -302,7 +305,22 @@ export interface GmailThreadRow {
   readonly lifecycle_state?: LifecycleState | null;
   readonly outcome_type?: 'complete' | 'snooze' | 'dismiss' | null;
   readonly lifecycle_updates: GmailThreadUpdate[];
+  readonly children?: GmailThreadChildRow[];
   readonly enrichment_status?: 'pending' | 'ready' | 'failed';
+  readonly presentation_status?: 'ai_ready' | 'ai_pending' | 'fallback';
+}
+
+export interface GmailThreadChildRow {
+  readonly message_id: string;
+  readonly gmail_thread_id?: string | null;
+  readonly sender?: string | null;
+  readonly subject?: string | null;
+  readonly ai_title?: string | null;
+  readonly snippet?: string | null;
+  readonly received_at: string;
+  readonly label_ids?: string[];
+  readonly labels?: string[];
+  readonly unread?: boolean;
 }
 
 export interface GmailThreadUpdate {
@@ -379,6 +397,8 @@ export interface MailboxResponse {
   readonly label: MailboxLabel;
   readonly total_threads: number;
   readonly next_cursor?: string | null;
+  readonly loaded_threads?: number | null;
+  readonly window_days?: number | null;
   readonly sections: GmailThreadSection[];
   readonly ready_count?: number;
   readonly pending_count?: number;
@@ -396,6 +416,9 @@ export interface MailboxSyncStateResponse {
   readonly last_sync_completed_at?: string | null;
   readonly last_sync_error?: string | null;
   readonly total_threads: number;
+  readonly full_import_running?: boolean;
+  readonly full_import_completed?: boolean;
+  readonly full_import_completed_at?: string | null;
 }
 
 export interface MailboxSyncTriggerResponse {
@@ -476,6 +499,7 @@ export interface AppSessionSyncState {
   readonly oldest_imported_at?: string | null;
   readonly full_import_running: boolean;
   readonly full_import_completed: boolean;
+  readonly full_import_completed_at?: string | null;
 }
 
 export interface AppSessionStateResponse {

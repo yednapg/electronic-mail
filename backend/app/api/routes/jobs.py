@@ -35,6 +35,8 @@ def ops_health(request: Request) -> OpsHealthResponse:
         stale_running_jobs=health.stale_running_jobs,
         oldest_queued_age_seconds=health.oldest_queued_age_seconds,
         workers=health.workers,
+        worker_online=health.worker_online,
+        required_queues_ready=health.required_queues_ready,
     )
 
 

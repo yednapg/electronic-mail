@@ -72,6 +72,231 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(archive.action, .archive)
     }
 
+    func testMailboxRowPresentationPrefersAITitleAndSummary() {
+        let row = GmailThreadRow(
+            threadID: "group-1",
+            entityID: "group-1",
+            title: "Raw Gmail subject",
+            href: "/v1/mailbox/threads/group-1",
+            latestSourceRecordID: "msg-1",
+            latestReceivedAt: "2026-05-23T12:00:00+00:00",
+            latestMessageAt: "2026-05-23T12:00:00+00:00",
+            latestSubject: "Raw Gmail subject",
+            latestSender: "Sender <sender@example.com>",
+            sender: "Sender <sender@example.com>",
+            participants: ["Sender"],
+            messageCount: 2,
+            summary: "Raw Gmail snippet",
+            aiGroupID: "group-1",
+            aiTitle: "AI grouped title",
+            aiSummary: "AI grouped summary",
+            snippet: "Raw Gmail snippet",
+            labelIDs: ["INBOX"],
+            labels: ["INBOX"],
+            unread: false,
+            actionNeeded: false,
+            actionType: "open",
+            actionTypeKey: "open",
+            priority: 20,
+            dashboardVisible: true,
+            currentState: .waiting,
+            lifecycleState: "active",
+            outcomeType: nil,
+            lifecycleUpdates: [],
+            enrichmentStatus: "ready"
+        )
+
+        XCTAssertEqual(row.displayTitle, "AI grouped title")
+        XCTAssertEqual(row.displaySummary, "AI grouped summary")
+    }
+
+    func testMailboxRowPresentationShowsPendingTitleState() throws {
+        let data = """
+        {
+          "thread_id": "group-1",
+          "entity_id": "group-1",
+          "title": "Raw Gmail subject",
+          "href": "/v1/mailbox/threads/group-1",
+          "latest_source_record_id": "msg-1",
+          "latest_received_at": "2026-05-23T12:00:00+00:00",
+          "latest_message_at": "2026-05-23T12:00:00+00:00",
+          "latest_subject": "Raw Gmail subject",
+          "latest_sender": "Sender <sender@example.com>",
+          "sender": "Sender <sender@example.com>",
+          "participants": ["Sender"],
+          "message_count": 1,
+          "summary": "Raw Gmail snippet",
+          "ai_group_id": null,
+          "ai_title": null,
+          "ai_summary": null,
+          "snippet": "Raw Gmail snippet",
+          "label_ids": ["INBOX"],
+          "labels": ["INBOX"],
+          "unread": false,
+          "action_needed": false,
+          "action_type": "open",
+          "action_type_key": "open",
+          "priority": 20,
+          "dashboard_visible": true,
+          "current_state": "waiting",
+          "lifecycle_state": "active",
+          "outcome_type": null,
+          "lifecycle_updates": [],
+          "enrichment_status": "pending",
+          "presentation_status": "ai_pending"
+        }
+        """.data(using: .utf8)!
+
+        let row = try JSONDecoder.backend.decode(GmailThreadRow.self, from: data)
+
+        XCTAssertEqual(row.displayTitle, "Building title... Raw Gmail subject")
+        XCTAssertEqual(row.childRows, [])
+    }
+
+    func testMailboxRowDecodesLightweightChildren() throws {
+        let data = """
+        {
+          "thread_id": "group-1",
+          "entity_id": "group-1",
+          "title": "Grouped subject",
+          "href": "/v1/mailbox/threads/group-1",
+          "latest_source_record_id": "msg-2",
+          "latest_received_at": "2026-05-23T12:10:00+00:00",
+          "latest_message_at": "2026-05-23T12:10:00+00:00",
+          "latest_subject": "Grouped subject",
+          "latest_sender": "Sender <sender@example.com>",
+          "sender": "Sender <sender@example.com>",
+          "participants": ["Sender"],
+          "message_count": 2,
+          "summary": "Grouped snippet",
+          "snippet": "Grouped snippet",
+          "label_ids": ["INBOX"],
+          "labels": ["INBOX"],
+          "unread": false,
+          "action_needed": false,
+          "action_type": "open",
+          "action_type_key": "open",
+          "priority": 20,
+          "dashboard_visible": true,
+          "current_state": "waiting",
+          "lifecycle_state": "active",
+          "outcome_type": null,
+          "lifecycle_updates": [],
+          "children": [
+            {
+              "message_id": "msg-1",
+              "gmail_thread_id": "gmail-thread-1",
+              "sender": "First <first@example.com>",
+              "subject": "First subject",
+              "snippet": "First snippet",
+              "received_at": "2026-05-23T12:00:00+00:00",
+              "label_ids": ["INBOX"],
+              "labels": ["INBOX"],
+              "unread": false
+            },
+            {
+              "message_id": "msg-2",
+              "gmail_thread_id": "gmail-thread-1",
+              "sender": "Second <second@example.com>",
+              "subject": "Second subject",
+              "ai_title": "Clean second title",
+              "snippet": "Second snippet",
+              "received_at": "2026-05-23T12:10:00+00:00",
+              "label_ids": ["INBOX", "UNREAD"],
+              "labels": ["INBOX", "UNREAD"],
+              "unread": true
+            }
+          ],
+          "enrichment_status": "ready",
+          "presentation_status": "ai_ready"
+        }
+        """.data(using: .utf8)!
+
+        let row = try JSONDecoder.backend.decode(GmailThreadRow.self, from: data)
+
+        XCTAssertEqual(row.childRows.map(\.messageID), ["msg-1", "msg-2"])
+        XCTAssertEqual(row.childRows[0].displaySender, "First")
+        XCTAssertEqual(row.childRows[1].displayTitle, "Clean second title")
+        XCTAssertTrue(row.childRows[1].isUnread)
+    }
+
+    func testGoogleAuthStateDecodesSendScopeFieldsAndDefaults() throws {
+        let scopedData = """
+        {
+          "available": true,
+          "connected": true,
+          "connect_url": null,
+          "can_send_mail": false,
+          "missing_scopes": ["https://www.googleapis.com/auth/gmail.send"]
+        }
+        """.data(using: .utf8)!
+        let legacyData = """
+        {
+          "available": true,
+          "connected": true,
+          "connect_url": null
+        }
+        """.data(using: .utf8)!
+
+        let scoped = try JSONDecoder.backend.decode(GoogleAuthState.self, from: scopedData)
+        let legacy = try JSONDecoder.backend.decode(GoogleAuthState.self, from: legacyData)
+
+        XCTAssertFalse(scoped.canSendMail)
+        XCTAssertEqual(scoped.missingScopes, ["https://www.googleapis.com/auth/gmail.send"])
+        XCTAssertFalse(legacy.canSendMail)
+        XCTAssertEqual(legacy.missingScopes, [])
+    }
+
+    func testMailSendResponseDecodesReauthRequired() throws {
+        let data = """
+        {
+          "client_send_id": "client-send-1",
+          "server_send_id": null,
+          "mailbox_thread_id": "group-1",
+          "gmail_thread_id": null,
+          "gmail_message_id": null,
+          "state": "reauth_required",
+          "queued_at": null,
+          "sent_at": null,
+          "error": "Google needs permission to send mail.",
+          "reauth_url": "http://127.0.0.1:3001/auth/google"
+        }
+        """.data(using: .utf8)!
+
+        let response = try JSONDecoder.backend.decode(MailSendResponse.self, from: data)
+
+        XCTAssertEqual(response.state, .reauthRequired)
+        XCTAssertEqual(response.reauthURL, "http://127.0.0.1:3001/auth/google")
+    }
+
+    func testMailboxResponseDecodesPaginationProgressFields() throws {
+        let data = """
+        {
+          "label": "inbox",
+          "total_threads": 273,
+          "next_cursor": "cursor-2",
+          "loaded_threads": 100,
+          "window_days": 90,
+          "sections": [],
+          "full_import_running": true,
+          "full_import_completed": false
+        }
+        """.data(using: .utf8)!
+
+        let mailbox = try JSONDecoder.backend.decode(MailboxResponse.self, from: data)
+
+        XCTAssertEqual(mailbox.nextCursor, "cursor-2")
+        XCTAssertEqual(mailbox.loadedThreads, 100)
+        XCTAssertEqual(mailbox.windowDays, 90)
+        XCTAssertEqual(mailbox.totalThreads, 273)
+    }
+
+    func testGoogleOAuthServiceParsesCustomCallbackLoginCode() throws {
+        let url = try XCTUnwrap(URL(string: "electronicmail://auth/callback?login_code=abc123"))
+
+        XCTAssertEqual(try GoogleOAuthService.loginCode(from: url), "abc123")
+    }
+
     func testEmailBodyResolverRoutesBasicTextLinkHTMLToHTML() {
         let html = #"""
         <!doctype html>
@@ -186,6 +411,15 @@ final class ModelDecodingTests: XCTestCase {
         let bodyKind = EmailReaderBodyResolver.bodyKind(message: message, fallbackText: "")
 
         XCTAssertEqual(bodyKind, .text(body))
+    }
+
+    func testEmailBodyResolverUsesExplicitFullEmailLoadingCopy() {
+        let message = makeThreadMessage(id: "missing-body", body: "")
+
+        XCTAssertEqual(
+            EmailReaderBodyResolver.bodyKind(message: message, fallbackText: ""),
+            .text("Loading full email...")
+        )
     }
 
     func testEmailBodyResolverRestoresCommonParagraphsWhenPlainTextWasFlattened() {
@@ -362,7 +596,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(EmailReaderBodyResolver.originalHTML(from: message), html)
     }
 
-    func testThreadPresentationOrdersOldestToNewestAndExpandsLatest() {
+    func testThreadPresentationOrdersNewestToOldestAndExpandsLatestFirst() {
         let newest = makeThreadMessage(id: "newest", receivedAt: "2026-05-19T19:33:06+00:00")
         let oldest = makeThreadMessage(id: "oldest", receivedAt: "2026-05-19T19:31:42+00:00")
 
@@ -370,18 +604,18 @@ final class ModelDecodingTests: XCTestCase {
         let items = EmailThreadPresentation.items(from: ordered)
         let latestKey = EmailThreadPresentation.latestMessageKey(in: items)
 
-        XCTAssertEqual(ordered.map(\.id), ["oldest", "newest"])
-        XCTAssertEqual(latestKey, "1::newest")
+        XCTAssertEqual(ordered.map(\.id), ["newest", "oldest"])
+        XCTAssertEqual(latestKey, "0::newest")
         XCTAssertFalse(
             EmailThreadPresentation.isExpanded(
-                messageKey: "0::oldest",
+                messageKey: "1::oldest",
                 latestMessageKey: latestKey,
                 userExpandedMessageKeys: []
             )
         )
         XCTAssertTrue(
             EmailThreadPresentation.isExpanded(
-                messageKey: "1::newest",
+                messageKey: "0::newest",
                 latestMessageKey: latestKey,
                 userExpandedMessageKeys: []
             )
@@ -398,14 +632,14 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(items.map(\.id), ["0::duplicate", "1::duplicate"])
         XCTAssertFalse(
             EmailThreadPresentation.isExpanded(
-                messageKey: "0::duplicate",
+                messageKey: "1::duplicate",
                 latestMessageKey: latestKey,
                 userExpandedMessageKeys: []
             )
         )
         XCTAssertTrue(
             EmailThreadPresentation.isExpanded(
-                messageKey: "1::duplicate",
+                messageKey: "0::duplicate",
                 latestMessageKey: latestKey,
                 userExpandedMessageKeys: []
             )

@@ -74,6 +74,8 @@ def _first_run_response(user_id: str, *, job_id: str) -> FirstRunImportJobRespon
         canonical_dashboard_ready_at=state.first_dashboard_ready_at if state else None,
         quality_status=quality_status,  # type: ignore[arg-type]
         quality_error=error_message,
+        full_import_started_at=getattr(state, "full_backfill_started_at", None) if state else None,
+        full_import_completed_at=getattr(state, "full_backfill_completed_at", None) if state else None,
         error_message=error_message,
         created_at=job.created_at if job else (state.updated_at if state else ""),
         started_at=job.started_at if job else (state.last_import_started_at if state else None),
