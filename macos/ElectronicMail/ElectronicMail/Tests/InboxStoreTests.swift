@@ -275,7 +275,12 @@ final class InboxStoreTests: XCTestCase {
 
     func testNonInboxLabelDoesNotFallBackToSessionInboxWhenMailboxFetchFails() async {
         let client = MailboxFailingAfterSessionAppClient()
-        let store = InboxStore(client: client, sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
         store.setSessionToken("live-session-token")
 
         await store.load()
@@ -298,7 +303,12 @@ final class InboxStoreTests: XCTestCase {
             labels: ["SENT"]
         )
         let client = MismatchedMailboxRowsAppClient(row: sentRow)
-        let store = InboxStore(client: client, sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
         store.setSessionToken("live-session-token")
 
         await store.load()
@@ -321,7 +331,12 @@ final class InboxStoreTests: XCTestCase {
 
     func testThreadPrefetchDedupesInFlightRequests() async {
         let client = SlowThreadAppClient()
-        let store = InboxStore(client: client, sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
 
         await store.load()
         async let first: Void = store.prefetchThread(threadID: "demo-special", force: true, silent: false)
@@ -605,6 +620,85 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(client.composeCallCount, 0)
         XCTAssertEqual(client.replyCallCount, 0)
     }
+
+    func testMailboxChangedSSEForcesActiveMailboxRefresh() async {
+        let initialMailbox = makeSingleRowMailbox(threadID: "old-thread", title: "Old mailbox row", receivedAt: "2026-05-29T09:30:00+05:30")
+        let refreshedMailbox = makeSingleRowMailbox(threadID: "new-thread", title: "Fresh mailbox row", receivedAt: "2026-05-29T10:30:00+05:30")
+        let client = RealtimeEventAppClient(sessionMailbox: initialMailbox, mailboxResponses: [initialMailbox, refreshedMailbox])
+        let store = InboxStore(client: client, sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+
+        await store.load()
+        XCTAssertEqual(store.flatRows.map(\.title), ["Old mailbox row"])
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: "7",
+                event: "mailbox-changed",
+                data: #"{"mailbox_label":"inbox","payload":{"mailbox_revision":"rev-2","mailbox_labels":["inbox"]}}"#
+            )
+        )
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+
+        XCTAssertEqual(store.flatRows.map(\.title), ["Fresh mailbox row", "Old mailbox row"])
+        XCTAssertEqual(client.mailboxCallCount, 2)
+        XCTAssertEqual(store.lastSSEEventID, "7")
+        XCTAssertEqual(store.lastSSEEventType, "mailbox-changed")
+        XCTAssertNotNil(store.lastForcedMailboxRefreshAt)
+        XCTAssertNil(store.lastForcedMailboxRefreshError)
+    }
+
+    func testMailboxChangedSSEIgnoresUnrelatedMailboxLabel() async {
+        let initialMailbox = makeSingleRowMailbox(threadID: "inbox-thread", title: "Inbox row")
+        let refreshedMailbox = makeSingleRowMailbox(threadID: "sent-thread", title: "Sent row")
+        let client = RealtimeEventAppClient(sessionMailbox: initialMailbox, mailboxResponses: [initialMailbox, refreshedMailbox])
+        let store = InboxStore(client: client, sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+
+        await store.load()
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: "8",
+                event: "mailbox-changed",
+                data: #"{"mailbox_label":"sent","payload":{"mailbox_revision":"rev-3","mailbox_labels":["sent"]}}"#
+            )
+        )
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+
+        XCTAssertEqual(store.flatRows.map(\.title), ["Inbox row"])
+        XCTAssertEqual(client.mailboxCallCount, 1)
+        XCTAssertNil(store.lastForcedMailboxRefreshAt)
+    }
+
+    func testDashboardChangedSSERefreshesSessionEvenForDuplicateRevision() async {
+        let mailbox = makeSingleRowMailbox(threadID: "inbox-thread", title: "Inbox row")
+        let client = RealtimeEventAppClient(sessionMailbox: mailbox, mailboxResponses: [mailbox, mailbox, mailbox])
+        let store = InboxStore(client: client, sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+
+        await store.load()
+        let initialSessionCalls = client.appSessionCallCount
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: nil,
+                event: "sync-state",
+                data: #"{"mailbox_revision":"rev-1"}"#
+            )
+        )
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        XCTAssertEqual(client.appSessionCallCount, initialSessionCalls)
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: "9",
+                event: "dashboard-changed",
+                data: #"{"mailbox_label":null,"payload":{"mailbox_revision":"rev-1"}}"#
+            )
+        )
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+
+        XCTAssertGreaterThan(client.appSessionCallCount, initialSessionCalls)
+        XCTAssertEqual(store.lastSSEEventID, "9")
+    }
 }
 
 private func makeMailboxRow(
@@ -650,6 +744,23 @@ private func makeMailboxRow(
         lifecycleUpdates: updates,
         children: children,
         enrichmentStatus: "ready"
+    )
+}
+
+private func makeSingleRowMailbox(threadID: String, title: String, receivedAt: String = "2026-05-29T09:30:00+05:30") -> MailboxResponse {
+    let row = makeMailboxRow(
+        threadID: threadID,
+        latestSourceRecordID: "\(threadID)-message",
+        receivedAt: receivedAt,
+        title: title
+    )
+    return MailboxResponse(
+        label: .inbox,
+        totalThreads: 1,
+        loadedThreads: 1,
+        sections: [GmailThreadSection(id: "today", title: "Today", rows: [row])],
+        fullImportRunning: false,
+        fullImportCompleted: true
     )
 }
 
@@ -700,6 +811,85 @@ private final class FixedMailboxAppClient: AppClient {
 
     func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
         fixedMailbox
+    }
+
+    func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
+        DemoAppFixtures.threads[threadID] ?? DemoAppFixtures.threads["demo-google-today"]!
+    }
+
+    func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
+        try await DemoAppClient().triggerMailboxSync()
+    }
+
+    func syncMailboxNow() async throws -> MailboxSyncTriggerResponse {
+        try await DemoAppClient().syncMailboxNow()
+    }
+
+    func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .archive)
+    }
+
+    func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .unarchive)
+    }
+
+    func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .markRead)
+    }
+
+    func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
+        try await DemoAppClient().enqueueThreadAction(request)
+    }
+
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        try await DemoAppClient().createTask(request)
+    }
+
+    func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse {
+        try await DemoAppClient().updateTask(taskID, request: request)
+    }
+
+    func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
+        try await DemoAppClient().completeEntity(entityID, request: request)
+    }
+}
+
+private final class RealtimeEventAppClient: AppClient {
+    var baseURL = AppConfiguration.defaultBackendURL
+    var sessionToken: String?
+    let mode: AppRunMode = .demo
+    private let sessionMailbox: MailboxResponse
+    private var mailboxResponses: [MailboxResponse]
+    private(set) var appSessionCallCount = 0
+    private(set) var mailboxCallCount = 0
+
+    init(sessionMailbox: MailboxResponse, mailboxResponses: [MailboxResponse]) {
+        self.sessionMailbox = sessionMailbox
+        self.mailboxResponses = mailboxResponses
+    }
+
+    func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
+        try await DemoAppClient().exchangeMobileSession(loginCode: loginCode)
+    }
+
+    func appSession() async throws -> AppSessionResponse {
+        appSessionCallCount += 1
+        let current = DemoAppFixtures.appSession
+        return AppSessionResponse(
+            user: current.user,
+            readiness: current.readiness,
+            dashboard: current.dashboard,
+            mailbox: sessionMailbox,
+            sync: current.sync
+        )
+    }
+
+    func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
+        mailboxCallCount += 1
+        if mailboxResponses.isEmpty {
+            return sessionMailbox
+        }
+        return mailboxResponses.removeFirst()
     }
 
     func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {

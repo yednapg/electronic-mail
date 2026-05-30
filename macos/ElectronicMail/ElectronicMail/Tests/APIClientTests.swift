@@ -92,6 +92,31 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(response.status, "synced")
     }
 
+    func testMailboxSyncStateUsesBackendSyncStateEndpoint() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/sync-state")
+            let response = MailboxSyncStateResponse(
+                connected: true,
+                lastHistoryID: "history-1",
+                lastFullSyncAt: nil,
+                watchExpirationAt: nil,
+                lastSyncStartedAt: nil,
+                lastSyncCompletedAt: nil,
+                lastSyncError: nil,
+                mailboxRevision: "rev-1",
+                totalThreads: 12
+            )
+            let data = try JSONEncoder.backend.encode(response)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+        }
+
+        let response = try await client.mailboxSyncState()
+
+        XCTAssertEqual(response.mailboxRevision, "rev-1")
+        XCTAssertEqual(response.totalThreads, 12)
+    }
+
     func testThreadIDIsEncodedAsSinglePathSegment() async throws {
         let client = makeClient { request in
             XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/threads/thread%2Fwith%20space")

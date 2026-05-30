@@ -472,6 +472,24 @@ class MailboxSyncStateResponse(BaseModel):
     last_ai_error: str | None = None
 
 
+class MailboxRealtimeStateResponse(BaseModel):
+    """Diagnostics for Gmail push, backend events, and client invalidation."""
+
+    watch_status: str | None = None
+    watch_expiration_at: str | None = None
+    last_history_id: str | None = None
+    last_pubsub_received_at: str | None = None
+    last_pubsub_history_id: str | None = None
+    last_delta_sync_at: str | None = None
+    last_mailbox_event_id: int | None = None
+    last_mailbox_event_at: str | None = None
+    last_mailbox_event_type: str | None = None
+    mailbox_revision: str | None = None
+    poller_online: bool | None = None
+    total_threads: int = 0
+    last_sync_error: str | None = None
+
+
 class MailboxSyncTriggerResponse(BaseModel):
     """Acknowledgement for a queued mailbox sync request."""
 

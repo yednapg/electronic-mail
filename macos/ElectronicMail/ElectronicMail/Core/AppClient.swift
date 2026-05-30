@@ -80,6 +80,7 @@ public protocol AppClient: AnyObject {
     func appSession() async throws -> AppSessionResponse
     func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse
     func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse
+    func mailboxSyncState() async throws -> MailboxSyncStateResponse
     func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse
     func syncMailboxNow() async throws -> MailboxSyncTriggerResponse
     func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse
@@ -94,6 +95,10 @@ public protocol AppClient: AnyObject {
 }
 
 public extension AppClient {
+    func mailboxSyncState() async throws -> MailboxSyncStateResponse {
+        throw APIError.httpStatus(501)
+    }
+
     func sendCompose(_ request: MailComposeRequest) async throws -> MailSendResponse {
         throw APIError.httpStatus(501)
     }
@@ -146,6 +151,10 @@ public final class LiveBackendAppClient: AppClient {
                 URLQueryItem(name: "offset", value: String(offset)),
             ]
         )
+    }
+
+    public func mailboxSyncState() async throws -> MailboxSyncStateResponse {
+        try await request(path: "/v1/mailbox/sync-state")
     }
 
     public func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {

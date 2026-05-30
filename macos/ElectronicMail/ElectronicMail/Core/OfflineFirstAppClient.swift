@@ -56,6 +56,10 @@ public final class OfflineFirstAppClient: AppClient {
         return response
     }
 
+    public func mailboxSyncState() async throws -> MailboxSyncStateResponse {
+        try await backend.mailboxSyncState()
+    }
+
     public func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
         await replayPendingThreadActions()
         return try await backend.triggerMailboxSync()

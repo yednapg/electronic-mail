@@ -107,12 +107,6 @@ public struct InboxView: View {
                 await store.load()
             }
         }
-        .onAppear {
-            store.startLiveRefreshLoop()
-        }
-        .onDisappear {
-            store.stopLiveRefreshLoop()
-        }
         .environment(\.font, .system(.body, design: .rounded))
     }
 
