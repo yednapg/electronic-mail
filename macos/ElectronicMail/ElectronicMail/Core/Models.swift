@@ -1054,19 +1054,47 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
 
 public struct ThreadMessageReader: Codable, Equatable {
     let primaryText: String
+    let renderMode: String?
     let markers: [ThreadMessageReaderMarker]
     let signatureText: String?
     let quotedText: String?
     let footerText: String?
     let originalHTMLAvailable: Bool
+    let htmlIsRich: Bool?
+    let quoteDetected: Bool?
 
     enum CodingKeys: String, CodingKey {
         case primaryText = "primary_text"
+        case renderMode = "render_mode"
         case markers
         case signatureText = "signature_text"
         case quotedText = "quoted_text"
         case footerText = "footer_text"
         case originalHTMLAvailable = "original_html_available"
+        case htmlIsRich = "html_is_rich"
+        case quoteDetected = "quote_detected"
+    }
+
+    init(
+        primaryText: String,
+        renderMode: String? = nil,
+        markers: [ThreadMessageReaderMarker],
+        signatureText: String?,
+        quotedText: String?,
+        footerText: String?,
+        originalHTMLAvailable: Bool,
+        htmlIsRich: Bool? = nil,
+        quoteDetected: Bool? = nil
+    ) {
+        self.primaryText = primaryText
+        self.renderMode = renderMode
+        self.markers = markers
+        self.signatureText = signatureText
+        self.quotedText = quotedText
+        self.footerText = footerText
+        self.originalHTMLAvailable = originalHTMLAvailable
+        self.htmlIsRich = htmlIsRich
+        self.quoteDetected = quoteDetected
     }
 }
 

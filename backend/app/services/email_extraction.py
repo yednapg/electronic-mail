@@ -156,14 +156,19 @@ def build_thread_message_reader(
     parts = _split_reader_text(source_text)
     primary_text = parts["primary_text"] or _reader_text_from_plain(text_body or snippet or "")
     primary_text = primary_text or compact_text(snippet)
+    html_is_rich = _is_rich_email_html(html_source or "") if html_source else False
+    quote_detected = bool(parts["quoted_text"])
 
     return {
         "primary_text": primary_text or "Loading email...",
+        "render_mode": "rich_html" if html_is_rich else "plain_conversation",
         "markers": parts["markers"],
         "signature_text": parts["signature_text"] or None,
         "quoted_text": parts["quoted_text"] or None,
         "footer_text": parts["footer_text"] or None,
         "original_html_available": bool((html_render_document or "").strip() or (html_body or "").strip()),
+        "html_is_rich": html_is_rich,
+        "quote_detected": quote_detected,
     }
 
 
