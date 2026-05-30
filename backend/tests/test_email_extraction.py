@@ -289,6 +289,63 @@ class EmailExtractionTests(unittest.TestCase):
         self.assertIn("IMPORTANT COMMUNICATION UPDATE", reader["footer_text"] or "")
         self.assertIn("Disclaimer:", reader["footer_text"] or "")
         self.assertTrue(reader["original_html_available"])
+        self.assertEqual(reader["render_mode"], "plain_conversation")
+        self.assertFalse(reader["html_is_rich"])
+        self.assertTrue(reader["quote_detected"])
+
+    def test_thread_message_reader_classifies_plain_html_reply_as_conversation(self) -> None:
+        html = """
+        <html><body>
+          <div>Hello TestUser,</div>
+          <div>Yes, you may request reconsideration in StudentPortal.</div>
+          <div>Test Person</div>
+          <div>From: "TestUser" &lt;hi@example.com&gt;</div>
+          <div>Sent: Friday, May 29, 2026 4:33 AM</div>
+          <div>To: university-admissions@example.edu</div>
+          <div>Subject: Reconsideration request</div>
+          <div>Hi,</div>
+          <div>I was admitted to State University Campus for Engineering for Fall Semester.</div>
+        </body></html>
+        """
+
+        reader = build_thread_message_reader(
+            html_render_document=html,
+            html_body=html,
+            text_body=None,
+            snippet=None,
+            headers={},
+        )
+
+        self.assertEqual(
+            reader["primary_text"],
+            "Hello TestUser,\n\nYes, you may request reconsideration in StudentPortal.\n\nTest Person",
+        )
+        self.assertIn('From: "TestUser"', reader["quoted_text"] or "")
+        self.assertEqual(reader["render_mode"], "plain_conversation")
+        self.assertFalse(reader["html_is_rich"])
+        self.assertTrue(reader["quote_detected"])
+
+    def test_thread_message_reader_classifies_designed_email_as_rich_html(self) -> None:
+        html = """
+        <html><body>
+          <table class="wrapper" role="presentation">
+            <tr><td><img src="https://example.com/hero.png" width="640" height="260"></td></tr>
+            <tr><td class="headline" style="font-size:32px">Product digest</td></tr>
+            <tr><td><a style="background:#111;color:#fff" href="https://example.com">Read update</a></td></tr>
+          </table>
+        </body></html>
+        """
+
+        reader = build_thread_message_reader(
+            html_render_document=html,
+            html_body=html,
+            text_body=None,
+            snippet=None,
+            headers={},
+        )
+
+        self.assertEqual(reader["render_mode"], "rich_html")
+        self.assertTrue(reader["html_is_rich"])
 
 
 if __name__ == "__main__":

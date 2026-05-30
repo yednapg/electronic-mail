@@ -297,7 +297,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(try GoogleOAuthService.loginCode(from: url), "abc123")
     }
 
-    func testEmailBodyResolverRoutesBasicTextLinkHTMLToHTML() {
+    func testEmailBodyResolverRoutesBasicTextLinkHTMLToText() {
         let html = #"""
         <!doctype html>
         <html>
@@ -321,14 +321,10 @@ final class ModelDecodingTests: XCTestCase {
 
         let bodyKind = EmailReaderBodyResolver.bodyKind(message: message, fallbackText: "")
 
-        guard case .html(let resolvedHTML, let fallbackText) = bodyKind else {
-            return XCTFail("Expected Gmail HTML to render as the primary body")
-        }
-        XCTAssertEqual(resolvedHTML, html)
-        XCTAssertEqual(fallbackText, "Hello,\n\n205759 is your one-time password.")
+        XCTAssertEqual(bodyKind, .text("Hello,\n\n205759 is your one-time password."))
     }
 
-    func testEmailBodyResolverRoutesSinglePresentationTableWithTrackingPixelToHTML() {
+    func testEmailBodyResolverRoutesSinglePresentationTableWithTrackingPixelToText() {
         let html = #"""
         <!doctype html>
         <html>
@@ -357,17 +353,13 @@ final class ModelDecodingTests: XCTestCase {
 
         let bodyKind = EmailReaderBodyResolver.bodyKind(message: message, fallbackText: "")
 
-        guard case .html(let resolvedHTML, let fallbackText) = bodyKind else {
-            return XCTFail("Expected Gmail HTML to render as the primary body")
-        }
-        XCTAssertEqual(resolvedHTML, html)
         XCTAssertEqual(
-            fallbackText,
-            "Hey,\n\nLooks like you started a speedrun application but didn't hit submit.\n\nFinish your app here: SR007"
+            bodyKind,
+            .text("Hey,\n\nLooks like you started a speedrun application but didn't hit submit.\n\nFinish your app here: SR007")
         )
     }
 
-    func testEmailBodyResolverRendersSimpleHTMLParagraphsAsHTML() {
+    func testEmailBodyResolverRendersSimpleHTMLParagraphsAsText() {
         let html = #"""
         <html>
           <body>
@@ -385,13 +377,9 @@ final class ModelDecodingTests: XCTestCase {
 
         let bodyKind = EmailReaderBodyResolver.bodyKind(message: message, fallbackText: "")
 
-        guard case .html(let resolvedHTML, let fallbackText) = bodyKind else {
-            return XCTFail("Expected Gmail HTML to render as the primary body")
-        }
-        XCTAssertEqual(resolvedHTML, html)
         XCTAssertEqual(
-            fallbackText,
-            "First paragraph with normal email copy.\n\nSecond paragraph keeps its own readable break."
+            bodyKind,
+            .text("First paragraph with normal email copy.\n\nSecond paragraph keeps its own readable break.")
         )
     }
 
@@ -470,7 +458,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(fallbackText, body)
     }
 
-    func testEmailBodyResolverKeepsStructuredLongHTMLInHTMLRenderer() {
+    func testEmailBodyResolverRoutesStructuredLongPlainHTMLToText() {
         let html = #"""
         <html>
           <body>
@@ -504,11 +492,10 @@ final class ModelDecodingTests: XCTestCase {
 
         let bodyKind = EmailReaderBodyResolver.bodyKind(message: message, fallbackText: "")
 
-        guard case .html(let resolvedHTML, let fallbackText) = bodyKind else {
-            return XCTFail("Expected raw original HTML to remain available")
+        guard case .text(let bodyText) = bodyKind else {
+            return XCTFail("Expected text-like table HTML to render through the native text reader")
         }
-        XCTAssertEqual(resolvedHTML, html)
-        XCTAssertTrue(fallbackText.contains("FX-Retail platform"))
+        XCTAssertTrue(bodyText.contains("FX-Retail platform"))
         XCTAssertEqual(EmailReaderBodyResolver.originalHTML(from: message), html)
     }
 
@@ -570,10 +557,11 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(EmailReaderBodyResolver.originalHTML(from: message), richHTML)
     }
 
-    func testEmailBodyResolverPrefersHTMLOverCleanReaderText() {
+    func testEmailBodyResolverPrefersCleanReaderTextOverTextLikeHTML() {
         let html = #"<html><body><table><tr><td style="background:#fff;color:#000">Noisy HTML</td></tr></table></body></html>"#
         let reader = ThreadMessageReader(
             primaryText: "Clean body only.",
+            renderMode: "plain_conversation",
             markers: [
                 ThreadMessageReaderMarker(kind: "classification", label: "Internal", text: "Classification - Internal")
             ],
@@ -591,12 +579,38 @@ final class ModelDecodingTests: XCTestCase {
 
         XCTAssertEqual(
             EmailReaderBodyResolver.bodyKind(message: message, fallbackText: ""),
-            .html(html, fallbackText: "Noisy HTML")
+            .text("Clean body only.")
         )
         XCTAssertEqual(EmailReaderBodyResolver.originalHTML(from: message), html)
     }
 
-    func testThreadPresentationOrdersNewestToOldestAndExpandsLatestFirst() {
+    func testEmailBodyResolverHonorsBackendRichHTMLMode() {
+        let html = #"<html><body><table><tr><td style="background:#fff;color:#000">Designed body</td></tr></table></body></html>"#
+        let reader = ThreadMessageReader(
+            primaryText: "Designed body",
+            renderMode: "rich_html",
+            markers: [],
+            signatureText: nil,
+            quotedText: nil,
+            footerText: nil,
+            originalHTMLAvailable: true,
+            htmlIsRich: true,
+            quoteDetected: false
+        )
+        let message = makeThreadMessage(
+            body: "Fallback",
+            htmlBody: html,
+            htmlRenderDocument: html,
+            reader: reader
+        )
+
+        XCTAssertEqual(
+            EmailReaderBodyResolver.bodyKind(message: message, fallbackText: ""),
+            .html(html, fallbackText: "Designed body")
+        )
+    }
+
+    func testThreadPresentationOrdersOldestToNewestAndExpandsLatestFirst() {
         let newest = makeThreadMessage(id: "newest", receivedAt: "2026-05-19T19:33:06+00:00")
         let oldest = makeThreadMessage(id: "oldest", receivedAt: "2026-05-19T19:31:42+00:00")
 
@@ -604,18 +618,18 @@ final class ModelDecodingTests: XCTestCase {
         let items = EmailThreadPresentation.items(from: ordered)
         let latestKey = EmailThreadPresentation.latestMessageKey(in: items)
 
-        XCTAssertEqual(ordered.map(\.id), ["newest", "oldest"])
-        XCTAssertEqual(latestKey, "0::newest")
+        XCTAssertEqual(ordered.map(\.id), ["oldest", "newest"])
+        XCTAssertEqual(latestKey, "1::newest")
         XCTAssertFalse(
             EmailThreadPresentation.isExpanded(
-                messageKey: "1::oldest",
+                messageKey: "0::oldest",
                 latestMessageKey: latestKey,
                 userExpandedMessageKeys: []
             )
         )
         XCTAssertTrue(
             EmailThreadPresentation.isExpanded(
-                messageKey: "0::newest",
+                messageKey: "1::newest",
                 latestMessageKey: latestKey,
                 userExpandedMessageKeys: []
             )
@@ -632,14 +646,14 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(items.map(\.id), ["0::duplicate", "1::duplicate"])
         XCTAssertFalse(
             EmailThreadPresentation.isExpanded(
-                messageKey: "1::duplicate",
+                messageKey: "0::duplicate",
                 latestMessageKey: latestKey,
                 userExpandedMessageKeys: []
             )
         )
         XCTAssertTrue(
             EmailThreadPresentation.isExpanded(
-                messageKey: "0::duplicate",
+                messageKey: "1::duplicate",
                 latestMessageKey: latestKey,
                 userExpandedMessageKeys: []
             )

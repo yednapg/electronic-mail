@@ -511,11 +511,14 @@ class ThreadMessageReader(BaseModel):
     """Clean reader projection for native thread detail views."""
 
     primary_text: str
+    render_mode: Literal["plain_conversation", "rich_html", "mixed"] = "plain_conversation"
     markers: list[ThreadMessageReaderMarker] = Field(default_factory=list)
     signature_text: str | None = None
     quoted_text: str | None = None
     footer_text: str | None = None
     original_html_available: bool = False
+    html_is_rich: bool = False
+    quote_detected: bool = False
 
 
 class ThreadMessage(BaseModel):
