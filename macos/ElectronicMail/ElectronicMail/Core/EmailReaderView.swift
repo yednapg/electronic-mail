@@ -401,18 +401,45 @@ enum EmailReaderBodyResolver {
         if let html = nonEmpty(message?.htmlRenderDocument) ?? nonEmpty(message?.htmlBody) {
             let analysis = analyzeHTML(html)
             let fallback = readableFallbackText(message: message, fallbackText: fallbackText, analysis: analysis)
+            let shouldRenderHTML = shouldRenderHTML(message: message, analysis: analysis)
+
+            if shouldRenderHTML {
+                logClassification(
+                    threadID: threadID,
+                    messageID: message?.id,
+                    mode: "html",
+                    visibleTextLength: analysis.visibleTextLength,
+                    imageCount: analysis.imageCount,
+                    tableCount: analysis.tableCount,
+                    fallbackReason: nil
+                )
+
+                return .html(html, fallbackText: fallback)
+            }
+
+            if let primaryText = nonEmpty(message?.reader?.primaryText) {
+                logClassification(
+                    threadID: threadID,
+                    messageID: message?.id,
+                    mode: "reader",
+                    visibleTextLength: primaryText.components(separatedBy: .whitespacesAndNewlines).joined().count,
+                    imageCount: analysis.imageCount,
+                    tableCount: analysis.tableCount,
+                    fallbackReason: "html-classified-as-conversation"
+                )
+                return .text(primaryText)
+            }
 
             logClassification(
                 threadID: threadID,
                 messageID: message?.id,
-                mode: "html",
-                visibleTextLength: analysis.visibleTextLength,
+                mode: "text",
+                visibleTextLength: fallback.components(separatedBy: .whitespacesAndNewlines).joined().count,
                 imageCount: analysis.imageCount,
                 tableCount: analysis.tableCount,
-                fallbackReason: nil
+                fallbackReason: "html-without-reader-primary"
             )
-
-            return .html(html, fallbackText: fallback)
+            return .text(fallback)
         }
 
         if let primaryText = nonEmpty(message?.reader?.primaryText) {
@@ -453,7 +480,21 @@ enum EmailReaderBodyResolver {
     }
 
     static func isRichEmailHTML(_ value: String) -> Bool {
-        nonEmpty(value) != nil
+        guard let html = nonEmpty(value) else {
+            return false
+        }
+        return analyzeHTML(html).isRich
+    }
+
+    private static func shouldRenderHTML(message: ThreadMessage?, analysis: HTMLBodyAnalysis) -> Bool {
+        switch message?.reader?.renderMode {
+        case "rich_html":
+            return true
+        case "plain_conversation", "mixed":
+            return false
+        default:
+            return message?.reader?.htmlIsRich ?? analysis.isRich
+        }
     }
 
     private static func analyzeHTML(_ value: String) -> HTMLBodyAnalysis {
@@ -723,6 +764,24 @@ enum EmailReaderBodyResolver {
         let styleCount: Int
         let classCount: Int
         let hasPictureElement: Bool
+
+        var isRich: Bool {
+            if hasPictureElement || substantiveImageCount > 0 {
+                return true
+            }
+
+            let sourceIsDocumentSized = sourceLength > max(700, visibleTextLength * 2)
+            if tableCount >= 2 && tableTagCount >= 4 && sourceIsDocumentSized {
+                return true
+            }
+            if tableCount >= 2 && tableTagCount >= 2 && (styleCount >= 1 || classCount >= 1) && sourceLength > max(500, visibleTextLength * 2) {
+                return true
+            }
+            if layoutTagCount >= 2 && (styleCount >= 1 || classCount >= 1) && sourceIsDocumentSized {
+                return true
+            }
+            return false
+        }
     }
 
 }
@@ -1110,9 +1169,9 @@ enum EmailThreadPresentation {
             let rhsDate = EmailReaderText.date(from: rhs.element.receivedAt)
             switch (lhsDate, rhsDate) {
             case let (lhsDate?, rhsDate?) where lhsDate != rhsDate:
-                return lhsDate > rhsDate
+                return lhsDate < rhsDate
             case (nil, nil) where lhs.element.receivedAt != rhs.element.receivedAt:
-                return lhs.element.receivedAt > rhs.element.receivedAt
+                return lhs.element.receivedAt < rhs.element.receivedAt
             default:
                 return lhs.offset < rhs.offset
             }
@@ -1120,7 +1179,7 @@ enum EmailThreadPresentation {
     }
 
     static func latestMessageID(in orderedMessages: [ThreadMessage]) -> String? {
-        orderedMessages.first?.id
+        orderedMessages.last?.id
     }
 
     static func items(from orderedMessages: [ThreadMessage]) -> [EmailThreadPresentationItem] {
@@ -1130,7 +1189,7 @@ enum EmailThreadPresentation {
     }
 
     static func latestMessageKey(in items: [EmailThreadPresentationItem]) -> String? {
-        items.first?.id
+        items.last?.id
     }
 
     static func isExpanded(
