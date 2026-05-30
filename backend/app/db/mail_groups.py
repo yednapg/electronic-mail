@@ -725,6 +725,33 @@ def list_mailbox_events_after(
     return [_mailbox_event_from_row(row) for row in rows]
 
 
+def latest_mailbox_event(
+    database_url: str,
+    *,
+    user_id: str,
+    event_type: str | None = None,
+) -> MailboxEventRecord | None:
+    clauses = ["user_id = :user_id"]
+    params: dict[str, Any] = {"user_id": user_id}
+    if event_type:
+        clauses.append("event_type = :event_type")
+        params["event_type"] = event_type
+    with get_engine(database_url).connect() as connection:
+        row = connection.execute(
+            text(
+                f"""
+                SELECT *
+                FROM mailbox_events
+                WHERE {" AND ".join(clauses)}
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ),
+            params,
+        ).mappings().first()
+    return _mailbox_event_from_row(row) if row is not None else None
+
+
 def upsert_pending_send(
     database_url: str,
     *,

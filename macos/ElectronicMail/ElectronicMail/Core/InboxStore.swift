@@ -52,6 +52,11 @@ public struct InboxMailboxFooterViewModel: Equatable {
     let canLoadMore: Bool
 }
 
+private struct MailboxEventEnvelope {
+    var mailboxRevision: String?
+    var mailboxLabels: [String] = []
+}
+
 @MainActor
 public final class InboxStore: ObservableObject {
     @Published public private(set) var phase: LoadPhase = .idle
@@ -73,12 +78,21 @@ public final class InboxStore: ObservableObject {
     @Published private(set) var openedThreads: [String: ThreadReaderResponse] = [:]
     @Published private(set) var mailboxPageLoading = false
     @Published private(set) var expandedThreadIDs: Set<String> = []
+    @Published private(set) var realtimeConnected = false
+    @Published private(set) var lastSSEConnectedAt: Date?
+    @Published private(set) var lastSSEDisconnectedAt: Date?
+    @Published private(set) var lastSSEEventID: String?
+    @Published private(set) var lastSSEEventType: String?
+    @Published private(set) var lastSSEEventAt: Date?
+    @Published private(set) var lastForcedMailboxRefreshAt: Date?
+    @Published private(set) var lastForcedMailboxRefreshError: String?
     @Published var navigationPlaceholderVisible = false
 
     private let client: AppClient
     private let sessionCache: AppSessionCache
     private let threadCache: ThreadCache
     private let localMailStore: LocalMailStore
+    private let automaticallyPrefetchThreads: Bool
     private var inFlightSessionRefresh: Task<AppSessionResponse, Error>?
     private var inFlightMailboxRefresh: Task<MailboxResponse, Error>?
     private var inFlightThreads: [String: Task<ThreadReaderResponse, Error>] = [:]
@@ -92,10 +106,11 @@ public final class InboxStore: ObservableObject {
     private var bodyRefreshAttempts: [String: Int] = [:]
     private var readActionQueuedKeys: Set<String> = []
     private var lastMailboxEventID: String?
+    private var lastSeenMailboxRevision: String?
     private var pendingEventRefreshNeedsSession = false
 
-    private let activeSyncInterval: TimeInterval = 60
-    private let minimumSyncGap: TimeInterval = 18
+    private let activeSyncInterval: TimeInterval = 10
+    private let minimumSyncGap: TimeInterval = 8
     private let minimumMailboxRefreshGap: TimeInterval = 20
     private let eventRefreshDebounce: TimeInterval = 1
     private let threadFetchLimit = 50
@@ -105,12 +120,14 @@ public final class InboxStore: ObservableObject {
         client: AppClient = LiveBackendAppClient(baseURL: AppConfiguration.defaultBackendURL),
         sessionCache: AppSessionCache = AppSessionCache(),
         threadCache: ThreadCache = ThreadCache(),
-        localMailStore: LocalMailStore = NoopLocalMailStore()
+        localMailStore: LocalMailStore = NoopLocalMailStore(),
+        automaticallyPrefetchThreads: Bool = true
     ) {
         self.client = client
         self.sessionCache = sessionCache
         self.threadCache = threadCache
         self.localMailStore = localMailStore
+        self.automaticallyPrefetchThreads = automaticallyPrefetchThreads
     }
 
     public var runMode: AppRunMode {
@@ -134,6 +151,7 @@ public final class InboxStore: ObservableObject {
     }
 
     public func setSessionToken(_ token: String?) {
+        let previousToken = client.sessionToken
         client.sessionToken = token
         if token == nil {
             session = nil
@@ -166,10 +184,22 @@ public final class InboxStore: ObservableObject {
             eventRefreshTask = nil
             pendingEventRefreshNeedsSession = false
             lastMailboxEventID = nil
+            lastSeenMailboxRevision = nil
+            realtimeConnected = false
+            lastSSEConnectedAt = nil
+            lastSSEDisconnectedAt = nil
+            lastSSEEventID = nil
+            lastSSEEventType = nil
+            lastSSEEventAt = nil
+            lastForcedMailboxRefreshAt = nil
+            lastForcedMailboxRefreshError = nil
             sessionCache.clear()
             localMailStore.clearAll()
             threadCache.clearMemory()
             phase = .idle
+        } else if previousToken != token {
+            stopMailboxEventStream()
+            startLiveRefreshLoop()
         }
     }
 
@@ -348,6 +378,9 @@ public final class InboxStore: ObservableObject {
             phase = .loading
         }
         await refresh()
+        if session != nil {
+            startLiveRefreshLoop()
+        }
     }
 
     public func refresh() async {
@@ -462,7 +495,9 @@ public final class InboxStore: ObservableObject {
             await refreshActiveMailbox(allowCachedFallback: true)
             seedActiveSelectionIfNeeded()
             refreshReaderRow()
-            prefetchPriorityThreads()
+            if automaticallyPrefetchThreads {
+                prefetchPriorityThreads()
+            }
         } catch is CancellationError {
             inFlightSessionRefresh = nil
         } catch {
@@ -478,13 +513,14 @@ public final class InboxStore: ObservableObject {
         }
     }
 
-    private func refreshActiveMailbox(allowCachedFallback: Bool) async {
+    private func refreshActiveMailbox(allowCachedFallback: Bool, force: Bool = false) async {
         guard let userID = session?.user.id else {
             return
         }
         let label = activeMailboxLabel
         let now = Date()
-        if let lastRefresh = lastMailboxRefreshAt[label],
+        if !force,
+           let lastRefresh = lastMailboxRefreshAt[label],
            activeMailbox != nil,
            now.timeIntervalSince(lastRefresh) < minimumMailboxRefreshGap {
             return
@@ -505,13 +541,22 @@ public final class InboxStore: ObservableObject {
             let merged = activeMailbox?.preservingLoadedPages(afterRefreshingFirstPage: mailbox) ?? mailbox
             activeMailbox = merged
             localMailStore.writeMailbox(merged, userID: userID, label: label)
+            if force {
+                lastForcedMailboxRefreshAt = Date()
+                lastForcedMailboxRefreshError = nil
+            }
             refreshFailed = false
             phase = .loaded
             seedActiveSelectionIfNeeded()
             refreshReaderRow()
-            prefetchPriorityThreads()
+            if automaticallyPrefetchThreads {
+                prefetchPriorityThreads()
+            }
         } catch {
             inFlightMailboxRefresh = nil
+            if force {
+                lastForcedMailboxRefreshError = error.localizedDescription
+            }
             refreshFailed = true
             if allowCachedFallback, let cached = localMailStore.readMailbox(userID: userID, label: activeMailboxLabel) {
                 activeMailbox = cached
@@ -775,7 +820,19 @@ public final class InboxStore: ObservableObject {
             return
         }
         lastSyncTriggerAt = Date()
-        await refreshActiveMailbox(allowCachedFallback: true)
+        do {
+            let state = try await client.mailboxSyncState()
+            guard let revision = state.mailboxRevision, !revision.isEmpty else {
+                return
+            }
+            guard lastSeenMailboxRevision != revision else {
+                return
+            }
+            lastSeenMailboxRevision = revision
+            await refreshActiveMailbox(allowCachedFallback: true, force: true)
+        } catch {
+            lastForcedMailboxRefreshError = error.localizedDescription
+        }
     }
 
     public func startLiveRefreshLoop() {
@@ -847,26 +904,54 @@ public final class InboxStore: ObservableObject {
         guard (200..<300).contains(httpResponse.statusCode) else {
             throw APIError.httpStatus(httpResponse.statusCode)
         }
+        realtimeConnected = true
+        lastSSEConnectedAt = Date()
         var parser = ServerSentEventParser()
-        for try await line in bytes.lines {
-            if Task.isCancelled {
-                return
+        do {
+            for try await line in bytes.lines {
+                if Task.isCancelled {
+                    realtimeConnected = false
+                    lastSSEDisconnectedAt = Date()
+                    return
+                }
+                if let event = parser.feed(line: line) {
+                    handleMailboxServerEvent(event)
+                }
             }
-            if let event = parser.feed(line: line) {
-                handleMailboxServerEvent(event)
-            }
+            realtimeConnected = false
+            lastSSEDisconnectedAt = Date()
+        } catch {
+            realtimeConnected = false
+            lastSSEDisconnectedAt = Date()
+            throw error
         }
     }
 
-    private func handleMailboxServerEvent(_ event: MailboxServerEvent) {
+    func handleMailboxServerEvent(_ event: MailboxServerEvent) {
         if let id = event.id, !id.isEmpty {
             lastMailboxEventID = id
+            lastSSEEventID = id
         }
+        lastSSEEventType = event.event
+        lastSSEEventAt = Date()
         switch event.event {
         case "mailbox-changed":
-            scheduleEventRefresh(needsSession: false)
+            let envelope = decodedEventEnvelope(event.data)
+            guard eventAffectsActiveMailbox(envelope) else {
+                return
+            }
+            if shouldRefreshForRevision(envelope.mailboxRevision) {
+                scheduleEventRefresh(needsSession: false)
+            }
         case "dashboard-changed":
+            let envelope = decodedEventEnvelope(event.data)
+            _ = shouldRefreshForRevision(envelope.mailboxRevision)
             scheduleEventRefresh(needsSession: true)
+        case "sync-state":
+            let revision = decodedSyncStateRevision(event.data)
+            if shouldRefreshForRevision(revision) {
+                scheduleEventRefresh(needsSession: false)
+            }
         default:
             break
         }
@@ -895,8 +980,51 @@ public final class InboxStore: ObservableObject {
         if needsSession {
             await refresh(allowEmptyDashboard: true)
         } else {
-            await refreshActiveMailbox(allowCachedFallback: true)
+            await refreshActiveMailbox(allowCachedFallback: true, force: true)
         }
+    }
+
+    private func shouldRefreshForRevision(_ revision: String?) -> Bool {
+        guard let revision, !revision.isEmpty else {
+            return true
+        }
+        if lastSeenMailboxRevision == revision {
+            return false
+        }
+        lastSeenMailboxRevision = revision
+        return true
+    }
+
+    private func eventAffectsActiveMailbox(_ envelope: MailboxEventEnvelope) -> Bool {
+        let labels = envelope.mailboxLabels
+        if labels.isEmpty {
+            return true
+        }
+        let active = activeMailboxLabel.rawValue
+        return labels.contains("all") || labels.contains(active)
+    }
+
+    private func decodedEventEnvelope(_ data: String) -> MailboxEventEnvelope {
+        guard let raw = data.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
+            return MailboxEventEnvelope()
+        }
+        let mailboxLabel = json["mailbox_label"] as? String
+        let payload = json["payload"] as? [String: Any] ?? [:]
+        let revision = payload["mailbox_revision"] as? String
+        let labels = payload["mailbox_labels"] as? [String]
+        return MailboxEventEnvelope(
+            mailboxRevision: revision,
+            mailboxLabels: labels ?? (mailboxLabel.map { [$0] } ?? [])
+        )
+    }
+
+    private func decodedSyncStateRevision(_ data: String) -> String? {
+        guard let raw = data.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
+            return nil
+        }
+        return json["mailbox_revision"] as? String
     }
 
     private func scheduleSelectionPrefetch(threadID: String) {

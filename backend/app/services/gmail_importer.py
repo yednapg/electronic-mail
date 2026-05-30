@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -42,6 +43,7 @@ GMAIL_BATCH_GET_SIZE = 50
 GMAIL_HISTORY_PAGE_SIZE = 500
 GMAIL_HISTORY_TYPES = ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
 GMAIL_METADATA_HEADERS = ["Subject", "From", "To", "Cc", "Bcc", "Date", "Message-ID", "In-Reply-To", "References", "List-ID"]
+logger = logging.getLogger(__name__)
 
 
 def run_gmail_import_batch(settings: Settings, *, user_id: str, batch_size: int, first_run: bool = False) -> int:
@@ -182,6 +184,15 @@ def run_gmail_delta_sync(
                 mailbox_label="all",
                 payload={"source": "gmail_delta", "deleted_count": len(deleted_ids)},
             )
+        logger.info(
+            "Gmail delta sync completed user_id=%s imported=%s deleted=%s pending_groups=%s latest_history_id=%s target_history_id=%s",
+            user_id,
+            len(messages),
+            len(deleted_ids),
+            len(deleted_pending_group_ids),
+            latest_history_id,
+            target_history_id,
+        )
         return touched + len(deleted_pending_group_ids)
     except HttpError as exc:
         if _is_history_cursor_expired(exc):
