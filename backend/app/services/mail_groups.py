@@ -70,6 +70,7 @@ from app.schemas.domain import (
     GmailThreadSection,
     GoogleAuthState,
     MailboxLabel,
+    MailboxRealtimeStateResponse,
     MailboxResponse,
     MailboxSyncStateResponse,
     PostLoginReadinessResponse,
@@ -87,6 +88,7 @@ from app.services.email_extraction import (
     sender_domain,
 )
 from app.services.integrations.google import GMAIL_SEND_SCOPE, missing_google_scopes
+from app.services.mailbox_events import GMAIL_PUBSUB_RECEIVED, latest_event
 
 FIRST_BATCH_SIZE = 50
 BACKFILL_BATCH_SIZE = 30
@@ -1186,6 +1188,28 @@ def build_mailbox_sync_state(settings: Settings, *, user_id: str) -> MailboxSync
         full_import_completed_at=getattr(state, "full_backfill_completed_at", None) if state else None,
         pending_action_count=count_pending_thread_actions(database_url, user_id=user_id),
         last_ai_error=last_ai_error,
+    )
+
+
+def build_mailbox_realtime_state(settings: Settings, *, user_id: str) -> MailboxRealtimeStateResponse:
+    sync_state = build_mailbox_sync_state(settings, user_id=user_id)
+    last_event = latest_event(settings, user_id=user_id)
+    last_pubsub = latest_event(settings, user_id=user_id, event_type=GMAIL_PUBSUB_RECEIVED)
+    pubsub_payload = last_pubsub.payload if last_pubsub is not None else {}
+    return MailboxRealtimeStateResponse(
+        watch_status=sync_state.watch_status,
+        watch_expiration_at=sync_state.watch_expiration_at,
+        last_history_id=sync_state.last_history_id,
+        last_pubsub_received_at=last_pubsub.created_at if last_pubsub is not None else None,
+        last_pubsub_history_id=str(pubsub_payload.get("history_id") or "") or None,
+        last_delta_sync_at=sync_state.last_delta_sync_at,
+        last_mailbox_event_id=last_event.id if last_event is not None else None,
+        last_mailbox_event_at=last_event.created_at if last_event is not None else None,
+        last_mailbox_event_type=last_event.event_type if last_event is not None else None,
+        mailbox_revision=sync_state.mailbox_revision,
+        poller_online=sync_state.poller_online,
+        total_threads=sync_state.total_threads,
+        last_sync_error=sync_state.last_sync_error,
     )
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from base64 import urlsafe_b64decode
 import asyncio
 import json
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
@@ -16,17 +17,18 @@ from app.core.config import load_settings
 from app.db.jobs import enqueue_job
 from app.db.mail_groups import MailboxCursorError
 from app.db.repository import get_user_by_email
-from app.schemas.domain import MailComposeRequest, MailReplyRequest, MailSendResponse, MailboxResponse, MailboxSyncStateResponse, MailboxSyncTriggerResponse, QueuedThreadActionRequest, QueuedThreadActionResponse, ThreadReaderResponse
+from app.schemas.domain import MailComposeRequest, MailReplyRequest, MailSendResponse, MailboxRealtimeStateResponse, MailboxResponse, MailboxSyncStateResponse, MailboxSyncTriggerResponse, QueuedThreadActionRequest, QueuedThreadActionResponse, ThreadReaderResponse
 from app.services.auth import require_current_user
 from app.services.gmail_importer import run_gmail_delta_sync, run_gmail_import_batch
 from app.services.gmail_watch import ensure_gmail_watch
 from app.services.mailbox_actions import enqueue_thread_action
-from app.services.mailbox_events import HEARTBEAT, SYNC_STATE, event_payload, format_sse_event, list_events_after, parse_last_event_id
+from app.services.mailbox_events import GMAIL_PUBSUB_RECEIVED, HEARTBEAT, SYNC_STATE, emit_mailbox_event, event_payload, format_sse_event, list_events_after, parse_last_event_id
 from app.services.mailbox_sends import send_compose, send_reply
-from app.services.mail_groups import build_app_session_response, build_group_detail_response, build_mailbox_response, build_mailbox_sync_state, enqueue_mailbox_sync, refresh_app_session_snapshot
+from app.services.mail_groups import build_app_session_response, build_group_detail_response, build_mailbox_realtime_state, build_mailbox_response, build_mailbox_sync_state, enqueue_mailbox_sync, refresh_app_session_snapshot
 
 router = APIRouter(tags=["mailbox"])
 settings = load_settings()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/v1/mailbox", response_model=MailboxResponse)
@@ -79,6 +81,12 @@ def mailbox_reply(request: Request, mailbox_thread_id: str, payload: MailReplyRe
 def mailbox_sync_state(request: Request) -> MailboxSyncStateResponse:
     user = require_current_user(settings, request)
     return build_mailbox_sync_state(settings, user_id=user.id)
+
+
+@router.get("/v1/mailbox/realtime-state", response_model=MailboxRealtimeStateResponse)
+def mailbox_realtime_state(request: Request) -> MailboxRealtimeStateResponse:
+    user = require_current_user(settings, request)
+    return build_mailbox_realtime_state(settings, user_id=user.id)
 
 
 @router.post("/v1/mailbox/sync", response_model=MailboxSyncTriggerResponse, status_code=202)
@@ -173,7 +181,15 @@ async def mailbox_pubsub(request: Request) -> dict[str, object]:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing Pub/Sub Gmail emailAddress or historyId")
     user = get_user_by_email(str(settings.database_path), email_address) if email_address else None
     if user is None:
+        logger.info("Ignoring Gmail Pub/Sub notification for unknown email=%s history_id=%s", email_address, history_id)
         return {"status": "ignored", "reason": "unknown_user"}
+    logger.info("Received Gmail Pub/Sub notification user_id=%s email=%s history_id=%s", user.id, email_address, history_id)
+    emit_mailbox_event(
+        settings,
+        user_id=user.id,
+        event_type=GMAIL_PUBSUB_RECEIVED,
+        payload={"email_address": email_address, "history_id": history_id},
+    )
     dedupe = f"gmail-pubsub:{user.id}:{history_id}"
     job = enqueue_job(
         str(settings.database_path),

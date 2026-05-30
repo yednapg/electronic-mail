@@ -115,6 +115,9 @@ private struct ElectronicMailRootView: View {
                 SignedInShellView(store: store) {
                     try await performGoogleReauthorization()
                 }
+                    .onAppear {
+                        store.startLiveRefreshLoop()
+                    }
                     .transition(.opacity)
             }
         }

@@ -20,7 +20,7 @@
     "backend:worker:fast": "cd backend && .venv/bin/python -m app.workers.main --queues critical,default",
     "backend:worker:reader": "cd backend && .venv/bin/python -m app.workers.main --queues reader --sleep 1",
     "backend:worker:slow": "cd backend && .venv/bin/python -m app.workers.main --queues slow --sleep 5",
-    "backend:worker:poller": "cd backend && .venv/bin/python -m app.workers.gmail_poller --interval ${GMAIL_POLL_INTERVAL_SECONDS:-120}",
+    "backend:worker:poller": "cd backend && .venv/bin/python -m app.workers.gmail_poller --interval ${GMAIL_POLL_INTERVAL_SECONDS:-30}",
     "backend:dev": "bash scripts/dev-backend-runtime.sh",
     "dev:backend": "npm run backend:dev",
     "backend:test": "cd backend && ../.venv/bin/python -m unittest discover -s tests -t . -p 'test_*.py'",

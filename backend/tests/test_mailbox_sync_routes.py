@@ -10,8 +10,8 @@ from fastapi.testclient import TestClient
 
 from app.api.routes import mailbox as mailbox_routes
 from app.main import app
-from app.schemas.domain import MailboxSyncStateResponse
-from app.services.mailbox_events import format_sse_event, parse_last_event_id
+from app.schemas.domain import MailboxRealtimeStateResponse, MailboxSyncStateResponse
+from app.services.mailbox_events import emit_mailbox_event, format_sse_event, parse_last_event_id
 
 
 class MailboxSyncRouteTests(unittest.TestCase):
@@ -53,6 +53,7 @@ class MailboxSyncRouteTests(unittest.TestCase):
             patch.object(mailbox_routes, "settings", local_settings),
             patch.object(mailbox_routes, "get_user_by_email", return_value=SimpleNamespace(id="user-1")),
             patch.object(mailbox_routes, "enqueue_job", return_value=SimpleNamespace(id="job-1")) as enqueue,
+            patch.object(mailbox_routes, "emit_mailbox_event") as emit_event,
         ):
             response = self.client.post("/v1/mailbox/pubsub", json={"message": {"data": _pubsub_data(history_id="123")}})
 
@@ -61,6 +62,9 @@ class MailboxSyncRouteTests(unittest.TestCase):
         enqueue.assert_called_once()
         self.assertEqual(enqueue.call_args.kwargs["kind"], "gmail_pubsub_sync")
         self.assertEqual(enqueue.call_args.kwargs["dedupe_key"], "gmail-pubsub:user-1:123")
+        emit_event.assert_called_once()
+        self.assertEqual(emit_event.call_args.kwargs["event_type"], "gmail-pubsub-received")
+        self.assertEqual(emit_event.call_args.kwargs["payload"]["history_id"], "123")
 
     def test_pubsub_route_rejects_missing_gmail_history_payload(self) -> None:
         local_settings = SimpleNamespace(is_production_like=False, database_path="postgresql://example/db")
@@ -89,6 +93,44 @@ class MailboxSyncRouteTests(unittest.TestCase):
         self.assertIn("id: 42\n", event)
         self.assertIn("event: mailbox-changed\n", event)
         self.assertIn('data: {"ok":true}', event)
+
+    def test_emit_mailbox_event_adds_revision_and_label_payload(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        with (
+            patch("app.services.mailbox_events.latest_gmail_mailbox_revision", return_value="rev-1"),
+            patch("app.services.mailbox_events.insert_mailbox_event", return_value=SimpleNamespace(id=1)) as insert,
+        ):
+            emit_mailbox_event(settings, user_id="user-1", event_type="mailbox-changed", mailbox_label="inbox", payload={"source": "test"})
+
+        payload = insert.call_args.kwargs["payload"]
+        self.assertEqual(payload["mailbox_revision"], "rev-1")
+        self.assertEqual(payload["mailbox_labels"], ["inbox"])
+
+    def test_realtime_state_exposes_backend_diagnostics(self) -> None:
+        realtime = MailboxRealtimeStateResponse(
+            watch_status="active",
+            watch_expiration_at="2026-06-06T00:00:00+00:00",
+            last_history_id="100",
+            last_pubsub_received_at="2026-05-30T00:00:00+00:00",
+            last_pubsub_history_id="101",
+            last_delta_sync_at="2026-05-30T00:00:01+00:00",
+            last_mailbox_event_id=7,
+            last_mailbox_event_at="2026-05-30T00:00:02+00:00",
+            last_mailbox_event_type="mailbox-changed",
+            mailbox_revision="2026-05-30T00:00:02+00:00",
+            poller_online=True,
+            total_threads=12,
+            last_sync_error=None,
+        )
+        with (
+            patch.object(mailbox_routes, "require_current_user", return_value=SimpleNamespace(id="user-1")),
+            patch.object(mailbox_routes, "build_mailbox_realtime_state", return_value=realtime),
+        ):
+            response = self.client.get("/v1/mailbox/realtime-state")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["last_pubsub_history_id"], "101")
+        self.assertEqual(response.json()["last_mailbox_event_id"], 7)
 
 
 def _pubsub_data(email: str = "me@example.com", history_id: str = "123") -> str:

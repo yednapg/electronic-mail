@@ -38,6 +38,19 @@ public final class DemoAppClient: AppClient {
         return thread
     }
 
+    public func mailboxSyncState() async throws -> MailboxSyncStateResponse {
+        MailboxSyncStateResponse(
+            connected: true,
+            lastHistoryID: nil,
+            lastFullSyncAt: sessionState.sync.lastSyncAt,
+            watchExpirationAt: nil,
+            lastSyncStartedAt: sessionState.sync.lastSyncAt,
+            lastSyncCompletedAt: sessionState.sync.lastSyncAt,
+            lastSyncError: nil,
+            totalThreads: sessionState.mailbox.totalThreads
+        )
+    }
+
     public func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
         MailboxSyncTriggerResponse(
             status: "queued",
