@@ -21,6 +21,7 @@ __pycache__
 *.tsbuildinfo
 backend/dev.db
 backend/dev.db-journal
+.codex_runtime/
 **/xcuserdata/
 **/*.xcuserstate
 **/Derived/
