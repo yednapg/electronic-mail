@@ -34,13 +34,25 @@ public struct InboxView: View {
                         thread: store.readerThread,
                         row: store.readerRow,
                         errorMessage: store.readerError,
+                        currentUserDisplayName: store.session?.user.displayName ?? store.session?.user.firstName,
+                        currentUserEmail: store.session?.user.email,
                         colorScheme: colorScheme,
                         onRetry: {
                             Task {
                                 await store.prefetchThread(threadID: readerThreadID, force: true, silent: false)
                             }
                         },
-                        onReply: { onReply(readerThreadID) }
+                        onReply: { onReply(readerThreadID) },
+                        onThreadAction: { action in
+                            Task {
+                                await store.performReaderThreadAction(action, threadID: readerThreadID)
+                            }
+                        },
+                        onOpenAttachment: { attachment, messageID in
+                            Task {
+                                await store.openAttachment(attachment, messageID: messageID)
+                            }
+                        }
                     )
                     .transition(.opacity)
                 } else {
@@ -531,6 +543,19 @@ private struct InboxRowView: View {
                 .clipped()
                 .offset(x: metrics.subjectLeading(isChild: row.isChild))
 
+            if row.hasAttachments {
+                Image(systemName: "paperclip")
+                    .font(.system(size: metrics.attachmentIconSize, weight: .regular, design: .rounded))
+                    .symbolRenderingMode(.monochrome)
+                    .foregroundStyle(attachmentIconColor)
+                    .frame(
+                        width: metrics.attachmentWidth,
+                        height: ElectronicMailTypography.bodyLineHeight,
+                        alignment: .center
+                    )
+                    .offset(x: metrics.attachmentLeading)
+            }
+
             rowText(row.timeLabel, alignment: .trailing)
                 .frame(
                     width: metrics.timeWidth,
@@ -563,6 +588,14 @@ private struct InboxRowView: View {
             return ElectronicMailDesign.unreadText(for: colorScheme)
         }
         return ElectronicMailDesign.readText(for: colorScheme)
+    }
+
+    private var attachmentIconColor: Color {
+        if row.isSelected {
+            return ElectronicMailDesign.selectedText(for: colorScheme).opacity(0.86)
+        }
+
+        return ElectronicMailDesign.secondaryText(for: colorScheme).opacity(0.72)
     }
 }
 
@@ -820,12 +853,24 @@ private struct InboxLayoutMetrics {
         windowSize.width - trailingInset - timeWidth
     }
 
+    var attachmentWidth: CGFloat {
+        16
+    }
+
+    var attachmentIconSize: CGFloat {
+        14
+    }
+
+    var attachmentLeading: CGFloat {
+        timeLeading - attachmentWidth - 16
+    }
+
     var subjectWidth: CGFloat {
-        max(0, timeLeading - subjectLeading - 20)
+        max(0, attachmentLeading - subjectLeading - 16)
     }
 
     func subjectWidth(isChild: Bool) -> CGFloat {
-        max(0, timeLeading - subjectLeading(isChild: isChild) - 20)
+        max(0, attachmentLeading - subjectLeading(isChild: isChild) - 16)
     }
 
     var trailingInset: CGFloat {

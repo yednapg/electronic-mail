@@ -11,6 +11,12 @@ public enum AppRunMode: String, Equatable {
     case localBackend
 }
 
+public struct DownloadedAttachment: Equatable {
+    let filename: String
+    let mimeType: String?
+    let data: Data
+}
+
 public struct MailboxServerEvent: Equatable {
     public let id: String?
     public let event: String
@@ -89,6 +95,7 @@ public protocol AppClient: AnyObject {
     func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse
     func sendCompose(_ request: MailComposeRequest) async throws -> MailSendResponse
     func sendReply(threadID: String, request: MailReplyRequest) async throws -> MailSendResponse
+    func downloadAttachment(messageID: String, attachment: ThreadAttachment) async throws -> DownloadedAttachment
     func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse
     func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse
     func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse
@@ -104,6 +111,10 @@ public extension AppClient {
     }
 
     func sendReply(threadID: String, request: MailReplyRequest) async throws -> MailSendResponse {
+        throw APIError.httpStatus(501)
+    }
+
+    func downloadAttachment(messageID: String, attachment: ThreadAttachment) async throws -> DownloadedAttachment {
         throw APIError.httpStatus(501)
     }
 }
@@ -192,6 +203,13 @@ public final class LiveBackendAppClient: AppClient {
         return try await self.request(path: "/v1/mailbox/threads/\(threadID.urlPathEncoded)/reply", method: "POST", body: body)
     }
 
+    public func downloadAttachment(messageID: String, attachment: ThreadAttachment) async throws -> DownloadedAttachment {
+        let path = attachment.downloadURL
+            ?? "/v1/mailbox/messages/\(messageID.urlPathEncoded)/attachments/\(attachment.attachmentID.urlPathEncoded)"
+        let data = try await rawRequest(path: path)
+        return DownloadedAttachment(filename: attachment.filename, mimeType: attachment.mimeType, data: data)
+    }
+
     public func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
         let body = try JSONEncoder.backend.encode(request)
         return try await self.request(path: "/v1/tasks", method: "POST", body: body)
@@ -243,6 +261,27 @@ public final class LiveBackendAppClient: AppClient {
             throw APIError.httpStatus(httpResponse.statusCode)
         }
         return try decoder.decode(Response.self, from: data)
+    }
+
+    private func rawRequest(path: String) async throws -> Data {
+        guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else {
+            throw APIError.invalidURL
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+        if let sessionToken, !sessionToken.isEmpty {
+            request.setValue("Bearer \(sessionToken)", forHTTPHeaderField: "Authorization")
+        }
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.emptyResponse
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw APIError.httpStatus(httpResponse.statusCode)
+        }
+        return data
     }
 }
 

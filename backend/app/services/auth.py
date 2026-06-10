@@ -26,7 +26,11 @@ from app.db.repository import (
     upsert_user,
 )
 from app.schemas.domain import DashboardProfile, GoogleAuthState
-from app.services.integrations.google import GMAIL_SEND_SCOPE, has_stored_google_tokens, load_google_account_profile, missing_google_scopes
+from app.services.integrations.google import (
+    GMAIL_SEND_SCOPE,
+    check_user_google_credentials,
+    missing_google_scopes,
+)
 from app.services.token_crypto import decrypt_json, encrypt_json
 
 
@@ -84,8 +88,8 @@ def get_current_user(settings: Settings, request: Request) -> CurrentUser | None
     return None
 
 
-def auth_state_for_request(settings: Settings, request: Request) -> GoogleAuthState:
-    """Fast auth state that never refreshes Google tokens."""
+def auth_state_for_request(settings: Settings, request: Request, *, verify_google_credentials: bool = False) -> GoogleAuthState:
+    """Return auth state, optionally verifying stored Google credentials for explicit auth checks."""
     if not settings.google_configured:
         return GoogleAuthState(available=False, connected=False, connect_url=None)
 
@@ -97,6 +101,17 @@ def auth_state_for_request(settings: Settings, request: Request) -> GoogleAuthSt
         return GoogleAuthState(available=True, connected=True, connect_url=None, can_send_mail=True)
 
     has_token = get_google_oauth_token(str(settings.database_path), user_id=user.id) is not None
+    if verify_google_credentials and has_token:
+        credential_status = check_user_google_credentials(settings, user_id=user.id, refresh_expired=True)
+        if not credential_status.connected:
+            return GoogleAuthState(
+                available=True,
+                connected=False,
+                connect_url=f"{settings.backend_origin}/auth/google",
+                reauth_required=credential_status.reauth_required or credential_status.has_stored_tokens,
+                error=credential_status.error,
+            )
+
     missing_scopes = missing_google_scopes(settings, user_id=user.id, required_scopes=[GMAIL_SEND_SCOPE]) if has_token else [GMAIL_SEND_SCOPE]
     return GoogleAuthState(
         available=True,

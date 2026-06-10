@@ -124,6 +124,10 @@ public final class OfflineFirstAppClient: AppClient {
         try await backend.sendReply(threadID: threadID, request: request)
     }
 
+    public func downloadAttachment(messageID: String, attachment: ThreadAttachment) async throws -> DownloadedAttachment {
+        try await backend.downloadAttachment(messageID: messageID, attachment: attachment)
+    }
+
     public func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
         try await backend.createTask(request)
     }

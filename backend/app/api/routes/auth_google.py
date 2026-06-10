@@ -57,7 +57,7 @@ def auth_google(redirect_to: str | None = None) -> RedirectResponse:
 @router.get("/v1/auth/google/state", response_model=GoogleAuthState)
 def auth_google_state(request: Request) -> GoogleAuthState:
     """Return the current Google connection state without building the dashboard."""
-    return auth_state_for_request(settings, request)
+    return auth_state_for_request(settings, request, verify_google_credentials=True)
 
 
 @router.get("/v1/auth/me", response_model=AuthMeResponse)

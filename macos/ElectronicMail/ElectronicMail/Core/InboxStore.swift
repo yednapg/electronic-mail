@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 public enum LoadPhase: Equatable {
@@ -27,6 +28,7 @@ public struct InboxRowViewModel: Identifiable, Equatable {
     let focusedMessageID: String?
     let messageCount: Int
     let timeLabel: String
+    let hasAttachments: Bool
     let presentationStatus: String?
     let isChild: Bool
     let isExpandable: Bool
@@ -230,6 +232,7 @@ public final class InboxStore: ObservableObject {
                     focusedMessageID: nil,
                     messageCount: row.messageCount,
                     timeLabel: Self.timeLabel(for: row.latestReceivedAt, sectionTitle: section.title),
+                    hasAttachments: row.hasAttachments == true || (row.attachmentCount ?? 0) > 0,
                     presentationStatus: row.presentationStatus,
                     isChild: false,
                     isExpandable: childRows.count > 1,
@@ -253,6 +256,7 @@ public final class InboxStore: ObservableObject {
                         focusedMessageID: child.messageID,
                         messageCount: 1,
                         timeLabel: Self.timeLabel(for: child.receivedAt, sectionTitle: section.title),
+                        hasAttachments: false,
                         presentationStatus: row.presentationStatus,
                         isChild: true,
                         isExpandable: false,
@@ -372,12 +376,12 @@ public final class InboxStore: ObservableObject {
         }
         if let cached = sessionCache.read() ?? localMailStore.readSession() {
             session = cached
-            activeMailbox = localMailStore.readMailbox(userID: cached.user.id, label: activeMailboxLabel) ?? cached.mailbox
-            phase = .loaded
+            activeMailbox = localMailStore.readMailbox(userID: cached.user.id, label: activeMailboxLabel)
+            phase = activeMailbox == nil ? .loading : .loaded
         } else {
             phase = .loading
         }
-        await refresh()
+        await refresh(allowEmptyDashboard: false, forceMailbox: true)
         if session != nil {
             startLiveRefreshLoop()
         }
@@ -475,7 +479,7 @@ public final class InboxStore: ObservableObject {
         return outcome
     }
 
-    private func refresh(allowEmptyDashboard: Bool) async {
+    private func refresh(allowEmptyDashboard: Bool, forceMailbox: Bool = false) async {
         do {
             let task = inFlightSessionRefresh ?? Task { [client] in
                 try await client.appSession()
@@ -485,14 +489,11 @@ public final class InboxStore: ObservableObject {
             inFlightSessionRefresh = nil
             let merged = sessionCache.merge(current: session ?? sessionCache.read(), next: next, allowEmptyDashboard: allowEmptyDashboard)
             session = merged
-            if activeMailboxLabel == .inbox {
-                activeMailbox = activeMailbox?.preservingLoadedPages(afterRefreshingFirstPage: merged.mailbox) ?? merged.mailbox
-            }
             sessionCache.write(merged)
             localMailStore.writeSession(merged)
             refreshFailed = false
             phase = .loaded
-            await refreshActiveMailbox(allowCachedFallback: true)
+            await refreshActiveMailbox(allowCachedFallback: true, force: forceMailbox || activeMailbox == nil)
             seedActiveSelectionIfNeeded()
             refreshReaderRow()
             if automaticallyPrefetchThreads {
@@ -502,15 +503,28 @@ public final class InboxStore: ObservableObject {
             inFlightSessionRefresh = nil
         } catch {
             inFlightSessionRefresh = nil
+            if Self.isAuthenticationFailure(error) {
+                refreshFailed = false
+                setSessionToken(nil)
+                phase = .failed("Sign in with Google to load your mailbox.")
+                return
+            }
             refreshFailed = true
             if session == nil, let cached = sessionCache.read() ?? localMailStore.readSession() {
                 session = cached
-                activeMailbox = localMailStore.readMailbox(userID: cached.user.id, label: activeMailboxLabel) ?? cached.mailbox
-                phase = .loaded
+                activeMailbox = localMailStore.readMailbox(userID: cached.user.id, label: activeMailboxLabel)
+                phase = activeMailbox == nil ? .failed(error.localizedDescription) : .loaded
             } else if session == nil {
                 phase = .failed(error.localizedDescription)
             }
         }
+    }
+
+    private static func isAuthenticationFailure(_ error: Error) -> Bool {
+        guard case APIError.httpStatus(let status) = error else {
+            return false
+        }
+        return status == 401 || status == 403
     }
 
     private func refreshActiveMailbox(allowCachedFallback: Bool, force: Bool = false) async {
@@ -540,6 +554,9 @@ public final class InboxStore: ObservableObject {
 
             let merged = activeMailbox?.preservingLoadedPages(afterRefreshingFirstPage: mailbox) ?? mailbox
             activeMailbox = merged
+            if let revision = merged.mailboxRevision, !revision.isEmpty {
+                lastSeenMailboxRevision = revision
+            }
             localMailStore.writeMailbox(merged, userID: userID, label: label)
             if force {
                 lastForcedMailboxRefreshAt = Date()
@@ -687,19 +704,14 @@ public final class InboxStore: ObservableObject {
             activeMailbox = cached
             phase = .loaded
             seedActiveSelectionIfNeeded()
-        } else if label == .inbox, let session {
-            activeMailbox = session.mailbox
-            phase = .loaded
-            seedActiveSelectionIfNeeded()
         } else {
             activeMailbox = nil
         }
         if label == .inbox {
-            await refresh()
-            await refreshActiveMailbox(allowCachedFallback: true)
+            await refreshActiveMailbox(allowCachedFallback: true, force: true)
             return
         }
-        await refreshActiveMailbox(allowCachedFallback: true)
+        await refreshActiveMailbox(allowCachedFallback: true, force: true)
     }
 
     public func syncNow() async {
@@ -730,6 +742,21 @@ public final class InboxStore: ObservableObject {
         _ = await performThreadAction(action, threadID: activeThreadID, targetMessageID: activeMessageID)
     }
 
+    public func performReaderThreadAction(_ action: GmailThreadAction, threadID: String) async {
+        _ = await performThreadAction(action, threadID: threadID, targetMessageID: readerFocusedMessageID)
+    }
+
+    public func openAttachment(_ attachment: ThreadAttachment, messageID: String) async {
+        do {
+            let downloaded = try await client.downloadAttachment(messageID: messageID, attachment: attachment)
+            let fileURL = try writeDownloadedAttachment(downloaded)
+            NSWorkspace.shared.open(fileURL)
+            lastForcedMailboxRefreshError = nil
+        } catch {
+            lastForcedMailboxRefreshError = "Could not open attachment: \(error.localizedDescription)"
+        }
+    }
+
     @discardableResult
     private func performThreadAction(_ action: GmailThreadAction, threadID: String, targetMessageID: String? = nil) async -> Bool {
         do {
@@ -741,7 +768,7 @@ public final class InboxStore: ObservableObject {
                 createdAt: ISO8601DateFormatter.backendActionTimestamp.string(from: Date())
             )
             _ = try await client.enqueueThreadAction(request)
-            applyLocalThreadAction(threadID: threadID, action: action)
+            applyLocalThreadAction(threadID: threadID, action: action, targetMessageID: targetMessageID)
             lastMailboxRefreshAt[activeMailboxLabel] = nil
             await refreshActiveMailbox(allowCachedFallback: true)
             return true
@@ -978,10 +1005,28 @@ public final class InboxStore: ObservableObject {
         eventRefreshTask = nil
         lastMailboxRefreshAt[activeMailboxLabel] = nil
         if needsSession {
-            await refresh(allowEmptyDashboard: true)
+            await refresh(allowEmptyDashboard: true, forceMailbox: true)
         } else {
             await refreshActiveMailbox(allowCachedFallback: true, force: true)
         }
+    }
+
+    private func writeDownloadedAttachment(_ attachment: DownloadedAttachment) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ElectronicMailAttachments", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let filename = sanitizedAttachmentFilename(attachment.filename)
+        let url = directory.appendingPathComponent("\(UUID().uuidString)-\(filename)")
+        try attachment.data.write(to: url, options: .atomic)
+        return url
+    }
+
+    private func sanitizedAttachmentFilename(_ filename: String) -> String {
+        let invalidCharacters = CharacterSet(charactersIn: "/\\:\0\r\n\t")
+        let cleaned = filename
+            .components(separatedBy: invalidCharacters)
+            .joined(separator: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "attachment" : cleaned
     }
 
     private func shouldRefreshForRevision(_ revision: String?) -> Bool {
@@ -1144,7 +1189,11 @@ public final class InboxStore: ObservableObject {
         }
     }
 
-    private func applyLocalThreadAction(threadID: String, action: GmailThreadAction) {
+    private func applyLocalThreadAction(threadID: String, action: GmailThreadAction, targetMessageID: String? = nil) {
+        if action == .markRead {
+            applyLocalMarkRead(threadID: threadID, targetMessageID: targetMessageID)
+            return
+        }
         guard shouldRemoveFromCurrentMailbox(action: action), let mailbox = activeMailbox else {
             return
         }
@@ -1165,6 +1214,8 @@ public final class InboxStore: ObservableObject {
             sections: nextSections,
             readyCount: mailbox.readyCount,
             pendingCount: mailbox.pendingCount,
+            mailboxRevision: mailbox.mailboxRevision,
+            generatedAt: mailbox.generatedAt,
             oldestImportedAt: mailbox.oldestImportedAt,
             fullImportRunning: mailbox.fullImportRunning,
             fullImportCompleted: mailbox.fullImportCompleted
@@ -1176,6 +1227,45 @@ public final class InboxStore: ObservableObject {
             activeMessageID = nil
             seedActiveSelectionIfNeeded()
         }
+    }
+
+    private func applyLocalMarkRead(threadID: String, targetMessageID: String?) {
+        guard let mailbox = activeMailbox else {
+            return
+        }
+        var changed = false
+        let nextSections = mailbox.sections.map { section in
+            GmailThreadSection(
+                id: section.id,
+                title: section.title,
+                rows: section.rows.map { row in
+                    guard row.threadID == threadID else {
+                        return row
+                    }
+                    changed = true
+                    return row.markedRead(targetMessageID: targetMessageID)
+                }
+            )
+        }
+        guard changed else {
+            return
+        }
+        activeMailbox = MailboxResponse(
+            label: mailbox.label,
+            totalThreads: mailbox.totalThreads,
+            nextCursor: mailbox.nextCursor,
+            loadedThreads: mailbox.loadedThreads,
+            windowDays: mailbox.windowDays,
+            sections: nextSections,
+            readyCount: mailbox.readyCount,
+            pendingCount: mailbox.pendingCount,
+            mailboxRevision: mailbox.mailboxRevision,
+            generatedAt: mailbox.generatedAt,
+            oldestImportedAt: mailbox.oldestImportedAt,
+            fullImportRunning: mailbox.fullImportRunning,
+            fullImportCompleted: mailbox.fullImportCompleted
+        )
+        refreshReaderRow()
     }
 
     private func shouldRemoveFromCurrentMailbox(action: GmailThreadAction) -> Bool {
@@ -1197,7 +1287,7 @@ public final class InboxStore: ObservableObject {
         if let activeMailbox, activeMailbox.label == activeMailboxLabel {
             return activeMailbox
         }
-        return activeMailboxLabel == .inbox ? session?.mailbox : nil
+        return nil
     }
 
     private func visibleRows(in section: GmailThreadSection) -> [GmailThreadRow] {

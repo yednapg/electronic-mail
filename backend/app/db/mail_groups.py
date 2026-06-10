@@ -69,6 +69,55 @@ class MailGroupRecord:
     generated_at: str | None
     created_at: str
     updated_at: str
+    classification_version: str | None = None
+    classification: dict[str, Any] | None = None
+    classification_confidence: float = 0.0
+    ranking_reason: str | None = None
+    suppression_reason: str | None = None
+    classified_at: str | None = None
+
+
+@dataclass(frozen=True)
+class VisibleMailGroupRecord:
+    id: str
+    user_id: str
+    projection_key: str
+    visibility: str
+    group_kind: str
+    status: str
+    canonical_entity: str
+    contact_channel: str | None
+    title: str
+    summary: str
+    workflow_type: str
+    confidence: float
+    source_group_id: str | None
+    source: str
+    evidence: dict[str, Any]
+    latest_message_at: str | None
+    latest_message_id: str | None
+    generated_at: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class VisibleMailGroupUpsert:
+    projection_key: str
+    visibility: str
+    group_kind: str
+    canonical_entity: str
+    contact_channel: str | None
+    title: str
+    summary: str
+    workflow_type: str
+    confidence: float
+    source_group_id: str | None
+    source: str
+    evidence: dict[str, Any]
+    latest_message_at: str | None
+    latest_message_id: str | None
+    members: list[tuple[GmailMessageRecord, str, float]]
 
 
 @dataclass(frozen=True)
@@ -1328,9 +1377,20 @@ def list_mail_groups_for_gmail_threads(database_url: str, *, user_id: str, gmail
                  AND groups.status = 'active'
                 ORDER BY requested_threads.thread_key,
                          CASE
-                           WHEN groups.membership_source = 'ai_batch' THEN 0
-                           WHEN groups.group_key NOT LIKE 'gmail-thread:%' THEN 1
-                           ELSE 2
+                           WHEN groups.membership_source = 'ai_batch'
+                            AND groups.enrichment_status = 'ready'
+                            AND (
+                              groups.group_type IN ('financial_transfer', 'support_case', 'billing', 'logistics', 'account_security')
+                              OR (
+                                groups.group_type = 'dashboard_bundle'
+                                AND groups.classification_json->>'workflow_family' IN ('financial_transfer', 'support_case', 'billing', 'logistics', 'account_security')
+                              )
+                            )
+                            THEN 0
+                           WHEN groups.group_key = 'gmail-thread:' || requested_threads.thread_key THEN 1
+                           WHEN groups.membership_source = 'ai_batch' THEN 2
+                           WHEN groups.group_key NOT LIKE 'gmail-thread:%' THEN 3
+                           ELSE 4
                          END,
                          CASE WHEN groups.enrichment_status = 'ready' THEN 0 ELSE 1 END,
                          groups.latest_message_at DESC NULLS LAST,
@@ -1406,6 +1466,210 @@ def list_messages_for_groups(database_url: str, *, user_id: str, group_ids: list
     return grouped
 
 
+def replace_visible_mail_projection(
+    database_url: str,
+    *,
+    user_id: str,
+    visibility: str,
+    groups: list[VisibleMailGroupUpsert],
+    audit_events: list[dict[str, Any]] | None = None,
+) -> None:
+    """Replace one visibility projection atomically.
+
+    The membership table carries a UNIQUE(user_id, visibility, gmail_message_id)
+    constraint so duplicate visible homes are rejected even if callers regress.
+    """
+    with get_engine(database_url).begin() as connection:
+        connection.execute(
+            text(
+                """
+                DELETE FROM visible_mail_groups
+                WHERE user_id = :user_id AND visibility = :visibility
+                """
+            ),
+            {"user_id": user_id, "visibility": visibility},
+        )
+        for group in groups:
+            visible_group_id = str(uuid4())
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO visible_mail_groups (
+                      id, user_id, projection_key, visibility, group_kind, status,
+                      canonical_entity, contact_channel, title, summary, workflow_type,
+                      confidence, source_group_id, source, evidence_json,
+                      latest_message_at, latest_message_id, generated_at, created_at, updated_at
+                    ) VALUES (
+                      :id, :user_id, :projection_key, :visibility, :group_kind, 'active',
+                      :canonical_entity, :contact_channel, :title, :summary, :workflow_type,
+                      :confidence, :source_group_id, :source, CAST(:evidence_json AS JSONB),
+                      :latest_message_at, :latest_message_id, now(), now(), now()
+                    )
+                    """
+                ),
+                {
+                    "id": visible_group_id,
+                    "user_id": user_id,
+                    "projection_key": group.projection_key,
+                    "visibility": visibility,
+                    "group_kind": group.group_kind,
+                    "canonical_entity": group.canonical_entity,
+                    "contact_channel": group.contact_channel,
+                    "title": group.title,
+                    "summary": group.summary,
+                    "workflow_type": group.workflow_type,
+                    "confidence": group.confidence,
+                    "source_group_id": group.source_group_id,
+                    "source": group.source,
+                    "evidence_json": json.dumps(group.evidence, ensure_ascii=True),
+                    "latest_message_at": group.latest_message_at,
+                    "latest_message_id": group.latest_message_id,
+                },
+            )
+            for message, reason, confidence in group.members:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO visible_mail_group_members (
+                          id, user_id, visible_group_id, visibility, gmail_message_id,
+                          gmail_thread_id, reason, confidence, created_at
+                        ) VALUES (
+                          :id, :user_id, :visible_group_id, :visibility, :gmail_message_id,
+                          :gmail_thread_id, :reason, :confidence, now()
+                        )
+                        """
+                    ),
+                    {
+                        "id": str(uuid4()),
+                        "user_id": user_id,
+                        "visible_group_id": visible_group_id,
+                        "visibility": visibility,
+                        "gmail_message_id": message.message_id,
+                        "gmail_thread_id": message.gmail_thread_id,
+                        "reason": reason,
+                        "confidence": confidence,
+                    },
+                )
+        for event in audit_events or []:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO grouping_decision_audit (
+                      id, user_id, source_group_id, projection_key, decision, reason,
+                      evidence_json, created_at
+                    ) VALUES (
+                      :id, :user_id, :source_group_id, :projection_key, :decision, :reason,
+                      CAST(:evidence_json AS JSONB), now()
+                    )
+                    """
+                ),
+                {
+                    "id": str(uuid4()),
+                    "user_id": user_id,
+                    "source_group_id": event.get("source_group_id"),
+                    "projection_key": event.get("projection_key"),
+                    "decision": str(event.get("decision") or "unknown")[:80],
+                    "reason": str(event.get("reason") or "")[:1000],
+                    "evidence_json": json.dumps(event.get("evidence") or {}, ensure_ascii=True),
+                },
+            )
+
+
+def list_visible_groups_for_gmail_threads(
+    database_url: str,
+    *,
+    user_id: str,
+    visibility: str,
+    gmail_thread_ids: list[str],
+) -> dict[str, VisibleMailGroupRecord]:
+    thread_ids = list(dict.fromkeys([thread_id for thread_id in gmail_thread_ids if thread_id]))
+    if not thread_ids:
+        return {}
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                WITH requested_threads AS (
+                  SELECT unnest(CAST(:thread_ids AS text[])) AS thread_key
+                )
+                SELECT DISTINCT ON (requested_threads.thread_key)
+                  requested_threads.thread_key AS mailbox_thread_id,
+                  groups.*
+                FROM requested_threads
+                JOIN visible_mail_group_members AS members
+                  ON members.user_id = :user_id
+                 AND members.visibility = :visibility
+                 AND COALESCE(NULLIF(members.gmail_thread_id, ''), members.gmail_message_id) = requested_threads.thread_key
+                JOIN visible_mail_groups AS groups
+                  ON groups.user_id = members.user_id
+                 AND groups.id = members.visible_group_id
+                 AND groups.visibility = members.visibility
+                 AND groups.status = 'active'
+                ORDER BY requested_threads.thread_key,
+                         CASE groups.group_kind
+                           WHEN 'conversation' THEN 0
+                           WHEN 'lifecycle' THEN 1
+                           WHEN 'single' THEN 2
+                           ELSE 3
+                         END,
+                         groups.confidence DESC,
+                         groups.latest_message_at DESC NULLS LAST
+                """
+            ),
+            {"user_id": user_id, "visibility": visibility, "thread_ids": thread_ids},
+        ).mappings().all()
+    return {str(row["mailbox_thread_id"]): _visible_group_from_row(row) for row in rows}
+
+
+def list_messages_for_visible_groups(database_url: str, *, user_id: str, visible_group_ids: list[str]) -> dict[str, list[GmailMessageRecord]]:
+    if not visible_group_ids:
+        return {}
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT
+                  members.visible_group_id AS member_group_id,
+                  messages.user_id,
+                  messages.message_id,
+                  messages.gmail_thread_id,
+                  messages.history_id,
+                  messages.label_ids_json,
+                  messages.internal_date,
+                  messages.subject,
+                  messages.ai_title,
+                  messages.ai_title_generated_at,
+                  messages.sender,
+                  messages.recipients_json,
+                  messages.headers_json,
+                  messages.snippet,
+                  '{}' AS raw_payload_json,
+                  NULL AS html_body_sanitized,
+                  NULL AS html_render_document,
+                  NULL AS text_body,
+                  messages.extracted_signals_json,
+                  messages.body_hash,
+                  messages.body_fetch_status,
+                  messages.body_fetched_at,
+                  messages.body_fetch_error,
+                  messages.render_doc_bytes,
+                  messages.created_at,
+                  messages.updated_at
+                FROM visible_mail_group_members members
+                JOIN gmail_messages messages
+                  ON messages.user_id = members.user_id AND messages.message_id = members.gmail_message_id
+                WHERE members.user_id = :user_id AND members.visible_group_id = ANY(:group_ids)
+                ORDER BY members.visible_group_id, messages.internal_date ASC NULLS LAST, messages.created_at ASC
+                """
+            ),
+            {"user_id": user_id, "group_ids": visible_group_ids},
+        ).mappings().all()
+    grouped: dict[str, list[GmailMessageRecord]] = {group_id: [] for group_id in visible_group_ids}
+    for row in rows:
+        grouped.setdefault(str(row["member_group_id"]), []).append(_message_from_row(row))
+    return grouped
+
+
 def upsert_mail_group(
     database_url: str,
     *,
@@ -1429,6 +1693,12 @@ def upsert_mail_group(
     ai_model: str | None = None,
     ai_error: str | None = None,
     ai_generated_at: str | None = None,
+    classification_version: str | None = None,
+    classification: dict[str, Any] | None = None,
+    classification_confidence: float = 0.0,
+    ranking_reason: str | None = None,
+    suppression_reason: str | None = None,
+    classified_at: str | None = None,
 ) -> MailGroupRecord:
     with get_engine(database_url).begin() as connection:
         row = connection.execute(
@@ -1438,12 +1708,18 @@ def upsert_mail_group(
                   id, user_id, group_key, group_type, status, enrichment_status, membership_source,
                   ai_model, ai_error, ai_generated_at, ai_title, ai_summary, labels_json,
                   action_needed, action_type, priority, timing_band, dashboard_visible, latest_message_at,
-                  latest_message_id, generated_from_hash, generated_at, created_at, updated_at
+                  latest_message_id, generated_from_hash, generated_at,
+                  classification_version, classification_json, classification_confidence,
+                  ranking_reason, suppression_reason, classified_at,
+                  created_at, updated_at
                 ) VALUES (
                   :id, :user_id, :group_key, :group_type, 'active', :enrichment_status, :membership_source,
                   :ai_model, :ai_error, :ai_generated_at, :ai_title, :ai_summary, :labels_json,
                   :action_needed, :action_type, :priority, :timing_band, :dashboard_visible, :latest_message_at,
-                  :latest_message_id, :generated_from_hash, :generated_at, now(), now()
+                  :latest_message_id, :generated_from_hash, :generated_at,
+                  :classification_version, CAST(:classification_json AS JSONB), :classification_confidence,
+                  :ranking_reason, :suppression_reason, :classified_at,
+                  now(), now()
                 )
                 ON CONFLICT (user_id, group_key) DO UPDATE SET
                   group_type = excluded.group_type,
@@ -1464,6 +1740,12 @@ def upsert_mail_group(
                   latest_message_id = excluded.latest_message_id,
                   generated_from_hash = excluded.generated_from_hash,
                   generated_at = excluded.generated_at,
+                  classification_version = excluded.classification_version,
+                  classification_json = excluded.classification_json,
+                  classification_confidence = excluded.classification_confidence,
+                  ranking_reason = excluded.ranking_reason,
+                  suppression_reason = excluded.suppression_reason,
+                  classified_at = excluded.classified_at,
                   updated_at = now()
                 RETURNING *
                 """
@@ -1478,6 +1760,12 @@ def upsert_mail_group(
                 "ai_model": ai_model,
                 "ai_error": ai_error,
                 "ai_generated_at": ai_generated_at,
+                "classification_version": classification_version,
+                "classification_json": json.dumps(classification or {}, ensure_ascii=True),
+                "classification_confidence": classification_confidence,
+                "ranking_reason": ranking_reason,
+                "suppression_reason": suppression_reason,
+                "classified_at": classified_at,
                 "ai_title": ai_title,
                 "ai_summary": ai_summary,
                 "labels_json": json.dumps(labels, ensure_ascii=True),
@@ -2177,6 +2465,8 @@ def _json_list(value: Any) -> list[str]:
 
 
 def _json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
     try:
         parsed = json.loads(value or "{}")
     except (TypeError, json.JSONDecodeError):
@@ -2185,6 +2475,7 @@ def _json_dict(value: Any) -> dict[str, Any]:
 
 
 def _group_from_row(row) -> MailGroupRecord:
+    classification_payload = row["classification_json"] if "classification_json" in row else {}
     return MailGroupRecord(
         id=str(row["id"]),
         user_id=str(row["user_id"]),
@@ -2208,6 +2499,45 @@ def _group_from_row(row) -> MailGroupRecord:
         latest_message_id=str(row["latest_message_id"]) if row["latest_message_id"] is not None else None,
         generated_from_hash=str(row["generated_from_hash"]),
         generated_at=_iso(row["generated_at"]) if row["generated_at"] is not None else None,
+        created_at=_iso(row["created_at"]),
+        updated_at=_iso(row["updated_at"]),
+        classification_version=str(row["classification_version"]) if "classification_version" in row and row["classification_version"] is not None else None,
+        classification=_json_dict(classification_payload),
+        classification_confidence=float(row["classification_confidence"]) if "classification_confidence" in row and row["classification_confidence"] is not None else 0.0,
+        ranking_reason=str(row["ranking_reason"]) if "ranking_reason" in row and row["ranking_reason"] is not None else None,
+        suppression_reason=str(row["suppression_reason"]) if "suppression_reason" in row and row["suppression_reason"] is not None else None,
+        classified_at=_iso(row["classified_at"]) if "classified_at" in row and row["classified_at"] is not None else None,
+    )
+
+
+def _visible_group_from_row(row) -> VisibleMailGroupRecord:
+    evidence_payload = row["evidence_json"] if "evidence_json" in row else {}
+    if isinstance(evidence_payload, str):
+        try:
+            evidence = json.loads(evidence_payload)
+        except json.JSONDecodeError:
+            evidence = {}
+    else:
+        evidence = dict(evidence_payload or {})
+    return VisibleMailGroupRecord(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        projection_key=str(row["projection_key"]),
+        visibility=str(row["visibility"]),
+        group_kind=str(row["group_kind"]),
+        status=str(row["status"]),
+        canonical_entity=str(row["canonical_entity"]),
+        contact_channel=str(row["contact_channel"]) if row["contact_channel"] is not None else None,
+        title=str(row["title"]),
+        summary=str(row["summary"]),
+        workflow_type=str(row["workflow_type"]),
+        confidence=float(row["confidence"] or 0),
+        source_group_id=str(row["source_group_id"]) if row["source_group_id"] is not None else None,
+        source=str(row["source"]),
+        evidence=evidence,
+        latest_message_at=_iso(row["latest_message_at"]) if row["latest_message_at"] is not None else None,
+        latest_message_id=str(row["latest_message_id"]) if row["latest_message_id"] is not None else None,
+        generated_at=_iso(row["generated_at"]),
         created_at=_iso(row["created_at"]),
         updated_at=_iso(row["updated_at"]),
     )

@@ -7,16 +7,117 @@ import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from google.auth.exceptions import RefreshError
 
 from app.api.routes import mailbox as mailbox_routes
 from app.main import app
 from app.schemas.domain import MailboxRealtimeStateResponse, MailboxSyncStateResponse
+from app.services import auth as auth_service
+from app.services import mail_groups as mail_group_service
+from app.services.integrations import google as google_integration
+from app.services.integrations.google import GOOGLE_REAUTH_REQUIRED_MESSAGE, GoogleCredentialStatus
 from app.services.mailbox_events import emit_mailbox_event, format_sse_event, parse_last_event_id
+
+
+class _FakeSettings(SimpleNamespace):
+    @property
+    def google_configured(self) -> bool:
+        return True
+
+
+class _ExpiredCredentials:
+    expired = True
+    refresh_token = "refresh-token"
+
+    def refresh(self, request) -> None:
+        raise RefreshError("invalid_grant: Token has been expired or revoked")
 
 
 class MailboxSyncRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(app)
+
+    def test_google_credential_check_reports_revoked_refresh_token(self) -> None:
+        settings = _FakeSettings(
+            database_path="postgresql://example/db",
+            google_client_id="client-id",
+            google_client_secret="client-secret",
+        )
+        token_row = SimpleNamespace(token_json_encrypted="encrypted")
+
+        with (
+            patch.object(google_integration, "get_google_oauth_token", return_value=token_row),
+            patch.object(google_integration, "decrypt_json", return_value={"token": "access-token", "refresh_token": "refresh-token"}),
+            patch.object(google_integration.Credentials, "from_authorized_user_info", return_value=_ExpiredCredentials()),
+            patch.object(google_integration, "persist_token_payload") as persist,
+        ):
+            status = google_integration.check_user_google_credentials(settings, user_id="user-1")
+
+        self.assertFalse(status.connected)
+        self.assertTrue(status.has_stored_tokens)
+        self.assertTrue(status.reauth_required)
+        self.assertEqual(status.error, GOOGLE_REAUTH_REQUIRED_MESSAGE)
+        persist.assert_not_called()
+
+    def test_sync_state_marks_revoked_credentials_disconnected(self) -> None:
+        settings = _FakeSettings(
+            database_path="postgresql://example/db",
+            gmail_pubsub_topic="projects/example/topics/gmail",
+        )
+
+        with (
+            patch.object(mail_group_service, "get_import_state", return_value=None),
+            patch.object(mail_group_service, "user_can_write_gmail", return_value=True),
+            patch.object(
+                mail_group_service,
+                "check_user_google_credentials",
+                return_value=GoogleCredentialStatus(
+                    connected=False,
+                    has_stored_tokens=True,
+                    reauth_required=True,
+                    error=GOOGLE_REAUTH_REQUIRED_MESSAGE,
+                ),
+            ),
+            patch.object(mail_group_service, "ensure_background_import_work") as ensure_background,
+            patch.object(mail_group_service, "count_mail_groups_by_enrichment_status", return_value={"ready": 1, "pending": 0}),
+            patch.object(mail_group_service, "latest_mail_group_ai_error", return_value=None),
+            patch.object(mail_group_service, "get_queue_health", return_value=SimpleNamespace(workers=[])),
+            patch.object(mail_group_service, "latest_gmail_mailbox_revision", return_value="rev-1"),
+            patch.object(mail_group_service, "count_mailbox_threads", return_value=12),
+            patch.object(mail_group_service, "count_pending_thread_actions", return_value=0),
+        ):
+            state = mail_group_service.build_mailbox_sync_state(settings, user_id="user-1")
+
+        self.assertFalse(state.connected)
+        self.assertEqual(state.last_sync_error, GOOGLE_REAUTH_REQUIRED_MESSAGE)
+        ensure_background.assert_not_called()
+
+    def test_verified_auth_state_reports_reauth_required(self) -> None:
+        settings = _FakeSettings(database_path="postgresql://example/db", backend_origin="http://127.0.0.1:3001")
+        request = SimpleNamespace(cookies={}, headers={})
+
+        with (
+            patch.object(auth_service, "get_current_user", return_value=SimpleNamespace(id="user-1", legacy_local=False)),
+            patch.object(auth_service, "get_google_oauth_token", return_value=SimpleNamespace(token_json_encrypted="encrypted")),
+            patch.object(
+                auth_service,
+                "check_user_google_credentials",
+                return_value=GoogleCredentialStatus(
+                    connected=False,
+                    has_stored_tokens=True,
+                    reauth_required=True,
+                    error=GOOGLE_REAUTH_REQUIRED_MESSAGE,
+                ),
+            ),
+            patch.object(auth_service, "missing_google_scopes") as missing_scopes,
+        ):
+            state = auth_service.auth_state_for_request(settings, request, verify_google_credentials=True)
+
+        self.assertFalse(state.connected)
+        self.assertTrue(state.reauth_required)
+        self.assertEqual(state.error, GOOGLE_REAUTH_REQUIRED_MESSAGE)
+        self.assertEqual(state.connect_url, "http://127.0.0.1:3001/auth/google")
+        missing_scopes.assert_not_called()
 
     def test_sync_now_returns_not_connected_when_credentials_are_missing(self) -> None:
         state = MailboxSyncStateResponse(connected=True, total_threads=12)

@@ -110,6 +110,8 @@ class GoogleAuthState(BaseModel):
     connect_url: str | None = None
     can_send_mail: bool = False
     missing_scopes: list[str] = Field(default_factory=list)
+    reauth_required: bool = False
+    error: str | None = None
 
 
 class AuthUserResponse(BaseModel):
@@ -383,6 +385,8 @@ class GmailThreadRow(BaseModel):
     ai_title: str | None = None
     ai_summary: str | None = None
     snippet: str | None = None
+    has_attachments: bool = False
+    attachment_count: int = 0
     label_ids: list[str] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
     unread: bool = False
@@ -442,6 +446,8 @@ class MailboxResponse(BaseModel):
     sections: list[GmailThreadSection] = Field(default_factory=list)
     ready_count: int = 0
     pending_count: int = 0
+    mailbox_revision: str | None = None
+    generated_at: str | None = None
     oldest_imported_at: str | None = None
     full_import_running: bool = False
     full_import_completed: bool = False
@@ -521,6 +527,18 @@ class ThreadMessageReader(BaseModel):
     quote_detected: bool = False
 
 
+class ThreadAttachment(BaseModel):
+    """Downloadable non-inline attachment shown in native thread detail views."""
+
+    id: str
+    filename: str
+    mime_type: str | None = None
+    size: int | None = None
+    attachment_id: str
+    part_id: str | None = None
+    download_url: str | None = None
+
+
 class ThreadMessage(BaseModel):
     """One message inside a mail group detail timeline."""
 
@@ -537,6 +555,7 @@ class ThreadMessage(BaseModel):
     html_render_document: str | None = None
     reader: ThreadMessageReader | None = None
     snippet: str | None = None
+    attachments: list[ThreadAttachment] = Field(default_factory=list)
     label_ids: list[str] = Field(default_factory=list)
     received_at: str
 

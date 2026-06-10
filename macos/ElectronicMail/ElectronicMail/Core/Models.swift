@@ -420,7 +420,7 @@ public struct GmailThreadChildRow: Codable, Equatable, Identifiable, Hashable {
     }
 
     private func cleanSender(_ value: String) -> String {
-        value.split(separator: "<", maxSplits: 1).first.map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) } ?? value
+        EmailAddressDisplayFormatter.displayName(from: value)
     }
 }
 
@@ -444,6 +444,8 @@ public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
     var aiTitle: String? = nil
     var aiSummary: String? = nil
     let snippet: String?
+    var hasAttachments: Bool? = nil
+    var attachmentCount: Int? = nil
     let labelIDs: [String]
     let labels: [String]
     let unread: Bool
@@ -506,6 +508,8 @@ public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
         case aiTitle = "ai_title"
         case aiSummary = "ai_summary"
         case snippet
+        case hasAttachments = "has_attachments"
+        case attachmentCount = "attachment_count"
         case labelIDs = "label_ids"
         case labels
         case unread
@@ -525,11 +529,114 @@ public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
     }
 
     private static func cleanSender(_ value: String) -> String {
-        value.split(separator: "<", maxSplits: 1).first.map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) } ?? value
+        EmailAddressDisplayFormatter.displayName(from: value)
     }
 
     private func cleanSender(_ value: String) -> String {
         Self.cleanSender(value)
+    }
+}
+
+private enum EmailAddressDisplayFormatter {
+    static func displayName(from rawValue: String) -> String {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            return rawValue
+        }
+
+        if let angleStart = value.firstIndex(of: "<"),
+           let angleEnd = value[angleStart...].firstIndex(of: ">") {
+            let name = cleanDisplayName(String(value[..<angleStart]))
+            if !name.isEmpty {
+                return name
+            }
+
+            let email = String(value[value.index(after: angleStart)..<angleEnd])
+            return displayEmailAddress(email)
+        }
+
+        let unquotedValue = cleanDisplayName(value)
+        if isEmailAddress(unquotedValue) {
+            return displayEmailAddress(unquotedValue)
+        }
+
+        return unquotedValue.isEmpty ? value : unquotedValue
+    }
+
+    private static func cleanDisplayName(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let unquoted: String
+        if trimmed.count >= 2,
+           trimmed.first == "\"",
+           trimmed.last == "\"" {
+            unquoted = String(trimmed.dropFirst().dropLast())
+        } else {
+            unquoted = trimmed
+        }
+
+        return unquoted
+            .replacingOccurrences(of: "\\\"", with: "\"")
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+    }
+
+    private static func displayEmailAddress(_ value: String) -> String {
+        let email = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let atIndex = email.firstIndex(of: "@") else {
+            return cleanDisplayName(email)
+        }
+
+        let localPart = String(email[..<atIndex])
+        let domain = String(email[email.index(after: atIndex)...]).lowercased()
+        if shouldPreserveRawEmail(localPart: localPart, domain: domain) {
+            return email
+        }
+
+        let localDisplay = displayLocalPart(localPart)
+        guard !localDisplay.isEmpty, !domain.isEmpty else {
+            return email
+        }
+
+        return "\(localDisplay) - \(domain)"
+    }
+
+    private static func shouldPreserveRawEmail(localPart: String, domain: String) -> Bool {
+        let freeMailDomains = ["gmail.com", "googlemail.com", "icloud.com", "me.com", "outlook.com", "hotmail.com", "yahoo.com"]
+        guard freeMailDomains.contains(domain) else {
+            return false
+        }
+
+        let normalized = localPart.lowercased()
+        let servicePrefixes = ["no-reply", "noreply", "notification", "notifications", "support", "alerts", "team", "update", "updates"]
+        if servicePrefixes.contains(where: { normalized == $0 || normalized.hasPrefix("\($0)+") || normalized.hasPrefix("\($0).") }) {
+            return false
+        }
+
+        return true
+    }
+
+    private static func displayLocalPart(_ value: String) -> String {
+        value
+            .split { character in
+                character == "." || character == "_" || character == "-" || character == "+"
+            }
+            .map { segment in
+                let text = String(segment).lowercased()
+                guard let first = text.first else {
+                    return text
+                }
+                return String(first).uppercased() + String(text.dropFirst())
+            }
+            .joined(separator: " ")
+    }
+
+    private static func isEmailAddress(_ value: String) -> Bool {
+        let parts = value.split(separator: "@", maxSplits: 1)
+        guard parts.count == 2 else {
+            return false
+        }
+
+        return !parts[0].isEmpty && parts[1].contains(".")
     }
 }
 
@@ -548,6 +655,8 @@ public struct MailboxResponse: Codable, Equatable {
     let sections: [GmailThreadSection]
     let readyCount: Int?
     let pendingCount: Int?
+    let mailboxRevision: String?
+    let generatedAt: String?
     let oldestImportedAt: String?
     let fullImportRunning: Bool?
     let fullImportCompleted: Bool?
@@ -565,6 +674,8 @@ public struct MailboxResponse: Codable, Equatable {
         sections: [GmailThreadSection] = [],
         readyCount: Int? = nil,
         pendingCount: Int? = nil,
+        mailboxRevision: String? = nil,
+        generatedAt: String? = nil,
         oldestImportedAt: String? = nil,
         fullImportRunning: Bool? = nil,
         fullImportCompleted: Bool? = nil
@@ -577,6 +688,8 @@ public struct MailboxResponse: Codable, Equatable {
         self.sections = sections
         self.readyCount = readyCount
         self.pendingCount = pendingCount
+        self.mailboxRevision = mailboxRevision
+        self.generatedAt = generatedAt
         self.oldestImportedAt = oldestImportedAt
         self.fullImportRunning = fullImportRunning
         self.fullImportCompleted = fullImportCompleted
@@ -591,6 +704,8 @@ public struct MailboxResponse: Codable, Equatable {
         case sections
         case readyCount = "ready_count"
         case pendingCount = "pending_count"
+        case mailboxRevision = "mailbox_revision"
+        case generatedAt = "generated_at"
         case oldestImportedAt = "oldest_imported_at"
         case fullImportRunning = "full_import_running"
         case fullImportCompleted = "full_import_completed"
@@ -982,6 +1097,26 @@ public struct ThreadReaderResponse: Codable, Equatable {
     }
 }
 
+public struct ThreadAttachment: Codable, Equatable, Identifiable {
+    public let id: String
+    let filename: String
+    let mimeType: String?
+    let size: Int?
+    let attachmentID: String
+    let partID: String?
+    let downloadURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case filename
+        case mimeType = "mime_type"
+        case size
+        case attachmentID = "attachment_id"
+        case partID = "part_id"
+        case downloadURL = "download_url"
+    }
+}
+
 public struct ThreadMessage: Codable, Equatable, Identifiable {
     public let id: String
     let source: SourceType
@@ -996,6 +1131,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
     let htmlRenderDocument: String?
     let reader: ThreadMessageReader?
     let snippet: String?
+    let attachments: [ThreadAttachment]
     let labelIDs: [String]
     let receivedAt: String
 
@@ -1013,8 +1149,29 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         case htmlRenderDocument = "html_render_document"
         case reader
         case snippet
+        case attachments
         case labelIDs = "label_ids"
         case receivedAt = "received_at"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        source = try container.decode(SourceType.self, forKey: .source)
+        threadID = try container.decodeIfPresent(String.self, forKey: .threadID)
+        fromAddress = try container.decodeIfPresent(String.self, forKey: .fromAddress)
+        to = try container.decodeIfPresent(String.self, forKey: .to)
+        cc = try container.decodeIfPresent(String.self, forKey: .cc)
+        bcc = try container.decodeIfPresent(String.self, forKey: .bcc)
+        subject = try container.decodeIfPresent(String.self, forKey: .subject)
+        body = try container.decode(String.self, forKey: .body)
+        htmlBody = try container.decodeIfPresent(String.self, forKey: .htmlBody)
+        htmlRenderDocument = try container.decodeIfPresent(String.self, forKey: .htmlRenderDocument)
+        reader = try container.decodeIfPresent(ThreadMessageReader.self, forKey: .reader)
+        snippet = try container.decodeIfPresent(String.self, forKey: .snippet)
+        attachments = try container.decodeIfPresent([ThreadAttachment].self, forKey: .attachments) ?? []
+        labelIDs = try container.decodeIfPresent([String].self, forKey: .labelIDs) ?? []
+        receivedAt = try container.decode(String.self, forKey: .receivedAt)
     }
 
     init(
@@ -1031,6 +1188,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         htmlRenderDocument: String?,
         reader: ThreadMessageReader? = nil,
         snippet: String?,
+        attachments: [ThreadAttachment] = [],
         labelIDs: [String],
         receivedAt: String
     ) {
@@ -1047,6 +1205,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         self.htmlRenderDocument = htmlRenderDocument
         self.reader = reader
         self.snippet = snippet
+        self.attachments = attachments
         self.labelIDs = labelIDs
         self.receivedAt = receivedAt
     }

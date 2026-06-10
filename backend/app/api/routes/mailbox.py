@@ -9,22 +9,23 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 
 from app.core.config import load_settings
 from app.db.jobs import enqueue_job
-from app.db.mail_groups import MailboxCursorError
+from app.db.mail_groups import MailboxCursorError, list_messages_by_ids
 from app.db.repository import get_user_by_email
 from app.schemas.domain import MailComposeRequest, MailReplyRequest, MailSendResponse, MailboxRealtimeStateResponse, MailboxResponse, MailboxSyncStateResponse, MailboxSyncTriggerResponse, QueuedThreadActionRequest, QueuedThreadActionResponse, ThreadReaderResponse
 from app.services.auth import require_current_user
 from app.services.gmail_importer import run_gmail_delta_sync, run_gmail_import_batch
 from app.services.gmail_watch import ensure_gmail_watch
+from app.services.integrations.google import fetch_gmail_attachment
 from app.services.mailbox_actions import enqueue_thread_action
 from app.services.mailbox_events import GMAIL_PUBSUB_RECEIVED, HEARTBEAT, SYNC_STATE, emit_mailbox_event, event_payload, format_sse_event, list_events_after, parse_last_event_id
 from app.services.mailbox_sends import send_compose, send_reply
-from app.services.mail_groups import build_app_session_response, build_group_detail_response, build_mailbox_realtime_state, build_mailbox_response, build_mailbox_sync_state, enqueue_mailbox_sync, refresh_app_session_snapshot
+from app.services.mail_groups import build_app_session_response, build_group_detail_response, build_mailbox_realtime_state, build_mailbox_response, build_mailbox_sync_state, enqueue_mailbox_sync, gmail_attachments_for_message, refresh_app_session_snapshot
 
 router = APIRouter(tags=["mailbox"])
 settings = load_settings()
@@ -57,6 +58,38 @@ def mailbox_thread(
     if detail is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mail group not found")
     return detail
+
+
+@router.get("/v1/mailbox/messages/{message_id}/attachments/{attachment_id}")
+def mailbox_attachment(request: Request, message_id: str, attachment_id: str) -> Response:
+    user = require_current_user(settings, request)
+    messages = list_messages_by_ids(str(settings.database_path), user_id=user.id, message_ids=[message_id])
+    if not messages:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    attachment = next(
+        (item for item in gmail_attachments_for_message(messages[0]) if item.attachment_id == attachment_id),
+        None,
+    )
+    if attachment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found")
+    try:
+        payload = fetch_gmail_attachment(settings, user_id=user.id, message_id=message_id, attachment_id=attachment_id)
+        raw_data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(raw_data, str) or not raw_data:
+            raise RuntimeError("Gmail attachment payload is empty")
+        padding = "=" * (-len(raw_data) % 4)
+        content = urlsafe_b64decode(f"{raw_data}{padding}".encode())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unable to fetch Gmail attachment") from exc
+
+    filename = _safe_attachment_filename(attachment.filename)
+    return Response(
+        content=content,
+        media_type=attachment.mime_type or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/v1/mailbox/thread-actions", response_model=QueuedThreadActionResponse, status_code=202)
@@ -201,3 +234,8 @@ async def mailbox_pubsub(request: Request) -> dict[str, object]:
         priority=80,
     )
     return {"status": "queued", "job_id": job.id}
+
+
+def _safe_attachment_filename(filename: str) -> str:
+    cleaned = "".join("_" if character in '/\\:\0\r\n\t' else character for character in filename).strip()
+    return cleaned or "attachment"
