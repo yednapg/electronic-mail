@@ -66,6 +66,43 @@ def sample_group() -> MailGroupRecord:
 
 
 class MailGroupDetailBodyTests(unittest.TestCase):
+    def test_synthetic_group_detail_expands_member_gmail_threads(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        group = replace(sample_group(), id="group-ai", group_key="ai:psu", membership_source="ai_batch", ai_title="State University application updates")
+        sent = replace(
+            sample_message(),
+            message_id="sent-1",
+            gmail_thread_id="thread-psu",
+            label_ids=["SENT"],
+            internal_date="2026-05-15T12:00:00+00:00",
+            sender="TestUser <hi@example.com>",
+            subject="Question About Reconsideration Request",
+            text_body="Can I request reconsideration?",
+        )
+        reply = replace(
+            sample_message(),
+            message_id="reply-1",
+            gmail_thread_id="thread-psu",
+            label_ids=["INBOX"],
+            internal_date="2026-05-15T13:00:00+00:00",
+            sender="State University <university-admissions@example.edu>",
+            subject="RE: Question About Reconsideration Request",
+            text_body="Yes, you may request reconsideration.",
+        )
+
+        with patch(
+            "app.services.mail_groups.get_mail_group_detail",
+            return_value=MailGroupDetail(group=group, messages=[reply]),
+        ), patch(
+            "app.services.mail_groups.list_messages_for_gmail_thread",
+            side_effect=[[], [sent, reply]],
+        ), patch("app.services.mail_groups.enqueue_job"):
+            response = build_group_detail_response(settings, user_id="user-1", group_id="group-ai")
+
+        self.assertIsNotNone(response)
+        self.assertEqual(response.total_messages, 2)
+        self.assertEqual([message.id for message in response.messages], ["sent-1", "reply-1"])
+
     def test_reader_fetches_full_body_immediately_when_cached_body_is_only_metadata_snippet(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
         group = sample_group()

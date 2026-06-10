@@ -81,17 +81,12 @@ def run_pending_thread_action(settings: Settings, *, user_id: str, server_action
         return _response_from_record(record)
     mark_pending_thread_action_applying(database_url, user_id=user_id, server_action_id=server_action_id)
     try:
-        if record.target_message_id:
-            messages = list_messages_by_ids(database_url, user_id=user_id, message_ids=[record.target_message_id])
-            thread_ids = sorted({message.gmail_thread_id for message in messages if message.gmail_thread_id})
-        else:
-            detail = get_mail_group_detail(database_url, user_id=user_id, group_id=record.mailbox_thread_id)
-            if detail is None:
-                messages = list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=record.mailbox_thread_id)
-                thread_ids = sorted({message.gmail_thread_id for message in messages if message.gmail_thread_id})
-            else:
-                messages = detail.messages
-                thread_ids = sorted({message.gmail_thread_id for message in messages if message.gmail_thread_id})
+        messages, thread_ids = _resolve_action_messages(
+            database_url,
+            user_id=user_id,
+            mailbox_thread_id=record.mailbox_thread_id,
+            target_message_id=record.target_message_id,
+        )
         if not record.target_message_id and not thread_ids and not messages:
             raise RuntimeError("Mail group not found")
         if record.target_message_id and not messages:
@@ -128,11 +123,12 @@ def run_pending_thread_action(settings: Settings, *, user_id: str, server_action
 
 def _apply_local_action(settings: Settings, *, user_id: str, mailbox_thread_id: str, action: str, target_message_id: str | None = None) -> None:
     database_url = str(settings.database_path)
-    if target_message_id:
-        messages = list_messages_by_ids(database_url, user_id=user_id, message_ids=[target_message_id])
-    else:
-        detail = get_mail_group_detail(database_url, user_id=user_id, group_id=mailbox_thread_id)
-        messages = detail.messages if detail is not None else list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=mailbox_thread_id)
+    messages, _thread_ids = _resolve_action_messages(
+        database_url,
+        user_id=user_id,
+        mailbox_thread_id=mailbox_thread_id,
+        target_message_id=target_message_id,
+    )
     if not messages:
         return
     changed = []
@@ -144,6 +140,28 @@ def _apply_local_action(settings: Settings, *, user_id: str, mailbox_thread_id: 
         return
     upsert_gmail_messages(database_url, changed)
     rebuild_touched_mail_groups(settings, user_id=user_id, message_ids=[message.message_id for message in changed], use_ai=False)
+
+
+def _resolve_action_messages(
+    database_url: str,
+    *,
+    user_id: str,
+    mailbox_thread_id: str,
+    target_message_id: str | None,
+):
+    if target_message_id:
+        messages = list_messages_by_ids(database_url, user_id=user_id, message_ids=[target_message_id])
+        return messages, sorted({message.gmail_thread_id for message in messages if message.gmail_thread_id})
+
+    messages = list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=mailbox_thread_id)
+    if messages:
+        return messages, sorted({message.gmail_thread_id for message in messages if message.gmail_thread_id})
+
+    detail = get_mail_group_detail(database_url, user_id=user_id, group_id=mailbox_thread_id)
+    if detail is None:
+        return [], []
+    messages = detail.messages
+    return messages, sorted({message.gmail_thread_id for message in messages if message.gmail_thread_id})
 
 
 def _labels_after_action(labels: list[str], action: str) -> list[str]:

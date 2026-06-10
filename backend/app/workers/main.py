@@ -27,6 +27,7 @@ from app.services.mail_groups import (
     enrich_pending_mail_groups,
     rebuild_mail_groups,
     refresh_app_session_snapshot,
+    refresh_visible_mail_projection,
     run_first_run_ai_grouping,
 )
 
@@ -193,6 +194,7 @@ def _run_job(settings, job) -> None:
     if job.kind == "projection_refresh":
         if not isinstance(user_id, str):
             raise RuntimeError("projection_refresh missing user_id")
+        refresh_visible_mail_projection(settings, user_id=user_id)
         refresh_app_session_snapshot(settings, user_id=user_id)
         emit_mailbox_event(settings, user_id=user_id, event_type=DASHBOARD_CHANGED, payload={"source": "projection_refresh"})
         return

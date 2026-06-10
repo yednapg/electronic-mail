@@ -177,7 +177,7 @@ private struct ElectronicMailRootView: View {
                 throw RuntimeError(message)
             }
 
-            await startSetupFlow(minimumDisplaySeconds: 30, maximumWaitSeconds: 60)
+            await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 60)
         } catch {
             tokenStore.clear()
             store.setSessionToken(nil)
