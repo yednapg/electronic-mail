@@ -42,6 +42,38 @@ class EmailExtractionTests(unittest.TestCase):
         self.assertIsNone(parsed["html_body_sanitized"])
         self.assertIn("example.com", parsed["extracted_signals"]["domains"])
 
+    def test_bank_correspondence_reference_extracts_ticket_id(self) -> None:
+        parsed = parse_gmail_message(
+            {
+                "id": "msg-northstar-ref",
+                "threadId": "thread-northstar-ref",
+                "labelIds": ["INBOX"],
+                "snippet": "The unique reference number for this correspondence is 900000003.",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": "Re: Unauthorized Credit Card Consent Request",
+                        },
+                        {
+                            "name": "From",
+                            "value": "Support Department <grievance.redressalcc@northstar.example>",
+                        },
+                    ],
+                    "mimeType": "text/plain",
+                    "body": {
+                        "data": encoded(
+                            "Dear Customer,\n"
+                            "The unique reference number for this correspondence is 900000003.\n"
+                        )
+                    },
+                },
+            },
+            user_id="user-1",
+        )
+
+        self.assertEqual(parsed["extracted_signals"]["ticket_id"], "900000003")
+
     def test_html_is_preserved_for_reader_when_gmail_supplies_html(self) -> None:
         rich_html = """
         <html><head><style>.headline { font-family: Arial; font-size: 32px; }</style></head><body>

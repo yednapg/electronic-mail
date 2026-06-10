@@ -49,6 +49,23 @@ class GoogleCallbackResult:
     google_sub: str
 
 
+@dataclass(frozen=True)
+class GoogleCredentialStatus:
+    connected: bool
+    has_stored_tokens: bool
+    reauth_required: bool = False
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class _CredentialLoadResult:
+    credentials: Credentials | None
+    status: GoogleCredentialStatus
+
+
+GOOGLE_REAUTH_REQUIRED_MESSAGE = "Google credentials have expired or were revoked. Please sign in with Google again."
+
+
 def build_google_service(api: str, version: str, credentials: Credentials):
     """Build a Google API service with a bounded request timeout."""
     http = httplib2.Http(timeout=GOOGLE_API_TIMEOUT_SECONDS)
@@ -125,26 +142,45 @@ def create_flow(settings: Settings) -> Flow:
 
 def create_authorized_credentials(settings: Settings, *, user_id: str | None = None) -> Credentials | None:
     """Load and refresh stored OAuth credentials for the current user."""
+    return _load_authorized_credentials(settings, user_id=user_id, refresh_expired=True).credentials
+
+
+def check_user_google_credentials(settings: Settings, *, user_id: str, refresh_expired: bool = True) -> GoogleCredentialStatus:
+    """Return whether stored Google credentials are usable, refreshing only on this explicit check."""
+    return _load_authorized_credentials(settings, user_id=user_id, refresh_expired=refresh_expired).status
+
+
+def _load_authorized_credentials(settings: Settings, *, user_id: str | None, refresh_expired: bool) -> _CredentialLoadResult:
     if not settings.google_configured:
-        return None
+        return _credential_result(False, False, error="Google OAuth is not configured")
 
     tokens: dict[str, object]
     if user_id is not None:
         token_row = get_google_oauth_token(str(settings.database_path), user_id=user_id)
         if token_row is None:
-            return None
+            return _credential_result(False, False)
         try:
             tokens = decrypt_json(settings, token_row.token_json_encrypted)
         except Exception:
-            return None
+            return _credential_result(
+                False,
+                True,
+                reauth_required=True,
+                error="Stored Google credentials could not be read. Please sign in with Google again.",
+            )
     elif TOKEN_FILE_PATH.exists():
         try:
             tokens = json.loads(TOKEN_FILE_PATH.read_text())
         except json.JSONDecodeError:
             clear_google_auth_state()
-            return None
+            return _credential_result(
+                False,
+                True,
+                reauth_required=True,
+                error="Stored Google credentials are invalid. Please sign in with Google again.",
+            )
     else:
-        return None
+        return _credential_result(False, False)
 
     normalized_tokens = {
         **tokens,
@@ -159,21 +195,57 @@ def create_authorized_credentials(settings: Settings, *, user_id: str | None = N
     except Exception:
         if user_id is None:
             clear_google_auth_state()
-        return None
+        return _credential_result(
+            False,
+            True,
+            reauth_required=True,
+            error="Stored Google credentials are invalid. Please sign in with Google again.",
+        )
 
+    refreshed_tokens: dict[str, object] | None = None
     if credentials.expired and credentials.refresh_token:
-        try:
-            credentials.refresh(Request())
-        except Exception:
-            if user_id is None:
-                clear_google_auth_state()
-            return None
-        persist_token_payload(settings, token_payload_from_credentials(credentials), user_id=user_id)
+        if refresh_expired:
+            try:
+                credentials.refresh(Request())
+            except Exception:
+                if user_id is None:
+                    clear_google_auth_state()
+                return _credential_result(False, True, reauth_required=True, error=GOOGLE_REAUTH_REQUIRED_MESSAGE)
+            refreshed_tokens = token_payload_from_credentials(credentials)
+            persist_token_payload(settings, refreshed_tokens, user_id=user_id)
+        else:
+            return _CredentialLoadResult(
+                credentials=credentials,
+                status=GoogleCredentialStatus(connected=True, has_stored_tokens=True),
+            )
+    elif credentials.expired:
+        return _credential_result(False, True, reauth_required=True, error=GOOGLE_REAUTH_REQUIRED_MESSAGE)
 
-    if normalized_tokens != tokens:
+    if normalized_tokens != tokens and refreshed_tokens is None:
         persist_token_payload(settings, normalized_tokens, user_id=user_id)
 
-    return credentials
+    return _CredentialLoadResult(
+        credentials=credentials,
+        status=GoogleCredentialStatus(connected=True, has_stored_tokens=True),
+    )
+
+
+def _credential_result(
+    connected: bool,
+    has_stored_tokens: bool,
+    *,
+    reauth_required: bool = False,
+    error: str | None = None,
+) -> _CredentialLoadResult:
+    return _CredentialLoadResult(
+        credentials=None,
+        status=GoogleCredentialStatus(
+            connected=connected,
+            has_stored_tokens=has_stored_tokens,
+            reauth_required=reauth_required,
+            error=error,
+        ),
+    )
 
 
 def create_gmail_service(settings: Settings, *, user_id: str | None = None):
@@ -309,6 +381,17 @@ def send_gmail_raw_message(
 def fetch_gmail_message(settings: Settings, *, user_id: str, message_id: str, format: str = "full") -> dict[str, object]:
     gmail_service = create_gmail_service(settings, user_id=user_id)
     return gmail_service.users().messages().get(userId="me", id=message_id, format=format).execute()
+
+
+def fetch_gmail_attachment(settings: Settings, *, user_id: str, message_id: str, attachment_id: str) -> dict[str, object]:
+    gmail_service = create_gmail_service(settings, user_id=user_id)
+    return (
+        gmail_service.users()
+        .messages()
+        .attachments()
+        .get(userId="me", messageId=message_id, id=attachment_id)
+        .execute()
+    )
 
 
 def token_payload_from_credentials(credentials: Credentials) -> dict[str, object]:

@@ -26,7 +26,17 @@ SPACE_RE = re.compile(r"\s+")
 SUBJECT_PREFIX_RE = re.compile(r"(?i)^\s*(re|fwd?|fw):\s*")
 STRICT_ID = r"(?=[A-Z0-9-]*\d)([A-Z0-9][A-Z0-9-]{4,})"
 ORDER_RE = re.compile(rf"(?i)\b(?:order|shipment)(?:\s*(?:id|number|no\.?|#))?\s*(?:[:#-]|\s)\s*{STRICT_ID}")
-TICKET_RE = re.compile(rf"(?i)\b(?:ticket|case|request)(?:\s*(?:id|number|no\.?|#))?\s*(?:[:#-]|\s)\s*{STRICT_ID}")
+TICKET_RE = re.compile(
+    rf"""(?ix)
+    \b(?:
+      ticket|case|request|service\s+request|case\s+reference|
+      (?:unique\s+)?reference(?:\s+number)?(?:\s+for\s+this\s+correspondence)?
+    )
+    (?:\s*(?:id|number|no\.?|\#))?
+    \s*(?:[:\#.-]|\bis\b|\s)\s*
+    {STRICT_ID}
+    """
+)
 TRACKING_RE = re.compile(rf"(?i)\b(?:tracking|awb)(?:\s*(?:id|number|no\.?|#))?\s*(?:[:#-]|\s)\s*{STRICT_ID}")
 INVOICE_RE = re.compile(rf"(?i)\b(?:invoice|receipt|bill)(?:\s*(?:id|number|no\.?|#))?\s*(?:[:#-]|\s)\s*{STRICT_ID}")
 BOOKING_RE = re.compile(rf"(?i)\b(?:booking|pnr|reservation)(?:\s*(?:id|number|no\.?|#))?\s*(?:[:#-]|\s)\s*{STRICT_ID}")

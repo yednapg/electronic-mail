@@ -9,13 +9,16 @@ from googleapiclient.errors import HttpError
 from httplib2 import Response
 
 from app.db.jobs import renew_heartbeat
-from app.db.mail_groups import AppSessionSnapshotRecord, GmailMessageRecord, MailboxCursorError, MailboxThreadPage, MailGroupRecord, decode_mailbox_cursor, encode_mailbox_cursor
+from app.db.mail_groups import AppSessionSnapshotRecord, GmailMessageRecord, MailboxCursorError, MailboxThreadPage, MailGroupRecord, VisibleMailGroupRecord, decode_mailbox_cursor, encode_mailbox_cursor
 from app.services.auth import CurrentUser
 from app.services.gmail_importer import _encode_full_mailbox_cursor, run_gmail_backfill, run_gmail_delta_sync, run_gmail_import_batch
 from app.services.gmail_watch import ensure_gmail_watch
 from app.services.mail_groups import (
     APP_SESSION_PROJECTION_VERSION,
     _candidate_groups,
+    _gmail_row_from_canonical_thread,
+    _message_title_map,
+    _refresh_ai_lifecycle_groups,
     build_app_session_response,
     build_mailbox_response,
     enqueue_mailbox_sync,
@@ -23,6 +26,7 @@ from app.services.mail_groups import (
     rebuild_touched_mail_groups,
     run_first_run_ai_grouping,
 )
+from app.services.attention_classifier import attention_enrichment_payload
 from app.workers.main import _run_job
 
 
@@ -79,11 +83,37 @@ def sample_group() -> MailGroupRecord:
     )
 
 
+def sample_visible_group() -> VisibleMailGroupRecord:
+    return VisibleMailGroupRecord(
+        id="visible-1",
+        user_id="user-1",
+        projection_key="inbox:visible-1",
+        visibility="inbox",
+        group_kind="lifecycle",
+        status="active",
+        canonical_entity="Northstar Bank",
+        contact_channel="Northstar Bank Care",
+        title="Northstar remittance support case",
+        summary="Northstar acknowledged and updated the wire transfer inquiry.",
+        workflow_type="support_case",
+        confidence=0.96,
+        source_group_id="group-1",
+        source="validated_projection",
+        evidence={"strong_evidence": ["ticket_id:900000002"]},
+        latest_message_at="2026-05-15T13:00:00+00:00",
+        latest_message_id="msg-2",
+        generated_at="2026-05-15T13:00:00+00:00",
+        created_at="2026-05-15T13:00:00+00:00",
+        updated_at="2026-05-15T13:00:00+00:00",
+    )
+
+
 class SpeedPipelineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = SimpleNamespace(
             database_path="postgresql://example/db",
             google_configured=True,
+            openai_configured=False,
             openai_model="gpt-5.4-mini",
             gmail_pubsub_topic="projects/example/topics/gmail",
             gmail_watch_renewal_hours=24,
@@ -459,6 +489,7 @@ class SpeedPipelineTests(unittest.TestCase):
 
     @patch("app.services.mail_groups.enqueue_job")
     @patch("app.services.mail_groups.refresh_app_session_snapshot")
+    @patch("app.services.mail_groups.refresh_visible_mail_projection")
     @patch("app.services.mail_groups.mark_import_completed")
     @patch("app.services.mail_groups.rebuild_touched_mail_groups", return_value=1)
     @patch("app.services.mail_groups._store_ai_batch_groups", return_value=(3, 1, {"msg-1"}))
@@ -475,6 +506,7 @@ class SpeedPipelineTests(unittest.TestCase):
         _mock_store: Mock,
         mock_rebuild_touched: Mock,
         _mock_completed: Mock,
+        _mock_visible_projection: Mock,
         _mock_snapshot: Mock,
         mock_enqueue: Mock,
     ) -> None:
@@ -490,7 +522,80 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_rebuild_touched.assert_called_once_with(self.settings, user_id="user-1", message_ids=["msg-2"], use_ai=False)
         self.assertTrue(any(call.kwargs.get("kind") == "mail_group_enrich" for call in mock_enqueue.call_args_list))
 
-    def test_candidate_groups_merge_same_sender_lifecycle_threads(self) -> None:
+    @patch("app.services.mail_groups.replace_group_members")
+    @patch("app.services.mail_groups.upsert_mail_group", return_value=SimpleNamespace(id="ai-lifecycle-group"))
+    @patch("app.services.mail_groups._ai_lifecycle_group_proposals")
+    @patch("app.services.mail_groups.list_recent_messages_since")
+    def test_projection_refresh_persists_ai_lifecycle_proposals(
+        self,
+        mock_recent: Mock,
+        mock_proposals: Mock,
+        mock_upsert_group: Mock,
+        mock_replace_members: Mock,
+    ) -> None:
+        settings = SimpleNamespace(**{**self.settings.__dict__, "openai_configured": True})
+        inbound = replace(
+            sample_message("msg-1"),
+            gmail_thread_id="thread-1",
+            sender="Northstar Bank <support@northstarbank.example>",
+            subject="Request for Status of International Wire Sent",
+            snippet="Northstar is checking the international wire status.",
+            extracted_signals={"sender_domain": "northstarbank.example"},
+        )
+        processed = replace(
+            sample_message("msg-2"),
+            gmail_thread_id="thread-2",
+            sender="Tradequalityunit <tradequalityunit@northstarbank.example>",
+            subject="Outward remittance processed",
+            snippet="The outward remittance was processed.",
+            extracted_signals={"sender_domain": "northstarbank.example"},
+        )
+        sent = replace(
+            sample_message("msg-3"),
+            gmail_thread_id="thread-3",
+            label_ids=["SENT"],
+            sender="TestUser <me@example.com>",
+            subject="Fwd: Request for Status of International Wire Sent",
+            extracted_signals={"sender_domain": "gmail.com"},
+        )
+        mock_recent.return_value = [inbound, processed, sent]
+        mock_proposals.return_value = [
+            {
+                "group_kind": "lifecycle",
+                "canonical_entity": "Northstar Bank",
+                "shared_object": "International wire remittance status",
+                "workflow_family": "financial_transfer",
+                "member_ids": ["msg-1", "msg-2"],
+                "context_sent_ids": ["msg-3"],
+                "excluded_ids": [],
+                "confidence": 0.96,
+                "risk_level": "low",
+                "per_message_evidence": {
+                    "msg-1": "Northstar support is responding on the wire status request.",
+                    "msg-2": "Northstar confirms the remittance was processed.",
+                },
+                "strong_evidence": ["same international wire/remittance lifecycle"],
+                "weak_evidence": ["same bank and close dates"],
+                "should_show_in_inbox": True,
+                "should_show_in_dashboard": True,
+                "workflow_state": "resolved",
+                "requires_user_action": False,
+                "terminal_state": True,
+                "urgency": "low",
+                "ai_title": "Northstar international wire remittance status",
+                "ai_summary": "Northstar support and remittance mail describe the same international wire status.",
+            }
+        ]
+
+        created = _refresh_ai_lifecycle_groups(settings, user_id="user-1")
+
+        self.assertEqual(created, 1)
+        self.assertEqual(mock_upsert_group.call_args.kwargs["membership_source"], "ai_lifecycle")
+        self.assertEqual(mock_upsert_group.call_args.kwargs["group_type"], "financial_transfer")
+        members = mock_replace_members.call_args.kwargs["members"]
+        self.assertEqual({message.message_id for message, _source, _confidence in members}, {"msg-1", "msg-2", "msg-3"})
+
+    def test_candidate_groups_keep_same_sender_lifecycle_threads_separate_without_exact_evidence(self) -> None:
         first = replace(
             sample_message("neo-1"),
             sender="Neo <neo-noreply@example.com>",
@@ -508,10 +613,37 @@ class SpeedPipelineTests(unittest.TestCase):
 
         groups = _candidate_groups([first, second])
 
-        self.assertEqual(len(groups), 1)
-        group_key, members = next(iter(groups.items()))
-        self.assertTrue(group_key.startswith("entity-lifecycle:neo.com:neo:neo"))
-        self.assertEqual({message.message_id for message in members}, {"neo-1", "neo-2"})
+        self.assertEqual(set(groups.keys()), {"gmail-thread:thread-neo-1", "gmail-thread:thread-neo-2"})
+        self.assertEqual({message.message_id for message in groups["gmail-thread:thread-neo-1"]}, {"neo-1"})
+        self.assertEqual({message.message_id for message in groups["gmail-thread:thread-neo-2"]}, {"neo-2"})
+
+    def test_candidate_groups_merge_cityflo_booking_lifecycle_threads_by_booking_id(self) -> None:
+        booked = replace(
+            sample_message("cityflo-booked"),
+            sender="Cityflo <transit-noreply@example.com>",
+            gmail_thread_id="thread-cityflo-booked",
+            subject="Your Cityflo ride is booked",
+            extracted_signals={"sender_domain": "transit.example", "booking_id": "CF123"},
+        )
+        modified = replace(
+            sample_message("cityflo-modified"),
+            sender="Cityflo <transit-noreply@example.com>",
+            gmail_thread_id="thread-cityflo-modified",
+            subject="Your Cityflo ride was modified",
+            extracted_signals={"sender_domain": "transit.example", "booking_id": "CF123"},
+        )
+        cancelled = replace(
+            sample_message("cityflo-cancelled"),
+            sender="Cityflo <transit-noreply@example.com>",
+            gmail_thread_id="thread-cityflo-cancelled",
+            subject="Your Cityflo ride was cancelled",
+            extracted_signals={"sender_domain": "transit.example", "booking_id": "CF123"},
+        )
+
+        groups = _candidate_groups([booked, modified, cancelled])
+
+        self.assertEqual(set(groups.keys()), {"booking_id:cityflo:CF123"})
+        self.assertEqual({message.message_id for message in groups["booking_id:cityflo:CF123"]}, {"cityflo-booked", "cityflo-modified", "cityflo-cancelled"})
 
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
     @patch("app.services.gmail_importer.enqueue_job")
@@ -655,9 +787,11 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertTrue(mock_completed.call_args.kwargs["full_backfill_completed"])
 
     @patch("app.services.mail_groups.ensure_background_import_work")
+    @patch("app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1")
     @patch("app.services.mail_groups.oldest_imported_message_at", return_value=None)
     @patch("app.services.mail_groups.count_mailbox_threads", return_value=0)
     @patch("app.services.mail_groups.list_mail_groups_for_gmail_threads", return_value={})
+    @patch("app.services.mail_groups.list_visible_groups_for_gmail_threads", return_value={})
     @patch("app.services.mail_groups.list_mailbox_thread_page", return_value=MailboxThreadPage(threads=[], next_cursor="cursor-2", loaded_threads=100))
     @patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 2, "pending": 9})
     @patch("app.services.mail_groups.count_active_jobs", return_value=0)
@@ -668,9 +802,11 @@ class SpeedPipelineTests(unittest.TestCase):
         _mock_active_jobs: Mock,
         _mock_counts: Mock,
         mock_thread_page: Mock,
-        _mock_ai_groups: Mock,
+        _mock_visible_groups: Mock,
+        _mock_thread_groups: Mock,
         mock_count_threads: Mock,
         _mock_oldest: Mock,
+        _mock_revision: Mock,
         _mock_recovery: Mock,
     ) -> None:
         mailbox = build_mailbox_response(self.settings, user_id="user-1")
@@ -679,6 +815,8 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual(mailbox.next_cursor, "cursor-2")
         self.assertEqual(mailbox.loaded_threads, 100)
         self.assertIsNone(mailbox.window_days)
+        self.assertEqual(mailbox.mailbox_revision, "rev-1")
+        self.assertIsNotNone(mailbox.generated_at)
         mock_thread_page.assert_called_once()
         self.assertEqual(mock_thread_page.call_args.kwargs["user_id"], "user-1")
         self.assertEqual(mock_thread_page.call_args.kwargs["label"], "inbox")
@@ -701,7 +839,34 @@ class SpeedPipelineTests(unittest.TestCase):
         with self.assertRaises(MailboxCursorError):
             decode_mailbox_cursor("not-a-valid-cursor")
 
-    def test_mailbox_uses_ai_group_rows_titles_and_summaries(self) -> None:
+    def test_candidate_groups_normalize_exact_reference_sender_variants(self) -> None:
+        grievance = replace(
+            sample_message("northstar-grievance"),
+            gmail_thread_id="thread-grievance",
+            sender="Support Department <grievance.redressalcc@northstar.example>",
+            extracted_signals={
+                "sender_domain": "northstar.example",
+                "normalized_subject": "unauthorized credit card consent request",
+                "ticket_id": "900000003",
+            },
+        )
+        service_request = replace(
+            sample_message("northstar-service"),
+            gmail_thread_id="thread-service",
+            sender="Northstar Bank Care <care@northstarbank.example>",
+            extracted_signals={
+                "sender_domain": "northstarbank.example",
+                "normalized_subject": "registered service request",
+                "ticket_id": "900000003",
+            },
+        )
+
+        candidates = _candidate_groups([grievance, service_request])
+
+        self.assertEqual(list(candidates), ["ticket_id:northstar-bank:900000003"])
+        self.assertEqual([message.message_id for message in candidates["ticket_id:northstar-bank:900000003"]], ["northstar-grievance", "northstar-service"])
+
+    def test_mailbox_uses_compatible_ai_group_for_title_and_summary_without_replacing_thread_id(self) -> None:
         first = replace(
             sample_message("msg-1"),
             gmail_thread_id="thread-1",
@@ -712,27 +877,51 @@ class SpeedPipelineTests(unittest.TestCase):
         )
         second = replace(
             sample_message("msg-2"),
-            gmail_thread_id="thread-2",
+            gmail_thread_id="thread-1",
             internal_date="2026-05-15T13:00:00+00:00",
             subject="Raw second subject",
             snippet="Raw second snippet",
             ai_title="Clean second title",
+            raw_payload={
+                "payload": {
+                    "parts": [
+                        {
+                            "partId": "1",
+                            "filename": "statement.pdf",
+                            "mimeType": "application/pdf",
+                            "headers": [{"name": "Content-Disposition", "value": "attachment"}],
+                            "body": {"attachmentId": "attach-1", "size": 2048},
+                        }
+                    ]
+                }
+            },
         )
-        group = replace(sample_group(), ai_title="AI grouped title", ai_summary="AI grouped summary")
+        visible_group = replace(
+            sample_visible_group(),
+            title="AI grouped title",
+            summary="AI grouped summary",
+            canonical_entity="Example Sender",
+            source_group_id="group-1",
+        )
 
         with patch("app.services.mail_groups.ensure_background_import_work"), patch(
             "app.services.mail_groups.get_import_state",
             return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
         ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 1, "pending": 0}), patch(
             "app.services.mail_groups.list_mailbox_thread_page",
-            return_value=MailboxThreadPage(threads=[("thread-1", [first]), ("thread-2", [second])], next_cursor=None, loaded_threads=2),
+            return_value=MailboxThreadPage(threads=[("thread-1", [first, second])], next_cursor=None, loaded_threads=1),
+        ), patch(
+            "app.services.mail_groups.list_visible_groups_for_gmail_threads",
+            return_value={"thread-1": visible_group},
         ), patch(
             "app.services.mail_groups.list_mail_groups_for_gmail_threads",
-            return_value={"thread-1": group, "thread-2": group},
-        ), patch("app.services.mail_groups.list_messages_for_groups", return_value={"group-1": [first, second]}), patch(
+            return_value={},
+        ), patch("app.services.mail_groups.list_messages_for_visible_groups", return_value={"visible-1": [first, second]}), patch(
             "app.services.mail_groups.count_mailbox_threads",
-            return_value=2,
+            return_value=1,
         ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1"
+        ), patch(
             "app.services.mail_groups.count_active_jobs", return_value=0
         ):
             mailbox = build_mailbox_response(self.settings, user_id="user-1")
@@ -740,17 +929,184 @@ class SpeedPipelineTests(unittest.TestCase):
         rows = [row for section in mailbox.sections for row in section.rows]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].thread_id, "group-1")
+        self.assertEqual(rows[0].entity_id, "visible-1")
         self.assertEqual(rows[0].title, "AI grouped title")
         self.assertEqual(rows[0].summary, "AI grouped summary")
+        self.assertEqual(rows[0].ai_group_id, "group-1")
         self.assertEqual(rows[0].ai_title, "AI grouped title")
         self.assertEqual(rows[0].ai_summary, "AI grouped summary")
+        self.assertEqual(rows[0].sender, "Example Sender")
+        self.assertEqual(mailbox.mailbox_revision, "rev-1")
+        self.assertIsNotNone(mailbox.generated_at)
         self.assertEqual(rows[0].latest_subject, "Raw second subject")
+        self.assertTrue(rows[0].has_attachments)
+        self.assertEqual(rows[0].attachment_count, 1)
         self.assertEqual(rows[0].message_count, 2)
         self.assertEqual([child.message_id for child in rows[0].children], ["msg-1", "msg-2"])
         self.assertEqual(rows[0].children[0].subject, "Raw first subject")
         self.assertEqual(rows[0].children[0].ai_title, "Clean first title")
         self.assertEqual(rows[0].children[1].subject, "Raw second subject")
         self.assertEqual(rows[0].children[1].ai_title, "Clean second title")
+
+    def test_mailbox_uses_thread_ai_group_for_plain_gmail_thread_rows(self) -> None:
+        message = replace(
+            sample_message("msg-plain"),
+            gmail_thread_id="thread-plain",
+            internal_date="2026-05-15T13:00:00+00:00",
+            subject="Raw bank subject",
+            snippet="Raw Gmail snippet",
+        )
+        ai_group = replace(
+            sample_group(),
+            id="group-thread-plain",
+            group_key="gmail-thread:thread-plain",
+            ai_title="Clean bank support title",
+            ai_summary="Bank confirmed the support case and next steps.",
+        )
+
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 1, "pending": 0}), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            return_value=MailboxThreadPage(threads=[("thread-plain", [message])], next_cursor=None, loaded_threads=1),
+        ), patch(
+            "app.services.mail_groups.list_mail_groups_for_gmail_threads",
+            return_value={"thread-plain": ai_group},
+        ), patch(
+            "app.services.mail_groups.list_visible_groups_for_gmail_threads",
+            return_value={},
+        ), patch(
+            "app.services.mail_groups.count_mailbox_threads",
+            return_value=1,
+        ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1"
+        ), patch(
+            "app.services.mail_groups.count_active_jobs", return_value=0
+        ):
+            mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
+
+        rows = [row for section in mailbox.sections for row in section.rows]
+        self.assertEqual(rows[0].thread_id, "thread-plain")
+        self.assertEqual(rows[0].entity_id, "group-thread-plain")
+        self.assertEqual(rows[0].title, "Clean bank support title")
+        self.assertEqual(rows[0].summary, "Bank confirmed the support case and next steps.")
+        self.assertEqual(rows[0].ai_group_id, "group-thread-plain")
+        self.assertEqual(rows[0].presentation_status, "ai_ready")
+
+    def test_mailbox_display_clusters_safe_newsletter_threads(self) -> None:
+        first = replace(
+            sample_message("claude-1"),
+            gmail_thread_id="thread-claude-1",
+            label_ids=["INBOX", "CATEGORY_PROMOTIONS"],
+            internal_date="2026-06-01T12:00:00+00:00",
+            sender="Claude Team <claude-noreply@example.com>",
+            subject="Using Claude for your everyday life",
+            snippet="Tips for using Claude in everyday work.",
+            extracted_signals={"sender_domain": "email.claude.com", "list_id": "claude.email.claude.com"},
+        )
+        second = replace(
+            sample_message("claude-2"),
+            gmail_thread_id="thread-claude-2",
+            label_ids=["INBOX", "CATEGORY_PROMOTIONS"],
+            internal_date="2026-06-04T12:00:00+00:00",
+            sender="Claude Team <claude-noreply@example.com>",
+            subject="Get more from Claude with these power moves",
+            snippet="More Claude product tips.",
+            extracted_signals={"sender_domain": "email.claude.com", "list_id": "claude.email.claude.com"},
+        )
+        older = replace(
+            sample_message("claude-3"),
+            gmail_thread_id="thread-claude-3",
+            label_ids=["INBOX", "CATEGORY_UPDATES"],
+            internal_date="2026-05-24T12:00:00+00:00",
+            sender="Claude Team <claude-noreply@example.com>",
+            subject="Welcome to Claude. Let's get you set up.",
+            snippet="Your step-by-step list to make Claude work better with you.",
+            extracted_signals={"sender_domain": "email.claude.com", "normalized_subject": "welcome to claude lets get you set up"},
+        )
+
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 2, "pending": 0}), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            return_value=MailboxThreadPage(
+                threads=[("thread-claude-2", [second]), ("thread-claude-1", [first]), ("thread-claude-3", [older])],
+                next_cursor=None,
+                loaded_threads=3,
+            ),
+        ), patch("app.services.mail_groups.list_visible_groups_for_gmail_threads", return_value={}), patch(
+            "app.services.mail_groups.list_mail_groups_for_gmail_threads",
+            return_value={},
+        ), patch(
+            "app.services.mail_groups.count_mailbox_threads",
+            return_value=2,
+        ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1"
+        ), patch(
+            "app.services.mail_groups.count_active_jobs", return_value=0
+        ):
+            mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
+
+        rows = [row for section in mailbox.sections for row in section.rows]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].sender, "Claude")
+        self.assertEqual(rows[0].title, "Claude updates")
+        self.assertEqual(rows[0].message_count, 3)
+        self.assertEqual([child.message_id for child in rows[0].children], ["claude-3", "claude-1", "claude-2"])
+
+    def test_mailbox_display_clusters_safe_provider_stream_with_sender_variants(self) -> None:
+        weekly = replace(
+            sample_message("slashy-weekly"),
+            gmail_thread_id="thread-slashy-weekly",
+            label_ids=["INBOX", "CATEGORY_UPDATES"],
+            internal_date="2026-06-02T12:00:00+00:00",
+            sender='"TestUser @ Slashy" <startup-founders@example.com>',
+            subject="Your meeting notes and your CRM now live in your inbox (Slashy Weekly #4)",
+            snippet="Slashy Weekly product update.",
+            extracted_signals={"sender_domain": "mail.startup.example", "domains": ["startup.example", "www.startup.example"]},
+        )
+        welcome = replace(
+            sample_message("slashy-welcome"),
+            gmail_thread_id="thread-slashy-welcome",
+            label_ids=["INBOX", "CATEGORY_PERSONAL"],
+            internal_date="2026-05-24T12:00:00+00:00",
+            sender="Slashy Team <startup-founders@example.com>",
+            subject="Welcome to Slashy!",
+            snippet="We're very excited to have you on Slashy.",
+            extracted_signals={"sender_domain": "startup.example", "normalized_subject": "welcome to slashy"},
+        )
+
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 2, "pending": 0}), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            return_value=MailboxThreadPage(
+                threads=[("thread-slashy-weekly", [weekly]), ("thread-slashy-welcome", [welcome])],
+                next_cursor=None,
+                loaded_threads=2,
+            ),
+        ), patch("app.services.mail_groups.list_visible_groups_for_gmail_threads", return_value={}), patch(
+            "app.services.mail_groups.list_mail_groups_for_gmail_threads",
+            return_value={},
+        ), patch(
+            "app.services.mail_groups.count_mailbox_threads",
+            return_value=2,
+        ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1"
+        ), patch(
+            "app.services.mail_groups.count_active_jobs", return_value=0
+        ):
+            mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
+
+        rows = [row for section in mailbox.sections for row in section.rows]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].sender, "Slashy")
+        self.assertEqual(rows[0].title, "Slashy updates")
+        self.assertEqual(rows[0].message_count, 2)
+        self.assertEqual([child.message_id for child in rows[0].children], ["slashy-welcome", "slashy-weekly"])
 
     def test_mailbox_row_uses_only_messages_matching_requested_label(self) -> None:
         inbox = replace(
@@ -768,9 +1124,10 @@ class SpeedPipelineTests(unittest.TestCase):
             internal_date="2026-05-15T13:00:00+00:00",
             subject="Sent reply",
             sender="Me <me@example.com>",
+            recipients={
+                "to": "Recipient Person <recipient@example.com>, Second Person <second@example.com>",
+            },
         )
-        group = replace(sample_group(), ai_title="AI thread", ai_summary="AI summary")
-
         with patch("app.services.mail_groups.ensure_background_import_work"), patch(
             "app.services.mail_groups.get_import_state",
             return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
@@ -778,12 +1135,17 @@ class SpeedPipelineTests(unittest.TestCase):
             "app.services.mail_groups.list_mailbox_thread_page",
             return_value=MailboxThreadPage(threads=[("thread-1", [inbox, sent])], next_cursor=None, loaded_threads=1),
         ), patch(
+            "app.services.mail_groups.list_visible_groups_for_gmail_threads",
+            return_value={},
+        ), patch(
             "app.services.mail_groups.list_mail_groups_for_gmail_threads",
-            return_value={"thread-1": group},
-        ), patch("app.services.mail_groups.list_messages_for_groups", return_value={"group-1": [inbox, sent]}), patch(
+            return_value={},
+        ), patch(
             "app.services.mail_groups.count_mailbox_threads",
             return_value=1,
         ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1"
+        ), patch(
             "app.services.mail_groups.count_active_jobs", return_value=0
         ):
             inbox_mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
@@ -793,44 +1155,65 @@ class SpeedPipelineTests(unittest.TestCase):
         sent_row = [row for section in sent_mailbox.sections for row in section.rows][0]
         self.assertEqual(inbox_row.message_count, 1)
         self.assertEqual(inbox_row.latest_subject, "Inbox copy")
+        self.assertEqual(inbox_row.latest_sender, "Sender <sender@example.com>")
+        self.assertEqual(inbox_row.sender, "Sender <sender@example.com>")
         self.assertEqual(inbox_row.label_ids, ["INBOX", "UNREAD"])
         self.assertEqual(inbox_row.participants, ["Sender"])
         self.assertEqual([child.message_id for child in inbox_row.children], ["inbox-1"])
+        self.assertEqual(inbox_row.children[0].sender, "Sender <sender@example.com>")
         self.assertEqual(inbox_row.children[0].label_ids, ["INBOX", "UNREAD"])
         self.assertEqual(sent_row.message_count, 1)
         self.assertEqual(sent_row.latest_subject, "Sent reply")
+        self.assertEqual(sent_row.latest_sender, "Me <me@example.com>")
+        self.assertEqual(sent_row.sender, "Recipient Person")
         self.assertEqual(sent_row.label_ids, ["SENT"])
-        self.assertEqual(sent_row.participants, ["Me"])
+        self.assertEqual(sent_row.participants, ["Recipient Person", "Second Person"])
         self.assertEqual([child.message_id for child in sent_row.children], ["sent-1"])
+        self.assertEqual(sent_row.children[0].sender, "Recipient Person")
         self.assertEqual(sent_row.children[0].label_ids, ["SENT"])
 
-    def test_mailbox_skips_overlapping_group_rows(self) -> None:
-        first = replace(
-            sample_message("msg-1"),
+    def test_sent_mailbox_display_sender_falls_back_to_recipient_email(self) -> None:
+        sent = replace(
+            sample_message("sent-1"),
             gmail_thread_id="thread-1",
+            label_ids=["SENT"],
+            internal_date="2026-05-15T13:00:00+00:00",
+            subject="Sent reply",
+            sender="Me <me@example.com>",
+            recipients={"to": "recipient@example.com"},
+        )
+
+        row = _gmail_row_from_canonical_thread("thread-1", [sent], "sent", None)
+
+        self.assertEqual(row.latest_sender, "Me <me@example.com>")
+        self.assertEqual(row.sender, "recipient@example.com")
+        self.assertEqual(row.participants, ["recipient@example.com"])
+        self.assertEqual(row.children[0].sender, "recipient@example.com")
+
+    def test_mailbox_renders_northstar_workflow_ai_group_across_gmail_threads(self) -> None:
+        first = replace(
+            sample_message("northstar-ack"),
+            gmail_thread_id="thread-northstar-ack",
             internal_date="2026-05-15T12:00:00+00:00",
-            subject="Raw first subject",
+            subject="Northstar Bank acknowledged your service request",
+            sender="Northstar Bank <support@northstarbank.example>",
+            ai_title="Bank acknowledged service request",
         )
         second = replace(
-            sample_message("msg-2"),
-            gmail_thread_id="thread-2",
+            sample_message("northstar-update"),
+            gmail_thread_id="thread-northstar-update",
             internal_date="2026-05-15T13:00:00+00:00",
-            subject="Raw second subject",
+            subject="Update on your Northstar wire transfer inquiry",
+            sender="Northstar Bank <support@northstarbank.example>",
+            ai_title="Bank updated wire transfer inquiry",
         )
-        ai_group = replace(
-            sample_group(),
-            id="group-ai",
-            membership_source="ai_batch",
-            ai_title="AI conversation",
-            ai_summary="AI summary",
-        )
-        lower_priority_group = replace(
-            sample_group(),
-            id="group-raw",
-            group_key="gmail-thread:thread-2",
-            membership_source="gmail_thread",
-            ai_title="Raw overlap",
-            ai_summary="Raw summary",
+        visible_group = replace(
+            sample_visible_group(),
+            id="visible-northstar",
+            source_group_id="group-northstar",
+            title="Northstar remittance support case",
+            summary="Northstar acknowledged and updated the wire transfer inquiry.",
+            canonical_entity="Northstar Bank",
         )
 
         with patch("app.services.mail_groups.ensure_background_import_work"), patch(
@@ -838,26 +1221,356 @@ class SpeedPipelineTests(unittest.TestCase):
             return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
         ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 2, "pending": 0}), patch(
             "app.services.mail_groups.list_mailbox_thread_page",
-            return_value=MailboxThreadPage(threads=[("thread-1", [first]), ("thread-2", [second])], next_cursor=None, loaded_threads=2),
+            return_value=MailboxThreadPage(threads=[("thread-northstar-update", [second]), ("thread-northstar-ack", [first])], next_cursor=None, loaded_threads=2),
+        ), patch(
+            "app.services.mail_groups.list_visible_groups_for_gmail_threads",
+            return_value={"thread-northstar-update": visible_group, "thread-northstar-ack": visible_group},
         ), patch(
             "app.services.mail_groups.list_mail_groups_for_gmail_threads",
-            return_value={"thread-1": ai_group, "thread-2": lower_priority_group},
+            return_value={},
         ), patch(
-            "app.services.mail_groups.list_messages_for_groups",
-            return_value={"group-ai": [first, second], "group-raw": [second]},
+            "app.services.mail_groups.list_messages_for_visible_groups",
+            return_value={"visible-northstar": [first, second]},
         ), patch(
             "app.services.mail_groups.count_mailbox_threads",
             return_value=2,
         ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1"
+        ), patch(
             "app.services.mail_groups.count_active_jobs", return_value=0
         ):
             mailbox = build_mailbox_response(self.settings, user_id="user-1")
 
         rows = [row for section in mailbox.sections for row in section.rows]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].thread_id, "group-ai")
-        self.assertEqual(rows[0].title, "AI conversation")
+        self.assertEqual(rows[0].thread_id, "group-northstar")
+        self.assertEqual(rows[0].entity_id, "visible-northstar")
+        self.assertEqual(rows[0].ai_group_id, "group-northstar")
+        self.assertEqual(rows[0].sender, "Northstar Bank")
+        self.assertEqual(rows[0].title, "Northstar remittance support case")
+        self.assertEqual(rows[0].summary, "Northstar acknowledged and updated the wire transfer inquiry.")
+        self.assertEqual(rows[0].latest_subject, "Update on your Northstar wire transfer inquiry")
         self.assertEqual(rows[0].message_count, 2)
+        self.assertEqual([child.message_id for child in rows[0].children], ["northstar-ack", "northstar-update"])
+        self.assertEqual([child.gmail_thread_id for child in rows[0].children], ["thread-northstar-ack", "thread-northstar-update"])
+
+    def test_visible_group_sender_falls_back_to_inbound_sender_when_projection_entity_is_user(self) -> None:
+        sent = replace(
+            sample_message("psu-sent"),
+            gmail_thread_id="thread-psu-sent",
+            label_ids=["SENT"],
+            internal_date="2026-05-15T12:00:00+00:00",
+            subject="Question About Reconsideration Request",
+            sender="TestUser <hi@example.com>",
+            recipients={"to": "State University <university-admissions@example.edu>"},
+        )
+        reply = replace(
+            sample_message("psu-reply"),
+            gmail_thread_id="thread-psu-reply",
+            label_ids=["INBOX"],
+            internal_date="2026-05-15T13:00:00+00:00",
+            subject="RE: Question About Reconsideration Request",
+            sender="State University <university-admissions@example.edu>",
+        )
+        visible_group = replace(
+            sample_visible_group(),
+            id="visible-psu",
+            source_group_id="group-psu",
+            title="State University reconsideration request",
+            summary="State University replied to the reconsideration request.",
+            canonical_entity="TestUser",
+        )
+
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 1, "pending": 0}), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            return_value=MailboxThreadPage(threads=[("thread-psu-reply", [reply]), ("thread-psu-sent", [sent])], next_cursor=None, loaded_threads=2),
+        ), patch(
+            "app.services.mail_groups.list_visible_groups_for_gmail_threads",
+            return_value={"thread-psu-reply": visible_group, "thread-psu-sent": visible_group},
+        ), patch(
+            "app.services.mail_groups.list_mail_groups_for_gmail_threads",
+            return_value={},
+        ), patch(
+            "app.services.mail_groups.list_messages_for_visible_groups",
+            return_value={"visible-psu": [sent, reply]},
+        ), patch(
+            "app.services.mail_groups.count_mailbox_threads",
+            return_value=2,
+        ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1"
+        ), patch(
+            "app.services.mail_groups.count_active_jobs", return_value=0
+        ):
+            mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
+
+        rows = [row for section in mailbox.sections for row in section.rows]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].latest_sender, "State University <university-admissions@example.edu>")
+        self.assertEqual(rows[0].sender, "State University <university-admissions@example.edu>")
+        self.assertEqual(rows[0].title, "State University reconsideration request")
+        self.assertEqual(rows[0].message_count, 1)
+        self.assertEqual([child.message_id for child in rows[0].children], ["psu-reply"])
+
+    def test_sent_only_visible_group_falls_back_to_canonical_inbox_thread(self) -> None:
+        sent = replace(
+            sample_message("psu-sent"),
+            gmail_thread_id="thread-psu-sent",
+            label_ids=["SENT"],
+            internal_date="2026-05-15T12:00:00+00:00",
+            subject="Question About Reconsideration Request",
+            sender="TestUser <hi@example.com>",
+            recipients={"to": "State University <university-admissions@example.edu>"},
+        )
+        reply = replace(
+            sample_message("psu-reply"),
+            gmail_thread_id="thread-psu-reply",
+            label_ids=["INBOX"],
+            internal_date="2026-05-15T13:00:00+00:00",
+            subject="RE: Question About Reconsideration Request",
+            sender="State University <university-admissions@example.edu>",
+        )
+        visible_group = replace(
+            sample_visible_group(),
+            id="visible-psu",
+            source_group_id="group-psu",
+            title="State University reconsideration request",
+            canonical_entity="TestUser",
+        )
+
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 1, "pending": 0}), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            return_value=MailboxThreadPage(threads=[("thread-psu-reply", [reply])], next_cursor=None, loaded_threads=1),
+        ), patch(
+            "app.services.mail_groups.list_visible_groups_for_gmail_threads",
+            return_value={"thread-psu-reply": visible_group},
+        ), patch(
+            "app.services.mail_groups.list_mail_groups_for_gmail_threads",
+            return_value={},
+        ), patch(
+            "app.services.mail_groups.list_messages_for_visible_groups",
+            return_value={"visible-psu": [sent]},
+        ), patch(
+            "app.services.mail_groups.count_mailbox_threads",
+            return_value=1,
+        ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1"
+        ), patch(
+            "app.services.mail_groups.count_active_jobs", return_value=0
+        ):
+            mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
+
+        rows = [row for section in mailbox.sections for row in section.rows]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].thread_id, "thread-psu-reply")
+        self.assertIsNone(rows[0].ai_group_id)
+        self.assertEqual(rows[0].sender, "State University <university-admissions@example.edu>")
+        self.assertEqual([child.message_id for child in rows[0].children], ["psu-reply"])
+
+    def test_attention_title_fallback_rejects_generic_application_update_subject(self) -> None:
+        message = replace(
+            sample_message("psu-app"),
+            subject="Application Update",
+            sender="State University <university-admissions@example.edu>",
+            snippet="We regret to inform you that your application was not selected.",
+            extracted_signals={"sender_domain": "university.example", "normalized_subject": "application update"},
+        )
+
+        enrichment = attention_enrichment_payload(messages=[message], group_key="gmail-thread:thread-psu")
+
+        self.assertEqual(enrichment["ai_title"], "State University application rejection")
+
+    def test_generic_ai_message_title_is_replaced_before_persistence(self) -> None:
+        message = replace(
+            sample_message("psu-app"),
+            subject="Application Update",
+            sender="State University <university-admissions@example.edu>",
+            snippet="We regret to inform you that your application was not selected.",
+            extracted_signals={"sender_domain": "university.example", "normalized_subject": "application update"},
+        )
+
+        titles = _message_title_map([{"message_id": "psu-app", "ai_title": "Application Update"}], [message])
+
+        self.assertEqual(titles, {"psu-app": "State University application rejection"})
+
+    def test_mailbox_keeps_related_cityflo_threads_separate_without_validated_projection(self) -> None:
+        booking = replace(
+            sample_message("cityflo-booking"),
+            gmail_thread_id="thread-cityflo-booking",
+            internal_date="2026-06-05T07:00:00+00:00",
+            subject="Your booking with Cityflo",
+            sender="Cityflo <transit-support@example.com>",
+            snippet="Your bus booking is confirmed.",
+            extracted_signals={"sender_domain": "transit.example", "normalized_subject": "your booking with cityflo"},
+        )
+        modified = replace(
+            sample_message("cityflo-modified"),
+            gmail_thread_id="thread-cityflo-modified",
+            internal_date="2026-06-05T08:00:00+00:00",
+            subject="Your trip was modified successfully",
+            sender="Cityflo <transit-support@example.com>",
+            snippet="Your ride time changed.",
+            extracted_signals={"sender_domain": "transit.example", "normalized_subject": "your trip was modified successfully"},
+        )
+        cancelled = replace(
+            sample_message("cityflo-cancelled"),
+            gmail_thread_id="thread-cityflo-cancelled",
+            internal_date="2026-06-05T09:00:00+00:00",
+            subject="Your trip on 05 Jun was cancelled",
+            sender="Cityflo <transit-support@example.com>",
+            snippet="Your Cityflo ride was cancelled.",
+            extracted_signals={"sender_domain": "transit.example", "normalized_subject": "your trip was cancelled"},
+        )
+
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 0, "pending": 0}), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            return_value=MailboxThreadPage(
+                threads=[
+                    ("thread-cityflo-cancelled", [cancelled]),
+                    ("thread-cityflo-modified", [modified]),
+                    ("thread-cityflo-booking", [booking]),
+                ],
+                next_cursor=None,
+                loaded_threads=3,
+            ),
+        ), patch(
+            "app.services.mail_groups.list_visible_groups_for_gmail_threads",
+            return_value={},
+        ), patch(
+            "app.services.mail_groups.list_mail_groups_for_gmail_threads",
+            return_value={},
+        ), patch(
+            "app.services.mail_groups.count_mailbox_threads",
+            return_value=3,
+        ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1"
+        ), patch(
+            "app.services.mail_groups.count_active_jobs", return_value=0
+        ):
+            mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
+
+        rows = [row for section in mailbox.sections for row in section.rows]
+        self.assertEqual([row.thread_id for row in rows], ["thread-cityflo-cancelled", "thread-cityflo-modified", "thread-cityflo-booking"])
+        self.assertEqual([row.ai_group_id for row in rows], [None, None, None])
+
+    def test_mailbox_does_not_cluster_job_alerts_as_billing(self) -> None:
+        first = replace(
+            sample_message("upwork-1"),
+            gmail_thread_id="thread-upwork-1",
+            internal_date="2026-05-28T08:00:00+00:00",
+            subject="New job alert: AI automation engineer",
+            sender="Upwork Notification <freelance-noreply@example.com>",
+            snippet="This job matches your alert settings. Payment verified client.",
+            extracted_signals={"sender_domain": "freelance.example", "normalized_subject": "new job alert ai automation engineer"},
+        )
+        second = replace(
+            sample_message("upwork-2"),
+            gmail_thread_id="thread-upwork-2",
+            internal_date="2026-05-28T09:00:00+00:00",
+            subject="New job alert: AI consultant",
+            sender="Upwork Notification <freelance-noreply@example.com>",
+            snippet="This job matches your alert settings. Payment verified client.",
+            extracted_signals={"sender_domain": "freelance.example", "normalized_subject": "new job alert ai consultant"},
+        )
+
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 0, "pending": 0}), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            return_value=MailboxThreadPage(
+                threads=[("thread-upwork-2", [second]), ("thread-upwork-1", [first])],
+                next_cursor=None,
+                loaded_threads=2,
+            ),
+        ), patch(
+            "app.services.mail_groups.list_visible_groups_for_gmail_threads",
+            return_value={},
+        ), patch(
+            "app.services.mail_groups.list_mail_groups_for_gmail_threads",
+            return_value={},
+        ), patch(
+            "app.services.mail_groups.count_mailbox_threads",
+            return_value=2,
+        ), patch("app.services.mail_groups.oldest_imported_message_at", return_value=None), patch(
+            "app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1"
+        ), patch(
+            "app.services.mail_groups.count_active_jobs", return_value=0
+        ):
+            mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
+
+        rows = [row for section in mailbox.sections for row in section.rows]
+        self.assertEqual([row.thread_id for row in rows], ["thread-upwork-2", "thread-upwork-1"])
+
+    def test_mailbox_keeps_psu_application_reconsideration_and_costs_as_separate_threads(self) -> None:
+        application = replace(
+            sample_message("psu-app"),
+            gmail_thread_id="thread-application",
+            internal_date="2026-05-29T08:00:00+00:00",
+            subject="Application Update",
+            sender="university-admissions@example.edu",
+        )
+        sent_question = replace(
+            sample_message("psu-sent"),
+            gmail_thread_id="thread-reconsideration",
+            label_ids=["SENT"],
+            internal_date="2026-05-29T08:30:00+00:00",
+            subject="Question About Reconsideration Request",
+            sender="TestUser <hi@example.com>",
+        )
+        reply = replace(
+            sample_message("psu-reply"),
+            gmail_thread_id="thread-reconsideration",
+            internal_date="2026-05-29T21:12:00+00:00",
+            subject="RE: Question About Reconsideration Request",
+            sender="State University Campus <behrend.university-admissions@example.edu>",
+        )
+        costs = replace(
+            sample_message("psu-costs"),
+            gmail_thread_id="thread-costs",
+            internal_date="2026-05-29T22:00:00+00:00",
+            subject="View Your Estimated Costs",
+            sender="osa-noreply@university.example",
+        )
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 1, "pending": 0}), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            return_value=MailboxThreadPage(
+                threads=[
+                    ("thread-costs", [costs]),
+                    ("thread-reconsideration", [sent_question, reply]),
+                    ("thread-application", [application]),
+                ],
+                next_cursor=None,
+                loaded_threads=3,
+            ),
+        ), patch(
+            "app.services.mail_groups.list_visible_groups_for_gmail_threads",
+            return_value={},
+        ), patch(
+            "app.services.mail_groups.list_mail_groups_for_gmail_threads",
+            return_value={},
+        ), patch("app.services.mail_groups.count_mailbox_threads", return_value=3), patch(
+            "app.services.mail_groups.oldest_imported_message_at", return_value=None
+        ), patch("app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1"), patch(
+            "app.services.mail_groups.count_active_jobs", return_value=0
+        ):
+            mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
+
+        rows = [row for section in mailbox.sections for row in section.rows]
+        self.assertEqual([row.thread_id for row in rows], ["thread-costs", "thread-reconsideration", "thread-application"])
+        self.assertEqual([row.ai_group_id for row in rows], [None, None, None])
+        self.assertEqual([row.latest_subject for row in rows], ["View Your Estimated Costs", "RE: Question About Reconsideration Request", "Application Update"])
 
     @patch("app.services.mail_groups.enqueue_projection_refresh")
     @patch("app.services.mail_groups.enqueue_job")

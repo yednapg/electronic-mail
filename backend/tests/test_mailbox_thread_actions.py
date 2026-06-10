@@ -138,7 +138,9 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
 
         with patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record), patch(
             "app.services.mailbox_actions.mark_pending_thread_action_applying"
-        ) as mark_applying, patch("app.services.mailbox_actions.get_mail_group_detail", return_value=detail), patch(
+        ) as mark_applying, patch("app.services.mailbox_actions.list_messages_for_gmail_thread", return_value=[]), patch(
+            "app.services.mailbox_actions.get_mail_group_detail", return_value=detail
+        ), patch(
             "app.services.mailbox_actions.archive_gmail_thread"
         ) as archive, patch(
             "app.services.mailbox_actions.mark_pending_thread_action_applied", return_value=applied
@@ -153,12 +155,40 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         mark_applied.assert_called_once_with("postgresql://example/db", user_id="user-1", server_action_id="server-1")
         refresh.assert_called_once_with(settings, user_id="user-1", priority=10)
 
+    def test_worker_resolves_canonical_gmail_thread_before_legacy_group_lookup(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        record = replace(pending_action(action="mark_read"), mailbox_thread_id="thread-a")
+        applied = replace(record, state="applied", applied_at="2026-05-21T09:01:00+00:00")
+        thread_messages = [sample_message("msg-1", "thread-a"), sample_message("msg-2", "thread-a")]
+
+        with patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record), patch(
+            "app.services.mailbox_actions.mark_pending_thread_action_applying"
+        ), patch(
+            "app.services.mailbox_actions.list_messages_for_gmail_thread", return_value=thread_messages
+        ) as list_thread, patch(
+            "app.services.mailbox_actions.get_mail_group_detail"
+        ) as get_detail, patch(
+            "app.services.mailbox_actions.mark_gmail_thread_read"
+        ) as mark_read, patch(
+            "app.services.mailbox_actions.mark_pending_thread_action_applied", return_value=applied
+        ), patch(
+            "app.services.mailbox_actions.enqueue_projection_refresh"
+        ):
+            response = run_pending_thread_action(settings, user_id="user-1", server_action_id="server-1")
+
+        self.assertEqual(response.state, "applied")
+        list_thread.assert_called_once_with("postgresql://example/db", user_id="user-1", gmail_thread_id="thread-a")
+        get_detail.assert_not_called()
+        mark_read.assert_called_once_with(settings, "thread-a", user_id="user-1")
+
     def test_move_trash_updates_local_labels_and_calls_gmail_trash(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
         record = pending_action(action="move_trash")
         detail = MailGroupDetail(group=sample_group(), messages=[sample_message("msg-1", "thread-a")])
 
         with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=record), patch(
+            "app.services.mailbox_actions.list_messages_for_gmail_thread", return_value=[]
+        ), patch(
             "app.services.mailbox_actions.get_mail_group_detail", return_value=detail
         ), patch(
             "app.services.mailbox_actions.upsert_gmail_messages"
@@ -182,7 +212,9 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         applied = replace(record, state="applied", applied_at="2026-05-21T09:01:00+00:00")
         with patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record), patch(
             "app.services.mailbox_actions.mark_pending_thread_action_applying"
-        ), patch("app.services.mailbox_actions.get_mail_group_detail", return_value=detail), patch(
+        ), patch("app.services.mailbox_actions.list_messages_for_gmail_thread", return_value=[]), patch(
+            "app.services.mailbox_actions.get_mail_group_detail", return_value=detail
+        ), patch(
             "app.services.mailbox_actions.move_gmail_thread_to_trash"
         ) as move_trash, patch(
             "app.services.mailbox_actions.mark_pending_thread_action_applied", return_value=applied
@@ -219,7 +251,9 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
 
         with patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record), patch(
             "app.services.mailbox_actions.mark_pending_thread_action_applying"
-        ), patch("app.services.mailbox_actions.get_mail_group_detail", return_value=detail), patch(
+        ), patch("app.services.mailbox_actions.list_messages_for_gmail_thread", return_value=[]), patch(
+            "app.services.mailbox_actions.get_mail_group_detail", return_value=detail
+        ), patch(
             "app.services.mailbox_actions.delete_gmail_thread_forever"
         ) as delete_forever, patch(
             "app.services.mailbox_actions.delete_gmail_messages", return_value=["group-1"]

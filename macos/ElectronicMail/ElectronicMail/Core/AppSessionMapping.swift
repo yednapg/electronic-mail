@@ -71,6 +71,8 @@ extension MailboxResponse {
             sections: nextSections,
             readyCount: readyCount,
             pendingCount: pendingCount,
+            mailboxRevision: mailboxRevision,
+            generatedAt: generatedAt,
             oldestImportedAt: oldestImportedAt,
             fullImportRunning: fullImportRunning,
             fullImportCompleted: fullImportCompleted
@@ -116,6 +118,8 @@ extension MailboxResponse {
             sections: nextSections,
             readyCount: page.readyCount ?? readyCount,
             pendingCount: page.pendingCount ?? pendingCount,
+            mailboxRevision: page.mailboxRevision ?? mailboxRevision,
+            generatedAt: page.generatedAt ?? generatedAt,
             oldestImportedAt: page.oldestImportedAt ?? oldestImportedAt,
             fullImportRunning: page.fullImportRunning ?? fullImportRunning,
             fullImportCompleted: page.fullImportCompleted ?? fullImportCompleted
@@ -156,6 +160,8 @@ extension MailboxResponse {
             sections: nextSections,
             readyCount: firstPage.readyCount ?? readyCount,
             pendingCount: firstPage.pendingCount ?? pendingCount,
+            mailboxRevision: firstPage.mailboxRevision ?? mailboxRevision,
+            generatedAt: firstPage.generatedAt ?? generatedAt,
             oldestImportedAt: firstPage.oldestImportedAt ?? oldestImportedAt,
             fullImportRunning: firstPage.fullImportRunning ?? fullImportRunning,
             fullImportCompleted: isStillComplete ? true : (firstPage.fullImportCompleted ?? fullImportCompleted)
@@ -215,7 +221,36 @@ private extension ISO8601DateFormatter {
 }
 
 extension GmailThreadRow {
-    func copy(unread: Bool? = nil, labelIDs: [String]? = nil) -> GmailThreadRow {
+    func markedRead(targetMessageID: String? = nil) -> GmailThreadRow {
+        guard let targetMessageID else {
+            return copy(
+                unread: false,
+                labelIDs: labelIDs.removingUnreadLabel(),
+                labels: labels.removingUnreadLabel(),
+                children: children?.map { $0.markedRead() }
+            )
+        }
+
+        let nextChildren = children?.map { child in
+            child.messageID == targetMessageID ? child.markedRead() : child
+        }
+        guard latestSourceRecordID == targetMessageID else {
+            return copy(children: nextChildren)
+        }
+        return copy(
+            unread: false,
+            labelIDs: labelIDs.removingUnreadLabel(),
+            labels: labels.removingUnreadLabel(),
+            children: nextChildren
+        )
+    }
+
+    func copy(
+        unread: Bool? = nil,
+        labelIDs: [String]? = nil,
+        labels: [String]? = nil,
+        children: [GmailThreadChildRow]? = nil
+    ) -> GmailThreadRow {
         GmailThreadRow(
             threadID: threadID,
             entityID: entityID,
@@ -234,8 +269,10 @@ extension GmailThreadRow {
             aiTitle: aiTitle,
             aiSummary: aiSummary,
             snippet: snippet,
+            hasAttachments: hasAttachments,
+            attachmentCount: attachmentCount,
             labelIDs: labelIDs ?? self.labelIDs,
-            labels: labels,
+            labels: labels ?? self.labels,
             unread: unread ?? self.unread,
             actionNeeded: actionNeeded,
             actionType: actionType,
@@ -246,7 +283,41 @@ extension GmailThreadRow {
             lifecycleState: lifecycleState,
             outcomeType: outcomeType,
             lifecycleUpdates: lifecycleUpdates,
-            enrichmentStatus: enrichmentStatus
+            children: children ?? self.children,
+            enrichmentStatus: enrichmentStatus,
+            presentationStatus: presentationStatus,
+            pendingAction: pendingAction
         )
+    }
+}
+
+extension GmailThreadChildRow {
+    func markedRead() -> GmailThreadChildRow {
+        copy(
+            unread: false,
+            labelIDs: labelIDs.removingUnreadLabel(),
+            labels: labels.removingUnreadLabel()
+        )
+    }
+
+    func copy(unread: Bool? = nil, labelIDs: [String]? = nil, labels: [String]? = nil) -> GmailThreadChildRow {
+        GmailThreadChildRow(
+            messageID: messageID,
+            gmailThreadID: gmailThreadID,
+            sender: sender,
+            subject: subject,
+            aiTitle: aiTitle,
+            snippet: snippet,
+            receivedAt: receivedAt,
+            labelIDs: labelIDs ?? self.labelIDs,
+            labels: labels ?? self.labels,
+            unread: unread ?? self.unread
+        )
+    }
+}
+
+private extension Array where Element == String {
+    func removingUnreadLabel() -> [String] {
+        filter { $0.uppercased() != "UNREAD" }
     }
 }

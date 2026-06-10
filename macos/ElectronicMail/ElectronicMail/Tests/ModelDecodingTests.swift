@@ -2,6 +2,38 @@ import XCTest
 @testable import ElectronicMailCore
 
 final class ModelDecodingTests: XCTestCase {
+    func testReaderSummaryDisclosureHidesSummaryByDefault() {
+        let model = EmailReaderSummaryDisclosureModel(
+            summary: "A quiet summary of the thread.",
+            isExpanded: false
+        )
+
+        XCTAssertTrue(model.hasSummary)
+        XCTAssertEqual(model.controlTitle, "View summary")
+        XCTAssertNil(model.visibleSummary)
+    }
+
+    func testReaderSummaryDisclosureShowsOnlySummaryWhenExpanded() {
+        let model = EmailReaderSummaryDisclosureModel(
+            summary: "A quiet summary of the thread.",
+            isExpanded: true
+        )
+
+        XCTAssertTrue(model.hasSummary)
+        XCTAssertEqual(model.controlTitle, "Hide summary")
+        XCTAssertEqual(model.visibleSummary, "A quiet summary of the thread.")
+    }
+
+    func testReaderSummaryDisclosureIgnoresEmptySummary() {
+        let model = EmailReaderSummaryDisclosureModel(
+            summary: "   \n\t  ",
+            isExpanded: true
+        )
+
+        XCTAssertFalse(model.hasSummary)
+        XCTAssertNil(model.visibleSummary)
+    }
+
     func testThreadReaderResponseDecodesSharedContractFixture() throws {
         let thread = try JSONDecoder.backend.decode(
             ThreadReaderResponse.self,
@@ -108,6 +140,43 @@ final class ModelDecodingTests: XCTestCase {
 
         XCTAssertEqual(row.displayTitle, "AI grouped title")
         XCTAssertEqual(row.displaySummary, "AI grouped summary")
+    }
+
+    func testMailboxRowDisplaySenderCleansQuotedDisplayName() {
+        let row = makeMailboxPresentationRow(
+            sender: "\"Cedar Mobile Updates\" <update@cedar-mobile.example>",
+            latestSender: "fallback@example.com"
+        )
+
+        XCTAssertEqual(row.displaySender, "Cedar Mobile Updates")
+    }
+
+    func testMailboxRowDisplaySenderFormatsEmailOnlySenderWithDomain() {
+        let row = makeMailboxPresentationRow(sender: "update@cedar-mobile.example")
+
+        XCTAssertEqual(row.displaySender, "Update - cedar-mobile.example")
+    }
+
+    func testMailboxRowDisplaySenderFormatsBareAngleAddress() {
+        let row = makeMailboxPresentationRow(sender: "<alerts@long-subdomain.example.co.in>")
+
+        XCTAssertEqual(row.displaySender, "Alerts - long-subdomain.example.co.in")
+    }
+
+    func testMailboxRowDisplaySenderPreservesPersonalGmailAddress() {
+        let row = makeMailboxPresentationRow(sender: "demo@example.test")
+
+        XCTAssertEqual(row.displaySender, "demo@example.test")
+    }
+
+    func testMailboxRowDisplaySenderUsesParticipantsFallback() {
+        let row = makeMailboxPresentationRow(
+            sender: nil,
+            latestSender: nil,
+            participants: ["no.reply+statements@mailer.example.com"]
+        )
+
+        XCTAssertEqual(row.displaySender, "No Reply Statements - mailer.example.com")
     }
 
     func testMailboxRowPresentationShowsPendingTitleState() throws {
@@ -581,6 +650,7 @@ final class ModelDecodingTests: XCTestCase {
             EmailReaderBodyResolver.bodyKind(message: message, fallbackText: ""),
             .text("Clean body only.")
         )
+        XCTAssertNil(EmailReaderBodyResolver.renderableHTML(from: message))
         XCTAssertEqual(EmailReaderBodyResolver.originalHTML(from: message), html)
     }
 
@@ -608,6 +678,7 @@ final class ModelDecodingTests: XCTestCase {
             EmailReaderBodyResolver.bodyKind(message: message, fallbackText: ""),
             .html(html, fallbackText: "Designed body")
         )
+        XCTAssertEqual(EmailReaderBodyResolver.renderableHTML(from: message), html)
     }
 
     func testThreadPresentationOrdersOldestToNewestAndExpandsLatestFirst() {
@@ -700,6 +771,45 @@ final class ModelDecodingTests: XCTestCase {
         }
 
         throw CocoaError(.fileNoSuchFile)
+    }
+
+    private func makeMailboxPresentationRow(
+        sender: String?,
+        latestSender: String? = "Sender <sender@example.com>",
+        participants: [String] = ["Sender"]
+    ) -> GmailThreadRow {
+        GmailThreadRow(
+            threadID: "group-1",
+            entityID: "group-1",
+            title: "Raw Gmail subject",
+            href: "/v1/mailbox/threads/group-1",
+            latestSourceRecordID: "msg-1",
+            latestReceivedAt: "2026-05-23T12:00:00+00:00",
+            latestMessageAt: "2026-05-23T12:00:00+00:00",
+            latestSubject: "Raw Gmail subject",
+            latestSender: latestSender,
+            sender: sender,
+            participants: participants,
+            messageCount: 1,
+            summary: "Raw Gmail snippet",
+            aiGroupID: "group-1",
+            aiTitle: nil,
+            aiSummary: nil,
+            snippet: "Raw Gmail snippet",
+            labelIDs: ["INBOX"],
+            labels: ["INBOX"],
+            unread: false,
+            actionNeeded: false,
+            actionType: "open",
+            actionTypeKey: "open",
+            priority: 20,
+            dashboardVisible: true,
+            currentState: .waiting,
+            lifecycleState: "active",
+            outcomeType: nil,
+            lifecycleUpdates: [],
+            enrichmentStatus: "ready"
+        )
     }
 
     private func makeThreadMessage(
