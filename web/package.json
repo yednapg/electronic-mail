@@ -3,9 +3,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev --port 5173",
-    "dev:demo": "NEXT_PUBLIC_UI_DEMO_MODE=1 next dev --port 5173",
     "build": "next build",
-    "build:demo": "NEXT_PUBLIC_UI_DEMO_MODE=1 next build",
     "test": "tsx --test app/**/*.test.ts lib/**/*.test.ts",
     "typecheck": "tsc --noEmit"
   },

@@ -5,8 +5,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { SignedInAppChrome } from '../../components/app/AppChrome';
 import { useAppSession } from '../../lib/app-session-store';
-import { getDemoThreadReader } from '../../lib/demo-data';
-import { isDemoMode } from '../../lib/demo-mode';
 import { useActiveMailboxSync } from '../../lib/use-active-mailbox-sync';
 import type { GmailThreadRow, MailboxResponse, ThreadMessage, ThreadReaderResponse } from '../../lib/types';
 import { GmailList, formatGmailSender } from './GmailView';
@@ -539,9 +537,6 @@ function escapeSelectorValue(value: string): string {
 }
 
 async function fetchMailboxThread(threadId: string): Promise<ThreadReaderResponse | null> {
-  if (isDemoMode()) {
-    return getDemoThreadReader(threadId);
-  }
   const query = `limit=${THREAD_FETCH_LIMIT}`;
   const urls = [
     `${getBrowserBackendURL()}/v1/mailbox/threads/${encodeURIComponent(threadId)}?${query}`,

@@ -2,14 +2,12 @@
 
 import { useEffect, useState } from 'react';
 
-import { getDemoAppSession } from './demo-data';
-import { isDemoMode } from './demo-mode';
 import type { AppSessionStateResponse } from './types';
 
 const APP_SESSION_STORAGE_PREFIX = 'electronic-mail-app-session:v1:';
 const CURRENT_USER_STORAGE_KEY = 'electronic-mail-current-user:v1';
 
-let memorySession: AppSessionStateResponse | null = isDemoMode() ? getDemoAppSession() : null;
+let memorySession: AppSessionStateResponse | null = null;
 let inFlightRefresh: Promise<AppSessionStateResponse | null> | null = null;
 const listeners = new Set<() => void>();
 
@@ -82,7 +80,7 @@ export async function refreshAppSession(): Promise<AppSessionStateResponse | nul
 }
 
 export function clearAppSessionCache(): void {
-  memorySession = isDemoMode() ? getDemoAppSession() : null;
+  memorySession = null;
   try {
     for (let index = window.localStorage.length - 1; index >= 0; index -= 1) {
       const key = window.localStorage.key(index);
@@ -123,9 +121,6 @@ function dashboardItemCount(session: AppSessionStateResponse): number {
 }
 
 async function fetchAppSession(): Promise<AppSessionStateResponse> {
-  if (isDemoMode()) {
-    return getDemoAppSession();
-  }
   const response = await fetch('/api/app/session', {
     cache: 'no-store',
     credentials: 'include',
