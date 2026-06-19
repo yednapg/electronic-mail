@@ -3,7 +3,6 @@
 import { useEffect, useRef } from 'react';
 
 import { refreshAppSession } from './app-session-store';
-import { isDemoMode } from './demo-mode';
 
 const ACTIVE_SYNC_INTERVAL_MS = 30_000;
 const MIN_SYNC_GAP_MS = 12_000;
@@ -14,7 +13,7 @@ export function useActiveMailboxSync(enabled: boolean) {
   const refreshTimersRef = useRef<number[]>([]);
 
   useEffect(() => {
-    if (!enabled || isDemoMode()) {
+    if (!enabled) {
       return;
     }
 

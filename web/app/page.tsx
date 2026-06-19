@@ -4,15 +4,10 @@ import { redirect } from 'next/navigation';
 
 import { AppMark } from '../components/AppMark';
 import { getBackendURL, getDashboard, getLatestFirstRunImportJob } from '../lib/api';
-import { isDemoMode } from '../lib/demo-mode';
 import { getServerCookieHeader } from '../lib/server-cookies';
 import type { DashboardResponse } from '../lib/types';
 
 export default async function HomePage() {
-  if (isDemoMode()) {
-    redirect('/dashboard');
-  }
-
   let signInHref = `${getBackendURL()}/auth/google`;
   let dashboard: DashboardResponse | null = null;
   const cookie = await getServerCookieHeader();
