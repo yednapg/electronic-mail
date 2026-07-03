@@ -1,4 +1,5 @@
-import type { DashboardResponse, FeedItem, FeedResponse, GmailThreadRow, GmailViewResponse } from './types';
+import { mailboxFromSmartInbox } from './smart-inbox-view';
+import type { AppSessionStateResponse, DashboardResponse, FeedItem, FeedResponse, GmailThreadRow, GmailViewResponse } from './types';
 
 export type CommandKind = 'navigation' | 'work' | 'email' | 'action';
 
@@ -22,22 +23,22 @@ export type CommandIndexResponse = {
 const DEFAULT_RESULT_LIMIT = 8;
 const STATIC_COMMANDS: Array<Omit<CommandItem, 'searchText'>> = [
   {
-    id: 'nav:dashboard',
-    kind: 'navigation',
-    title: 'Dashboard',
-    subtitle: 'Go to current work',
-    keywords: ['home', 'today', 'now', 'work'],
-    priority: 20,
-    href: '/dashboard',
-  },
-  {
     id: 'nav:gmail',
     kind: 'navigation',
     title: 'Inbox',
-    subtitle: 'Open Gmail-style thread list',
-    keywords: ['gmail', 'mail', 'inbox', 'threads'],
-    priority: 24,
+    subtitle: 'Open organized email groups',
+    keywords: ['gmail', 'mail', 'inbox', 'threads', 'email'],
+    priority: 20,
     href: '/gmail',
+  },
+  {
+    id: 'nav:dashboard',
+    kind: 'navigation',
+    title: 'To-do',
+    subtitle: 'Open current work',
+    keywords: ['home', 'today', 'now', 'work', 'tasks'],
+    priority: 28,
+    href: '/dashboard',
   },
 ];
 
@@ -57,6 +58,21 @@ export function buildCommandIndex(
     generatedAt: typeof generatedAt === 'string' ? generatedAt : generatedAt.toISOString(),
     commands,
   };
+}
+
+export function buildCommandIndexFromAppSession(
+  session: AppSessionStateResponse | null,
+  generatedAt: Date | string = new Date(),
+): CommandIndexResponse {
+  if (session === null) {
+    return buildCommandIndex(null, generatedAt, null);
+  }
+
+  return buildCommandIndex(
+    session.dashboard,
+    generatedAt,
+    mailboxFromSmartInbox(session.smart_inbox, session.mailbox),
+  );
 }
 
 export function getStaticCommands(): CommandItem[] {
@@ -161,7 +177,7 @@ function toWorkCommand(
     id: `work:${item.id}`,
     kind: 'work',
     title,
-    subtitle: entityId ? `${sectionTitle} - Open related thread` : `${sectionTitle} - Open dashboard`,
+    subtitle: entityId ? `${sectionTitle} - Open related thread` : `${sectionTitle} - Open To-do`,
     keywords: keywordsForItem(item, sectionTitle),
     priority,
     href,
@@ -182,15 +198,14 @@ function toGmailThreadCommand(
   }
 
   indexedThreadIds.add(threadId);
-  const subject = compactText(row.latest_subject || row.summary || row.snippet || 'Untitled email', 92);
+  const subject = compactText(row.title || row.ai_title || row.latest_subject || 'Untitled email', 92);
   const sender = compactText(formatSender(row.latest_sender), 56);
-  const preview = compactText(row.summary || row.snippet || '', 120);
 
   return withSearchText({
     id: `email:${threadId}`,
     kind: 'email',
     title: `${sender}: ${subject}`,
-    subtitle: preview ? `${sectionTitle} - ${preview}` : `${sectionTitle} - Open email`,
+    subtitle: `${sectionTitle} - Open email`,
     keywords: [
       'gmail',
       'mail',
@@ -198,10 +213,10 @@ function toGmailThreadCommand(
       'email',
       sectionTitle,
       threadId,
+      row.title ?? '',
+      row.ai_title ?? '',
       row.latest_subject ?? '',
       row.latest_sender ?? '',
-      row.summary ?? '',
-      row.snippet ?? '',
       ...row.participants,
     ],
     priority,

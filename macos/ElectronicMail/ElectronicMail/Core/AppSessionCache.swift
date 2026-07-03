@@ -49,21 +49,21 @@ public final class AppSessionCache {
             return next
         }
 
-        let currentDashboardCount = current.dashboard.feed.now.count
-            + current.dashboard.feed.today.count
-            + current.dashboard.feed.worthKnowing.count
-        let nextDashboardCount = next.dashboard.feed.now.count
-            + next.dashboard.feed.today.count
-            + next.dashboard.feed.worthKnowing.count
-        let dashboard = !allowEmptyDashboard && currentDashboardCount > 0 && nextDashboardCount == 0 ? current.dashboard : next.dashboard
         let mailbox = !current.mailbox.isEmpty && next.mailbox.isEmpty ? current.mailbox : next.mailbox
+        let keepCurrentSmartProjection = current.smartInbox?.isEmpty == false && next.smartInbox?.isEmpty != false
+        let smartInbox = keepCurrentSmartProjection ? current.smartInbox : next.smartInbox
+        let smartWorkQueue = keepCurrentSmartProjection && current.smartWorkQueue?.hasOpenItems == true && next.smartWorkQueue?.hasOpenItems != true ? current.smartWorkQueue : next.smartWorkQueue
+        let smartReadiness = keepCurrentSmartProjection ? current.smartReadiness : next.smartReadiness
 
         return AppSessionResponse(
             user: next.user,
             readiness: next.readiness,
-            dashboard: dashboard,
+            dashboard: next.dashboard,
             mailbox: mailbox,
-            sync: next.sync
+            sync: next.sync,
+            smartInbox: smartInbox,
+            smartWorkQueue: smartWorkQueue,
+            smartReadiness: smartReadiness
         )
     }
 

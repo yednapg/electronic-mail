@@ -31,6 +31,30 @@ final class ModelDecodingTests: XCTestCase {
         )
 
         XCTAssertFalse(model.hasSummary)
+        XCTAssertEqual(model.controlTitle, "Generate summary")
+        XCTAssertNil(model.visibleSummary)
+    }
+
+    func testReaderSummaryDisclosureShowsGenerateStateBeforeSummaryExists() {
+        let model = EmailReaderSummaryDisclosureModel(
+            summary: nil,
+            isExpanded: false
+        )
+
+        XCTAssertFalse(model.hasSummary)
+        XCTAssertEqual(model.controlTitle, "Generate summary")
+        XCTAssertNil(model.visibleSummary)
+    }
+
+    func testReaderSummaryDisclosureShowsLoadingStateWhileGenerating() {
+        let model = EmailReaderSummaryDisclosureModel(
+            summary: nil,
+            isExpanded: true,
+            isLoading: true
+        )
+
+        XCTAssertFalse(model.hasSummary)
+        XCTAssertEqual(model.controlTitle, "Generating summary...")
         XCTAssertNil(model.visibleSummary)
     }
 
@@ -222,6 +246,61 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(row.childRows, [])
     }
 
+    func testMailboxRowTitleDoesNotFallBackToSummaryOrSnippet() {
+        let row = GmailThreadRow(
+            threadID: "group-1",
+            entityID: "group-1",
+            title: nil,
+            href: "/v1/mailbox/threads/group-1",
+            latestSourceRecordID: "msg-1",
+            latestReceivedAt: "2026-05-23T12:00:00+00:00",
+            latestMessageAt: "2026-05-23T12:00:00+00:00",
+            latestSubject: nil,
+            latestSender: "Sender <sender@example.com>",
+            sender: "Sender <sender@example.com>",
+            participants: ["Sender"],
+            messageCount: 1,
+            summary: "This is body-derived summary text that must not become the inbox title.",
+            aiGroupID: nil,
+            aiTitle: nil,
+            aiSummary: nil,
+            snippet: "This is a raw Gmail body snippet that must not become the inbox title.",
+            labelIDs: ["INBOX"],
+            labels: ["INBOX"],
+            unread: false,
+            actionNeeded: false,
+            actionType: "open",
+            actionTypeKey: "open",
+            priority: 20,
+            dashboardVisible: true,
+            currentState: .waiting,
+            lifecycleState: "active",
+            outcomeType: nil,
+            lifecycleUpdates: [],
+            enrichmentStatus: "ready"
+        )
+
+        XCTAssertEqual(row.displayTitle, "Untitled mail")
+        XCTAssertEqual(row.displaySummary, "This is body-derived summary text that must not become the inbox title.")
+    }
+
+    func testMailboxChildTitleDoesNotFallBackToSnippet() {
+        let row = GmailThreadChildRow(
+            messageID: "msg-1",
+            gmailThreadID: "thread-1",
+            sender: "Sender <sender@example.com>",
+            subject: nil,
+            aiTitle: nil,
+            snippet: "This raw child body snippet must not become the inbox title.",
+            receivedAt: "2026-05-23T12:00:00+00:00",
+            labelIDs: ["INBOX"],
+            labels: ["INBOX"],
+            unread: false
+        )
+
+        XCTAssertEqual(row.displayTitle, "Untitled mail")
+    }
+
     func testMailboxRowDecodesLightweightChildren() throws {
         let data = """
         {
@@ -345,7 +424,7 @@ final class ModelDecodingTests: XCTestCase {
           "total_threads": 273,
           "next_cursor": "cursor-2",
           "loaded_threads": 100,
-          "window_days": 90,
+          "window_days": 30,
           "sections": [],
           "full_import_running": true,
           "full_import_completed": false
@@ -356,7 +435,7 @@ final class ModelDecodingTests: XCTestCase {
 
         XCTAssertEqual(mailbox.nextCursor, "cursor-2")
         XCTAssertEqual(mailbox.loadedThreads, 100)
-        XCTAssertEqual(mailbox.windowDays, 90)
+        XCTAssertEqual(mailbox.windowDays, 30)
         XCTAssertEqual(mailbox.totalThreads, 273)
     }
 

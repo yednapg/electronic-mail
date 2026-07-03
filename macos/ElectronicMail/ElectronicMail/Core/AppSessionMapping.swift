@@ -7,7 +7,10 @@ extension AppSessionResponse {
             readiness: readiness,
             dashboard: dashboard.replacingFeed(transform(dashboard.feed)),
             mailbox: mailbox,
-            sync: sync
+            sync: sync,
+            smartInbox: smartInbox,
+            smartWorkQueue: smartWorkQueue,
+            smartReadiness: smartReadiness
         )
     }
 
@@ -17,7 +20,10 @@ extension AppSessionResponse {
             readiness: readiness,
             dashboard: dashboard,
             mailbox: mailbox.replacingRows(transform),
-            sync: sync
+            sync: sync,
+            smartInbox: smartInbox,
+            smartWorkQueue: smartWorkQueue,
+            smartReadiness: smartReadiness
         )
     }
 }
@@ -131,7 +137,9 @@ extension MailboxResponse {
         var rowsBySection = Dictionary(uniqueKeysWithValues: firstPage.sections.map { ($0.id, $0.rows) })
         var titlesBySection = Dictionary(uniqueKeysWithValues: firstPage.sections.map { ($0.id, $0.title) })
         var seenRowKeys = Set<String>()
-        firstPage.sections.flatMap(\.rows).forEach { Self.insertMergeKeys(for: $0, into: &seenRowKeys) }
+        let firstPageRows = firstPage.sections.flatMap(\.rows)
+        firstPageRows.forEach { Self.insertMergeKeys(for: $0, into: &seenRowKeys) }
+        let firstPageOldestDate = firstPageRows.map(Self.sortDate(for:)).min()
 
         for section in sections {
             if rowsBySection[section.id] == nil {
@@ -139,7 +147,12 @@ extension MailboxResponse {
                 rowsBySection[section.id] = []
                 titlesBySection[section.id] = section.title
             }
-            let preservedRows = section.rows.filter { Self.insertMergeKeysIfUnique(for: $0, into: &seenRowKeys) }
+            let preservedRows = section.rows.filter { row in
+                if let firstPageOldestDate, Self.sortDate(for: row) >= firstPageOldestDate {
+                    return false
+                }
+                return Self.insertMergeKeysIfUnique(for: row, into: &seenRowKeys)
+            }
             rowsBySection[section.id, default: []].append(contentsOf: preservedRows)
         }
 

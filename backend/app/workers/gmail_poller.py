@@ -11,6 +11,7 @@ from uuid import uuid4
 from app.core.config import load_settings
 from app.db.jobs import enqueue_job, renew_heartbeat
 from app.db.mail_groups import get_import_state, list_connected_gmail_user_ids
+from app.services.gmail_importer import FIRST_BATCH_SIZE
 
 STOP = False
 WATCH_EXPIRY_GRACE = timedelta(minutes=5)
@@ -52,7 +53,7 @@ def poll_once(settings, *, worker_id: str = "gmail-poller") -> int:
                 user_id=user_id,
                 dedupe_key=f"gmail-poll-import:{user_id}",
                 priority=80,
-                payload={"user_id": user_id, "batch_size": 50, "first_run": state is None},
+                payload={"user_id": user_id, "batch_size": FIRST_BATCH_SIZE, "first_run": state is None},
             )
             queued += 1
             continue

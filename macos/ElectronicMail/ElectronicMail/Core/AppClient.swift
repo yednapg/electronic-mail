@@ -7,7 +7,9 @@ public enum APIError: Error, Equatable {
 }
 
 public enum AppRunMode: String, Equatable {
+    #if DEBUG
     case demo
+    #endif
     case localBackend
 }
 
@@ -86,6 +88,7 @@ public protocol AppClient: AnyObject {
     func appSession() async throws -> AppSessionResponse
     func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse
     func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse
+    func threadSummary(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse
     func mailboxSyncState() async throws -> MailboxSyncStateResponse
     func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse
     func syncMailboxNow() async throws -> MailboxSyncTriggerResponse
@@ -102,6 +105,10 @@ public protocol AppClient: AnyObject {
 }
 
 public extension AppClient {
+    func threadSummary(threadID: String, limit: Int = 50, offset: Int = 0) async throws -> ThreadReaderResponse {
+        try await thread(threadID: threadID, limit: limit, offset: offset)
+    }
+
     func mailboxSyncState() async throws -> MailboxSyncStateResponse {
         throw APIError.httpStatus(501)
     }
@@ -160,6 +167,17 @@ public final class LiveBackendAppClient: AppClient {
             queryItems: [
                 URLQueryItem(name: "limit", value: String(limit)),
                 URLQueryItem(name: "offset", value: String(offset)),
+            ]
+        )
+    }
+
+    public func threadSummary(threadID: String, limit: Int = 50, offset: Int = 0) async throws -> ThreadReaderResponse {
+        try await request(
+            path: "/v1/mailbox/threads/\(threadID.urlPathEncoded)",
+            queryItems: [
+                URLQueryItem(name: "limit", value: String(limit)),
+                URLQueryItem(name: "offset", value: String(offset)),
+                URLQueryItem(name: "include_summary", value: "true"),
             ]
         )
     }

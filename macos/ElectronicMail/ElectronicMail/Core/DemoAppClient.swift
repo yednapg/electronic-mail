@@ -1,5 +1,6 @@
 import Foundation
 
+#if DEBUG
 public final class DemoAppClient: AppClient {
     public var baseURL: URL
     public var sessionToken: String?
@@ -598,3 +599,4 @@ enum DemoAppFixtures {
         )
     }
 }
+#endif

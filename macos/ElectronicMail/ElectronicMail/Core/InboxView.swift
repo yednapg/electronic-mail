@@ -34,12 +34,20 @@ public struct InboxView: View {
                         thread: store.readerThread,
                         row: store.readerRow,
                         errorMessage: store.readerError,
+                        summaryLoading: store.readerSummaryLoading,
+                        summaryError: store.readerSummaryError,
+                        canRequestSummary: store.readerThread != nil,
                         currentUserDisplayName: store.session?.user.displayName ?? store.session?.user.firstName,
                         currentUserEmail: store.session?.user.email,
                         colorScheme: colorScheme,
                         onRetry: {
                             Task {
                                 await store.prefetchThread(threadID: readerThreadID, force: true, silent: false)
+                            }
+                        },
+                        onRequestSummary: {
+                            Task {
+                                await store.requestReaderSummary(threadID: readerThreadID)
                             }
                         },
                         onReply: { onReply(readerThreadID) },
@@ -297,7 +305,7 @@ public struct InboxView: View {
 
             for row in section.rows {
                 let rowStart = y
-                let rowEnd = rowStart + ElectronicMailTypography.bodyLineHeight
+                let rowEnd = rowStart + metrics.rowHeight(for: row)
 
                 if row.id == rowID {
                     return rowStart..<rowEnd
@@ -314,7 +322,9 @@ public struct InboxView: View {
         store.sections.enumerated().reduce(CGFloat(0)) { height, indexedSection in
             height
                 + metrics.sectionHeaderHeight(isFirst: indexedSection.offset == 0)
-                + CGFloat(indexedSection.element.rows.count) * ElectronicMailTypography.bodyLineHeight
+                + indexedSection.element.rows.reduce(CGFloat(0)) { rowHeight, row in
+                    rowHeight + metrics.rowHeight(for: row)
+                }
         }
     }
 }
@@ -797,7 +807,7 @@ private enum ElectronicMailTypography {
     static let iconSize = ElectronicMailType.iconSize
 }
 
-private struct InboxLayoutMetrics {
+struct InboxLayoutMetrics {
     let windowSize: CGSize
 
     let timeWidth: CGFloat = 190
@@ -892,9 +902,15 @@ private struct InboxLayoutMetrics {
     func sectionHeaderHeight(isFirst: Bool) -> CGFloat {
         sectionTopSpacing(isFirst: isFirst) + ElectronicMailTypography.bodyLineHeight + 3
     }
+
+    func rowHeight(for _: InboxRowViewModel) -> CGFloat {
+        ElectronicMailTypography.bodyLineHeight
+    }
 }
 
+#if DEBUG
 #Preview {
     InboxView(store: InboxStore(client: DemoAppClient()))
         .frame(width: 1440, height: 900)
 }
+#endif

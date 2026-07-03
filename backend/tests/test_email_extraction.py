@@ -74,6 +74,101 @@ class EmailExtractionTests(unittest.TestCase):
 
         self.assertEqual(parsed["extracted_signals"]["ticket_id"], "106756996")
 
+    def test_fx_retail_trade_number_extracts_trade_id_from_body(self) -> None:
+        parsed = parse_gmail_message(
+            {
+                "id": "msg-fx-retail-trade",
+                "threadId": "thread-fx-retail-trade",
+                "labelIds": ["INBOX"],
+                "snippet": "Please find the details of the trade executed through FX Retail platform.",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": "FX-Retail - Trade Confirmation of TestUser | INPP29022231",
+                        },
+                        {
+                            "name": "From",
+                            "value": "FxNoReply@ccilindia.co.in",
+                        },
+                    ],
+                    "mimeType": "text/plain",
+                    "body": {
+                        "data": encoded(
+                            "FX-Retail Trade No. 202606029000072\n"
+                            "Relationship Bank Northstar BANK LIMITED\n"
+                            "Bharat Connect Transaction ID AX9961531be30f8f4ec8\n"
+                        )
+                    },
+                },
+            },
+            user_id="user-1",
+        )
+
+        self.assertEqual(parsed["extracted_signals"]["trade_id"], "202606029000072")
+
+    def test_credit_dispute_reference_extracts_dispute_id(self) -> None:
+        parsed = parse_gmail_message(
+            {
+                "id": "msg-cibil-dispute",
+                "threadId": "thread-cibil-dispute",
+                "labelIds": ["INBOX"],
+                "snippet": "Dispute ID P20052026334071 is under review.",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": "Dispute Status Update -P20052026334071",
+                        },
+                        {
+                            "name": "From",
+                            "value": "TransUnion <info@cibildisputesalert.transunion.com>",
+                        },
+                    ],
+                    "mimeType": "text/plain",
+                    "body": {
+                        "data": encoded(
+                            "Dear Customer,\n"
+                            "We have an update on the dispute you submitted.\n"
+                            "Dispute ID P20052026334071\n"
+                        )
+                    },
+                },
+            },
+            user_id="user-1",
+        )
+
+        self.assertEqual(parsed["extracted_signals"]["dispute_id"], "p20052026334071")
+
+    def test_credit_dispute_subject_reference_extracts_dispute_id(self) -> None:
+        parsed = parse_gmail_message(
+            {
+                "id": "msg-cibil-dispute-subject",
+                "threadId": "thread-cibil-dispute-subject",
+                "labelIds": ["INBOX"],
+                "snippet": "Here is a list of disputes which are open under review.",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": "Dispute Interim Update -P20052026334071",
+                        },
+                        {
+                            "name": "From",
+                            "value": "TransUnion <info@cibildisputesalert.transunion.com>",
+                        },
+                    ],
+                    "mimeType": "text/plain",
+                    "body": {
+                        "data": encoded("Here is a list of disputes which are open under review.")
+                    },
+                },
+            },
+            user_id="user-1",
+        )
+
+        self.assertEqual(parsed["extracted_signals"]["dispute_id"], "p20052026334071")
+
     def test_html_is_preserved_for_reader_when_gmail_supplies_html(self) -> None:
         rich_html = """
         <html><head><style>.headline { font-family: Arial; font-size: 32px; }</style></head><body>

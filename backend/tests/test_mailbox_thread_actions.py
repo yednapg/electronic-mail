@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
-from app.db.mail_groups import GmailMessageRecord, MailGroupDetail, MailGroupRecord, PendingThreadActionRecord
+from app.db.mail_groups import GmailMessageRecord, MailGroupDetail, MailGroupRecord, PendingThreadActionRecord, SmartInboxRowRecord
 from app.main import app
 from app.services.mailbox_actions import enqueue_thread_action, run_pending_thread_action
 
@@ -154,6 +154,57 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         self.assertEqual([call.args[1] for call in archive.call_args_list], ["thread-a", "thread-b"])
         mark_applied.assert_called_once_with("postgresql://example/db", user_id="user-1", server_action_id="server-1")
         refresh.assert_called_once_with(settings, user_id="user-1", priority=10)
+
+    def test_worker_resolves_smart_row_reader_to_source_gmail_thread_ids(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        record = replace(pending_action(action="mark_read"), mailbox_thread_id="smart-row:smart-row-northstar-wire")
+        applied = replace(record, state="applied", applied_at="2026-05-21T09:01:00+00:00")
+        smart_row = SmartInboxRowRecord(
+            id="user-1:smart-row-northstar-wire",
+            public_id="smart-row-northstar-wire",
+            user_id="user-1",
+            row_key="mail-object:northstar-wire",
+            row_type="verified_group",
+            title="Wire transfer status with Northstar Bank",
+            summary="Two Northstar emails track the same wire transfer.",
+            source_thread_ids=["thread-wire", "thread-reply"],
+            source_message_ids=["msg-wire", "msg-reply"],
+            latest_message_at="2026-06-07T11:00:00+00:00",
+            latest_message_id="msg-reply",
+            action_type="review",
+        )
+        messages_by_thread = {
+            "thread-wire": [sample_message("msg-wire", "thread-wire")],
+            "thread-reply": [sample_message("msg-reply", "thread-reply")],
+        }
+
+        def thread_messages(_database_url: str, *, user_id: str, gmail_thread_id: str):
+            self.assertEqual(user_id, "user-1")
+            return messages_by_thread.get(gmail_thread_id, [])
+
+        with patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record), patch(
+            "app.services.mailbox_actions.mark_pending_thread_action_applying"
+        ), patch(
+            "app.services.mailbox_actions.get_smart_inbox_row",
+            return_value=smart_row,
+        ) as get_row, patch(
+            "app.services.mailbox_actions.list_messages_by_ids",
+            return_value=[],
+        ), patch(
+            "app.services.mailbox_actions.list_messages_for_gmail_thread",
+            side_effect=thread_messages,
+        ), patch(
+            "app.services.mailbox_actions.mark_gmail_thread_read"
+        ) as mark_read, patch(
+            "app.services.mailbox_actions.mark_pending_thread_action_applied", return_value=applied
+        ), patch(
+            "app.services.mailbox_actions.enqueue_projection_refresh"
+        ):
+            response = run_pending_thread_action(settings, user_id="user-1", server_action_id="server-1")
+
+        self.assertEqual(response.state, "applied")
+        get_row.assert_called_once_with("postgresql://example/db", user_id="user-1", row_id="smart-row-northstar-wire")
+        self.assertEqual([call.args[1] for call in mark_read.call_args_list], ["thread-reply", "thread-wire"])
 
     def test_worker_resolves_canonical_gmail_thread_before_legacy_group_lookup(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")

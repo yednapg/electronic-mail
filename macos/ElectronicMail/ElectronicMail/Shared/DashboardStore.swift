@@ -97,7 +97,7 @@ public final class DashboardStore: ObservableObject {
 
     public func load() async {
         guard hasSessionToken else {
-            phase = .failed("Sign in with Google to load your dashboard.")
+            phase = .failed("Sign in with Google to load your inbox.")
             return
         }
 
@@ -114,7 +114,7 @@ public final class DashboardStore: ObservableObject {
 
     public func refresh() async {
         guard hasSessionToken else {
-            phase = .failed("Sign in with Google to load your dashboard.")
+            phase = .failed("Sign in with Google to load your inbox.")
             return
         }
 
@@ -139,10 +139,10 @@ public final class DashboardStore: ObservableObject {
             refreshFailed = true
             if session == nil, let cached = sessionCache.read() {
                 session = cached
-                rebuildSnapshot(refreshWarning: "Dashboard could not refresh. Showing last saved state.")
+                rebuildSnapshot(refreshWarning: "Inbox could not refresh. Showing last saved state.")
                 phase = .loaded
             } else if session != nil {
-                rebuildSnapshot(refreshWarning: "Dashboard could not refresh. Showing last saved state.")
+                rebuildSnapshot(refreshWarning: "Inbox could not refresh. Showing last saved state.")
                 phase = .loaded
             } else {
                 phase = .failed(error.localizedDescription)
@@ -167,7 +167,7 @@ public final class DashboardStore: ObservableObject {
     public func dismissItem(_ itemID: String) {
         hiddenItemIDs.insert(itemID)
         actionStates[itemID] = .done
-        rebuildSnapshot(refreshWarning: refreshFailed ? "Dashboard could not refresh. Showing last saved state." : nil)
+        rebuildSnapshot(refreshWarning: refreshFailed ? "Inbox could not refresh. Showing last saved state." : nil)
     }
 
     public func openThread(for item: DashboardSectionItemViewModel) async {
@@ -177,7 +177,7 @@ public final class DashboardStore: ObservableObject {
 
     public func openThread(for row: MobileInboxRowViewModel) async {
         selectedItemID = row.id
-        await openThread(entityID: row.id)
+        await openThread(entityID: row.threadID)
     }
 
     public func clearSelectedThread() {
@@ -261,7 +261,7 @@ public final class DashboardStore: ObservableObject {
             hiddenItemIDs: hiddenItemIDs,
             refreshWarning: refreshWarning
         )
-        inboxSnapshot = MobileInboxViewModelBuilder.snapshot(from: session.mailbox)
+        inboxSnapshot = MobileInboxViewModelBuilder.snapshot(from: session)
     }
 }
 

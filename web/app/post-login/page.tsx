@@ -12,7 +12,7 @@ export default async function PostLoginPage() {
   }
 
   return (
-    <main className="post-login-page" aria-label="Preparing your dashboard">
+    <main className="post-login-page" aria-label="Preparing your inbox">
       <section className="post-login-shell">
         <div className="post-login-copy">
           <RotatingStatus />

@@ -5,7 +5,7 @@ private enum RootStage {
     case restoring
     case signedOut
     case importing
-    case dashboard
+    case app
 }
 
 struct ElectronicMailiOSRootView: View {
@@ -23,7 +23,7 @@ struct ElectronicMailiOSRootView: View {
         Group {
             switch stage {
             case .restoring:
-                ProgressView("Opening dashboard")
+                ProgressView("Opening inbox")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .task {
                         await restoreSession()
@@ -38,7 +38,7 @@ struct ElectronicMailiOSRootView: View {
                 )
             case .importing:
                 ImportProgressView(startedAt: importStartedAt)
-            case .dashboard:
+            case .app:
                 DashboardScreen(
                     store: store,
                     onSignOut: {
@@ -48,7 +48,7 @@ struct ElectronicMailiOSRootView: View {
             }
         }
         .onChange(of: scenePhase) { _, nextPhase in
-            guard nextPhase == .active, stage == .dashboard else {
+            guard nextPhase == .active, stage == .app else {
                 return
             }
             Task { await store.refresh() }
@@ -73,7 +73,7 @@ struct ElectronicMailiOSRootView: View {
             return
         }
 
-        stage = .dashboard
+        stage = .app
     }
 
     @MainActor
@@ -109,7 +109,7 @@ struct ElectronicMailiOSRootView: View {
 
             AppHaptics.success()
             withAnimation(.easeInOut(duration: 0.45)) {
-                stage = .dashboard
+                stage = .app
             }
         } catch {
             tokenStore.clear()
@@ -166,7 +166,7 @@ private struct SignInView: View {
                 .font(.system(size: 64))
                 .accessibilityHidden(true)
 
-                Text("Turn your emails into to-do's!")
+                Text("Electronic Mail")
                     .font(.system(size: 31, weight: .bold, design: .rounded))
                     .multilineTextAlignment(.center)
                     .foregroundStyle(IOSMailSurface.primaryText(for: colorScheme))
@@ -233,8 +233,8 @@ private struct ImportProgressView: View {
     private let steps = [
         "Importing emails ...",
         "Grouping related emails ...",
-        "Finding to-do items ...",
-        "Building dashboard ...",
+        "Writing useful titles ...",
+        "Preparing your inbox ...",
         "Almost ready!",
     ]
 
