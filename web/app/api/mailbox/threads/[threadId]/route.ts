@@ -14,9 +14,10 @@ export async function GET(request: Request, { params }: MailboxThreadRouteContex
   const searchParams = new URL(request.url).searchParams;
   const limit = parseBoundedInteger(searchParams.get('limit'), 25, 1, 100);
   const offset = parseBoundedInteger(searchParams.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
+  const includeSummary = searchParams.get('include_summary') === 'true';
   const cookie = getRequestCookieHeader(request);
   const authPromise = requireConnectedGoogleAccount(request);
-  const threadPromise = getMailboxThread(threadId, { limit, offset }, { cookie });
+  const threadPromise = getMailboxThread(threadId, { limit, offset, includeSummary }, { cookie });
   const unauthorized = await authPromise;
   if (unauthorized) {
     void threadPromise.catch(() => {});

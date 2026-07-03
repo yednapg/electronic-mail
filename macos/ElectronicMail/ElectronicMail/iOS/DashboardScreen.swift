@@ -4,7 +4,7 @@ import SwiftUI
 struct DashboardScreen: View {
     @ObservedObject var store: DashboardStore
     let onSignOut: () -> Void
-    @State private var selectedMode: DashboardMode = .todo
+    @State private var selectedMode: DashboardMode = .inbox
 
     var body: some View {
         NavigationStack {
@@ -20,14 +20,14 @@ struct DashboardScreen: View {
     private var content: some View {
         switch store.phase {
         case .idle, .loading:
-            ProgressView("Loading dashboard")
+            ProgressView("Loading inbox")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .task {
                     await store.load()
                 }
         case .failed(let message):
             ContentUnavailableView(
-                "Dashboard unavailable",
+                "Inbox unavailable",
                 systemImage: "exclamationmark.triangle",
                 description: Text(message)
             )
@@ -45,7 +45,7 @@ struct DashboardScreen: View {
                     onSignOut: onSignOut
                 )
             } else {
-                ContentUnavailableView("Dashboard is empty", systemImage: "tray")
+                ContentUnavailableView("Inbox is empty", systemImage: "tray")
             }
         }
     }

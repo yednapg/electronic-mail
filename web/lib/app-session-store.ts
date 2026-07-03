@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 
 import type { AppSessionStateResponse } from './types';
+import { hasSmartInboxRows } from './smart-inbox-view';
 
 const APP_SESSION_STORAGE_PREFIX = 'decision-pipeline-app-session:v1:';
 const CURRENT_USER_STORAGE_KEY = 'decision-pipeline-current-user:v1';
@@ -92,7 +93,7 @@ export function clearAppSessionCache(): void {
   notify();
 }
 
-function mergeAppSession(
+export function mergeAppSession(
   current: AppSessionStateResponse | null,
   next: AppSessionStateResponse,
 ): AppSessionStateResponse {
@@ -100,24 +101,15 @@ function mergeAppSession(
     return next;
   }
 
-  const currentDashboardCount = dashboardItemCount(current);
-  const nextDashboardCount = dashboardItemCount(next);
   const currentMailboxCount = current.mailbox.total_threads;
   const nextMailboxCount = next.mailbox.total_threads;
+  const keepCurrentSmartInbox = hasSmartInboxRows(current.smart_inbox) && !hasSmartInboxRows(next.smart_inbox);
 
   return {
     ...next,
-    dashboard: currentDashboardCount > 0 && nextDashboardCount === 0 ? current.dashboard : next.dashboard,
     mailbox: currentMailboxCount > 0 && nextMailboxCount === 0 ? current.mailbox : next.mailbox,
+    smart_inbox: keepCurrentSmartInbox ? current.smart_inbox : next.smart_inbox,
   };
-}
-
-function dashboardItemCount(session: AppSessionStateResponse): number {
-  return (
-    session.dashboard.feed.now.length
-    + session.dashboard.feed.today.length
-    + session.dashboard.feed.worth_knowing.length
-  );
 }
 
 async function fetchAppSession(): Promise<AppSessionStateResponse> {

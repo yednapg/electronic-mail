@@ -16,6 +16,7 @@ from typing import Any
 
 from app.db.mail_groups import GmailMessageRecord
 from app.services.email_extraction import compact_text, sender_domain
+from app.services.mail_group_config import MAILBOX_TASK_REFERENCE_SIGNALS
 
 
 CLASSIFICATION_VERSION = "attention_classifier_v1"
@@ -23,11 +24,11 @@ CLASSIFICATION_VERSION = "attention_classifier_v1"
 ACTION_TYPES = {"pay", "reply", "confirm", "track", "review", "open", "none"}
 TIMING_BANDS = {"now", "today", "later", "hidden"}
 
-REFERENCE_SIGNAL_NAMES = ["order_id", "ticket_id", "tracking_id", "invoice_id", "booking_id", "application_id"]
+REFERENCE_SIGNAL_NAMES = list(MAILBOX_TASK_REFERENCE_SIGNALS)
 
 FAMILY_PATTERNS: dict[str, re.Pattern[str]] = {
     "financial_transfer": re.compile(r"(?i)\b(fx[- ]?retail|forex|wire transfer|international wire|outward remittance|remittance|swift payment|trade confirmation|trade summary)\b"),
-    "support_case": re.compile(r"(?i)\b(service request|support case|case reference|ticket|grievance|complaint|inquiry|query)\b"),
+    "support_case": re.compile(r"(?i)\b(service request|support case|case reference|ticket|grievance|complaint|dispute|inquiry|query)\b"),
     "application": re.compile(r"(?i)\b(application|admission|reconsideration|financial aid|estimated costs)\b"),
     "billing": re.compile(r"(?i)\b(invoice|statement|payment|billing|subscription|renewal|card consent)\b"),
     "account_security": re.compile(r"(?i)\b(sign[ -]?in|login|security alert|verification code|otp|account access|password)\b"),
@@ -45,7 +46,10 @@ ACTION_REQUIRED_RE = re.compile(
 TERMINAL_RE = re.compile(r"(?i)\b(processed|resolved|completed|closed|settled|approved|delivered|sent successfully|made available|received and is now available)\b")
 WAITING_RE = re.compile(r"(?i)\b(acknowledged|registered|we'?ll respond|will respond|working on it|under review|in progress|pending review|expected update|resolution by)\b")
 STALE_SECURITY_RE = re.compile(r"(?i)\b(sign[ -]?in|login|verification code|otp|security alert)\b")
-REFERENCE_RE = re.compile(r"(?i)\b(?:case reference(?: no\.?| number)?|reference(?: no\.?| number)?|service request|ticket|case|trade no|trade number|ccil reference number|application id|dispute|order|invoice)[:#\s.-]*([a-z]{0,8}\d[a-z0-9-]{4,})\b")
+REFERENCE_RE = re.compile(r"(?i)\b(?:case reference(?: no\.?| number)?|reference(?: no\.?| number)?|service request|ticket|case|trade no|trade number|application id|dispute|order|invoice)[:#\s.-]*([a-z]{0,8}\d[a-z0-9-]{4,})\b")
+DISPUTE_REFERENCE_RE = re.compile(
+    r"(?ix)\bdispute(?:\s*(?:id|number|no\.?|\#)\s*[:\#.-]?|\s+(?:acknowledgement|status\s+update|interim\s+update)\s*[-:])\s*([a-z]{0,8}\d[a-z0-9-]{4,})\b"
+)
 MONEY_RE = re.compile(r"(?i)(?:₹|rs\.?|inr|usd|\$|eur|gbp)\s?[0-9][0-9,]*(?:\.[0-9]{1,2})?")
 DATE_HINT_RE = re.compile(r"(?i)\b(?:by|before|on|due)\s+([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4}|[0-9]{4}-[0-9]{2}-[0-9]{2})\b")
 REJECTION_RE = re.compile(r"(?i)\b(rejected|not selected|not be selected|unable to offer|regret to inform|declined|unsuccessful)\b")
@@ -243,14 +247,16 @@ def attention_enrichment_payload(
     facts, classification = classify_with_ai_output(messages, ai_output)
     policy = apply_attention_policy(classification, facts)
     latest = latest_message(messages)
+    summary_hint = compact_text(str((ai_output or {}).get("ai_summary") or ""))
     title = _quality_title(
         ai_output=(ai_output or {}).get("ai_title"),
         message_title=latest.ai_title,
         subject=latest.subject,
         classification=classification,
         facts=facts,
+        context=summary_hint,
     )[:180]
-    summary = compact_text(str((ai_output or {}).get("ai_summary") or latest.snippet or latest.text_body or classification.reason or title))[:1200]
+    summary = compact_text(str(summary_hint or latest.snippet or latest.text_body or classification.reason or title))[:1200]
     labels = sorted(set(_string_list((ai_output or {}).get("labels")) + facts.labels + [classification.workflow_family, classification.workflow_state]))[:16]
     return {
         "group_type": classification.workflow_family,
@@ -276,20 +282,16 @@ def attention_enrichment_payload(
     }
 
 
-def workflow_cluster_key(group_type: str, classification_json: dict[str, Any], latest_at: str | None) -> str | None:
+def workflow_cluster_key(group_type: str, classification_json: dict[str, Any], _latest_at: str | None) -> str | None:
     classification = classification_json if isinstance(classification_json, dict) else {}
     facts = classification.get("facts") if isinstance(classification.get("facts"), dict) else {}
     family = str(classification.get("workflow_family") or group_type or "other")
     if family in {"other", "marketing", "newsletter"}:
         return None
     provider = str(facts.get("provider") or "unknown")
-    if family == "financial_transfer":
-        return f"{family}:window:{provider}:{_week_key(latest_at)}"
     reference = str(classification.get("reference_id") or facts.get("reference_id") or "").strip()
     if reference:
-        return f"{family}:ref:{_slug(reference)}"
-    if family in {"application", "account_security", "logistics"}:
-        return f"{family}:window:{provider}:{_week_key(latest_at)}"
+        return f"ref:{_slug(provider)}:{_slug(reference)}"
     return None
 
 
@@ -420,16 +422,23 @@ def _classification_reason(*, family: str, state: str, facts: WorkflowFacts) -> 
 
 
 def _policy_action_type(classification: WorkflowClassification, facts: WorkflowFacts) -> str:
-    text = facts.text.lower()
-    if classification.workflow_family == "billing" or "pay" in text or "payment failed" in text or "invoice" in text:
+    text = _action_intent_text(facts.text)
+    if classification.workflow_family == "billing" or re.search(r"\b(?:pay|payment|invoice|overdue)\b", text):
         return "pay"
-    if "reply" in text or "respond" in text:
+    if re.search(r"\b(?:reply|respond)\b", text):
         return "reply"
-    if "confirm" in text or "approve" in text or "rsvp" in text or "verify" in text:
+    if re.search(r"\b(?:confirm|approve|rsvp|verify)\b", text):
         return "confirm"
     if classification.workflow_family == "logistics":
         return "track"
     return "review"
+
+
+def _action_intent_text(value: str) -> str:
+    text = value.lower()
+    text = re.sub(r"\b[\w.+%-]+@[\w.-]+\.[a-z]{2,}\b", " ", text)
+    text = re.sub(r"\b(?:do[-_ ]?not[-_ ]?reply|donotreply|no[-_ ]?reply|noreply)\b", " ", text)
+    return text
 
 
 def _stale_security_awareness(classification: WorkflowClassification, facts: WorkflowFacts) -> bool:
@@ -463,6 +472,9 @@ def _reference_id(messages: list[GmailMessageRecord], text: str) -> str | None:
             value = message.extracted_signals.get(signal_name)
             if isinstance(value, str) and value.strip():
                 return f"{signal_name}:{_slug(value)}"
+    dispute_match = DISPUTE_REFERENCE_RE.search(text)
+    if dispute_match:
+        return f"dispute_id:{_slug(dispute_match.group(1))}"
     match = REFERENCE_RE.search(text)
     if match:
         return f"ref:{_slug(match.group(1))}"
@@ -555,42 +567,240 @@ def _quality_title(
     subject: str | None,
     classification: WorkflowClassification,
     facts: WorkflowFacts,
+    context: str | None = None,
 ) -> str:
-    fallback = _fallback_title(classification, facts)
+    context_text = compact_text(" ".join(value for value in [facts.text, context or ""] if value))
+    fallback = polish_inbox_title(_fallback_title(classification, facts, context_text=context_text))
     for value in [ai_output, message_title, subject]:
         title = compact_text(str(value or ""))
-        if title and not _generic_title(title, classification=classification):
-            return title
+        if not title:
+            continue
+        stateful = polish_inbox_title(_stateful_title(title, classification=classification, facts=facts, context_text=context_text))
+        if not _generic_title(title, classification=classification, facts=facts):
+            return stateful
+        if stateful != title and _title_has_provider_and_object_or_reference(stateful, classification=classification, facts=facts):
+            return stateful
     return fallback
 
 
-def _generic_title(title: str, *, classification: WorkflowClassification) -> bool:
+def polish_inbox_title(title: str) -> str:
+    """Remove stacked workflow states from titles before they reach Inbox UI."""
+    cleaned = compact_text(title).strip(" -–—:|.,")
+    if not cleaned:
+        return ""
+    replacements = [
+        (r"\bpending\s+response\s+resolved\b", "resolved"),
+        (r"\bawaiting\s+response\s+resolved\b", "resolved"),
+        (r"\bunder\s+review\s+resolved\b", "resolved"),
+        (r"\banswered\s+reply\b", "answered"),
+        (r"\breplied\s+reply\b", "replied"),
+        (r"\bresponded\s+reply\b", "responded"),
+        (r"\b(successful|successfully|succeeded)\s+confirmed\b", "confirmed"),
+        (r"\b(ready|available|received|processed|completed|delivered|approved)\s+confirmed\b", r"\1"),
+        (r"\b(credited\s+and\s+debited)\s+confirmed\b", r"\1"),
+        (r"\b(credited|debited)\s+confirmed\b", r"\1"),
+        (r"\bneeds\s+(.{1,64}?)\s+action\s+required\b", r"needs \1"),
+        (r"\bneeded\s+action\s+required\b", "needed"),
+        (r"\brequires?\s+action\s+action\s+required\b", "action required"),
+    ]
+    polished = cleaned
+    for pattern, replacement in replacements:
+        polished = re.sub(pattern, replacement, polished, flags=re.IGNORECASE)
+    if re.search(r"\b(?:admission|application|i-20|student|reconsideration)\b", polished, flags=re.IGNORECASE):
+        polished = re.sub(r"\s+\barriving\b", "", polished, flags=re.IGNORECASE)
+    return compact_text(polished).strip(" -–—:|.,")
+
+
+def _generic_title(title: str, *, classification: WorkflowClassification, facts: WorkflowFacts) -> bool:
     normalized = _slug(title).replace("-", " ")
     family = classification.workflow_family.replace("_", " ")
     state = classification.workflow_state.replace("_", " ")
     generic_titles = {
         "application update",
         "status update",
+        "status updates",
         "case update",
+        "case updates",
         "service request",
         "support update",
+        "support updates",
         "important update",
+        "important updates",
+        "order status",
+        "order update",
+        "order updates",
+        "account update",
+        "account updates",
         "update",
+        "updates",
         "notification",
+        "notice",
+        "message",
         "new message",
         family,
         state,
         f"{family} update",
+        f"{family} updates",
         f"{family} status",
     }
-    return normalized in generic_titles
+    if normalized in generic_titles:
+        return True
+    provider_titles = {_slug(_provider_title(facts)).replace("-", " "), _slug(facts.provider).replace("-", " ")}
+    provider_titles.discard("")
+    provider_tail_titles = {
+        "updates",
+        "update",
+        "messages",
+        "message",
+        "notifications",
+        "notification",
+        "notices",
+        "notice",
+        "emails",
+        "email",
+        "support",
+        "support case",
+        "case update",
+        "application update",
+        "order update",
+        "order updates",
+        "account update",
+        "service request update",
+        "service request updates",
+    }
+    return any(normalized == f"{provider} {tail}" for provider in provider_titles for tail in provider_tail_titles)
 
 
-def _fallback_title(classification: WorkflowClassification, facts: WorkflowFacts) -> str:
+def _stateful_title(
+    title: str,
+    *,
+    classification: WorkflowClassification,
+    facts: WorkflowFacts,
+    context_text: str,
+) -> str:
+    cleaned = polish_inbox_title(title)
+    if not cleaned:
+        return _fallback_title(classification, facts, context_text=context_text)
+    outcome = _title_outcome(classification, context_text or facts.text)
+    if not outcome or _title_has_concrete_state(cleaned, outcome):
+        return cleaned
+    replacement = outcome
+    substitutions = [
+        r"\bstatus\s+updates?\b$",
+        r"\bupdates?\b$",
+        r"\bstatus\b$",
+        r"\bnotices?\b$",
+        r"\bnotifications?\b$",
+        r"\bmessages?\b$",
+        r"\bpending\s+response\b$",
+        r"\bawaiting\s+response\b$",
+        r"\bunder\s+review\b$",
+        r"\bwaiting\b$",
+    ]
+    for pattern in substitutions:
+        updated = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE).strip()
+        if updated != cleaned:
+            return polish_inbox_title(updated)
+    if len(cleaned) + len(replacement) + 1 <= 180:
+        return polish_inbox_title(f"{cleaned} {replacement}")
+    return cleaned
+
+
+def _title_has_concrete_state(title: str, outcome: str) -> bool:
+    normalized = _slug(title).replace("-", " ")
+    outcome_tokens = [token for token in _slug(outcome).split("-") if token]
+    if outcome_tokens and all(token in normalized.split() for token in outcome_tokens):
+        return True
+    if outcome == "action required" and re.search(r"\b(?:needs?|needed|required|requires? action)\b", normalized):
+        return True
+    if outcome == "confirmed" and re.search(r"\b(?:successful|successfully|succeeded|ready|available|received|credited|debited|approved)\b", normalized):
+        return True
+    if outcome == "reply" and re.search(r"\b(?:reply|replied|responded|response|answered)\b", normalized):
+        return True
+    if outcome in {"waiting", "awaiting response", "under review", "acknowledged"} and re.search(
+        r"\b(?:pending response|awaiting response|under review|waiting|acknowledged|registered)\b",
+        normalized,
+    ):
+        return True
+    state_markers = {
+        "acknowledged",
+        "action required",
+        "approved",
+        "arriving",
+        "awaiting response",
+        "cancelled",
+        "canceled",
+        "closed",
+        "completed",
+        "confirmed",
+        "declined",
+        "delayed",
+        "delivered",
+        "modified",
+        "not selected",
+        "out for delivery",
+        "processed",
+        "ready",
+        "received",
+        "rejected",
+        "resolved",
+        "shipped",
+        "successful",
+        "under review",
+        "unsuccessful",
+        "waiting",
+    }
+    return any(marker in normalized for marker in state_markers)
+
+
+def _title_has_provider_and_object_or_reference(
+    title: str,
+    *,
+    classification: WorkflowClassification,
+    facts: WorkflowFacts,
+) -> bool:
+    normalized = _slug(title).replace("-", " ")
+    title_tokens = set(normalized.split())
+    if facts.reference_id and ":" in facts.reference_id:
+        _signal, raw_value = facts.reference_id.split(":", 1)
+        reference_tokens = set(re.findall(r"[a-z0-9]+", raw_value.lower()))
+        if reference_tokens and reference_tokens <= title_tokens:
+            return True
+    provider_values = {_provider_title(facts), facts.provider}
+    provider_tokens = {
+        token
+        for value in provider_values
+        for token in re.findall(r"[a-z0-9]+", value.lower())
+        if len(token) > 1 and token not in DOMAIN_STOP_WORDS
+    }
+    if not provider_tokens & title_tokens:
+        return False
+    object_tokens_by_family = {
+        "account_security": {"account", "access", "login", "password", "security", "sign", "signin", "verification"},
+        "application": {"admission", "application", "cost", "costs", "financial", "reconsideration"},
+        "billing": {"billing", "card", "invoice", "payment", "renewal", "statement", "subscription"},
+        "financial_transfer": {"fx", "remittance", "swift", "trade", "transfer", "wire"},
+        "logistics": {"booking", "delivery", "order", "reservation", "shipment", "tracking", "trip"},
+        "support_case": {"case", "complaint", "dispute", "grievance", "query", "request", "service", "ticket"},
+    }
+    object_tokens = object_tokens_by_family.get(classification.workflow_family, set())
+    return bool(object_tokens & title_tokens)
+
+
+def _fallback_title(
+    classification: WorkflowClassification,
+    facts: WorkflowFacts,
+    *,
+    context_text: str | None = None,
+) -> str:
     family = classification.workflow_family.replace("_", " ")
     provider = _provider_title(facts)
-    topic = _title_topic(classification.workflow_family, facts.text)
-    outcome = _title_outcome(classification, facts.text)
+    text = context_text or facts.text
+    topic = _title_topic(classification.workflow_family, text)
+    reference = _title_reference_fragment(classification.workflow_family, facts.reference_id)
+    if reference and reference.lower() not in topic.lower():
+        topic = reference
+    outcome = _title_outcome(classification, text)
     parts = [provider, topic or family]
     if outcome:
         parts.append(outcome)
@@ -598,30 +808,21 @@ def _fallback_title(classification: WorkflowClassification, facts: WorkflowFacts
 
 
 def _provider_title(facts: WorkflowFacts) -> str:
-    source = " ".join([*facts.domains, facts.text[:700]]).lower()
-    overrides = [
-        (("penn state", "psu.edu", "psu"), "Penn State"),
-        (("hdfcbank", "hdfc.bank", "hdfc"), "HDFC"),
-        (("ccilindia", "fxclear", "fxnoreply"), "CCIL FX Retail"),
-        (("interactivebrokers", "ibkr"), "Interactive Brokers"),
-        (("cityflo",), "Cityflo"),
-        (("tatastarbucks", "starbucks"), "Starbucks India"),
-        (("openai", "chatgpt"), "OpenAI"),
-        (("amazon web services", "amazonaws", "aws"), "Amazon Web Services"),
-    ]
-    for needles, title in overrides:
-        if any(needle in source for needle in needles):
-            return title
     provider = facts.provider.replace("-", " ").strip()
-    if provider in {"sbi", "hsbc"}:
-        return provider.upper()
-    return provider.title() if provider else "Unknown"
+    if not provider:
+        return "Unknown"
+    words = re.findall(r"[a-z0-9]+", provider.lower())
+    return " ".join(word.upper() if word.isalpha() and len(word) <= 4 else word.title() for word in words) or "Unknown"
 
 
 def _title_topic(family: str, text: str) -> str:
     lowered = text.lower()
     if family == "financial_transfer":
-        return "transfer"
+        if "remittance" in lowered:
+            return "remittance"
+        if "fx" in lowered or "trade" in lowered:
+            return "trade"
+        return "wire transfer" if "wire" in lowered else "transfer"
     if family == "support_case":
         return "case"
     if family == "application":
@@ -631,6 +832,8 @@ def _title_topic(family: str, text: str) -> str:
             return "financial aid"
         return "application"
     if family == "logistics":
+        if "order" in lowered:
+            return "order"
         if any(token in lowered for token in ["trip", "ride", "bus", "reservation", "booking"]):
             return "trip"
         return "delivery"
@@ -647,6 +850,21 @@ def _title_topic(family: str, text: str) -> str:
 
 def _title_outcome(classification: WorkflowClassification, text: str) -> str:
     lowered = text.lower()
+    logistics_context = classification.workflow_family == "logistics" or re.search(
+        r"(?i)\b(order|delivery|shipment|shipping|tracking|package|parcel|booking|reservation|ride|trip|bus)\b",
+        text,
+    )
+    if logistics_context:
+        if "out for delivery" in lowered:
+            return "out for delivery"
+        if re.search(r"(?i)\b(arriv(?:es|ing)|expected delivery|delivery expected)\b", text):
+            return "arriving"
+        if "delayed" in lowered:
+            return "delayed"
+        if "shipped" in lowered:
+            return "shipped"
+        if "delivered" in lowered:
+            return "delivered"
     if classification.workflow_family == "application" and REJECTION_RE.search(text):
         return "rejection"
     if classification.workflow_family == "application" and "reconsideration" in lowered and REPLY_RE.search(text):
@@ -655,16 +873,52 @@ def _title_outcome(classification: WorkflowClassification, text: str) -> str:
         return "cancelled"
     if MODIFIED_RE.search(text):
         return "modified"
-    if "delivered" in lowered:
-        return "delivered"
     if "processed" in lowered or "completed" in lowered or "settled" in lowered:
         return "processed"
+    if "closed" in lowered or "resolved" in lowered:
+        return "resolved"
     if CONFIRMED_RE.search(text):
         return "confirmed"
     if classification.workflow_state == "needs_user_action":
         return "action required"
     if classification.workflow_state == "waiting" and classification.workflow_family in {"support_case", "financial_transfer"}:
+        if re.search(r"(?i)\b(acknowledged|registered|received your|has been received)\b", text):
+            return "acknowledged"
+        if re.search(r"(?i)\b(under review|in progress|working on it|checking)\b", text):
+            return "under review"
+        if re.search(r"(?i)\b(will respond|we'?ll respond|resolution by|expected update)\b", text):
+            return "awaiting response"
         return "waiting"
+    return ""
+
+
+def _title_reference_fragment(family: str, reference_id: str | None) -> str:
+    if not reference_id or ":" not in reference_id:
+        return ""
+    signal_name, raw_value = reference_id.split(":", 1)
+    value = raw_value.strip("-")
+    if not value:
+        return ""
+    display_value = value.upper() if re.search(r"[a-z]", value) and re.search(r"\d", value) else value
+    label_by_signal = {
+        "application_id": "application",
+        "booking_id": "booking",
+        "dispute_id": "dispute",
+        "invoice_id": "invoice",
+        "order_id": "order",
+        "repair_id": "repair",
+        "ticket_id": "case",
+        "trade_id": "trade",
+        "tracking_id": "tracking",
+    }
+    label = label_by_signal.get(signal_name)
+    if label:
+        return f"{label} {display_value}"
+    if signal_name == "ref":
+        if family == "support_case":
+            return f"case {display_value}"
+        if family == "financial_transfer":
+            return f"transfer {display_value}"
     return ""
 
 
@@ -676,14 +930,6 @@ def _parse_iso(value: str | None) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-
-
-def _week_key(value: str | None) -> str:
-    parsed = _parse_iso(value)
-    if parsed is None:
-        return str(value or "unknown")[:10]
-    year, week, _ = parsed.isocalendar()
-    return f"{year}-w{week:02d}"
 
 
 def _slug(value: str) -> str:

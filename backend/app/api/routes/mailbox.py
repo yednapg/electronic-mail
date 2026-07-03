@@ -52,9 +52,17 @@ def mailbox_thread(
     group_id: str,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    include_summary: bool = Query(default=False),
 ) -> ThreadReaderResponse:
     user = require_current_user(settings, request)
-    detail = build_group_detail_response(settings, user_id=user.id, group_id=group_id, limit=limit, offset=offset)
+    detail = build_group_detail_response(
+        settings,
+        user_id=user.id,
+        group_id=group_id,
+        limit=limit,
+        offset=offset,
+        include_summary=include_summary,
+    )
     if detail is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mail group not found")
     return detail

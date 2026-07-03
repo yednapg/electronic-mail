@@ -108,6 +108,7 @@ test('gmail view renders clean mail-group rows without duplicating summaries', (
   assert.doesNotMatch(markup, /Apple shipped your order/);
   assert.doesNotMatch(markup, /Archive|Unarchive/);
   assert.doesNotMatch(markup, /Apple confirmed the order/);
+  assert.doesNotMatch(markup, /App settings|Worth Knowing|Calendar/);
 });
 
 test('gmail thread route uses the mounted mailbox client instead of server thread fetching', () => {
@@ -117,8 +118,20 @@ test('gmail thread route uses the mounted mailbox client instead of server threa
 });
 
 test('gmail background processing copy does not imply first-run grouping is blocking', () => {
+  assert.match(gmailInboxClientSource, /mailboxFromSmartInbox\(session\?\.smart_inbox/);
   assert.match(gmailInboxClientSource, /Importing older mail in background/);
   assert.match(gmailInboxClientSource, /Finishing AI titles for older mail/);
+  assert.match(gmailInboxClientSource, /useActiveMailboxSync\(Boolean\(session\?\.user\.id\)\)/);
+  assert.doesNotMatch(gmailInboxClientSource, /useActiveMailboxSync\(Boolean\(session\?\.dashboard\.auth\.connected\)\)/);
   assert.doesNotMatch(gmailInboxClientSource, /Processing older mail: /);
   assert.doesNotMatch(gmailInboxClientSource, /groups left/);
+  assert.doesNotMatch(gmailInboxClientSource, /prefetch\('\/dashboard'\)/);
+});
+
+test('gmail thread reader requests summaries only after an explicit action', () => {
+  assert.match(gmailInboxClientSource, /Generate summary/);
+  assert.match(gmailInboxClientSource, /include_summary/);
+  assert.match(gmailInboxClientSource, /summaryRequestedThreadIds/);
+  assert.doesNotMatch(gmailInboxClientSource, /row\?\.summary\?\.trim\(\) \|\| row\?\.snippet/);
+  assert.doesNotMatch(gmailInboxClientSource, /const body = row\.summary/);
 });

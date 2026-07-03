@@ -7,6 +7,8 @@ import path from 'node:path';
 import type { DashboardResponse, GoogleAuthState, ThreadReaderResponse } from '../../lib/types';
 import { buildSections, buildSummary } from './page';
 
+const dashboardClientSource = fs.readFileSync(new URL('./DashboardClient.tsx', import.meta.url), 'utf8');
+
 function fixturePath(name: string): string {
   let current = process.cwd();
 
@@ -38,6 +40,11 @@ test('dashboard fixture maps to dashboard view models', () => {
   const worthKnowing = sections.find((section) => section.id === 'worth-knowing');
 
   assert.equal(worthKnowing?.items[0].id, 'item-2');
+});
+
+test('dashboard keeps mailbox sync active from signed-in session identity', () => {
+  assert.match(dashboardClientSource, /useActiveMailboxSync\(Boolean\(session\?\.user\.id\)\)/);
+  assert.doesNotMatch(dashboardClientSource, /useActiveMailboxSync\(Boolean\(session\?\.dashboard\.auth\.connected\)\)/);
 });
 
 test('auth fixture matches shared TypeScript contracts', () => {

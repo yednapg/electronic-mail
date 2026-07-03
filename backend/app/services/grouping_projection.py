@@ -10,24 +10,47 @@ import re
 from typing import Any
 
 from app.db.mail_groups import GmailMessageRecord, MailGroupRecord, VisibleMailGroupUpsert
-from app.services.attention_classifier import deterministic_classification
+from app.services.attention_classifier import deterministic_classification, polish_inbox_title
 from app.services.email_extraction import compact_text, sender_domain
+from app.services.mail_group_config import AI_LIFECYCLE_MIN_INBOX_CONFIDENCE, MAILBOX_TASK_REFERENCE_SIGNALS
 
 
 INBOX_STRICT_WORKFLOWS = {"financial_transfer", "support_case", "billing", "logistics", "account_security", "application"}
-EXACT_SIGNAL_PREFIXES = ("order_id:", "ticket_id:", "tracking_id:", "invoice_id:", "booking_id:", "application_id:")
+EXACT_SIGNAL_PREFIXES = tuple(f"{signal_name}:" for signal_name in MAILBOX_TASK_REFERENCE_SIGNALS)
 GENERIC_ENTITY_NAMES = {"default user", "support", "noreply", "no-reply", "notification", "notifications", "team", "info", "mail"}
-AI_LIFECYCLE_MIN_INBOX_CONFIDENCE = 0.94
-AI_LIFECYCLE_ALLOWED_PARTNER_ENTITIES = (
-    frozenset({"HDFC Bank", "CCIL FX Retail"}),
-)
+DOMAIN_SUFFIX_PARTS = {"app", "bank", "co", "com", "dev", "edu", "email", "example", "gov", "in", "io", "localhost", "mail", "net", "org", "test", "uk", "us"}
+GENERIC_DOMAIN_PARTS = {
+    "account",
+    "accounts",
+    "admin",
+    "alert",
+    "alerts",
+    "billing",
+    "care",
+    "contact",
+    "customer",
+    "default",
+    "hello",
+    "help",
+    "info",
+    "mail",
+    "newsletter",
+    "news",
+    "noreply",
+    "notification",
+    "notifications",
+    "no",
+    "reply",
+    "service",
+    "services",
+    "support",
+    "team",
+    "update",
+    "updates",
+    "user",
+}
 CONFLICTING_SIGNAL_KEYS = (
-    "order_id",
-    "ticket_id",
-    "tracking_id",
-    "invoice_id",
-    "booking_id",
-    "application_id",
+    *MAILBOX_TASK_REFERENCE_SIGNALS,
     "case_id",
     "reference_id",
     "transaction_ref",
@@ -146,6 +169,8 @@ def evaluate_inbox_candidate(group: MailGroupRecord, messages: list[GmailMessage
     entity, channel = canonical_entity_for_messages(messages)
     ai_contract = _ai_grouping_contract(group)
     ai_allows_inbox = _ai_contract_allows_inbox(ai_contract, group, messages)
+    if group.membership_source in {"ai_batch", "ai_lifecycle"} and ai_contract and not ai_allows_inbox:
+        return _rejected(group, messages, "AI output did not explicitly justify this as an Inbox lifecycle group")
     strong_evidence = _strong_evidence(group, messages)
     if not strong_evidence:
         return _rejected(group, messages, "cross-thread Inbox group has no strong shared reference evidence")
@@ -155,9 +180,6 @@ def evaluate_inbox_candidate(group: MailGroupRecord, messages: list[GmailMessage
 
     if _has_conflicting_extracted_references(messages):
         return _rejected(group, messages, "cross-thread group has conflicting extracted references")
-
-    if group.membership_source in {"ai_batch", "ai_lifecycle"} and not ai_allows_inbox:
-        return _rejected(group, messages, "AI output did not explicitly justify this as an Inbox lifecycle group")
 
     title = _visible_title(group, entity, strong_evidence)
     summary = compact_text(group.ai_summary or f"{entity} updates for {strong_evidence[0]}.") or title
@@ -205,29 +227,10 @@ def canonical_entity_for_message(message: GmailMessageRecord) -> tuple[str, str 
     raw_domain = str(message.extracted_signals.get("sender_domain") or sender_domain(message.sender) or "").lower()
     display_name, email_address = parseaddr(message.sender or "")
     local = email_address.split("@", 1)[0].lower() if "@" in email_address else ""
-    text = " ".join([raw_domain, display_name.lower(), local])
-
-    overrides = [
-        (("hdfcbank", "hdfc.bank", "hdfcfx", "hdfc"), "HDFC Bank"),
-        (("ccilindia", "fxclear", "fxnoreply"), "CCIL FX Retail"),
-        (("interactivebrokers", "ibkr"), "Interactive Brokers"),
-        (("cityflo",), "Cityflo"),
-        (("tatastarbucks", "starbucks"), "Starbucks India"),
-        (("google",), "Google"),
-        (("sbi",), "SBI"),
-        (("hsbc",), "HSBC"),
-        (("openai", "chatgpt"), "OpenAI"),
-        (("amazon web services", "amazonaws", "aws"), "Amazon Web Services"),
-        (("flipkart",), "Flipkart"),
-        (("railway",), "Railway"),
-    ]
-    for needles, entity in overrides:
-        if any(needle in text for needle in needles):
-            return entity, _contact_channel(display_name, local)
-
-    candidate = compact_text(display_name or "")
-    if not candidate or candidate.lower() in GENERIC_ENTITY_NAMES:
-        candidate = _entity_from_domain(raw_domain)
+    domain_entity = _entity_from_domain(raw_domain)
+    candidate = _entity_from_display_name(display_name, domain_entity)
+    if not candidate:
+        candidate = domain_entity
     if not candidate:
         candidate = compact_text(email_address or message.sender or "Unknown Sender")
     return candidate, _contact_channel(display_name, local)
@@ -351,8 +354,6 @@ def _crosses_unrelated_entities(messages: list[GmailMessageRecord], accepted_ent
     entities = {entity for entity, _channel in (canonical_entity_for_message(message) for message in _inbox_visible_messages(messages)) if entity}
     if len(entities) <= 1:
         return False
-    if any(entities <= allowed for allowed in AI_LIFECYCLE_ALLOWED_PARTNER_ENTITIES):
-        return False
     return True
 
 
@@ -390,7 +391,7 @@ def _inbox_visible_messages(messages: list[GmailMessageRecord]) -> list[GmailMes
 
 
 def _visible_title(group: MailGroupRecord, entity: str, evidence: list[str]) -> str:
-    title = compact_text(group.ai_title or "")
+    title = polish_inbox_title(group.ai_title or "")
     if title and not _generic_title(title):
         return title
     reference = evidence[0].split(":", 1)[-1] if evidence else ""
@@ -398,7 +399,16 @@ def _visible_title(group: MailGroupRecord, entity: str, evidence: list[str]) -> 
 
 
 def _generic_title(title: str) -> bool:
-    return title.lower().strip() in GENERIC_ENTITY_NAMES or title.lower().strip() in {"updates", "support case", "transfer updates"}
+    return title.lower().strip() in GENERIC_ENTITY_NAMES or title.lower().strip() in {
+        "updates",
+        "support case",
+        "transfer updates",
+        "transfer mail",
+        "billing mail",
+        "delivery mail",
+        "application mail",
+        "newsletter mail",
+    }
 
 
 def _thread_ids(messages: list[GmailMessageRecord]) -> set[str]:
@@ -408,10 +418,39 @@ def _thread_ids(messages: list[GmailMessageRecord]) -> set[str]:
 def _entity_from_domain(domain: str) -> str:
     if not domain:
         return ""
-    parts = [part for part in domain.split(".") if part and part not in {"com", "co", "in", "net", "org", "mail", "email"}]
+    parts = [
+        part
+        for part in re.findall(r"[a-z0-9]+", domain.lower())
+        if part and part not in DOMAIN_SUFFIX_PARTS and part not in GENERIC_DOMAIN_PARTS
+    ]
     if not parts:
         return domain
-    return parts[0].replace("-", " ").title()
+    return _humanize_entity_token(parts[0])
+
+
+def _entity_from_display_name(display_name: str, domain_entity: str) -> str:
+    candidate = compact_text(display_name or "")
+    if not candidate or candidate.lower() in GENERIC_ENTITY_NAMES:
+        return ""
+    normalized_domain = _normalized_entity_key(domain_entity)
+    normalized_candidate = _normalized_entity_key(candidate)
+    if normalized_domain and normalized_domain in normalized_candidate:
+        return domain_entity
+    tokens = [token for token in re.findall(r"[a-z0-9]+", candidate.lower()) if token not in GENERIC_DOMAIN_PARTS]
+    if not tokens:
+        return ""
+    return _humanize_entity_token(" ".join(tokens))
+
+
+def _humanize_entity_token(value: str) -> str:
+    words = re.findall(r"[a-z0-9]+", value.replace("-", " ").lower())
+    if not words:
+        return ""
+    return " ".join(word.upper() if word.isalpha() and len(word) <= 4 else word.title() for word in words)
+
+
+def _normalized_entity_key(value: str) -> str:
+    return "".join(re.findall(r"[a-z0-9]+", (value or "").lower()))
 
 
 def _contact_channel(display_name: str, local: str) -> str | None:

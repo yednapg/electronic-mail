@@ -73,8 +73,8 @@ public struct TodoHomeView: View {
                             aiBuildStatusPanel(aiBuildStatus)
                         }
 
-                        if let dashboardBuildStatus = snapshot.dashboardBuildStatus {
-                            aiBuildStatusPanel(dashboardBuildStatus)
+                        if let inboxBuildStatus = snapshot.inboxBuildStatus {
+                            aiBuildStatusPanel(inboxBuildStatus)
                         } else {
                             agendaPanel(snapshot.agenda)
 
@@ -854,17 +854,23 @@ private struct TodoItemRow: View {
 
     private var expandedContent: some View {
         VStack(alignment: .leading, spacing: metrics.expandedContentGap) {
-            Text(row.detailText)
-                .font(TodoTypography.small())
-                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                .lineSpacing(4)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(width: metrics.detailWidth, alignment: .leading)
-                .offset(x: metrics.subjectLeading)
+            if hasDetailText {
+                Text(row.detailText)
+                    .font(TodoTypography.small())
+                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                    .lineSpacing(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: metrics.detailWidth, alignment: .leading)
+                    .offset(x: metrics.subjectLeading)
+            }
 
             actionRow
         }
         .frame(width: metrics.contentWidth, alignment: .leading)
+    }
+
+    private var hasDetailText: Bool {
+        !row.detailText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var actionRow: some View {
@@ -1008,7 +1014,7 @@ struct TodoHomeSnapshot: Equatable {
     let worthKnowing: TodoSectionModel
     let refreshWarning: String?
     let aiBuildStatus: String?
-    let dashboardBuildStatus: String?
+    let inboxBuildStatus: String?
 }
 
 struct TodoSummary: Equatable {
@@ -1145,7 +1151,39 @@ enum TodoHomeMapper {
         refreshWarning: String? = nil
     ) -> TodoHomeSnapshot {
         let feed = session.dashboard.feed
-        let inboxRowsByThreadID = Dictionary(uniqueKeysWithValues: inboxRows.map { ($0.threadID, $0) })
+        let inboxRowsByThreadID = inboxRowsByThreadID(from: inboxRows)
+        if let queue = session.smartWorkQueue {
+            return TodoHomeSnapshot(
+                greeting: greeting(from: session, now: now),
+                timeLabel: DateFormatter.todoHeaderTime.string(from: now),
+                headerContextLabel: "35°C",
+                summary: summary(from: session.dashboard),
+                agenda: agenda(from: feed),
+                now: TodoSectionModel(
+                    id: "now",
+                    title: "Needs Action",
+                    rows: todoRows(from: queue.needsAction, inboxRowsByThreadID: inboxRowsByThreadID, hiddenEntityIDs: hiddenEntityIDs)
+                ),
+                laterToday: TodoSectionModel(
+                    id: "later-today",
+                    title: "Waiting",
+                    rows: todoRows(from: queue.waiting, inboxRowsByThreadID: inboxRowsByThreadID, hiddenEntityIDs: hiddenEntityIDs)
+                ),
+                worthKnowing: TodoSectionModel(
+                    id: "worth-knowing",
+                    title: "Conversation Updates",
+                    rows: todoRows(
+                        from: queue.activeConversations + queue.importantUpdates + queue.manualReminders,
+                        inboxRowsByThreadID: inboxRowsByThreadID,
+                        hiddenEntityIDs: hiddenEntityIDs
+                    )
+                ),
+                refreshWarning: refreshWarning,
+                aiBuildStatus: aiBuildStatus(from: session),
+                inboxBuildStatus: nil
+            )
+        }
+
         return TodoHomeSnapshot(
             greeting: greeting(from: session, now: now),
             timeLabel: DateFormatter.todoHeaderTime.string(from: now),
@@ -1169,7 +1207,7 @@ enum TodoHomeMapper {
             ),
             refreshWarning: refreshWarning,
             aiBuildStatus: aiBuildStatus(from: session),
-            dashboardBuildStatus: dashboardBuildStatus(from: session)
+            inboxBuildStatus: inboxBuildStatus(from: session)
         )
     }
 
@@ -1214,36 +1252,35 @@ enum TodoHomeMapper {
 
     private static func aiBuildStatus(from session: AppSessionResponse) -> String? {
         if let error = session.sync.lastAIError?.trimmingCharacters(in: .whitespacesAndNewlines), !error.isEmpty, session.sync.readyGroupCount == 0 {
-            return "AI summaries need attention. \(error)"
+            return "AI titles need attention. \(error)"
         }
         guard session.sync.enrichmentPendingCount > 0, session.sync.readyGroupCount == 0 else {
             return nil
         }
-        return "Building AI summaries from your inbox"
+        return "Building AI titles from your inbox"
     }
 
-    private static func dashboardBuildStatus(from session: AppSessionResponse) -> String? {
+    private static func inboxBuildStatus(from session: AppSessionResponse) -> String? {
         let feed = session.dashboard.feed
         let feedCount = feed.now.count + feed.today.count + feed.worthKnowing.count
         guard feedCount == 0 else {
             return nil
         }
         let readiness = session.readiness
-        let importOrDashboardWorkActive = !readiness.readyToEnter
-            || !readiness.dashboardReady
+        let importOrInboxWorkActive = !readiness.readyToEnter
             || readiness.fullImportRunning
             || session.mailbox.fullImportRunning == true
             || session.sync.enrichmentPendingCount > 0
-        guard importOrDashboardWorkActive else {
+        guard importOrInboxWorkActive else {
             return nil
         }
         switch readiness.stage {
         case "starting_full_import", "importing_recent_gmail":
-            return "Syncing Gmail to build your dashboard"
+            return "Syncing Gmail to prepare your inbox"
         case "grouping_threads", "writing_titles":
             return "Grouping your inbox into useful work"
         default:
-            return "Building your dashboard"
+            return "Preparing your inbox"
         }
     }
 
@@ -1274,6 +1311,69 @@ enum TodoHomeMapper {
             }
     }
 
+    private static func todoRows(
+        from items: [SmartWorkItem],
+        inboxRowsByThreadID: [String: InboxRowViewModel],
+        hiddenEntityIDs: Set<String>
+    ) -> [TodoRowViewModel] {
+        items
+            .filter { !hiddenEntityIDs.contains($0.id) }
+            .sorted { left, right in
+                if left.priority != right.priority {
+                    return left.priority > right.priority
+                }
+                return (left.createdAt ?? "") < (right.createdAt ?? "")
+            }
+            .map { item in
+                let threadID = item.primaryThreadID
+                return row(from: item, inboxRow: threadID.flatMap { inboxRowsByThreadID[$0] })
+            }
+    }
+
+    private static func inboxRowsByThreadID(from inboxRows: [InboxRowViewModel]) -> [String: InboxRowViewModel] {
+        inboxRows.reduce(into: [String: InboxRowViewModel]()) { rowsByThreadID, row in
+            guard !row.threadID.isEmpty else {
+                return
+            }
+            guard let existing = rowsByThreadID[row.threadID] else {
+                rowsByThreadID[row.threadID] = row
+                return
+            }
+            rowsByThreadID[row.threadID] = preferredInboxRow(existing, row)
+        }
+    }
+
+    private static func preferredInboxRow(_ existing: InboxRowViewModel, _ candidate: InboxRowViewModel) -> InboxRowViewModel {
+        let existingScore = inboxRowRepresentativeScore(existing)
+        let candidateScore = inboxRowRepresentativeScore(candidate)
+        guard candidateScore > existingScore else {
+            return existing
+        }
+        return candidate
+    }
+
+    private static func inboxRowRepresentativeScore(_ row: InboxRowViewModel) -> Int {
+        var score = 0
+        if !row.isChild {
+            score += 100
+        }
+        switch row.presentationStatus {
+        case "ai_ready":
+            score += 40
+        case "ai_pending":
+            score += 20
+        default:
+            break
+        }
+        if row.isGrouped {
+            score += 10
+        }
+        if row.summary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            score += 5
+        }
+        return score
+    }
+
     private static func row(from item: AttentionItem, inboxRow: InboxRowViewModel?) -> TodoRowViewModel {
         TodoRowViewModel(
             id: item.id,
@@ -1285,6 +1385,21 @@ enum TodoHomeMapper {
             actionLabel: actionLabel(for: item),
             sourceLabel: sourceLabel(for: item),
             gmailThreadID: item.gmailThreadID?.isEmpty == false ? item.gmailThreadID : nil
+        )
+    }
+
+    private static func row(from item: SmartWorkItem, inboxRow: InboxRowViewModel?) -> TodoRowViewModel {
+        let threadID = item.primaryThreadID
+        return TodoRowViewModel(
+            id: item.id,
+            entityID: threadID ?? item.smartRowID ?? item.id,
+            sender: inboxRow?.sender ?? sourceLabel(for: item),
+            title: inboxRow?.title ?? item.title,
+            timeLabel: inboxRow?.timeLabel ?? dueTimeLabel(for: item.dueAt),
+            detailText: "",
+            actionLabel: actionLabel(for: item),
+            sourceLabel: sourceLabel(for: item),
+            gmailThreadID: threadID
         )
     }
 
@@ -1319,11 +1434,41 @@ enum TodoHomeMapper {
         return item.primaryAction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Open" : item.primaryAction
     }
 
+    private static func actionLabel(for item: SmartWorkItem) -> String {
+        switch item.kind {
+        case "needs_action":
+            return "Reply"
+        case "waiting":
+            return "Waiting"
+        case "important_update":
+            return "Review"
+        default:
+            return "Open"
+        }
+    }
+
     private static func sourceLabel(for item: AttentionItem) -> String {
         if let label = item.detail?.sourceLabel.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty {
             return label
         }
         return item.source?.rawValue.capitalized ?? "Source"
+    }
+
+    private static func sourceLabel(for item: SmartWorkItem) -> String {
+        switch item.kind {
+        case "needs_action":
+            return "Needs action"
+        case "waiting":
+            return "Waiting"
+        case "active_conversation":
+            return "Active conversation"
+        case "important_update":
+            return "Important update"
+        case "manual_reminder":
+            return "Manual reminder"
+        default:
+            return "Mail"
+        }
     }
 
     private static func dueTimeLabel(for value: String?) -> String {
@@ -1417,7 +1562,9 @@ private extension DateFormatter {
     }()
 }
 
+#if DEBUG
 #Preview {
     TodoHomeView(store: InboxStore(client: DemoAppClient()))
         .frame(width: 1100, height: 760)
 }
+#endif

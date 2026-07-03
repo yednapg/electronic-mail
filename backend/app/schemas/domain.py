@@ -21,6 +21,123 @@ MailSendState = Literal["queued", "sending", "sent", "failed", "reauth_required"
 MailboxLabel = Literal["inbox", "sent", "drafts", "spam", "trash", "archive", "all"]
 JobStatus = Literal["queued", "running", "succeeded", "failed"]
 ThreadMessageReaderMarkerKind = Literal["external_warning", "classification"]
+SmartInboxRowType = Literal["verified_group", "summarized_thread", "related_bundle", "waiting", "update", "normal"]
+SmartWorkItemKind = Literal["needs_action", "waiting", "active_conversation", "important_update", "manual_reminder"]
+SmartConfidenceTier = Literal["exact", "strong", "medium", "weak", "unknown"]
+SmartReadinessState = Literal["partial", "ready", "stale", "failed"]
+
+
+class SmartInboxRow(BaseModel):
+    """Materialized AI-native inbox row backed by one or more Gmail messages."""
+
+    id: str
+    row_key: str
+    row_type: SmartInboxRowType
+    title: str
+    summary: str = ""
+    primary_sender: str | None = None
+    latest_message_at: str | None = None
+    latest_message_id: str | None = None
+    reader_thread_id: str | None = None
+    source_thread_ids: list[str] = Field(default_factory=list)
+    source_message_ids: list[str] = Field(default_factory=list)
+    confidence_tier: SmartConfidenceTier = "unknown"
+    confidence: float = 0.0
+    grouping_reason: dict[str, Any] = Field(default_factory=dict)
+    offline_status: SmartReadinessState = "partial"
+    readiness: SmartReadinessState = "partial"
+    action_type: Literal["pay", "reply", "confirm", "track", "review", "read", "open", "none"] = "none"
+    priority: int = 0
+
+
+class SmartInboxSection(BaseModel):
+    """Date or semantic bucket containing smart inbox rows."""
+
+    id: str
+    title: str
+    rows: list[SmartInboxRow] = Field(default_factory=list)
+
+
+class SmartRelatedSuggestion(BaseModel):
+    """Medium-confidence relationship between smart inbox rows that should not be auto-merged."""
+
+    id: str
+    suggestion_key: str
+    source_row_id: str
+    related_row_id: str
+    title: str
+    reason: str
+    confidence: float = 0.0
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    status: Literal["active", "dismissed", "accepted"] = "active"
+
+
+class SmartInboxResponse(BaseModel):
+    """AI-native inbox payload used by the new Smart Inbox surface."""
+
+    total_rows: int = 0
+    sections: list[SmartInboxSection] = Field(default_factory=list)
+    related_suggestions: list[SmartRelatedSuggestion] = Field(default_factory=list)
+    ready_count: int = 0
+    partial_count: int = 0
+    failed_count: int = 0
+    generated_at: str | None = None
+    hot_window_days: int = 30
+    hot_window_message_cap: int = 0
+    hot_window_thread_cap: int = 0
+
+
+class SmartWorkItem(BaseModel):
+    """Mail-derived work queue item generated from smart inbox intelligence."""
+
+    id: str
+    kind: SmartWorkItemKind
+    title: str
+    summary: str = ""
+    status: Literal["open", "done", "snoozed", "dismissed"] = "open"
+    smart_row_id: str | None = None
+    source_thread_ids: list[str] = Field(default_factory=list)
+    source_message_ids: list[str] = Field(default_factory=list)
+    due_at: str | None = None
+    priority: int = 0
+    confidence: float = 0.0
+    reason: dict[str, Any] = Field(default_factory=dict)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class SmartWorkQueueResponse(BaseModel):
+    """Smart to-do replacement derived from mail state."""
+
+    needs_action: list[SmartWorkItem] = Field(default_factory=list)
+    waiting: list[SmartWorkItem] = Field(default_factory=list)
+    active_conversations: list[SmartWorkItem] = Field(default_factory=list)
+    important_updates: list[SmartWorkItem] = Field(default_factory=list)
+    manual_reminders: list[SmartWorkItem] = Field(default_factory=list)
+    total_open: int = 0
+    generated_at: str | None = None
+
+
+class SmartReadinessResponse(BaseModel):
+    """Progress contract for hot-window smart inbox readiness."""
+
+    stage: Literal["empty", "syncing", "classifying", "grouping", "snapshot_ready", "offline_ready", "failed"] = "empty"
+    first_ready_complete: bool = False
+    hot_window_complete: bool = False
+    offline_ready: bool = False
+    first_ready_target_messages: int = 300
+    hot_window_message_cap: int = 0
+    hot_window_thread_cap: int = 0
+    processed_messages: int = 0
+    processed_threads: int = 0
+    ready_rows: int = 0
+    partial_rows: int = 0
+    failed_rows: int = 0
+    offline_ready_rows: int = 0
+    offline_partial_rows: int = 0
+    offline_failed_rows: int = 0
+    last_error: str | None = None
+
 
 class SourceRecord(BaseModel):
     """Normalized source record entering the backend pipeline."""
@@ -173,7 +290,7 @@ class DashboardResponse(BaseModel):
 
 
 class FirstRunImportJobResponse(BaseModel):
-    """Durable status for first-login Gmail and dashboard setup."""
+    """Durable status for first-login Gmail and inbox setup."""
 
     id: str
     user_id: str
@@ -187,6 +304,7 @@ class FirstRunImportJobResponse(BaseModel):
     first_groups_ready_at: str | None = None
     dashboard_ready_at: str | None = None
     canonical_dashboard_ready_at: str | None = None
+    hot_window_ready_at: str | None = None
     quality_status: Literal["pending", "ready", "failed"] = "pending"
     quality_error: str | None = None
     full_import_started_at: str | None = None
@@ -199,7 +317,7 @@ class FirstRunImportJobResponse(BaseModel):
 
     @property
     def ready(self) -> bool:
-        return self.inbox_ready_at is not None and self.first_groups_ready_at is not None and self.dashboard_ready_at is not None
+        return self.inbox_ready_at is not None and self.first_groups_ready_at is not None and self.hot_window_ready_at is not None
 
 
 class PostLoginReadinessResponse(BaseModel):
@@ -212,7 +330,7 @@ class PostLoginReadinessResponse(BaseModel):
         "importing_recent_gmail",
         "grouping_threads",
         "writing_titles",
-        "building_dashboard",
+        "preparing_inbox",
         "ready",
         "failed",
     ]
@@ -402,6 +520,7 @@ class GmailThreadRow(BaseModel):
     children: list["GmailThreadChildRow"] = Field(default_factory=list)
     enrichment_status: Literal["pending", "ready", "failed"] = "ready"
     presentation_status: Literal["ai_ready", "ai_pending", "fallback"] = "ai_ready"
+    grouping_metadata: dict[str, Any] = Field(default_factory=dict)
     pending_action: GmailThreadAction | None = None
 
 
@@ -472,6 +591,8 @@ class MailboxSyncStateResponse(BaseModel):
     full_import_running: bool = False
     full_import_completed: bool = False
     full_import_completed_at: str | None = None
+    hot_window_started_at: str | None = None
+    hot_window_completed_at: str | None = None
     pending_action_count: int = 0
     last_action_sync_at: str | None = None
     last_action_error: str | None = None
@@ -626,6 +747,8 @@ class AppSessionSyncState(BaseModel):
     full_import_running: bool = False
     full_import_completed: bool = False
     full_import_completed_at: str | None = None
+    hot_window_started_at: str | None = None
+    hot_window_completed_at: str | None = None
     pending_action_count: int = 0
     last_action_sync_at: str | None = None
     last_action_error: str | None = None
@@ -640,6 +763,9 @@ class AppSessionResponse(BaseModel):
     dashboard: DashboardResponse
     mailbox: MailboxResponse
     sync: AppSessionSyncState
+    smart_inbox: SmartInboxResponse = Field(default_factory=SmartInboxResponse)
+    smart_work_queue: SmartWorkQueueResponse = Field(default_factory=SmartWorkQueueResponse)
+    smart_readiness: SmartReadinessResponse = Field(default_factory=SmartReadinessResponse)
 
 MailGroupRow = GmailThreadRow
 MailGroupSection = GmailThreadSection

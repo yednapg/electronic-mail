@@ -210,7 +210,7 @@ def auth_google_callback(
     state: str | None = None,
     error: str | None = None,
 ) -> RedirectResponse:
-    """Exchange the Google OAuth code and send the user back to the dashboard."""
+    """Exchange the Google OAuth code and send the user into inbox preparation."""
     if error is not None:
         raise HTTPException(status_code=400, detail=f"Google OAuth failed: {error}")
 

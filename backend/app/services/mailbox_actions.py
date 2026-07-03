@@ -9,6 +9,7 @@ from app.db.mail_groups import (
     delete_gmail_messages,
     get_mail_group_detail,
     get_pending_thread_action,
+    get_smart_inbox_row,
     list_messages_by_ids,
     list_messages_for_gmail_thread,
     mark_pending_thread_action_applied,
@@ -31,6 +32,8 @@ from app.services.integrations.google import (
 )
 from app.services.mailbox_events import MAILBOX_CHANGED, emit_mailbox_event
 from app.services.mail_groups import enqueue_projection_refresh, rebuild_touched_mail_groups
+
+SMART_ROW_READER_PREFIX = "smart-row:"
 
 
 def enqueue_thread_action(settings: Settings, *, user_id: str, request: QueuedThreadActionRequest) -> QueuedThreadActionResponse:
@@ -151,6 +154,20 @@ def _resolve_action_messages(
 ):
     if target_message_id:
         messages = list_messages_by_ids(database_url, user_id=user_id, message_ids=[target_message_id])
+        return messages, sorted({message.gmail_thread_id for message in messages if message.gmail_thread_id})
+
+    if mailbox_thread_id.startswith(SMART_ROW_READER_PREFIX):
+        smart_row = get_smart_inbox_row(database_url, user_id=user_id, row_id=mailbox_thread_id[len(SMART_ROW_READER_PREFIX) :])
+        if smart_row is None:
+            return [], []
+        messages_by_id = {
+            message.message_id: message
+            for message in list_messages_by_ids(database_url, user_id=user_id, message_ids=smart_row.source_message_ids)
+        }
+        for thread_id in smart_row.source_thread_ids:
+            for message in list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=thread_id):
+                messages_by_id.setdefault(message.message_id, message)
+        messages = list(messages_by_id.values())
         return messages, sorted({message.gmail_thread_id for message in messages if message.gmail_thread_id})
 
     messages = list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=mailbox_thread_id)

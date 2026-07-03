@@ -27,9 +27,9 @@ def gmail_view(request: Request) -> GmailViewResponse:
 
 
 @router.get("/v1/mail-groups/{group_id}", response_model=ThreadReaderResponse)
-def mail_group_detail(request: Request, group_id: str) -> ThreadReaderResponse:
+def mail_group_detail(request: Request, group_id: str, include_summary: bool = Query(default=False)) -> ThreadReaderResponse:
     user = require_current_user(settings, request)
-    detail = build_group_detail_response(settings, user_id=user.id, group_id=group_id)
+    detail = build_group_detail_response(settings, user_id=user.id, group_id=group_id, include_summary=include_summary)
     if detail is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mail group not found")
     return detail

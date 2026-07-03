@@ -56,6 +56,12 @@ public final class OfflineFirstAppClient: AppClient {
         return response
     }
 
+    public func threadSummary(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
+        let response = try await backend.threadSummary(threadID: threadID, limit: limit, offset: offset)
+        localMailStore.writeThread(response, userID: response.userID, threadID: threadID)
+        return response
+    }
+
     public func mailboxSyncState() async throws -> MailboxSyncStateResponse {
         try await backend.mailboxSyncState()
     }

@@ -26,6 +26,18 @@ SPACE_RE = re.compile(r"\s+")
 SUBJECT_PREFIX_RE = re.compile(r"(?i)^\s*(re|fwd?|fw):\s*")
 STRICT_ID = r"(?=[A-Z0-9-]*\d)([A-Z0-9][A-Z0-9-]{4,})"
 ORDER_RE = re.compile(rf"(?i)\b(?:order|shipment)(?:\s*(?:id|number|no\.?|#))?\s*(?:[:#-]|\s)\s*{STRICT_ID}")
+TRADE_RE = re.compile(
+    rf"""(?ix)
+    \b(?:
+      (?:fx[-\s]?retail\s+)?trade(?:\s+confirmation)?|
+      (?:fx[-\s]?retail\s+)?deal|
+      ccil\s+reference
+    )
+    (?:\s*(?:id|number|no\.?|\#))?
+    \s*(?:[:\#.-]|\bfor\b|\s)\s*
+    {STRICT_ID}
+    """
+)
 TICKET_RE = re.compile(
     rf"""(?ix)
     \b(?:
@@ -36,6 +48,9 @@ TICKET_RE = re.compile(
     \s*(?:[:\#.-]|\bis\b|\s)\s*
     {STRICT_ID}
     """
+)
+DISPUTE_RE = re.compile(
+    rf"(?ix)\bdispute(?:\s*(?:id|number|no\.?|\#)\s*[:\#.-]?|\s+(?:acknowledgement|status\s+update|interim\s+update)\s*[-:])\s*{STRICT_ID}"
 )
 TRACKING_RE = re.compile(rf"(?i)\b(?:tracking|awb)(?:\s*(?:id|number|no\.?|#))?\s*(?:[:#-]|\s)\s*{STRICT_ID}")
 INVOICE_RE = re.compile(rf"(?i)\b(?:invoice|receipt|bill)(?:\s*(?:id|number|no\.?|#))?\s*(?:[:#-]|\s)\s*{STRICT_ID}")
@@ -517,7 +532,9 @@ def extract_signals(*, subject: str | None, sender: str | None, text: str, heade
     }
     for key, pattern in {
         "order_id": ORDER_RE,
+        "trade_id": TRADE_RE,
         "ticket_id": TICKET_RE,
+        "dispute_id": DISPUTE_RE,
         "tracking_id": TRACKING_RE,
         "invoice_id": INVOICE_RE,
         "booking_id": BOOKING_RE,

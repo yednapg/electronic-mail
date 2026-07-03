@@ -130,6 +130,19 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(response.gmailThreadID, "demo-google-today")
     }
 
+    func testThreadSummaryRequestsSummaryExplicitly() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/threads/thread%2Fwith%20space")
+            XCTAssertEqual(request.url?.query(percentEncoded: false), "limit=50&offset=0&include_summary=true")
+            let data = try JSONEncoder.backend.encode(DemoAppFixtures.threads["demo-google-today"]!)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+        }
+
+        let response = try await client.threadSummary(threadID: "thread/with space", limit: 50, offset: 0)
+
+        XCTAssertEqual(response.gmailThreadID, "demo-google-today")
+    }
+
     func testArchiveThreadUsesPostEndpoint() async throws {
         let client = makeClient { request in
             XCTAssertEqual(request.httpMethod, "POST")

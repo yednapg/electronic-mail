@@ -112,7 +112,7 @@ public enum DashboardViewModelBuilder {
             timeLabel: DateFormatter.dashboardTime.string(from: now),
             summary: summary(from: session.dashboard),
             agenda: agenda(from: session.dashboard.feed),
-            sections: sections(from: session.dashboard.feed, hiddenItemIDs: hiddenItemIDs),
+            sections: sections(from: session, hiddenItemIDs: hiddenItemIDs),
             fullImportRunning: session.mailbox.fullImportRunning ?? session.sync.fullImportRunning,
             refreshWarning: refreshWarning
         )
@@ -121,8 +121,8 @@ public enum DashboardViewModelBuilder {
     public static func summary(from dashboard: DashboardResponse) -> DashboardSummaryViewModel {
         guard let briefing = dashboard.briefing else {
             return DashboardSummaryViewModel(
-                headline: "Dashboard",
-                brief: "Connect Google to generate a personalized briefing.",
+                headline: "Inbox",
+                brief: "Connect Google to prepare your inbox.",
                 parts: [],
                 important: nil,
                 calendarAvailability: nil
@@ -205,6 +205,31 @@ public enum DashboardViewModelBuilder {
         ]
     }
 
+    public static func sections(from session: AppSessionResponse, hiddenItemIDs: Set<String> = []) -> [DashboardSectionViewModel] {
+        guard let queue = session.smartWorkQueue else {
+            return sections(from: session.dashboard.feed, hiddenItemIDs: hiddenItemIDs)
+        }
+
+        let definitions: [(id: String, title: String, items: [SmartWorkItem], maxVisible: Int?)] = [
+            ("needs-action", "Needs Action", queue.needsAction, 8),
+            ("waiting", "Waiting", queue.waiting, 6),
+            ("active-conversations", "Active Conversations", queue.activeConversations, 6),
+            ("important-updates", "Important Updates", queue.importantUpdates, 5),
+            ("manual-reminders", "Manual Reminders", queue.manualReminders, 4),
+        ]
+
+        return definitions
+            .map { definition in
+                DashboardSectionViewModel(
+                    id: definition.id,
+                    title: definition.title,
+                    items: smartSectionItems(from: definition.items, hiddenItemIDs: hiddenItemIDs),
+                    maxVisible: definition.maxVisible
+                )
+            }
+            .filter { !$0.items.isEmpty }
+    }
+
     private static func sectionItems(from items: [AttentionItem], hiddenItemIDs: Set<String>) -> [DashboardSectionItemViewModel] {
         sortSectionFeedItems(items)
             .filter { $0.source != .calendar }
@@ -223,6 +248,67 @@ public enum DashboardViewModelBuilder {
             detail: detail(from: item),
             action: action(from: item)
         )
+    }
+
+    private static func smartSectionItems(from items: [SmartWorkItem], hiddenItemIDs: Set<String>) -> [DashboardSectionItemViewModel] {
+        items
+            .filter { !hiddenItemIDs.contains($0.id) }
+            .sorted { left, right in
+                if left.priority != right.priority {
+                    return left.priority > right.priority
+                }
+                return (left.createdAt ?? "") < (right.createdAt ?? "")
+            }
+            .map { item in
+                DashboardSectionItemViewModel(
+                    id: item.id,
+                    entityID: item.primaryThreadID ?? item.smartRowID ?? item.id,
+                    title: item.title,
+                    primaryAction: primaryAction(for: item),
+                    needType: item.kind,
+                    source: "gmail",
+                    detail: DashboardItemDetailViewModel(
+                        body: [item.displaySummary],
+                        actionLabel: primaryAction(for: item),
+                        confirmLabel: "Done",
+                        dismissLabel: "Not needed",
+                        sourceLabel: sourceLabel(for: item)
+                    ),
+                    action: nil
+                )
+            }
+    }
+
+    private static func primaryAction(for item: SmartWorkItem) -> String {
+        switch item.kind {
+        case "needs_action":
+            return "reply"
+        case "waiting":
+            return "waiting"
+        case "active_conversation":
+            return "open"
+        case "important_update":
+            return "review"
+        default:
+            return "open"
+        }
+    }
+
+    private static func sourceLabel(for item: SmartWorkItem) -> String {
+        switch item.kind {
+        case "needs_action":
+            return "Needs action"
+        case "waiting":
+            return "Waiting"
+        case "active_conversation":
+            return "Active conversation"
+        case "important_update":
+            return "Important update"
+        case "manual_reminder":
+            return "Manual reminder"
+        default:
+            return "Mail"
+        }
     }
 
     private static func detail(from item: AttentionItem) -> DashboardItemDetailViewModel? {
@@ -258,6 +344,8 @@ public enum DashboardViewModelBuilder {
                 return DashboardItemActionViewModel(label: "Unarchive", tone: .blue, operation: .unarchive, gmailThreadID: threadID)
             case .markRead:
                 return DashboardItemActionViewModel(label: "Mark Read", tone: .green, operation: .markRead, gmailThreadID: threadID)
+            case .moveTrash, .deleteForever:
+                return nil
             }
         }
 

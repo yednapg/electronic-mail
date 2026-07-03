@@ -1,4 +1,4 @@
-/** Dashboard fetcher shared by server-rendered app routes. */
+/** Backend fetchers shared by server-rendered app routes. */
 import type {
   DashboardResponse,
   AppSessionStateResponse,
@@ -17,6 +17,7 @@ const DEFAULT_BACKEND_URL = 'http://localhost:3001';
 export type MailGroupDetailOptions = {
   limit?: number;
   offset?: number;
+  includeSummary?: boolean;
 };
 
 export type BackendRequestOptions = {
@@ -105,7 +106,7 @@ options: BackendRequestOptions = {}): Promise<MailboxResponse> {
 
 export async function getMailboxThread(
   threadId: string,
-  { limit, offset }: MailGroupDetailOptions = {},
+  { limit, offset, includeSummary }: MailGroupDetailOptions = {},
   options: BackendRequestOptions = {},
 ): Promise<ThreadReaderResponse> {
   const params = new URLSearchParams();
@@ -114,6 +115,9 @@ export async function getMailboxThread(
   }
   if (offset !== undefined) {
     params.set('offset', String(offset));
+  }
+  if (includeSummary === true) {
+    params.set('include_summary', 'true');
   }
   const query = params.toString();
   const res = await fetch(`${getBackendURL()}/v1/mailbox/threads/${encodeURIComponent(threadId)}${query ? `?${query}` : ''}`, {

@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { SignedInAppChrome } from '../../components/app/AppChrome';
 import { useAppSession } from '../../lib/app-session-store';
+import { mailboxFromSmartInbox } from '../../lib/smart-inbox-view';
 import { useActiveMailboxSync } from '../../lib/use-active-mailbox-sync';
 import type { GmailThreadRow, MailboxResponse, ThreadMessage, ThreadReaderResponse } from '../../lib/types';
 import { GmailList, formatGmailSender } from './GmailView';
@@ -16,6 +17,11 @@ const PREFETCH_THREAD_COUNT = 10;
 
 let inMemoryThreadCache: { userKey: string; threads: Record<string, ThreadReaderResponse> } | null = null;
 type ActiveRowSource = 'keyboard' | 'programmatic';
+type ThreadFetchOptions = {
+  force?: boolean;
+  silent?: boolean;
+  includeSummary?: boolean;
+};
 
 type GmailInboxClientProps = {
   initialThreadId?: string | null;
@@ -25,23 +31,28 @@ type GmailInboxClientProps = {
 export function GmailInboxClient({ initialThreadId = null, initialMailbox = null }: GmailInboxClientProps) {
   const router = useRouter();
   const { session, refreshFailed: appSessionRefreshFailed } = useAppSession();
-  const [gmail, setGmail] = useState<MailboxResponse | null>(() => session?.mailbox ?? initialMailbox);
+  const [gmail, setGmail] = useState<MailboxResponse | null>(
+    () => mailboxFromSmartInbox(session?.smart_inbox, session?.mailbox ?? initialMailbox),
+  );
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(() => cleanThreadId(initialThreadId));
   const [threadCache, setThreadCache] = useState<Record<string, ThreadReaderResponse>>(
     () => inMemoryThreadCache?.threads ?? {},
   );
   const [threadErrors, setThreadErrors] = useState<Record<string, string>>({});
+  const [summaryRequestedThreadIds, setSummaryRequestedThreadIds] = useState<Set<string>>(() => new Set());
+  const [summaryLoadingThreadIds, setSummaryLoadingThreadIds] = useState<Set<string>>(() => new Set());
+  const [summaryErrors, setSummaryErrors] = useState<Record<string, string>>({});
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [refreshFailed, setRefreshFailed] = useState(false);
   const [cacheUserKey, setCacheUserKey] = useState<string | null>(() => session?.user.id ?? null);
   const threadCacheRef = useRef(threadCache);
   const gmailRef = useRef(gmail);
-  const inFlightThreadsRef = useRef(new Set<string>());
+  const inFlightThreadsRef = useRef(new Map<string, boolean>());
   const activeRowFrameRef = useRef<number | null>(null);
   const activePrefetchTimeoutRef = useRef<number | null>(null);
   const activeRowSourceRef = useRef<ActiveRowSource>('programmatic');
 
-  useActiveMailboxSync(Boolean(session?.dashboard.auth.connected));
+  useActiveMailboxSync(Boolean(session?.user.id));
 
   useEffect(() => {
     threadCacheRef.current = threadCache;
@@ -63,20 +74,17 @@ export function GmailInboxClient({ initialThreadId = null, initialMailbox = null
   }, []);
 
   useEffect(() => {
-    router.prefetch('/dashboard');
-  }, [router]);
-
-  useEffect(() => {
     if (session === null && appSessionRefreshFailed) {
       router.replace('/');
     }
   }, [appSessionRefreshFailed, router, session]);
 
-  const fetchThread = useCallback((threadId: string, options: { force?: boolean; silent?: boolean } = {}) => {
+  const fetchThread = useCallback((threadId: string, options: ThreadFetchOptions = {}) => {
     const cleanId = cleanThreadId(threadId);
     if (cleanId === null) {
       return;
     }
+    const includeSummary = options.includeSummary === true;
 
     const cachedThread = threadCacheRef.current[cleanId] ?? (
       cacheUserKey === null ? null : readCachedThread(cacheUserKey, cleanId)
@@ -84,35 +92,58 @@ export function GmailInboxClient({ initialThreadId = null, initialMailbox = null
     if (cachedThread !== null && threadCacheRef.current[cleanId] === undefined) {
       setThreadCache((current) => ({ ...current, [cleanId]: cachedThread }));
     }
-    if (!options.force && cachedThread !== null) {
+    if (!options.force && cachedThread !== null && (!includeSummary || hasThreadSummary(cachedThread))) {
       return;
     }
-    if (inFlightThreadsRef.current.has(cleanId)) {
+    const inFlightIncludesSummary = inFlightThreadsRef.current.get(cleanId);
+    if (inFlightIncludesSummary === true || (inFlightIncludesSummary === false && !includeSummary)) {
       return;
     }
 
-    inFlightThreadsRef.current.add(cleanId);
-    fetchMailboxThread(cleanId)
+    inFlightThreadsRef.current.set(cleanId, includeSummary);
+    if (includeSummary) {
+      setSummaryErrors((current) => omitKey(current, cleanId));
+      setSummaryLoadingThreadIds((current) => addSetValue(current, cleanId));
+    }
+    fetchMailboxThread(cleanId, { includeSummary })
       .then((thread) => {
         if (thread === null) {
           router.replace('/');
           return;
         }
-        setThreadCache((current) => ({ ...current, [cleanId]: thread }));
+        const threadWithCachedSummary = mergeThreadSummary(thread, threadCacheRef.current[cleanId]);
+        setThreadCache((current) => {
+          const mergedThread = mergeThreadSummary(threadWithCachedSummary, current[cleanId]);
+          threadCacheRef.current = { ...current, [cleanId]: mergedThread };
+          return threadCacheRef.current;
+        });
         setThreadErrors((current) => omitKey(current, cleanId));
+        if (includeSummary && !hasThreadSummary(threadWithCachedSummary)) {
+          setSummaryErrors((current) => ({
+            ...current,
+            [cleanId]: 'Summary is not ready yet.',
+          }));
+        } else if (includeSummary) {
+          setSummaryErrors((current) => omitKey(current, cleanId));
+        }
         if (cacheUserKey !== null) {
           inMemoryThreadCache = {
             userKey: cacheUserKey,
             threads: {
               ...(inMemoryThreadCache?.userKey === cacheUserKey ? inMemoryThreadCache.threads : {}),
-              [cleanId]: thread,
+              [cleanId]: threadWithCachedSummary,
             },
           };
-          writeCachedThread(cacheUserKey, cleanId, thread);
+          writeCachedThread(cacheUserKey, cleanId, threadWithCachedSummary);
         }
       })
       .catch(() => {
-        if (!options.silent) {
+        if (includeSummary) {
+          setSummaryErrors((current) => ({
+            ...current,
+            [cleanId]: 'Summary could not load.',
+          }));
+        } else if (!options.silent) {
           setThreadErrors((current) => ({
             ...current,
             [cleanId]: 'Full thread could not refresh.',
@@ -120,7 +151,12 @@ export function GmailInboxClient({ initialThreadId = null, initialMailbox = null
         }
       })
       .finally(() => {
-        inFlightThreadsRef.current.delete(cleanId);
+        if (inFlightThreadsRef.current.get(cleanId) === includeSummary) {
+          inFlightThreadsRef.current.delete(cleanId);
+        }
+        if (includeSummary) {
+          setSummaryLoadingThreadIds((current) => removeSetValue(current, cleanId));
+        }
       });
   }, [cacheUserKey, router]);
 
@@ -131,7 +167,7 @@ export function GmailInboxClient({ initialThreadId = null, initialMailbox = null
     const nextCacheUserKey = session.user.id;
     setCacheUserKey(nextCacheUserKey);
     setGmail((current) => {
-      const nextMailbox = session.mailbox;
+      const nextMailbox = mailboxFromSmartInbox(session.smart_inbox, session.mailbox) ?? session.mailbox;
       if (current !== null && current.total_threads > 0 && nextMailbox.total_threads === 0) {
         return current;
       }
@@ -260,6 +296,12 @@ export function GmailInboxClient({ initialThreadId = null, initialMailbox = null
     ? null
     : threadCache[selectedThreadId] ?? (selectedRow ? buildPreviewThread(selectedRow) : null);
   const selectedError = selectedThreadId ? threadErrors[selectedThreadId] ?? null : null;
+  const selectedSummaryRequested = selectedThreadId !== null && summaryRequestedThreadIds.has(selectedThreadId);
+  const selectedSummary = selectedSummaryRequested ? selectedThread?.summary?.trim() || null : null;
+  const selectedSummaryLoading = selectedThreadId !== null && summaryLoadingThreadIds.has(selectedThreadId);
+  const selectedSummaryError = selectedThreadId !== null && selectedSummaryRequested
+    ? summaryErrors[selectedThreadId] ?? null
+    : null;
 
   const openThread = useCallback((row: GmailThreadRow) => {
     setSelectedThreadId(row.thread_id);
@@ -273,6 +315,14 @@ export function GmailInboxClient({ initialThreadId = null, initialMailbox = null
     setSelectedThreadId(null);
     pushMailboxURL(null);
   }, []);
+
+  const requestSelectedSummary = useCallback(() => {
+    if (selectedThreadId === null) {
+      return;
+    }
+    setSummaryRequestedThreadIds((current) => addSetValue(current, selectedThreadId));
+    fetchThread(selectedThreadId, { force: true, includeSummary: true });
+  }, [fetchThread, selectedThreadId]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -338,9 +388,14 @@ export function GmailInboxClient({ initialThreadId = null, initialMailbox = null
           <GmailThreadPanel
             errorMessage={selectedError}
             row={selectedRow}
+            summary={selectedSummary}
+            summaryError={selectedSummaryError}
+            summaryLoading={selectedSummaryLoading}
             thread={selectedThread}
             threadId={selectedThreadId}
+            canRequestSummary={selectedThread !== null && selectedThread.messages.length > 0}
             onBack={closeThread}
+            onRequestSummary={requestSelectedSummary}
           />
         ) : gmail !== null ? (
           <GmailList
@@ -395,17 +450,26 @@ function GmailThreadPanel({
   threadId,
   row,
   thread,
+  summary,
+  summaryError,
+  summaryLoading,
+  canRequestSummary,
   errorMessage,
   onBack,
+  onRequestSummary,
 }: {
   threadId: string;
   row: GmailThreadRow | null;
   thread: ThreadReaderResponse | null;
+  summary: string | null;
+  summaryError: string | null;
+  summaryLoading: boolean;
+  canRequestSummary: boolean;
   errorMessage: string | null;
   onBack: () => void;
+  onRequestSummary: () => void;
 }) {
-  const title = thread?.subject?.trim() || row?.latest_subject?.trim() || 'Thread';
-  const summary = row?.summary?.trim() || row?.snippet?.trim() || null;
+  const title = thread?.title?.trim() || thread?.subject?.trim() || row?.title?.trim() || row?.latest_subject?.trim() || 'Thread';
   const messages = thread?.messages ?? [];
 
   return (
@@ -423,6 +487,19 @@ function GmailThreadPanel({
           </button>
           <h1 className="thread-reader-title">{title}</h1>
           {summary ? <p className="thread-reader-summary">{summary}</p> : null}
+          {!summary ? (
+            <button
+              type="button"
+              className="thread-reader-summary-button"
+              disabled={!canRequestSummary || summaryLoading}
+              onClick={() => {
+                onRequestSummary();
+              }}
+            >
+              {summaryLoading ? 'Generating summary...' : 'Generate summary'}
+            </button>
+          ) : null}
+          {summaryError ? <p className="thread-reader-summary-error" role="status">{summaryError}</p> : null}
           {errorMessage ? <p className="thread-reader-empty" role="status">{errorMessage}</p> : null}
         </header>
 
@@ -495,13 +572,15 @@ function GmailThreadMessageCard({ message }: { message: ThreadMessage }) {
 }
 
 function buildPreviewThread(row: GmailThreadRow): ThreadReaderResponse {
-  const body = row.summary || row.snippet || 'Thread preview is loading.';
+  const body = row.snippet || 'Thread preview is loading.';
   return {
     entity_id: row.entity_id ?? `gmail-thread:${row.thread_id}`,
     user_id: '',
     source: 'gmail',
     gmail_thread_id: row.thread_id,
     subject: row.latest_subject,
+    title: row.title ?? row.latest_subject ?? null,
+    summary: null,
     total_messages: Math.max(row.message_count, 1),
     limit: THREAD_FETCH_LIMIT,
     offset: 0,
@@ -517,7 +596,7 @@ function buildPreviewThread(row: GmailThreadRow): ThreadReaderResponse {
         bcc: null,
         subject: row.latest_subject,
         body,
-        snippet: row.snippet ?? row.summary ?? null,
+        snippet: row.snippet ?? null,
         label_ids: row.label_ids ?? [],
         received_at: row.latest_received_at,
       },
@@ -536,8 +615,15 @@ function escapeSelectorValue(value: string): string {
   return value.replace(/["\\]/g, '\\$&');
 }
 
-async function fetchMailboxThread(threadId: string): Promise<ThreadReaderResponse | null> {
-  const query = `limit=${THREAD_FETCH_LIMIT}`;
+async function fetchMailboxThread(
+  threadId: string,
+  { includeSummary = false }: { includeSummary?: boolean } = {},
+): Promise<ThreadReaderResponse | null> {
+  const params = new URLSearchParams({ limit: String(THREAD_FETCH_LIMIT) });
+  if (includeSummary) {
+    params.set('include_summary', 'true');
+  }
+  const query = params.toString();
   const urls = [
     `${getBrowserBackendURL()}/v1/mailbox/threads/${encodeURIComponent(threadId)}?${query}`,
     `/api/mailbox/threads/${encodeURIComponent(threadId)}?${query}`,
@@ -594,6 +680,20 @@ function writeCachedThread(userKey: string, threadId: string, thread: ThreadRead
   } catch (_error) {}
 }
 
+function hasThreadSummary(thread: ThreadReaderResponse | null | undefined): boolean {
+  return Boolean(thread?.summary?.trim());
+}
+
+function mergeThreadSummary(next: ThreadReaderResponse, previous: ThreadReaderResponse | null | undefined): ThreadReaderResponse {
+  if (hasThreadSummary(next) || !hasThreadSummary(previous)) {
+    return next;
+  }
+  return {
+    ...next,
+    summary: previous?.summary ?? null,
+  };
+}
+
 function threadStorageKey(userKey: string, threadId: string): string {
   return `${THREAD_STORAGE_PREFIX}${userKey}:${threadId}`;
 }
@@ -636,6 +736,24 @@ function omitKey<T>(values: Record<string, T>, key: string): Record<string, T> {
   }
   const next = { ...values };
   delete next[key];
+  return next;
+}
+
+function addSetValue(current: Set<string>, value: string): Set<string> {
+  if (current.has(value)) {
+    return current;
+  }
+  const next = new Set(current);
+  next.add(value);
+  return next;
+}
+
+function removeSetValue(current: Set<string>, value: string): Set<string> {
+  if (!current.has(value)) {
+    return current;
+  }
+  const next = new Set(current);
+  next.delete(value);
   return next;
 }
 

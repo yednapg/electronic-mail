@@ -25,7 +25,7 @@ export function DashboardClient({ initialDashboard = null }: DashboardClientProp
   const now = useMemo(() => new Date(), []);
   const dashboard = session?.dashboard ?? initialDashboard;
 
-  useActiveMailboxSync(Boolean(session?.dashboard.auth.connected));
+  useActiveMailboxSync(Boolean(session?.user.id));
 
   useEffect(() => {
     router.prefetch('/gmail');
@@ -61,7 +61,7 @@ export function DashboardClient({ initialDashboard = null }: DashboardClientProp
       ) : null}
       {refreshFailed ? (
         <p className="inbox-refresh-status" role="status">
-          Dashboard could not refresh. Showing last saved state.
+          To-do could not refresh. Showing last saved state.
         </p>
       ) : null}
     </SignedInAppChrome>
@@ -74,7 +74,7 @@ function DashboardLoadingView({ dateLabel, timeLabel }: { dateLabel: string; tim
       dateLabel={dateLabel}
       timeLabel={timeLabel}
       liveMeta={false}
-      summary={{ headline: 'Dashboard', brief: 'Loading your saved workspace...' }}
+      summary={{ headline: 'To-do', brief: 'Loading your saved work...' }}
       agenda={[]}
       sections={[
         { id: 'now', title: 'Now', items: [], maxVisible: 6, collapsedByDefault: true },

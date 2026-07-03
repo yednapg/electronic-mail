@@ -30,15 +30,17 @@ from app.db.mail_groups import (
 )
 from app.services.email_extraction import has_persisted_renderable_body, parse_gmail_message
 from app.services.integrations.google import build_google_service, create_authorized_credentials
+from app.services.mail_group_config import FIRST_RUN_HOT_WINDOW_BATCH_SIZE, SMART_HOT_WINDOW_DAYS
 from app.services.mailbox_events import MAILBOX_CHANGED, emit_mailbox_event
 from app.services.mail_groups import enqueue_projection_refresh, rebuild_touched_mail_groups
 
-FIRST_BATCH_SIZE = 50
+FIRST_BATCH_SIZE = 300
 BACKFILL_BATCH_SIZE = 100
-FIRST_RUN_RECENT_DAYS = 90
-FIRST_RUN_RECENT_MAX_MESSAGES = 5000
-FIRST_RUN_ALL_MAIL_SEED = "__ALL_MAIL__"
-FIRST_RUN_SEED_LABELS = ("INBOX", "SENT", "DRAFT", "SPAM", "TRASH", FIRST_RUN_ALL_MAIL_SEED)
+FIRST_RUN_RECENT_DAYS = SMART_HOT_WINDOW_DAYS
+FIRST_RUN_RECENT_MAX_MESSAGES: int | None = None
+FIRST_RUN_CURSOR_TYPE = "first_run_hot_window_v1"
+LEGACY_FIRST_RUN_CURSOR_TYPES = {"first_run_90d"}
+FIRST_RUN_SEED_LABELS = ("INBOX", "SENT")
 GMAIL_BATCH_GET_SIZE = 50
 GMAIL_HISTORY_PAGE_SIZE = 500
 GMAIL_HISTORY_TYPES = ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
@@ -73,25 +75,12 @@ def run_gmail_import_batch(settings: Settings, *, user_id: str, batch_size: int,
             full_backfill_cursor=backfill_cursor,
             clear_full_backfill_cursor=False,
             full_backfill_started=next_cursor is None,
+            hot_window_started=True,
+            hot_window_completed=next_cursor is None,
         )
-        enqueue_job(
-            database_url,
-            kind="gmail_backfill",
-            queue="slow",
-            user_id=user_id,
-            dedupe_key=f"gmail-backfill:{user_id}",
-            priority=80,
-            payload={"user_id": user_id, "batch_size": BACKFILL_BATCH_SIZE},
-        )
-        enqueue_job(
-            database_url,
-            kind="first_run_ai_grouping",
-            queue="critical",
-            user_id=user_id,
-            dedupe_key=f"first-run-ai-grouping:{user_id}",
-            priority=95,
-            payload={"user_id": user_id, "batch_size": FIRST_BATCH_SIZE},
-        )
+        _enqueue_gmail_backfill_for_cursor(settings, user_id=user_id, cursor=backfill_cursor, dedupe_suffix="initial")
+        if next_cursor is None:
+            _enqueue_hot_window_ai_grouping(settings, user_id=user_id)
         if messages:
             emit_mailbox_event(
                 settings,
@@ -206,7 +195,6 @@ def run_gmail_delta_sync(
 
 def run_gmail_backfill(settings: Settings, *, user_id: str, batch_size: int = BACKFILL_BATCH_SIZE) -> int:
     """Continue importing older Gmail using the independent full-backfill cursor."""
-    batch_size = max(1, min(batch_size, BACKFILL_BATCH_SIZE))
     database_url = str(settings.database_path)
     if not user_can_write_gmail(database_url, user_id=user_id):
         return 0
@@ -221,6 +209,7 @@ def run_gmail_backfill(settings: Settings, *, user_id: str, batch_size: int = BA
     try:
         first_run_cursor = _decode_first_run_cursor(page_token)
         full_mailbox_cursor = None if first_run_cursor is not None else _decode_full_mailbox_cursor(page_token)
+        batch_size = _bounded_backfill_batch_size(batch_size, first_run_hot_window=first_run_cursor is not None)
         if first_run_cursor is not None:
             messages, latest_history_id, next_cursor = _hydrate_first_run_cursor_page(
                 settings,
@@ -255,6 +244,7 @@ def run_gmail_backfill(settings: Settings, *, user_id: str, batch_size: int = BA
             message_ids=[message.message_id for message in messages],
             use_ai=False,
         )
+        hot_window_completed = first_run_cursor is not None and next_cursor is not None and _decode_full_mailbox_cursor(next_cursor) is not None
         mark_import_completed(
             database_url,
             user_id=user_id,
@@ -266,17 +256,12 @@ def run_gmail_backfill(settings: Settings, *, user_id: str, batch_size: int = BA
             clear_full_backfill_cursor=next_cursor is None,
             full_backfill_started=full_backfill_started,
             full_backfill_completed=full_backfill_completed,
+            hot_window_completed=hot_window_completed,
         )
         if next_cursor:
-            enqueue_job(
-                database_url,
-                kind="gmail_backfill",
-                queue="slow",
-                user_id=user_id,
-                dedupe_key=f"gmail-backfill:{user_id}:{next_cursor}",
-                priority=80,
-                payload={"user_id": user_id, "batch_size": batch_size},
-            )
+            _enqueue_gmail_backfill_for_cursor(settings, user_id=user_id, cursor=next_cursor, dedupe_suffix=next_cursor)
+        if hot_window_completed:
+            _enqueue_hot_window_ai_grouping(settings, user_id=user_id)
         if messages:
             enqueue_job(
                 database_url,
@@ -405,6 +390,7 @@ def run_gmail_body_fetch(settings: Settings, *, user_id: str, group_id: str = ""
         ]
     except Exception as exc:
         mark_gmail_messages_body_fetch_state(database_url, user_id=user_id, message_ids=missing, status="failed", error=f"{type(exc).__name__}: {exc}")
+        enqueue_projection_refresh(settings, user_id=user_id)
         raise
     upsert_gmail_messages(database_url, parsed_messages)
     rebuild_touched_mail_groups(settings, user_id=user_id, message_ids=[message.message_id for message in parsed_messages], use_ai=False)
@@ -422,12 +408,13 @@ def _has_body_for_reader(message: GmailMessageRecord) -> bool:
 
 
 def _hydrate_first_run_recent_window(settings: Settings, *, user_id: str, batch_size: int) -> tuple[list[GmailMessageRecord], str | None, str | None]:
-    recent_days = max(1, int(getattr(settings, "gmail_recent_days", FIRST_RUN_RECENT_DAYS) or FIRST_RUN_RECENT_DAYS))
+    recent_days = _first_run_recent_days(settings)
     cutoff = datetime.now(timezone.utc) - timedelta(days=recent_days)
     cutoff_ms = int(cutoff.timestamp() * 1000)
     messages_by_id: dict[str, GmailMessageRecord] = {}
     latest_history_id: str | None = None
-    page_size = max(1, min(max(batch_size, FIRST_BATCH_SIZE), 500))
+    first_batch_limit = max(1, min(batch_size, FIRST_BATCH_SIZE))
+    page_size = _first_run_seed_page_size(first_batch_limit, seed_count=len(FIRST_RUN_SEED_LABELS))
     next_tokens: dict[str, str | None] = {}
     completed_labels: set[str] = set()
     for label_id in FIRST_RUN_SEED_LABELS:
@@ -461,8 +448,13 @@ def _hydrate_first_run_recent_window(settings: Settings, *, user_id: str, batch_
         messages_by_id.setdefault(message.message_id, message)
 
     messages = sorted(messages_by_id.values(), key=lambda item: item.internal_date or item.updated_at, reverse=True)
-    next_cursor = _encode_first_run_cursor(next_tokens=next_tokens, completed_labels=completed_labels, cutoff_ms=cutoff_ms)
-    return messages[:FIRST_RUN_RECENT_MAX_MESSAGES], latest_history_id, next_cursor
+    next_cursor = _encode_first_run_cursor(
+        next_tokens=next_tokens,
+        completed_labels=completed_labels,
+        cutoff_ms=cutoff_ms,
+        imported_count=len(messages),
+    )
+    return messages, latest_history_id, next_cursor
 
 
 def _hydrate_first_run_cursor_page(
@@ -473,11 +465,19 @@ def _hydrate_first_run_cursor_page(
     cursor: dict[str, Any],
 ) -> tuple[list[GmailMessageRecord], str | None, str | None]:
     cutoff_ms = int(cursor.get("cutoff_ms") or 0)
-    next_tokens = {str(key): value for key, value in dict(cursor.get("next_tokens") or {}).items() if isinstance(value, str) and value}
+    imported_count = max(0, int(cursor.get("imported_count") or 0))
+    batch_limit = max(1, batch_size)
+    seed_labels = set(FIRST_RUN_SEED_LABELS)
+    next_tokens = {
+        str(key): value
+        for key, value in dict(cursor.get("next_tokens") or {}).items()
+        if str(key) in seed_labels and isinstance(value, str) and value
+    }
     completed_labels = {str(label) for label in list(cursor.get("completed_labels") or [])}
     messages_by_id: dict[str, GmailMessageRecord] = {}
     latest_history_id: str | None = None
-    page_size = max(1, min(max(batch_size, BACKFILL_BATCH_SIZE), 500))
+    active_seed_count = len([label_id for label_id in FIRST_RUN_SEED_LABELS if label_id not in completed_labels and next_tokens.get(label_id)])
+    page_size = _first_run_seed_page_size(batch_limit, seed_count=active_seed_count)
     for label_id in FIRST_RUN_SEED_LABELS:
         if label_id in completed_labels:
             continue
@@ -515,20 +515,52 @@ def _hydrate_first_run_cursor_page(
     for message in thread_messages:
         messages_by_id.setdefault(message.message_id, message)
     messages = sorted(messages_by_id.values(), key=lambda item: item.internal_date or item.updated_at, reverse=True)
-    next_cursor = _encode_first_run_cursor(next_tokens=next_tokens, completed_labels=completed_labels, cutoff_ms=cutoff_ms)
-    return messages[:FIRST_RUN_RECENT_MAX_MESSAGES], latest_history_id, next_cursor
+    next_cursor = _encode_first_run_cursor(
+        next_tokens=next_tokens,
+        completed_labels=completed_labels,
+        cutoff_ms=cutoff_ms,
+        imported_count=imported_count + len(messages),
+    )
+    return messages, latest_history_id, next_cursor
 
 
-def _encode_first_run_cursor(*, next_tokens: dict[str, str | None], completed_labels: set[str], cutoff_ms: int) -> str | None:
-    active_tokens = {label: token for label, token in next_tokens.items() if token and label not in completed_labels}
+def _first_run_recent_days(settings: Settings) -> int:
+    configured = int(getattr(settings, "gmail_recent_days", FIRST_RUN_RECENT_DAYS) or FIRST_RUN_RECENT_DAYS)
+    return max(1, min(configured, FIRST_RUN_RECENT_DAYS))
+
+
+def _first_run_seed_page_size(target_messages: int, *, seed_count: int) -> int:
+    seed_count = max(1, seed_count)
+    target = max(1, target_messages)
+    return max(1, min((target + seed_count - 1) // seed_count, 500))
+
+
+def _encode_first_run_cursor(
+    *,
+    next_tokens: dict[str, str | None],
+    completed_labels: set[str],
+    cutoff_ms: int,
+    imported_count: int = 0,
+    max_messages: int | None = FIRST_RUN_RECENT_MAX_MESSAGES,
+) -> str | None:
+    imported_count = max(0, imported_count)
+    seed_labels = set(FIRST_RUN_SEED_LABELS)
+    active_tokens = {
+        label: token
+        for label, token in next_tokens.items()
+        if label in seed_labels and token and label not in completed_labels
+    }
     if not active_tokens:
         return None
     payload = {
-        "type": "first_run_90d",
+        "type": FIRST_RUN_CURSOR_TYPE,
         "next_tokens": active_tokens,
         "completed_labels": sorted(completed_labels),
         "cutoff_ms": cutoff_ms,
+        "imported_count": imported_count,
     }
+    if max_messages is not None:
+        payload["max_messages"] = max(1, max_messages)
     return _encode_cursor_payload(payload)
 
 
@@ -574,7 +606,7 @@ def _list_first_run_seed_messages(
 
 
 def _label_ids_for_first_run_seed(label_id: str) -> list[str] | None:
-    return None if label_id == FIRST_RUN_ALL_MAIL_SEED else [label_id]
+    return [label_id]
 
 
 def _list_draft_messages(
@@ -628,7 +660,7 @@ def _merge_listed_messages(primary: dict[str, Any], secondary: dict[str, Any]) -
 
 def _decode_first_run_cursor(cursor: str | None) -> dict[str, Any] | None:
     payload = _decode_cursor_payload(cursor)
-    if not isinstance(payload, dict) or payload.get("type") != "first_run_90d":
+    if not isinstance(payload, dict) or payload.get("type") not in {FIRST_RUN_CURSOR_TYPE, *LEGACY_FIRST_RUN_CURSOR_TYPES}:
         return None
     return payload
 
@@ -904,6 +936,39 @@ def _enqueue_enrichment_and_projection(settings: Settings, *, user_id: str, prio
         payload={"user_id": user_id},
     )
     enqueue_projection_refresh(settings, user_id=user_id, priority=20)
+
+
+def _enqueue_gmail_backfill_for_cursor(settings: Settings, *, user_id: str, cursor: str, dedupe_suffix: str) -> None:
+    hot_window_cursor = _decode_first_run_cursor(cursor) is not None
+    enqueue_job(
+        str(settings.database_path),
+        kind="gmail_backfill",
+        queue="critical" if hot_window_cursor else "slow",
+        user_id=user_id,
+        dedupe_key=f"gmail-backfill:{user_id}:{dedupe_suffix}",
+        priority=90 if hot_window_cursor else 80,
+        payload={
+            "user_id": user_id,
+            "batch_size": FIRST_RUN_HOT_WINDOW_BATCH_SIZE if hot_window_cursor else BACKFILL_BATCH_SIZE,
+        },
+    )
+
+
+def _enqueue_hot_window_ai_grouping(settings: Settings, *, user_id: str) -> None:
+    enqueue_job(
+        str(settings.database_path),
+        kind="first_run_ai_grouping",
+        queue="critical",
+        user_id=user_id,
+        dedupe_key=f"first-run-ai-grouping-hot-window:{user_id}",
+        priority=98,
+        payload={"user_id": user_id, "batch_size": FIRST_BATCH_SIZE, "source": "hot_window_completed"},
+    )
+
+
+def _bounded_backfill_batch_size(batch_size: int, *, first_run_hot_window: bool) -> int:
+    limit = FIRST_RUN_HOT_WINDOW_BATCH_SIZE if first_run_hot_window else BACKFILL_BATCH_SIZE
+    return max(1, min(batch_size, limit))
 
 
 def _is_history_cursor_expired(exc: HttpError) -> bool:
