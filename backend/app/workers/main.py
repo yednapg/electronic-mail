@@ -143,6 +143,7 @@ def _run_job(settings, job) -> None:
         if not isinstance(user_id, str):
             raise RuntimeError(f"{job.kind} missing user_id")
         preferred_group_ids = payload.get("preferred_group_ids")
+        first_run_hot_window = payload.get("source") == "first_run_hot_window"
         touched = enrich_pending_mail_groups(
             settings,
             user_id=user_id,
@@ -154,11 +155,15 @@ def _run_job(settings, job) -> None:
             enqueue_job(
                 str(settings.database_path),
                 kind="mail_group_enrich",
-                queue="default",
+                queue="critical" if first_run_hot_window else "default",
                 user_id=user_id,
-                dedupe_key=f"mail-group-enrich:{user_id}:{uuid4()}",
-                priority=40,
-                payload={"user_id": user_id},
+                dedupe_key=(
+                    f"first-run-mail-group-enrich:{user_id}:{uuid4()}"
+                    if first_run_hot_window
+                    else f"mail-group-enrich:{user_id}:{uuid4()}"
+                ),
+                priority=96 if first_run_hot_window else 40,
+                payload={"user_id": user_id, **({"source": "first_run_hot_window"} if first_run_hot_window else {})},
             )
         return
     if job.kind == "first_run_ai_grouping":
@@ -197,6 +202,12 @@ def _run_job(settings, job) -> None:
         refresh_visible_mail_projection(settings, user_id=user_id)
         refresh_app_session_snapshot(settings, user_id=user_id)
         emit_mailbox_event(settings, user_id=user_id, event_type=DASHBOARD_CHANGED, payload={"source": "projection_refresh"})
+        return
+    if job.kind == "app_session_snapshot_refresh":
+        if not isinstance(user_id, str):
+            raise RuntimeError("app_session_snapshot_refresh missing user_id")
+        refresh_app_session_snapshot(settings, user_id=user_id)
+        emit_mailbox_event(settings, user_id=user_id, event_type=DASHBOARD_CHANGED, payload={"source": "app_session_snapshot_refresh"})
         return
     if job.kind == "job_retention_cleanup":
         cleanup_old_jobs(str(settings.database_path))

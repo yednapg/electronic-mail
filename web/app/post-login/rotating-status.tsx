@@ -2,29 +2,27 @@
 
 import { useEffect, useRef, useState } from 'react';
 
-import { DASHBOARD_ROUTE } from '../../lib/post-login-flow';
+import { APP_HOME_ROUTE } from '../../lib/post-login-flow';
 import { warmPostLoginCaches } from '../../lib/post-login-cache';
 import { waitForPostLoginReady } from '../../lib/post-login-readiness';
 import type { PostLoginReadinessResponse } from '../../lib/types';
 
 const STATUS_VISIBLE_MS = 6000;
 const LONG_WAIT_MS = 90000;
-const RETURNING_MINIMUM_MS = 30000;
-const FIRST_TIME_MINIMUM_MS = 60000;
 
 const firstTimeStatusMessages = [
   'Importing emails ...',
   'Understanding threads ...',
-  'Writing titles and summaries ...',
+  'Writing useful titles ...',
   'Finding what needs action ...',
-  'Building dashboard ...',
+  'Preparing your inbox ...',
   'Almost ready!',
 ];
 
 const returningStatusMessages = [
   'Welcome back ...',
   'Checking your latest Gmail ...',
-  'Refreshing your dashboard ...',
+  'Refreshing your inbox ...',
   'Almost ready!',
 ];
 
@@ -37,11 +35,14 @@ function wait(ms: number): Promise<void> {
 export function RotatingStatus() {
   const [activeIndex, setActiveIndex] = useState(0);
   const [readiness, setReadiness] = useState<PostLoginReadinessResponse | null>(null);
+  const [setupMode, setSetupMode] = useState<PostLoginReadinessResponse['mode'] | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isLongWait, setIsLongWait] = useState(false);
   const intervalRef = useRef<number | null>(null);
-  const messages = readiness?.mode === 'returning' ? returningStatusMessages : firstTimeStatusMessages;
-  const activeMessage = errorMessage ?? (isLongWait ? 'Still setting things up, keep this open ...' : statusMessage(messages, activeIndex, readiness));
+  const setupModeRef = useRef<PostLoginReadinessResponse['mode'] | null>(null);
+  const visibleMode = setupMode ?? readiness?.mode ?? 'first_time';
+  const messages = visibleMode === 'returning' ? returningStatusMessages : firstTimeStatusMessages;
+  const activeMessage = errorMessage ?? (isLongWait ? 'Still setting things up, keep this open ...' : statusMessage(messages, activeIndex, readiness, visibleMode));
 
   useEffect(() => {
     intervalRef.current = window.setInterval(() => {
@@ -68,35 +69,34 @@ export function RotatingStatus() {
     let cancelled = false;
     const controller = new AbortController();
 
-    function redirectToDashboard() {
-      window.location.assign(DASHBOARD_ROUTE);
+    function redirectToInbox() {
+      window.location.assign(APP_HOME_ROUTE);
     }
 
     async function redirectWhenReady() {
-      const startedAt = Date.now();
-      let minimumMs = FIRST_TIME_MINIMUM_MS;
       const ready = await waitForPostLoginReady({
         signal: controller.signal,
         onUpdate: (nextReadiness) => {
           if (!cancelled) {
             setReadiness(nextReadiness);
+            if (setupModeRef.current === null) {
+              setupModeRef.current = nextReadiness.mode;
+              setSetupMode(nextReadiness.mode);
+            }
           }
-          minimumMs = nextReadiness.mode === 'returning' ? RETURNING_MINIMUM_MS : FIRST_TIME_MINIMUM_MS;
         },
       });
       if (!cancelled) {
         setReadiness(ready);
+        if (setupModeRef.current === null) {
+          setupModeRef.current = ready.mode;
+          setSetupMode(ready.mode);
+        }
       }
-      const warmCaches = warmPostLoginCaches().catch(() => undefined);
-      const remainingMs = minimumMs - (Date.now() - startedAt);
-      if (remainingMs > 0) {
-        await Promise.all([wait(remainingMs), warmCaches]);
-      } else {
-        await warmCaches;
-      }
+      await warmPostLoginCaches().catch(() => undefined);
 
       if (!cancelled) {
-        redirectToDashboard();
+        redirectToInbox();
       }
     }
 
@@ -142,10 +142,15 @@ export function RotatingStatus() {
   );
 }
 
-function statusMessage(messages: string[], activeIndex: number, readiness: PostLoginReadinessResponse | null): string {
+function statusMessage(
+  messages: string[],
+  activeIndex: number,
+  readiness: PostLoginReadinessResponse | null,
+  visibleMode: PostLoginReadinessResponse['mode'],
+): string {
   const index = Math.min(activeIndex, messages.length - 1);
-  if (readiness?.mode === 'returning' && index === 0) {
-    return `Welcome back${firstNameSuffix(readiness.user_display_name)}!`;
+  if (visibleMode === 'returning' && index === 0) {
+    return `Welcome back${firstNameSuffix(readiness?.user_display_name)}!`;
   }
   return messages[index] ?? firstTimeStatusMessages[0];
 }

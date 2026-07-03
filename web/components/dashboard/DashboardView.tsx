@@ -38,7 +38,7 @@ export function DashboardView({ dateLabel, timeLabel, liveMeta, summary, agenda,
         </div>
 
         <p className="digest-empty-state" data-dashboard-empty>
-          All dashboard blocks are hidden by view settings.
+          All To-do blocks are hidden by view settings.
         </p>
       </div>
     </main>

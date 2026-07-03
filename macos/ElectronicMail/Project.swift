@@ -45,19 +45,29 @@ let project = Project(
             product: .app,
             bundleId: "app.electronicmail.mac",
             deploymentTargets: .macOS("14.0"),
-            infoPlist: .extendingDefault(with: [
+            infoPlist: .dictionary([
+                "CFBundleDevelopmentRegion": "$(DEVELOPMENT_LANGUAGE)",
                 "CFBundleDisplayName": "Electronic Mail",
+                "CFBundleExecutable": "$(EXECUTABLE_NAME)",
+                "CFBundleIdentifier": "$(PRODUCT_BUNDLE_IDENTIFIER)",
+                "CFBundleInfoDictionaryVersion": "6.0",
                 "CFBundleName": "Electronic Mail",
-                "LSMinimumSystemVersion": "14.0",
+                "CFBundlePackageType": "APPL",
+                "CFBundleShortVersionString": "1.0",
+                "CFBundleVersion": "1",
                 "CFBundleURLTypes": [
                     [
                         "CFBundleURLName": "app.electronicmail.mac",
                         "CFBundleURLSchemes": ["electronicmail"]
                     ]
                 ],
+                "LSMinimumSystemVersion": "14.0",
                 "NSAppTransportSecurity": [
                     "NSAllowsArbitraryLoads": true
                 ],
+                "NSHumanReadableCopyright": "Copyright ©. All rights reserved.",
+                "NSPrincipalClass": "NSApplication",
+                "NSQuitAlwaysKeepsWindows": false,
                 "NSRequiresAquaSystemAppearance": false
             ]),
             sources: ["ElectronicMail/Mac/**"],

@@ -26,7 +26,7 @@ type CommandPaletteProps = {
 
 type RefreshState = 'idle' | 'refreshing' | 'stale';
 
-const COMMAND_INDEX_STORAGE_KEY = 'electronic-mail-command-index:v4';
+const COMMAND_INDEX_STORAGE_KEY = 'electronic-mail-command-index:v5';
 const RESULT_LIMIT = 8;
 const SEARCH_QUERY_MIN_LENGTH = 2;
 

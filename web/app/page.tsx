@@ -3,28 +3,32 @@ import Link from 'next/link';
 import { redirect } from 'next/navigation';
 
 import { AppMark } from '../components/AppMark';
-import { getBackendURL, getDashboard, getLatestFirstRunImportJob } from '../lib/api';
+import { getBackendURL, getGoogleAuthState, getLatestFirstRunImportJob } from '../lib/api';
 import { getServerCookieHeader } from '../lib/server-cookies';
-import type { DashboardResponse } from '../lib/types';
+import type { GoogleAuthState } from '../lib/types';
 
 export default async function HomePage() {
   let signInHref = `${getBackendURL()}/auth/google`;
-  let dashboard: DashboardResponse | null = null;
+  let auth: GoogleAuthState | null = null;
   const cookie = await getServerCookieHeader();
 
   try {
-    dashboard = await getDashboard({ cookie });
+    auth = await getGoogleAuthState({ cookie });
   } catch {
     signInHref = `${getBackendURL()}/auth/google`;
   }
 
-  if (dashboard?.auth.connected) {
+  if (auth?.connected) {
     const latestImportJob = await getLatestFirstRunImportJob({ cookie });
-    const firstRunReady = Boolean(latestImportJob?.inbox_ready_at && latestImportJob?.first_groups_ready_at && latestImportJob?.dashboard_ready_at);
-    redirect(firstRunReady ? '/dashboard' : '/post-login');
+    const firstRunReady = Boolean(
+      latestImportJob?.inbox_ready_at
+      && latestImportJob?.first_groups_ready_at
+      && latestImportJob?.hot_window_ready_at,
+    );
+    redirect(firstRunReady ? '/gmail' : '/post-login');
   }
 
-  signInHref = dashboard?.auth.connect_url ?? signInHref;
+  signInHref = auth?.connect_url ?? signInHref;
 
   return (
     <main className="login-page">
@@ -33,8 +37,8 @@ export default async function HomePage() {
 
         <div className="login-copy">
           <h1 className="login-title">
-            <span className="login-title-line">Work first.</span>
-            <span className="login-title-line">Emails underneath.</span>
+            <span className="login-title-line">Inbox first.</span>
+            <span className="login-title-line">Tasks underneath.</span>
           </h1>
         </div>
 

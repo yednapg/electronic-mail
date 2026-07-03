@@ -4,26 +4,12 @@ import SwiftUI
 
 @main
 struct ElectronicMailApp: App {
-    @StateObject private var store: InboxStore
-
-    init() {
-        let localMailStore = AppClientFactory.makeLocalMailStore()
-        _store = StateObject(
-            wrappedValue: InboxStore(
-                client: AppClientFactory.makeDefaultClient(localMailStore: localMailStore),
-                localMailStore: localMailStore
-            )
-        )
-    }
+    @NSApplicationDelegateAdaptor(ElectronicMailAppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        WindowGroup {
-            ElectronicMailRootView(store: store)
-                .frame(minWidth: 1100, minHeight: 680)
-                .background(WindowTrafficLightOffset())
+        Settings {
+            EmptyView()
         }
-        .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 1440, height: 900)
         .commands {
             CommandGroup(after: .appInfo) {
                 Button("Open Command Palette") {
@@ -37,6 +23,72 @@ struct ElectronicMailApp: App {
                 .keyboardShortcut("n", modifiers: [.command])
             }
         }
+    }
+}
+
+@MainActor
+private final class ElectronicMailAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private let store: InboxStore
+    private var window: NSWindow?
+
+    override init() {
+        let localMailStore = AppClientFactory.makeLocalMailStore()
+        self.store = InboxStore(
+            client: AppClientFactory.makeDefaultClient(localMailStore: localMailStore),
+            localMailStore: localMailStore
+        )
+        super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        showMainWindow()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showMainWindow()
+        return false
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard notification.object as? NSWindow === window else {
+            return
+        }
+        window = nil
+    }
+
+    private func showMainWindow() {
+        if let window {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let rootView = ElectronicMailRootView(store: store)
+            .frame(minWidth: 1100, minHeight: 680)
+            .background(WindowTrafficLightOffset())
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Electronic Mail"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        window.minSize = NSSize(width: 1100, height: 680)
+        window.contentView = NSHostingView(rootView: rootView)
+        window.delegate = self
+        window.center()
+
+        self.window = window
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
@@ -86,6 +138,7 @@ private struct ElectronicMailRootView: View {
     @State private var stage: AppLaunchStage = .signIn
     @State private var setupStartedAt = Date()
     @State private var setupError: String?
+    @State private var setupLongWait = false
     @State private var signInInProgress = false
     @State private var signInError: String?
 
@@ -106,9 +159,10 @@ private struct ElectronicMailRootView: View {
                 SetupAnimationView(
                     startedAt: setupStartedAt,
                     readiness: store.currentReadiness,
+                    isLongWait: setupLongWait,
                     errorMessage: setupError
                 ) {
-                    Task { await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 60) }
+                    Task { await startSetupFlow(minimumDisplaySeconds: 0, longWaitStatusSeconds: 60) }
                 }
                 .transition(.opacity)
             case .app:
@@ -145,14 +199,14 @@ private struct ElectronicMailRootView: View {
             return
         }
 
-        if store.isReadyForMainInterface || store.canEnterWithBuildingDashboard {
+        if store.isReadyForMainInterface {
             withAnimation(.easeInOut(duration: 0.35)) {
                 stage = .app
             }
             return
         }
 
-        await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 60)
+        await startSetupFlow(minimumDisplaySeconds: 0, longWaitStatusSeconds: 60)
     }
 
     @MainActor
@@ -177,7 +231,7 @@ private struct ElectronicMailRootView: View {
                 throw RuntimeError(message)
             }
 
-            await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 60)
+            await startSetupFlow(minimumDisplaySeconds: 0, longWaitStatusSeconds: 60)
         } catch {
             tokenStore.clear()
             store.setSessionToken(nil)
@@ -199,9 +253,10 @@ private struct ElectronicMailRootView: View {
     }
 
     @MainActor
-    private func startSetupFlow(minimumDisplaySeconds: TimeInterval, maximumWaitSeconds: TimeInterval) async {
+    private func startSetupFlow(minimumDisplaySeconds: TimeInterval, longWaitStatusSeconds: TimeInterval) async {
         setupStartedAt = Date()
         setupError = nil
+        setupLongWait = false
 
         withAnimation(.easeInOut(duration: 0.35)) {
             stage = .setup
@@ -209,11 +264,13 @@ private struct ElectronicMailRootView: View {
 
         let ready = await PostLoginCoordinator(store: store).waitForReadiness(
             minimumDisplaySeconds: minimumDisplaySeconds,
-            maximumWaitSeconds: maximumWaitSeconds
-        )
+            longWaitStatusSeconds: longWaitStatusSeconds
+        ) {
+            setupLongWait = true
+        }
 
         guard ready else {
-            setupError = store.currentReadiness?.errorMessage ?? "Still syncing Gmail. Try again in a moment."
+            setupError = store.currentReadiness?.errorMessage ?? "Inbox setup failed. Try again in a moment."
             return
         }
 
@@ -230,16 +287,25 @@ private struct ElectronicMailRootView: View {
 private struct PostLoginCoordinator {
     let store: InboxStore
 
-    func waitForReadiness(minimumDisplaySeconds: TimeInterval, maximumWaitSeconds: TimeInterval) async -> Bool {
+    func waitForReadiness(
+        minimumDisplaySeconds: TimeInterval,
+        longWaitStatusSeconds: TimeInterval,
+        onLongWait: () -> Void
+    ) async -> Bool {
         let startedAt = Date()
+        var longWaitReported = false
         while !Task.isCancelled {
             await store.refreshForReadiness()
             let elapsed = Date().timeIntervalSince(startedAt)
             if elapsed >= minimumDisplaySeconds, store.isReadyForMainInterface {
                 return true
             }
-            if elapsed >= maximumWaitSeconds, store.canEnterWithBuildingDashboard {
-                return true
+            if store.currentReadiness?.stage == "failed" {
+                return false
+            }
+            if !longWaitReported, elapsed >= longWaitStatusSeconds {
+                longWaitReported = true
+                onLongWait()
             }
             let sleepSeconds = max(0.25, min(2, minimumDisplaySeconds - elapsed > 0 ? minimumDisplaySeconds - elapsed : 2))
             try? await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
@@ -294,7 +360,7 @@ private struct GoogleSignInView: View {
                 }
                 .font(ElectronicMailType.sectionTitle())
 
-                Text("Turn your emails into to-do's!")
+                Text("Electronic Mail")
                     .font(ElectronicMailType.sectionTitle())
                     .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                     .tracking(ElectronicMailType.bodyTracking)
@@ -337,14 +403,15 @@ private struct SetupAnimationView: View {
 
     let startedAt: Date
     let readiness: PostLoginReadinessResponse?
+    let isLongWait: Bool
     let errorMessage: String?
     let onRetry: () -> Void
 
     private let steps = [
         "Importing emails ...",
         "Grouping related emails ...",
-        "Finding to-do items ...",
-        "Building dashboard ...",
+        "Writing useful titles ...",
+        "Preparing your inbox ...",
         "Almost ready!"
     ]
 
@@ -382,18 +449,21 @@ private struct SetupAnimationView: View {
     }
 
     private func statusText(fallbackStep: Int) -> String {
+        if isLongWait {
+            return "Still setting things up, keep this open ..."
+        }
         guard let readiness else {
             return steps[fallbackStep]
         }
         switch readiness.stage {
         case "starting_full_import", "importing_recent_gmail":
-            return "Importing 90 days of email ..."
+            return "Importing recent email ..."
         case "grouping_threads":
             return "Grouping related emails ..."
         case "writing_titles":
             return "Writing useful titles ..."
-        case "building_dashboard":
-            return "Building dashboard ..."
+        case "preparing_inbox":
+            return "Preparing your inbox ..."
         case "ready", "welcome_back":
             return "Almost ready!"
         default:

@@ -213,6 +213,8 @@ public struct AppSessionSyncState: Codable, Equatable {
     let fullImportRunning: Bool
     let fullImportCompleted: Bool
     var fullImportCompletedAt: String? = nil
+    var hotWindowStartedAt: String? = nil
+    var hotWindowCompletedAt: String? = nil
     var pendingActionCount: Int? = nil
     var lastActionSyncAt: String? = nil
     var lastActionError: String? = nil
@@ -227,6 +229,8 @@ public struct AppSessionSyncState: Codable, Equatable {
         case fullImportRunning = "full_import_running"
         case fullImportCompleted = "full_import_completed"
         case fullImportCompletedAt = "full_import_completed_at"
+        case hotWindowStartedAt = "hot_window_started_at"
+        case hotWindowCompletedAt = "hot_window_completed_at"
         case pendingActionCount = "pending_action_count"
         case lastActionSyncAt = "last_action_sync_at"
         case lastActionError = "last_action_error"
@@ -268,6 +272,292 @@ public struct AppSessionResponse: Codable, Equatable {
     let dashboard: DashboardResponse
     let mailbox: MailboxResponse
     let sync: AppSessionSyncState
+    let smartInbox: SmartInboxResponse?
+    let smartWorkQueue: SmartWorkQueueResponse?
+    let smartReadiness: SmartReadinessResponse?
+
+    init(
+        user: AppSessionUser,
+        readiness: PostLoginReadinessResponse,
+        dashboard: DashboardResponse,
+        mailbox: MailboxResponse,
+        sync: AppSessionSyncState,
+        smartInbox: SmartInboxResponse? = nil,
+        smartWorkQueue: SmartWorkQueueResponse? = nil,
+        smartReadiness: SmartReadinessResponse? = nil
+    ) {
+        self.user = user
+        self.readiness = readiness
+        self.dashboard = dashboard
+        self.mailbox = mailbox
+        self.sync = sync
+        self.smartInbox = smartInbox
+        self.smartWorkQueue = smartWorkQueue
+        self.smartReadiness = smartReadiness
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case user
+        case readiness
+        case dashboard
+        case mailbox
+        case sync
+        case smartInbox = "smart_inbox"
+        case smartWorkQueue = "smart_work_queue"
+        case smartReadiness = "smart_readiness"
+    }
+}
+
+public struct SmartInboxRow: Codable, Equatable, Identifiable {
+    public let id: String
+    let rowKey: String
+    let rowType: String
+    let title: String
+    let summary: String
+    let primarySender: String?
+    let latestMessageAt: String?
+    let latestMessageID: String?
+    let readerThreadID: String?
+    let sourceThreadIDs: [String]
+    let sourceMessageIDs: [String]
+    let confidenceTier: String
+    let confidence: Double
+    let groupingReason: [String: JSONValue]
+    let offlineStatus: String
+    let readiness: String
+    let actionType: String
+    let priority: Int
+
+    var primaryThreadID: String {
+        sourceThreadIDs.first { !$0.isEmpty } ?? rowKey
+    }
+
+    var primaryMessageID: String {
+        latestMessageID?.isEmpty == false ? latestMessageID! : (sourceMessageIDs.first { !$0.isEmpty } ?? primaryThreadID)
+    }
+
+    var readerTargetID: String {
+        if let readerThreadID, !readerThreadID.isEmpty {
+            return readerThreadID
+        }
+        return primaryThreadID
+    }
+
+    var displaySender: String {
+        EmailAddressDisplayFormatter.displayName(from: primarySender ?? "Unknown")
+    }
+
+    var displayTitle: String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Untitled mail" : trimmed
+    }
+
+    var displaySummary: String? {
+        let trimmed = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    var isGrouped: Bool {
+        rowType == "verified_group"
+            || rowType == "related_bundle"
+            || sourceThreadIDs.count > 1
+            || sourceMessageIDs.count > 1
+    }
+
+    var isUnread: Bool {
+        readiness == "partial" || readiness == "stale"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case rowKey = "row_key"
+        case rowType = "row_type"
+        case title
+        case summary
+        case primarySender = "primary_sender"
+        case latestMessageAt = "latest_message_at"
+        case latestMessageID = "latest_message_id"
+        case readerThreadID = "reader_thread_id"
+        case sourceThreadIDs = "source_thread_ids"
+        case sourceMessageIDs = "source_message_ids"
+        case confidenceTier = "confidence_tier"
+        case confidence
+        case groupingReason = "grouping_reason"
+        case offlineStatus = "offline_status"
+        case readiness
+        case actionType = "action_type"
+        case priority
+    }
+}
+
+public struct SmartInboxSection: Codable, Equatable, Identifiable {
+    public let id: String
+    let title: String
+    let rows: [SmartInboxRow]
+}
+
+public struct SmartRelatedSuggestion: Codable, Equatable, Identifiable {
+    public let id: String
+    let suggestionKey: String
+    let sourceRowID: String
+    let relatedRowID: String
+    let title: String
+    let reason: String
+    let confidence: Double
+    let evidence: [String: JSONValue]
+    let status: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case suggestionKey = "suggestion_key"
+        case sourceRowID = "source_row_id"
+        case relatedRowID = "related_row_id"
+        case title
+        case reason
+        case confidence
+        case evidence
+        case status
+    }
+}
+
+public struct SmartInboxResponse: Codable, Equatable {
+    let totalRows: Int
+    let sections: [SmartInboxSection]
+    let relatedSuggestions: [SmartRelatedSuggestion]
+    let readyCount: Int
+    let partialCount: Int
+    let failedCount: Int
+    let generatedAt: String?
+    let hotWindowDays: Int
+    let hotWindowMessageCap: Int
+    let hotWindowThreadCap: Int
+
+    var isEmpty: Bool {
+        totalRows == 0 || sections.allSatisfy { $0.rows.isEmpty }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case totalRows = "total_rows"
+        case sections
+        case relatedSuggestions = "related_suggestions"
+        case readyCount = "ready_count"
+        case partialCount = "partial_count"
+        case failedCount = "failed_count"
+        case generatedAt = "generated_at"
+        case hotWindowDays = "hot_window_days"
+        case hotWindowMessageCap = "hot_window_message_cap"
+        case hotWindowThreadCap = "hot_window_thread_cap"
+    }
+}
+
+public struct SmartWorkItem: Codable, Equatable, Identifiable {
+    public let id: String
+    let kind: String
+    let title: String
+    let summary: String
+    let status: String
+    let smartRowID: String?
+    let sourceThreadIDs: [String]
+    let sourceMessageIDs: [String]
+    let dueAt: String?
+    let priority: Int
+    let confidence: Double
+    let reason: [String: JSONValue]
+    let createdAt: String?
+    let updatedAt: String?
+
+    var primaryThreadID: String? {
+        sourceThreadIDs.first { !$0.isEmpty }
+    }
+
+    var displaySummary: String {
+        let trimmed = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? title : trimmed
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case kind
+        case title
+        case summary
+        case status
+        case smartRowID = "smart_row_id"
+        case sourceThreadIDs = "source_thread_ids"
+        case sourceMessageIDs = "source_message_ids"
+        case dueAt = "due_at"
+        case priority
+        case confidence
+        case reason
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+public struct SmartWorkQueueResponse: Codable, Equatable {
+    let needsAction: [SmartWorkItem]
+    let waiting: [SmartWorkItem]
+    let activeConversations: [SmartWorkItem]
+    let importantUpdates: [SmartWorkItem]
+    let manualReminders: [SmartWorkItem]
+    let totalOpen: Int
+    let generatedAt: String?
+
+    var hasOpenItems: Bool {
+        totalOpen > 0
+            || !needsAction.isEmpty
+            || !waiting.isEmpty
+            || !activeConversations.isEmpty
+            || !importantUpdates.isEmpty
+            || !manualReminders.isEmpty
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case needsAction = "needs_action"
+        case waiting
+        case activeConversations = "active_conversations"
+        case importantUpdates = "important_updates"
+        case manualReminders = "manual_reminders"
+        case totalOpen = "total_open"
+        case generatedAt = "generated_at"
+    }
+}
+
+public struct SmartReadinessResponse: Codable, Equatable {
+    let stage: String
+    let firstReadyComplete: Bool
+    let hotWindowComplete: Bool
+    let offlineReady: Bool
+    let firstReadyTargetMessages: Int
+    let hotWindowMessageCap: Int
+    let hotWindowThreadCap: Int
+    let processedMessages: Int
+    let processedThreads: Int
+    let readyRows: Int
+    let partialRows: Int
+    let failedRows: Int
+    let offlineReadyRows: Int
+    let offlinePartialRows: Int
+    let offlineFailedRows: Int
+    let lastError: String?
+
+    enum CodingKeys: String, CodingKey {
+        case stage
+        case firstReadyComplete = "first_ready_complete"
+        case hotWindowComplete = "hot_window_complete"
+        case offlineReady = "offline_ready"
+        case firstReadyTargetMessages = "first_ready_target_messages"
+        case hotWindowMessageCap = "hot_window_message_cap"
+        case hotWindowThreadCap = "hot_window_thread_cap"
+        case processedMessages = "processed_messages"
+        case processedThreads = "processed_threads"
+        case readyRows = "ready_rows"
+        case partialRows = "partial_rows"
+        case failedRows = "failed_rows"
+        case offlineReadyRows = "offline_ready_rows"
+        case offlinePartialRows = "offline_partial_rows"
+        case offlineFailedRows = "offline_failed_rows"
+        case lastError = "last_error"
+    }
 }
 
 public struct FeedResponse: Codable, Equatable {
@@ -399,7 +689,7 @@ public struct GmailThreadChildRow: Codable, Equatable, Identifiable, Hashable {
     }
 
     var displayTitle: String {
-        aiTitle ?? subject ?? snippet ?? "Untitled"
+        aiTitle ?? subject ?? "Untitled mail"
     }
 
     var isUnread: Bool {
@@ -469,9 +759,9 @@ public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
 
     var displayTitle: String {
         if presentationStatus == "ai_pending", aiTitle == nil {
-            return "Building title... \(title ?? latestSubject ?? summary ?? snippet ?? "Email")"
+            return "Building title... \(title ?? latestSubject ?? "Email")"
         }
-        return aiTitle ?? title ?? latestSubject ?? summary ?? snippet ?? "Untitled"
+        return aiTitle ?? title ?? latestSubject ?? "Untitled mail"
     }
 
     var displaySummary: String? {

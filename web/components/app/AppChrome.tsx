@@ -32,16 +32,6 @@ export function SignedInAppChrome({ active, children }: SignedInAppChromeProps) 
     <div className="signed-in-app">
       <nav className="app-chrome-nav" aria-label="Primary">
         <Link
-          href="/dashboard"
-          prefetch
-          className={`app-chrome-link ${active === 'dashboard' ? 'is-active' : ''}`}
-          aria-label="To-do"
-          aria-current={active === 'dashboard' ? 'page' : undefined}
-          title="To-do"
-        >
-          <TodoIcon />
-        </Link>
-        <Link
           href="/gmail"
           prefetch
           className={`app-chrome-link ${active === 'gmail' ? 'is-active' : ''}`}
@@ -51,8 +41,18 @@ export function SignedInAppChrome({ active, children }: SignedInAppChromeProps) 
         >
           <InboxIcon />
         </Link>
+        <Link
+          href="/dashboard"
+          prefetch
+          className={`app-chrome-link ${active === 'dashboard' ? 'is-active' : ''}`}
+          aria-label="To-do"
+          aria-current={active === 'dashboard' ? 'page' : undefined}
+          title="To-do"
+        >
+          <TodoIcon />
+        </Link>
       </nav>
-      <AppSettingsPanel />
+      {active === 'dashboard' ? <AppSettingsPanel /> : null}
       {children}
     </div>
   );
@@ -72,11 +72,11 @@ function AppSettingsPanel() {
               Reset
             </button>
           </div>
-          <Link href="/dashboard" prefetch className="view-settings-link">
-            Dashboard
-          </Link>
           <Link href="/gmail" prefetch className="view-settings-link">
             Inbox
+          </Link>
+          <Link href="/dashboard" prefetch className="view-settings-link">
+            To-do
           </Link>
           <div className="view-settings-options">
             {VIEW_SETTING_OPTIONS.map((option) => (

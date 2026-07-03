@@ -58,8 +58,8 @@ export function buildSummary(dashboard: {
   }
 
   return {
-    headline: 'Your dashboard is ready.',
-    brief: 'Connect Google to generate a personalized briefing.',
+    headline: 'Your to-do list is ready.',
+    brief: 'Connect Google to generate a personalized work queue.',
   };
 }
 

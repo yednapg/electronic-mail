@@ -9,10 +9,14 @@ struct EmailReaderView: View {
     let thread: ThreadReaderResponse?
     let row: InboxRowViewModel?
     let errorMessage: String?
+    let summaryLoading: Bool
+    let summaryError: String?
+    let canRequestSummary: Bool
     let currentUserDisplayName: String?
     let currentUserEmail: String?
     let colorScheme: ColorScheme
     let onRetry: () -> Void
+    let onRequestSummary: () -> Void
     let onReply: () -> Void
     let onThreadAction: (GmailThreadAction) -> Void
     let onOpenAttachment: (ThreadAttachment, String) -> Void
@@ -44,10 +48,14 @@ struct EmailReaderView: View {
                                 message: thread?.messages.first,
                                 row: row,
                                 errorMessage: errorMessage,
+                                summaryLoading: summaryLoading,
+                                summaryError: summaryError,
+                                canRequestSummary: canRequestSummary,
                                 currentUserDisplayName: currentUserDisplayName,
                                 currentUserEmail: currentUserEmail,
                                 colorScheme: colorScheme,
                                 onRetry: onRetry,
+                                onRequestSummary: onRequestSummary,
                                 onReply: onReply,
                                 onThreadAction: onThreadAction,
                                 onOpenAttachment: onOpenAttachment
@@ -62,11 +70,15 @@ struct EmailReaderView: View {
                                 expectedMessageCount: resolvedMessageCount,
                                 focusedMessageID: focusedMessageID,
                                 errorMessage: errorMessage,
+                                summaryLoading: summaryLoading,
+                                summaryError: summaryError,
+                                canRequestSummary: canRequestSummary,
                                 currentUserDisplayName: currentUserDisplayName,
                                 currentUserEmail: currentUserEmail,
                                 colorScheme: colorScheme,
                                 expandedMessageKeys: $expandedMessageKeys,
                                 onRetry: onRetry,
+                                onRequestSummary: onRequestSummary,
                                 onReply: onReply,
                                 onThreadAction: onThreadAction,
                                 onOpenAttachment: onOpenAttachment,
@@ -107,7 +119,7 @@ struct EmailReaderView: View {
     }
 
     private var readerSummary: String? {
-        let value = nonEmpty(thread?.summary) ?? nonEmpty(row?.summary)
+        let value = nonEmpty(thread?.summary)
         guard value != readerTitle else {
             return nil
         }
@@ -146,10 +158,14 @@ private struct SingleEmailContent: View {
     let message: ThreadMessage?
     let row: InboxRowViewModel?
     let errorMessage: String?
+    let summaryLoading: Bool
+    let summaryError: String?
+    let canRequestSummary: Bool
     let currentUserDisplayName: String?
     let currentUserEmail: String?
     let colorScheme: ColorScheme
     let onRetry: () -> Void
+    let onRequestSummary: () -> Void
     let onReply: () -> Void
     let onThreadAction: (GmailThreadAction) -> Void
     let onOpenAttachment: (ThreadAttachment, String) -> Void
@@ -160,6 +176,10 @@ private struct SingleEmailContent: View {
                 title: title,
                 summary: summary,
                 summaryExpanded: $summaryExpanded,
+                summaryLoading: summaryLoading,
+                summaryError: summaryError,
+                canRequestSummary: canRequestSummary,
+                onRequestSummary: onRequestSummary,
                 colorScheme: colorScheme
             )
 
@@ -201,11 +221,15 @@ private struct GroupedEmailContent: View {
     let expectedMessageCount: Int
     let focusedMessageID: String?
     let errorMessage: String?
+    let summaryLoading: Bool
+    let summaryError: String?
+    let canRequestSummary: Bool
     let currentUserDisplayName: String?
     let currentUserEmail: String?
     let colorScheme: ColorScheme
     @Binding var expandedMessageKeys: Set<String>
     let onRetry: () -> Void
+    let onRequestSummary: () -> Void
     let onReply: () -> Void
     let onThreadAction: (GmailThreadAction) -> Void
     let onOpenAttachment: (ThreadAttachment, String) -> Void
@@ -217,6 +241,10 @@ private struct GroupedEmailContent: View {
                 title: title,
                 summary: summary,
                 summaryExpanded: $summaryExpanded,
+                summaryLoading: summaryLoading,
+                summaryError: summaryError,
+                canRequestSummary: canRequestSummary,
+                onRequestSummary: onRequestSummary,
                 colorScheme: colorScheme
             )
 
@@ -328,10 +356,19 @@ private struct EmailReaderTitleHeader: View {
     let title: String
     let summary: String?
     @Binding var summaryExpanded: Bool
+    let summaryLoading: Bool
+    let summaryError: String?
+    let canRequestSummary: Bool
+    let onRequestSummary: () -> Void
     let colorScheme: ColorScheme
 
     var body: some View {
-        let summaryModel = EmailReaderSummaryDisclosureModel(summary: summary, isExpanded: summaryExpanded)
+        let summaryModel = EmailReaderSummaryDisclosureModel(
+            summary: summary,
+            isExpanded: summaryExpanded,
+            isLoading: summaryLoading
+        )
+        let showsSummaryControl = summaryModel.hasSummary || canRequestSummary || summaryLoading || summaryError != nil
 
         VStack(alignment: .leading, spacing: 9) {
             Text(title)
@@ -340,25 +377,39 @@ private struct EmailReaderTitleHeader: View {
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
 
-            if summaryModel.hasSummary {
+            if showsSummaryControl {
                 Button {
                     withAnimation(.easeInOut(duration: 0.16)) {
-                        summaryExpanded.toggle()
+                        if summaryModel.hasSummary {
+                            summaryExpanded.toggle()
+                        } else {
+                            summaryExpanded = true
+                            onRequestSummary()
+                        }
                     }
                 } label: {
                     HStack(spacing: 4) {
                         Text(summaryModel.controlTitle)
-                        Image(systemName: summaryExpanded ? "chevron.up" : "chevron.down")
+                        Image(systemName: summaryExpanded && summaryModel.hasSummary ? "chevron.up" : "chevron.down")
                             .font(.system(size: 9, weight: .semibold))
                     }
                     .font(EmailReaderTypography.metadata(weight: .medium))
                     .foregroundStyle(ElectronicMailDesign.appleBlue)
                 }
                 .buttonStyle(.plain)
+                .disabled(summaryLoading)
                 .help(summaryModel.controlAccessibilityLabel)
                 .accessibilityLabel(summaryModel.controlAccessibilityLabel)
 
-                if let visibleSummary = summaryModel.visibleSummary {
+                if summaryExpanded, summaryLoading {
+                    Text("Generating summary...")
+                        .font(EmailReaderTypography.subtitle())
+                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                } else if summaryExpanded, let summaryError {
+                    Text(summaryError)
+                        .font(EmailReaderTypography.subtitle())
+                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                } else if let visibleSummary = summaryModel.visibleSummary {
                     Text(visibleSummary)
                         .font(EmailReaderTypography.subtitle())
                         .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
@@ -374,11 +425,13 @@ private struct EmailReaderTitleHeader: View {
 struct EmailReaderSummaryDisclosureModel: Equatable {
     let summary: String?
     let isExpanded: Bool
+    let isLoading: Bool
 
-    init(summary: String?, isExpanded: Bool) {
+    init(summary: String?, isExpanded: Bool, isLoading: Bool = false) {
         let trimmed = summary?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.summary = trimmed?.isEmpty == false ? trimmed : nil
         self.isExpanded = isExpanded
+        self.isLoading = isLoading
     }
 
     var hasSummary: Bool {
@@ -386,7 +439,13 @@ struct EmailReaderSummaryDisclosureModel: Equatable {
     }
 
     var controlTitle: String {
-        isExpanded ? "Hide summary" : "View summary"
+        if isLoading {
+            return "Generating summary..."
+        }
+        guard hasSummary else {
+            return "Generate summary"
+        }
+        return isExpanded ? "Hide summary" : "View summary"
     }
 
     var controlAccessibilityLabel: String {
@@ -2329,6 +2388,7 @@ private extension Array where Element: Hashable {
     }
 }
 
+#if DEBUG
 #Preview("Single Email") {
     EmailReaderView(
         threadID: "demo-google-today",
@@ -2336,13 +2396,18 @@ private extension Array where Element: Hashable {
         thread: DemoAppFixtures.threads["demo-google-today"],
         row: nil,
         errorMessage: nil,
+        summaryLoading: false,
+        summaryError: nil,
+        canRequestSummary: true,
         currentUserDisplayName: "TestUser",
         currentUserEmail: "demo@example.test",
         colorScheme: .dark,
         onRetry: {},
+        onRequestSummary: {},
         onReply: {},
         onThreadAction: { _ in },
         onOpenAttachment: { _, _ in }
     )
     .frame(width: 1440, height: 900)
 }
+#endif

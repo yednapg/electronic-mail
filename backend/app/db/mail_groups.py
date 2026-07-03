@@ -3,9 +3,11 @@ from __future__ import annotations
 """Postgres repositories for Gmail messages, mail groups, import state, and deletion guards."""
 
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import json
+import re
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -102,6 +104,43 @@ class VisibleMailGroupRecord:
 
 
 @dataclass(frozen=True)
+class MailObjectRecord:
+    id: str
+    user_id: str
+    object_type: str
+    canonical_key: str
+    title: str
+    summary: str
+    lifecycle_state: str
+    confidence: float
+    evidence: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class MailObjectBundle:
+    object: MailObjectRecord
+    messages: list[GmailMessageRecord]
+
+
+@dataclass(frozen=True)
+class SmartInboxRowRecord:
+    id: str
+    public_id: str
+    user_id: str
+    row_key: str
+    row_type: str
+    title: str
+    summary: str
+    source_thread_ids: list[str]
+    source_message_ids: list[str]
+    latest_message_at: str | None
+    latest_message_id: str | None
+    action_type: str
+
+
+@dataclass(frozen=True)
 class VisibleMailGroupUpsert:
     projection_key: str
     visibility: str
@@ -179,6 +218,8 @@ class GmailImportState:
     full_backfill_cursor: str | None
     full_backfill_started_at: str | None
     full_backfill_completed_at: str | None
+    hot_window_started_at: str | None
+    hot_window_completed_at: str | None
     first_batch_imported_at: str | None
     first_groups_ready_at: str | None
     first_dashboard_ready_at: str | None
@@ -199,6 +240,9 @@ class AppSessionSnapshotRecord:
     mailbox: dict[str, Any]
     sync: dict[str, Any]
     updated_at: str
+    smart_inbox: dict[str, Any] = field(default_factory=dict)
+    smart_work_queue: dict[str, Any] = field(default_factory=dict)
+    smart_readiness: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -332,7 +376,21 @@ def delete_user_mail_data(database_url: str, *, user_id: str) -> None:
             ),
             {"user_id": user_id},
         )
-        for table in ["app_session_snapshots", "mail_group_members", "mail_groups", "gmail_messages", "gmail_import_state"]:
+        for table in [
+            "related_suggestions",
+            "grouping_audit",
+            "smart_work_items",
+            "smart_inbox_rows",
+            "object_members",
+            "mail_objects",
+            "thread_summaries",
+            "message_signals",
+            "app_session_snapshots",
+            "mail_group_members",
+            "mail_groups",
+            "gmail_messages",
+            "gmail_import_state",
+        ]:
             connection.execute(text(f"DELETE FROM {table} WHERE user_id = :user_id"), {"user_id": user_id})
         connection.execute(
             text(
@@ -375,6 +433,8 @@ def mark_import_completed(
     clear_full_backfill_cursor: bool = False,
     full_backfill_started: bool = False,
     full_backfill_completed: bool = False,
+    hot_window_started: bool = False,
+    hot_window_completed: bool = False,
 ) -> None:
     with get_engine(database_url).begin() as connection:
         connection.execute(
@@ -382,12 +442,14 @@ def mark_import_completed(
                 """
                 INSERT INTO gmail_import_state (
                   user_id, last_history_id, full_backfill_cursor, full_backfill_started_at,
-                  full_backfill_completed_at, first_batch_imported_at,
+                  full_backfill_completed_at, hot_window_started_at, hot_window_completed_at, first_batch_imported_at,
                   first_groups_ready_at, first_dashboard_ready_at, last_import_completed_at, updated_at
                 ) VALUES (
                   :user_id, :last_history_id, :full_backfill_cursor,
                   CASE WHEN :full_backfill_started THEN now() ELSE NULL END,
                   CASE WHEN :full_backfill_completed THEN now() ELSE NULL END,
+                  CASE WHEN :hot_window_started THEN now() ELSE NULL END,
+                  CASE WHEN :hot_window_completed THEN now() ELSE NULL END,
                   CASE WHEN :first_batch THEN now() ELSE NULL END,
                   CASE WHEN :groups_ready THEN now() ELSE NULL END,
                   CASE WHEN :dashboard_ready THEN now() ELSE NULL END,
@@ -405,6 +467,8 @@ def mark_import_completed(
                     WHEN excluded.full_backfill_cursor IS NOT NULL THEN NULL
                     ELSE gmail_import_state.full_backfill_completed_at
                   END,
+                  hot_window_started_at = COALESCE(gmail_import_state.hot_window_started_at, excluded.hot_window_started_at),
+                  hot_window_completed_at = COALESCE(gmail_import_state.hot_window_completed_at, excluded.hot_window_completed_at),
                   first_batch_imported_at = COALESCE(gmail_import_state.first_batch_imported_at, excluded.first_batch_imported_at),
                   first_groups_ready_at = COALESCE(gmail_import_state.first_groups_ready_at, excluded.first_groups_ready_at),
                   first_dashboard_ready_at = COALESCE(gmail_import_state.first_dashboard_ready_at, excluded.first_dashboard_ready_at),
@@ -420,6 +484,8 @@ def mark_import_completed(
                 "clear_full_backfill_cursor": clear_full_backfill_cursor,
                 "full_backfill_started": full_backfill_started,
                 "full_backfill_completed": full_backfill_completed,
+                "hot_window_started": hot_window_started,
+                "hot_window_completed": hot_window_completed,
                 "first_batch": first_batch,
                 "groups_ready": groups_ready,
                 "dashboard_ready": dashboard_ready,
@@ -574,7 +640,141 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                 ),
                 _message_params(message),
             )
+        _upsert_message_signals(connection, rows)
+        _upsert_mail_objects_from_messages(connection, rows)
     return len(rows)
+
+
+def upsert_message_signals(database_url: str, messages: Iterable[GmailMessageRecord]) -> int:
+    rows = list(messages)
+    if not rows:
+        return 0
+    with get_engine(database_url).begin() as connection:
+        return _upsert_message_signals(connection, rows)
+
+
+def _upsert_message_signals(connection, messages: list[GmailMessageRecord]) -> int:
+    for message in messages:
+        connection.execute(
+            text(
+                """
+                INSERT INTO message_signals (
+                  id, user_id, gmail_message_id, gmail_thread_id, sender_domain,
+                  normalized_subject, reference_ids_json, dates_json, money_json,
+                  links_json, reply_refs_json, list_signals_json, extraction_version,
+                  generated_from_hash, extracted_at, created_at, updated_at
+                ) VALUES (
+                  :id, :user_id, :gmail_message_id, :gmail_thread_id, :sender_domain,
+                  :normalized_subject, CAST(:reference_ids_json AS JSONB), CAST(:dates_json AS JSONB),
+                  CAST(:money_json AS JSONB), CAST(:links_json AS JSONB), CAST(:reply_refs_json AS JSONB),
+                  CAST(:list_signals_json AS JSONB), :extraction_version,
+                  :generated_from_hash, now(), now(), now()
+                )
+                ON CONFLICT (user_id, gmail_message_id) DO UPDATE SET
+                  gmail_thread_id = excluded.gmail_thread_id,
+                  sender_domain = excluded.sender_domain,
+                  normalized_subject = excluded.normalized_subject,
+                  reference_ids_json = excluded.reference_ids_json,
+                  dates_json = excluded.dates_json,
+                  money_json = excluded.money_json,
+                  links_json = excluded.links_json,
+                  reply_refs_json = excluded.reply_refs_json,
+                  list_signals_json = excluded.list_signals_json,
+                  extraction_version = excluded.extraction_version,
+                  generated_from_hash = excluded.generated_from_hash,
+                  extracted_at = now(),
+                  updated_at = now()
+                """
+            ),
+            _message_signal_params(message),
+        )
+    return len(messages)
+
+
+def upsert_mail_objects_from_messages(database_url: str, messages: Iterable[GmailMessageRecord]) -> int:
+    rows = list(messages)
+    if not rows:
+        return 0
+    with get_engine(database_url).begin() as connection:
+        return _upsert_mail_objects_from_messages(connection, rows)
+
+
+def _upsert_mail_objects_from_messages(connection, messages: list[GmailMessageRecord]) -> int:
+    message_keys = [(message.user_id, message.message_id) for message in messages]
+    for user_id, message_id in message_keys:
+        connection.execute(
+            text(
+                """
+                DELETE FROM object_members
+                WHERE user_id = :user_id AND gmail_message_id = :message_id
+                """
+            ),
+            {"user_id": user_id, "message_id": message_id},
+        )
+
+    object_count = 0
+    for message in messages:
+        for spec in _mail_object_specs(message):
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO mail_objects (
+                      id, user_id, object_type, canonical_key, title, summary,
+                      lifecycle_state, confidence, evidence_json, created_at, updated_at
+                    ) VALUES (
+                      :id, :user_id, :object_type, :canonical_key, :title, :summary,
+                      'active', :confidence, CAST(:evidence_json AS JSONB), now(), now()
+                    )
+                    ON CONFLICT (user_id, canonical_key) DO UPDATE SET
+                      object_type = excluded.object_type,
+                      title = excluded.title,
+                      summary = excluded.summary,
+                      confidence = GREATEST(mail_objects.confidence, excluded.confidence),
+                      evidence_json = excluded.evidence_json,
+                      updated_at = now()
+                    """
+                ),
+                spec["object"],
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO object_members (
+                      id, user_id, object_id, gmail_message_id, gmail_thread_id,
+                      link_type, confidence, evidence_json, created_at
+                    ) VALUES (
+                      :id, :user_id, :object_id, :gmail_message_id, :gmail_thread_id,
+                      :link_type, :confidence, CAST(:evidence_json AS JSONB), now()
+                    )
+                    ON CONFLICT (user_id, object_id, gmail_message_id) DO UPDATE SET
+                      gmail_thread_id = excluded.gmail_thread_id,
+                      link_type = excluded.link_type,
+                      confidence = GREATEST(object_members.confidence, excluded.confidence),
+                      evidence_json = excluded.evidence_json
+                    """
+                ),
+                spec["member"],
+            )
+            object_count += 1
+
+    user_ids = sorted({user_id for user_id, _message_id in message_keys})
+    for user_id in user_ids:
+        connection.execute(
+            text(
+                """
+                DELETE FROM mail_objects AS objects
+                WHERE objects.user_id = :user_id
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM object_members AS members
+                    WHERE members.user_id = objects.user_id
+                      AND members.object_id = objects.id
+                  )
+                """
+            ),
+            {"user_id": user_id},
+        )
+    return object_count
 
 
 def update_gmail_message_ai_titles(database_url: str, *, user_id: str, titles: dict[str, str], generated_at: str) -> int:
@@ -1117,37 +1317,91 @@ def list_messages_by_ids(database_url: str, *, user_id: str, message_ids: list[s
     return [by_id[message_id] for message_id in message_ids if message_id in by_id]
 
 
-def list_recent_messages(database_url: str, *, user_id: str, limit: int = 500) -> list[GmailMessageRecord]:
+def get_smart_inbox_row(database_url: str, *, user_id: str, row_id: str) -> SmartInboxRowRecord | None:
+    public_id = str(row_id or "").strip()
+    if not public_id:
+        return None
+    storage_id = public_id if public_id.startswith(f"{user_id}:") else f"{user_id}:{public_id}"
+    with get_engine(database_url).connect() as connection:
+        row = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM smart_inbox_rows
+                WHERE user_id = :user_id
+                  AND status = 'active'
+                  AND (id = :public_id OR id = :storage_id)
+                ORDER BY CASE WHEN id = :storage_id THEN 0 ELSE 1 END
+                LIMIT 1
+                """
+            ),
+            {"user_id": user_id, "public_id": public_id, "storage_id": storage_id},
+        ).mappings().first()
+    if row is None:
+        return None
+    return _smart_inbox_row_from_row(row, user_id=user_id)
+
+
+def list_recent_messages(database_url: str, *, user_id: str, limit: int | None = 500) -> list[GmailMessageRecord]:
+    limit_clause = "LIMIT :limit" if limit is not None else ""
+    params: dict[str, Any] = {"user_id": user_id}
+    if limit is not None:
+        params["limit"] = max(1, int(limit))
     with get_engine(database_url).connect() as connection:
         rows = connection.execute(
             text(
-                """
+                f"""
                 SELECT * FROM gmail_messages
                 WHERE user_id = :user_id
                 ORDER BY internal_date DESC NULLS LAST, updated_at DESC
-                LIMIT :limit
+                {limit_clause}
                 """
             ),
-            {"user_id": user_id, "limit": limit},
+            params,
         ).mappings().all()
     return [_message_from_row(row) for row in rows]
 
 
-def list_recent_messages_since(database_url: str, *, user_id: str, since_iso: str, limit: int = 500) -> list[GmailMessageRecord]:
+def list_recent_messages_since(database_url: str, *, user_id: str, since_iso: str, limit: int | None = 500) -> list[GmailMessageRecord]:
+    limit_clause = "LIMIT :limit" if limit is not None else ""
+    params: dict[str, Any] = {"user_id": user_id, "since_iso": since_iso}
+    if limit is not None:
+        params["limit"] = max(1, int(limit))
     with get_engine(database_url).connect() as connection:
         rows = connection.execute(
             text(
-                """
+                f"""
                 SELECT * FROM gmail_messages
                 WHERE user_id = :user_id
                   AND internal_date >= :since_iso
                 ORDER BY internal_date DESC NULLS LAST, updated_at DESC
-                LIMIT :limit
+                {limit_clause}
                 """
             ),
-            {"user_id": user_id, "since_iso": since_iso, "limit": limit},
+            params,
         ).mappings().all()
     return [_message_from_row(row) for row in rows]
+
+
+def count_gmail_messages(database_url: str, *, user_id: str, since_iso: str | None = None) -> int:
+    filters = ["user_id = :user_id"]
+    params: dict[str, Any] = {"user_id": user_id}
+    if since_iso:
+        filters.append("COALESCE(internal_date, updated_at) >= :since_iso")
+        params["since_iso"] = since_iso
+    where_clause = "\n                  AND ".join(filters)
+    with get_engine(database_url).connect() as connection:
+        value = connection.execute(
+            text(
+                f"""
+                SELECT COUNT(*)
+                FROM gmail_messages
+                WHERE {where_clause}
+                """
+            ),
+            params,
+        ).scalar_one()
+    return int(value)
 
 
 def get_mail_group_by_key(database_url: str, *, user_id: str, group_key: str) -> MailGroupRecord | None:
@@ -1575,6 +1829,324 @@ def replace_visible_mail_projection(
             )
 
 
+def replace_smart_inbox_projection(
+    database_url: str,
+    *,
+    user_id: str,
+    rows: list[dict[str, Any]],
+    work_items: list[dict[str, Any]],
+    related_suggestions: list[dict[str, Any]] | None = None,
+) -> None:
+    """Replace the durable smart inbox and work queue projection for one user."""
+    active_row_ids = {str(row.get("id")) for row in rows if row.get("id")}
+    with get_engine(database_url).begin() as connection:
+        connection.execute(text("DELETE FROM smart_work_items WHERE user_id = :user_id"), {"user_id": user_id})
+        connection.execute(text("DELETE FROM related_suggestions WHERE user_id = :user_id"), {"user_id": user_id})
+        connection.execute(text("DELETE FROM smart_inbox_rows WHERE user_id = :user_id"), {"user_id": user_id})
+        for row in rows:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO smart_inbox_rows (
+                      id, user_id, row_key, row_type, section, status, title, summary,
+                      primary_sender, latest_message_at, latest_message_id,
+                      source_thread_ids_json, source_message_ids_json,
+                      confidence_tier, confidence, grouping_reason_json,
+                      offline_status, readiness, action_type, priority,
+                      generated_from_hash, generated_at, created_at, updated_at
+                    ) VALUES (
+                      :id, :user_id, :row_key, :row_type, :section, :status, :title, :summary,
+                      :primary_sender, :latest_message_at, :latest_message_id,
+                      CAST(:source_thread_ids_json AS JSONB), CAST(:source_message_ids_json AS JSONB),
+                      :confidence_tier, :confidence, CAST(:grouping_reason_json AS JSONB),
+                      :offline_status, :readiness, :action_type, :priority,
+                      :generated_from_hash, now(), now(), now()
+                    )
+                    """
+                ),
+                {
+                    "id": str(row.get("id") or uuid4()),
+                    "user_id": user_id,
+                    "row_key": str(row.get("row_key") or row.get("id") or uuid4()),
+                    "row_type": str(row.get("row_type") or "normal"),
+                    "section": str(row.get("section") or "inbox"),
+                    "status": str(row.get("status") or "active"),
+                    "title": str(row.get("title") or "Untitled email")[:1000],
+                    "summary": str(row.get("summary") or "")[:6000],
+                    "primary_sender": row.get("primary_sender"),
+                    "latest_message_at": row.get("latest_message_at"),
+                    "latest_message_id": row.get("latest_message_id"),
+                    "source_thread_ids_json": json.dumps(row.get("source_thread_ids") or [], ensure_ascii=True),
+                    "source_message_ids_json": json.dumps(row.get("source_message_ids") or [], ensure_ascii=True),
+                    "confidence_tier": str(row.get("confidence_tier") or "unknown"),
+                    "confidence": float(row.get("confidence") or 0),
+                    "grouping_reason_json": json.dumps(row.get("grouping_reason") or {}, ensure_ascii=True),
+                    "offline_status": str(row.get("offline_status") or "partial"),
+                    "readiness": str(row.get("readiness") or "partial"),
+                    "action_type": str(row.get("action_type") or "none"),
+                    "priority": int(row.get("priority") or 0),
+                    "generated_from_hash": str(row.get("generated_from_hash") or _stable_projection_hash(row)),
+                },
+            )
+        _upsert_thread_titles_from_smart_rows(connection, user_id=user_id, rows=rows)
+        for suggestion in related_suggestions or []:
+            source_row_id = suggestion.get("source_row_id")
+            related_row_id = suggestion.get("related_row_id")
+            if (
+                source_row_id is None
+                or related_row_id is None
+                or str(source_row_id) not in active_row_ids
+                or str(related_row_id) not in active_row_ids
+            ):
+                continue
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO related_suggestions (
+                      id, user_id, source_smart_row_id, related_smart_row_id,
+                      suggestion_key, title, reason, confidence, evidence_json,
+                      status, created_at, updated_at
+                    ) VALUES (
+                      :id, :user_id, :source_smart_row_id, :related_smart_row_id,
+                      :suggestion_key, :title, :reason, :confidence, CAST(:evidence_json AS JSONB),
+                      :status, now(), now()
+                    )
+                    """
+                ),
+                {
+                    "id": str(suggestion.get("id") or uuid4()),
+                    "user_id": user_id,
+                    "source_smart_row_id": str(source_row_id),
+                    "related_smart_row_id": str(related_row_id),
+                    "suggestion_key": str(suggestion.get("suggestion_key") or suggestion.get("id") or uuid4()),
+                    "title": str(suggestion.get("title") or "Related mail")[:1000],
+                    "reason": str(suggestion.get("reason") or "")[:1000],
+                    "confidence": float(suggestion.get("confidence") or 0),
+                    "evidence_json": json.dumps(suggestion.get("evidence") or {}, ensure_ascii=True),
+                    "status": str(suggestion.get("status") or "active"),
+                },
+            )
+        for item in work_items:
+            smart_row_id = item.get("smart_row_id")
+            if smart_row_id is not None and str(smart_row_id) not in active_row_ids:
+                smart_row_id = None
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO smart_work_items (
+                      id, user_id, smart_row_id, kind, status, title, summary,
+                      source_thread_ids_json, source_message_ids_json, due_at,
+                      priority, confidence, reason_json, created_at, updated_at
+                    ) VALUES (
+                      :id, :user_id, :smart_row_id, :kind, :status, :title, :summary,
+                      CAST(:source_thread_ids_json AS JSONB), CAST(:source_message_ids_json AS JSONB), :due_at,
+                      :priority, :confidence, CAST(:reason_json AS JSONB), now(), now()
+                    )
+                    """
+                ),
+                {
+                    "id": str(item.get("id") or uuid4()),
+                    "user_id": user_id,
+                    "smart_row_id": smart_row_id,
+                    "kind": str(item.get("kind") or "important_update"),
+                    "status": str(item.get("status") or "open"),
+                    "title": str(item.get("title") or "Mail update")[:1000],
+                    "summary": str(item.get("summary") or "")[:6000],
+                    "source_thread_ids_json": json.dumps(item.get("source_thread_ids") or [], ensure_ascii=True),
+                    "source_message_ids_json": json.dumps(item.get("source_message_ids") or [], ensure_ascii=True),
+                    "due_at": item.get("due_at"),
+                    "priority": int(item.get("priority") or 0),
+                    "confidence": float(item.get("confidence") or 0),
+                    "reason_json": json.dumps(item.get("reason") or {}, ensure_ascii=True),
+                },
+            )
+
+
+def _upsert_thread_titles_from_smart_rows(connection, *, user_id: str, rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        thread_ids = [str(value) for value in row.get("source_thread_ids") or [] if value]
+        if not thread_ids:
+            continue
+        source_message_ids = [str(value) for value in row.get("source_message_ids") or [] if value]
+        summary_level = "group" if len(thread_ids) > 1 or str(row.get("row_type") or "") in {"verified_group", "related_bundle"} else "thread"
+        generated_hash = _stable_projection_hash(
+            {
+                "summary_version": "smart-thread-title-v1",
+                "thread_ids": thread_ids,
+                "title": row.get("title"),
+                "source_message_ids": source_message_ids,
+            }
+        )
+        for thread_id in thread_ids:
+            evidence = {
+                "source": "smart_inbox_projection",
+                "smart_row_id": row.get("id"),
+                "row_type": row.get("row_type"),
+                "confidence_tier": row.get("confidence_tier"),
+                "grouping_reason": row.get("grouping_reason") or {},
+            }
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO thread_summaries (
+                      id, user_id, gmail_thread_id, summary_level, ai_title, summary,
+                      state, action_type, confidence, source_message_ids_json,
+                      evidence_json, model, summary_version, generated_from_hash,
+                      generated_at, created_at, updated_at
+                    ) VALUES (
+                      :id, :user_id, :gmail_thread_id, :summary_level, :ai_title, :summary,
+                      :state, :action_type, :confidence, CAST(:source_message_ids_json AS JSONB),
+                      CAST(:evidence_json AS JSONB), :model, :summary_version, :generated_from_hash,
+                      now(), now(), now()
+                    )
+                    ON CONFLICT (user_id, gmail_thread_id) DO UPDATE SET
+                      summary_level = excluded.summary_level,
+                      ai_title = excluded.ai_title,
+                      summary = excluded.summary,
+                      state = excluded.state,
+                      action_type = excluded.action_type,
+                      confidence = excluded.confidence,
+                      source_message_ids_json = excluded.source_message_ids_json,
+                      evidence_json = excluded.evidence_json,
+                      model = excluded.model,
+                      summary_version = excluded.summary_version,
+                      generated_from_hash = excluded.generated_from_hash,
+                      generated_at = excluded.generated_at,
+                      updated_at = now()
+                    """
+                ),
+                {
+                    "id": _stable_id("thread-summary", user_id, thread_id),
+                    "user_id": user_id,
+                    "gmail_thread_id": thread_id,
+                    "summary_level": summary_level,
+                    "ai_title": str(row.get("title") or "Untitled email")[:1000],
+                    "summary": "",
+                    "state": _thread_summary_state(row),
+                    "action_type": str(row.get("action_type") or "none"),
+                    "confidence": float(row.get("confidence") or 0),
+                    "source_message_ids_json": json.dumps(source_message_ids, ensure_ascii=True),
+                    "evidence_json": json.dumps(evidence, ensure_ascii=True),
+                    "model": "smart-inbox-projection",
+                    "summary_version": "smart-thread-title-v1",
+                    "generated_from_hash": generated_hash,
+                },
+            )
+
+
+def _thread_summary_state(row: dict[str, Any]) -> str:
+    action_type = str(row.get("action_type") or "none")
+    if action_type in {"pay", "reply", "confirm", "track", "review"}:
+        return "needs_action"
+    if str(row.get("readiness") or "") == "failed":
+        return "failed"
+    return "open"
+
+
+def list_mail_object_bundles(
+    database_url: str,
+    *,
+    user_id: str,
+    limit: int = 100,
+) -> list[MailObjectBundle]:
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                WITH ranked_objects AS (
+                  SELECT
+                    objects.id,
+                    MAX(messages.internal_date) AS latest_message_at,
+                    COUNT(*) AS member_count,
+                    COUNT(*) FILTER (WHERE messages.label_ids_json::jsonb ? 'INBOX') AS inbox_count
+                  FROM mail_objects AS objects
+                  JOIN object_members AS members
+                    ON members.user_id = objects.user_id
+                   AND members.object_id = objects.id
+                  JOIN gmail_messages AS messages
+                    ON messages.user_id = members.user_id
+                   AND messages.message_id = members.gmail_message_id
+                  WHERE objects.user_id = :user_id
+                  GROUP BY objects.id
+                  HAVING COUNT(*) > 1
+                     AND COUNT(*) FILTER (WHERE messages.label_ids_json::jsonb ? 'INBOX') > 0
+                  ORDER BY MAX(messages.internal_date) DESC NULLS LAST, objects.id DESC
+                  LIMIT :limit
+                )
+                SELECT
+                  objects.id AS object_id,
+                  objects.user_id AS object_user_id,
+                  objects.object_type,
+                  objects.canonical_key,
+                  objects.title AS object_title,
+                  objects.summary AS object_summary,
+                  objects.lifecycle_state AS object_lifecycle_state,
+                  objects.confidence AS object_confidence,
+                  objects.evidence_json AS object_evidence_json,
+                  objects.created_at AS object_created_at,
+                  objects.updated_at AS object_updated_at,
+                  members.link_type AS member_link_type,
+                  members.confidence AS member_confidence,
+                  messages.user_id,
+                  messages.message_id,
+                  messages.gmail_thread_id,
+                  messages.history_id,
+                  messages.label_ids_json,
+                  messages.internal_date,
+                  messages.subject,
+                  messages.ai_title,
+                  messages.ai_title_generated_at,
+                  messages.sender,
+                  messages.recipients_json,
+                  messages.headers_json,
+                  messages.snippet,
+                  '{}' AS raw_payload_json,
+                  messages.html_body_sanitized,
+                  messages.html_render_document,
+                  messages.text_body,
+                  messages.extracted_signals_json,
+                  messages.body_hash,
+                  messages.body_fetch_status,
+                  messages.body_fetched_at,
+                  messages.body_fetch_error,
+                  messages.render_doc_bytes,
+                  messages.created_at,
+                  messages.updated_at
+                FROM ranked_objects
+                JOIN mail_objects AS objects
+                  ON objects.user_id = :user_id
+                 AND objects.id = ranked_objects.id
+                JOIN object_members AS members
+                  ON members.user_id = objects.user_id
+                 AND members.object_id = objects.id
+                JOIN gmail_messages AS messages
+                  ON messages.user_id = members.user_id
+                 AND messages.message_id = members.gmail_message_id
+                ORDER BY ranked_objects.latest_message_at DESC NULLS LAST,
+                         objects.id DESC,
+                         messages.internal_date DESC NULLS LAST,
+                         messages.created_at DESC
+                """
+            ),
+            {"user_id": user_id, "limit": max(1, int(limit))},
+        ).mappings().all()
+    bundles: list[MailObjectBundle] = []
+    by_object: dict[str, tuple[MailObjectRecord, list[GmailMessageRecord]]] = {}
+    for row in rows:
+        object_id = str(row["object_id"])
+        if object_id not in by_object:
+            by_object[object_id] = (_mail_object_from_row(row), [])
+        by_object[object_id][1].append(_message_from_row(row))
+    for mail_object, messages in by_object.values():
+        bundles.append(MailObjectBundle(object=mail_object, messages=messages))
+    return bundles
+
+
+def _stable_projection_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def list_visible_groups_for_gmail_threads(
     database_url: str,
     *,
@@ -1781,6 +2353,33 @@ def upsert_mail_group(
             },
         ).mappings().one()
     return _group_from_row(row)
+
+
+def update_mail_group_ai_summary(
+    database_url: str,
+    *,
+    user_id: str,
+    group_id: str,
+    ai_summary: str,
+) -> MailGroupRecord | None:
+    with get_engine(database_url).begin() as connection:
+        row = connection.execute(
+            text(
+                """
+                UPDATE mail_groups
+                SET ai_summary = :ai_summary,
+                    updated_at = now()
+                WHERE user_id = :user_id AND id = :group_id
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": user_id,
+                "group_id": group_id,
+                "ai_summary": ai_summary,
+            },
+        ).mappings().first()
+    return _group_from_row(row) if row is not None else None
 
 
 def replace_group_members(
@@ -2163,7 +2762,20 @@ def count_mail_groups(database_url: str, *, user_id: str) -> int:
     return int(value)
 
 
-def count_ready_mail_groups_since(database_url: str, *, user_id: str, since_iso: str) -> int:
+def count_ready_mail_groups_since(
+    database_url: str,
+    *,
+    user_id: str,
+    since_iso: str,
+    mailbox_label: str | None = None,
+) -> int:
+    if mailbox_label:
+        return count_mail_groups_by_enrichment_status_since(
+            database_url,
+            user_id=user_id,
+            since_iso=since_iso,
+            mailbox_label=mailbox_label,
+        ).get("ready", 0)
     with get_engine(database_url).connect() as connection:
         value = connection.execute(
             text(
@@ -2179,6 +2791,59 @@ def count_ready_mail_groups_since(database_url: str, *, user_id: str, since_iso:
             {"user_id": user_id, "since_iso": since_iso},
         ).scalar_one()
     return int(value)
+
+
+def count_mail_groups_by_enrichment_status_since(
+    database_url: str,
+    *,
+    user_id: str,
+    since_iso: str,
+    mailbox_label: str | None = None,
+) -> dict[str, int]:
+    if mailbox_label:
+        normalized_label = _normalized_mailbox_label(mailbox_label)
+        label_clause = _mailbox_label_clause("messages", normalized_label)
+        with get_engine(database_url).connect() as connection:
+            rows = connection.execute(
+                text(
+                    f"""
+                    SELECT groups.enrichment_status, COUNT(DISTINCT groups.id) AS count
+                    FROM mail_groups AS groups
+                    WHERE groups.user_id = :user_id
+                      AND groups.status = 'active'
+                      AND groups.latest_message_at >= :since_iso
+                      AND EXISTS (
+                        SELECT 1
+                        FROM mail_group_members AS members
+                        JOIN gmail_messages AS messages
+                          ON messages.user_id = members.user_id
+                         AND messages.message_id = members.gmail_message_id
+                        WHERE members.user_id = groups.user_id
+                          AND members.group_id = groups.id
+                          AND COALESCE(messages.internal_date, messages.updated_at) >= :since_iso
+                          AND {label_clause}
+                      )
+                    GROUP BY groups.enrichment_status
+                    """
+                ),
+                {"user_id": user_id, "since_iso": since_iso},
+            ).mappings().all()
+        return {str(row["enrichment_status"]): int(row["count"]) for row in rows}
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT enrichment_status, COUNT(*) AS count
+                FROM mail_groups
+                WHERE user_id = :user_id
+                  AND status = 'active'
+                  AND latest_message_at >= :since_iso
+                GROUP BY enrichment_status
+                """
+            ),
+            {"user_id": user_id, "since_iso": since_iso},
+        ).mappings().all()
+    return {str(row["enrichment_status"]): int(row["count"]) for row in rows}
 
 
 def count_dashboard_mail_groups(database_url: str, *, user_id: str, since_iso: str) -> int:
@@ -2260,12 +2925,16 @@ def get_app_session_snapshot(database_url: str, *, user_id: str) -> AppSessionSn
         ).mappings().first()
     if row is None:
         return None
+    row_dict = dict(row)
     return AppSessionSnapshotRecord(
-        user_id=str(row["user_id"]),
-        dashboard=json.loads(row["dashboard_json"] or "{}"),
-        mailbox=json.loads(row["mailbox_json"] or "{}"),
-        sync=json.loads(row["sync_json"] or "{}"),
-        updated_at=_iso(row["updated_at"]),
+        user_id=str(row_dict["user_id"]),
+        dashboard=json.loads(row_dict["dashboard_json"] or "{}"),
+        mailbox=json.loads(row_dict["mailbox_json"] or "{}"),
+        sync=json.loads(row_dict["sync_json"] or "{}"),
+        updated_at=_iso(row_dict["updated_at"]),
+        smart_inbox=json.loads(row_dict.get("smart_inbox_json") or "{}"),
+        smart_work_queue=json.loads(row_dict.get("smart_work_queue_json") or "{}"),
+        smart_readiness=json.loads(row_dict.get("smart_readiness_json") or "{}"),
     )
 
 
@@ -2276,17 +2945,29 @@ def upsert_app_session_snapshot(
     dashboard: dict[str, Any],
     mailbox: dict[str, Any],
     sync: dict[str, Any],
+    smart_inbox: dict[str, Any] | None = None,
+    smart_work_queue: dict[str, Any] | None = None,
+    smart_readiness: dict[str, Any] | None = None,
 ) -> None:
     with get_engine(database_url).begin() as connection:
         connection.execute(
             text(
                 """
-                INSERT INTO app_session_snapshots (user_id, dashboard_json, mailbox_json, sync_json, updated_at)
-                VALUES (:user_id, :dashboard_json, :mailbox_json, :sync_json, now())
+                INSERT INTO app_session_snapshots (
+                  user_id, dashboard_json, mailbox_json, sync_json,
+                  smart_inbox_json, smart_work_queue_json, smart_readiness_json, updated_at
+                )
+                VALUES (
+                  :user_id, :dashboard_json, :mailbox_json, :sync_json,
+                  :smart_inbox_json, :smart_work_queue_json, :smart_readiness_json, now()
+                )
                 ON CONFLICT (user_id) DO UPDATE SET
                   dashboard_json = excluded.dashboard_json,
                   mailbox_json = excluded.mailbox_json,
                   sync_json = excluded.sync_json,
+                  smart_inbox_json = excluded.smart_inbox_json,
+                  smart_work_queue_json = excluded.smart_work_queue_json,
+                  smart_readiness_json = excluded.smart_readiness_json,
                   updated_at = now()
                 """
             ),
@@ -2295,6 +2976,9 @@ def upsert_app_session_snapshot(
                 "dashboard_json": json.dumps(dashboard, ensure_ascii=True),
                 "mailbox_json": json.dumps(mailbox, ensure_ascii=True),
                 "sync_json": json.dumps(sync, ensure_ascii=True),
+                "smart_inbox_json": json.dumps(smart_inbox or {}, ensure_ascii=True),
+                "smart_work_queue_json": json.dumps(smart_work_queue or {}, ensure_ascii=True),
+                "smart_readiness_json": json.dumps(smart_readiness or {}, ensure_ascii=True),
             },
         )
 
@@ -2361,6 +3045,197 @@ def _message_params(message: GmailMessageRecord) -> dict[str, Any]:
     }
 
 
+def _message_signal_params(message: GmailMessageRecord) -> dict[str, Any]:
+    signals = message.extracted_signals if isinstance(message.extracted_signals, dict) else {}
+    headers = message.headers if isinstance(message.headers, dict) else {}
+    reference_ids = {
+        key: str(value).strip()
+        for key in ["order_id", "trade_id", "ticket_id", "tracking_id", "invoice_id", "booking_id", "application_id", "reference_id"]
+        if (value := signals.get(key))
+    }
+    domains = signals.get("domains") if isinstance(signals.get("domains"), list) else []
+    links = [{"domain": str(domain).strip().lower()} for domain in domains if str(domain).strip()]
+    reply_refs = _message_reply_refs(signals=signals, headers=headers)
+    list_signals = {
+        key: value
+        for key, value in {
+            "list_id": signals.get("list_id") or headers.get("list-id") or headers.get("List-ID"),
+            "list_unsubscribe": headers.get("list-unsubscribe") or headers.get("List-Unsubscribe"),
+        }.items()
+        if value
+    }
+    generated_from_hash = message.body_hash or _stable_projection_hash(
+        {
+            "message_id": message.message_id,
+            "signals": signals,
+            "headers": headers,
+        }
+    )
+    return {
+        "id": f"message-signal:{message.user_id}:{message.message_id}",
+        "user_id": message.user_id,
+        "gmail_message_id": message.message_id,
+        "gmail_thread_id": message.gmail_thread_id,
+        "sender_domain": str(signals.get("sender_domain") or "").strip().lower() or None,
+        "normalized_subject": str(signals.get("normalized_subject") or "").strip() or None,
+        "reference_ids_json": json.dumps(reference_ids, ensure_ascii=True),
+        "dates_json": json.dumps([], ensure_ascii=True),
+        "money_json": json.dumps([], ensure_ascii=True),
+        "links_json": json.dumps(links, ensure_ascii=True),
+        "reply_refs_json": json.dumps(reply_refs, ensure_ascii=True),
+        "list_signals_json": json.dumps(list_signals, ensure_ascii=True),
+        "extraction_version": "message-signals-v1",
+        "generated_from_hash": generated_from_hash,
+    }
+
+
+REFERENCE_OBJECT_TYPES = {
+    "order_id": "order",
+    "trade_id": "trade",
+    "ticket_id": "ticket",
+    "tracking_id": "shipment",
+    "invoice_id": "invoice",
+    "booking_id": "booking",
+    "application_id": "application",
+    "reference_id": "reference",
+}
+
+
+REFERENCE_OBJECT_TITLES = {
+    "order_id": "order",
+    "trade_id": "trade",
+    "ticket_id": "ticket",
+    "tracking_id": "tracking",
+    "invoice_id": "invoice",
+    "booking_id": "booking",
+    "application_id": "application",
+    "reference_id": "reference",
+}
+
+GENERIC_NAMESPACE_PARTS = {
+    "co",
+    "com",
+    "email",
+    "in",
+    "mail",
+    "net",
+    "no-reply",
+    "noreply",
+    "notification",
+    "notifications",
+    "org",
+    "support",
+}
+
+
+def _mail_object_specs(message: GmailMessageRecord) -> list[dict[str, dict[str, Any]]]:
+    signals = message.extracted_signals if isinstance(message.extracted_signals, dict) else {}
+    provider = _message_signal_namespace(message)
+    specs: list[dict[str, dict[str, Any]]] = []
+    for signal_name, object_type in REFERENCE_OBJECT_TYPES.items():
+        raw_value = signals.get(signal_name)
+        if not raw_value:
+            continue
+        reference_value = _slug_token(str(raw_value))
+        if not reference_value:
+            continue
+        reference_provider = _message_reference_provider(signal_name, provider)
+        canonical_key = f"{signal_name}:{reference_provider}:{reference_value}"
+        object_id = _stable_id("mail-object", message.user_id, canonical_key)
+        title_reference = str(raw_value).strip()
+        title = f"{_provider_title(reference_provider)} {REFERENCE_OBJECT_TITLES[signal_name]} {title_reference}".strip()
+        evidence = {
+            "source": "message_signals",
+            "signal_name": signal_name,
+            "reference_value": title_reference,
+            "sender_domain": signals.get("sender_domain"),
+            "normalized_subject": signals.get("normalized_subject"),
+            "gmail_thread_id": message.gmail_thread_id,
+        }
+        specs.append(
+            {
+                "object": {
+                    "id": object_id,
+                    "user_id": message.user_id,
+                    "object_type": object_type,
+                    "canonical_key": canonical_key,
+                    "title": title[:1000],
+                    "summary": f"Mail related to {title}."[:6000],
+                    "confidence": 1.0,
+                    "evidence_json": json.dumps(evidence, ensure_ascii=True),
+                },
+                "member": {
+                    "id": _stable_id("object-member", message.user_id, object_id, message.message_id),
+                    "user_id": message.user_id,
+                    "object_id": object_id,
+                    "gmail_message_id": message.message_id,
+                    "gmail_thread_id": message.gmail_thread_id,
+                    "link_type": signal_name,
+                    "confidence": 1.0,
+                    "evidence_json": json.dumps(evidence, ensure_ascii=True),
+                },
+            }
+        )
+    return specs
+
+
+def _message_signal_namespace(message: GmailMessageRecord) -> str:
+    signals = message.extracted_signals if isinstance(message.extracted_signals, dict) else {}
+    raw_domains = [str(signals.get("sender_domain") or "").strip().lower()]
+    signal_domains = signals.get("domains")
+    if isinstance(signal_domains, list):
+        raw_domains.extend(str(item).strip().lower() for item in signal_domains if item)
+    namespaces = [namespace for raw_domain in raw_domains if (namespace := _domain_namespace_slug(raw_domain))]
+    if namespaces:
+        return sorted(set(namespaces), key=lambda item: (len(item), item))[0]
+    return _slug_token(message.sender or "") or "unknown"
+
+
+def _domain_namespace_slug(domain: str) -> str:
+    parts = [
+        part
+        for part in re.findall(r"[a-z0-9-]+", domain.lower())
+        if part and part not in GENERIC_NAMESPACE_PARTS
+    ]
+    return _slug_token(parts[0] if parts else domain)
+
+
+def _provider_title(provider: str) -> str:
+    return " ".join(part.upper() if len(part) <= 3 else part.title() for part in provider.split("-") if part) or "Mail"
+
+
+def _message_reference_provider(signal_name: str, provider: str) -> str:
+    if signal_name == "trade_id":
+        return "fx-retail"
+    return provider
+
+
+def _slug_token(value: str) -> str:
+    return "-".join(part for part in re.findall(r"[a-z0-9]+", value.lower()) if part)[:120]
+
+
+def _stable_id(prefix: str, *parts: str) -> str:
+    digest = hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()[:32]
+    return f"{prefix}:{digest}"
+
+
+def _message_reply_refs(*, signals: dict[str, Any], headers: dict[str, str]) -> list[str]:
+    values: list[str] = []
+    for key in ["in_reply_to", "references", "message_id"]:
+        value = signals.get(key)
+        if value:
+            values.extend(_split_reference_header(str(value)))
+    for key in ["in-reply-to", "In-Reply-To", "references", "References", "message-id", "Message-ID"]:
+        value = headers.get(key)
+        if value:
+            values.extend(_split_reference_header(str(value)))
+    return list(dict.fromkeys(values))[:24]
+
+
+def _split_reference_header(value: str) -> list[str]:
+    return [part.strip() for part in value.replace(",", " ").split() if part.strip()]
+
+
 def _message_from_row(row) -> GmailMessageRecord:
     return GmailMessageRecord(
         user_id=str(row["user_id"]),
@@ -2388,6 +3263,22 @@ def _message_from_row(row) -> GmailMessageRecord:
         body_fetched_at=_iso(row["body_fetched_at"]) if row.get("body_fetched_at") is not None else None,
         body_fetch_error=str(row["body_fetch_error"]) if row.get("body_fetch_error") is not None else None,
         render_doc_bytes=int(row["render_doc_bytes"] or 0) if row.get("render_doc_bytes") is not None else 0,
+    )
+
+
+def _mail_object_from_row(row) -> MailObjectRecord:
+    return MailObjectRecord(
+        id=str(row["object_id"]),
+        user_id=str(row["object_user_id"]),
+        object_type=str(row["object_type"]),
+        canonical_key=str(row["canonical_key"]),
+        title=str(row["object_title"]),
+        summary=str(row["object_summary"] or ""),
+        lifecycle_state=str(row["object_lifecycle_state"]),
+        confidence=float(row["object_confidence"] or 0),
+        evidence=_json_dict(row["object_evidence_json"]),
+        created_at=_iso(row["object_created_at"]),
+        updated_at=_iso(row["object_updated_at"]),
     )
 
 
@@ -2455,6 +3346,8 @@ def _pending_send_from_row(row) -> PendingSendRecord:
 
 
 def _json_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
     try:
         parsed = json.loads(value or "[]")
     except (TypeError, json.JSONDecodeError):
@@ -2462,6 +3355,26 @@ def _json_list(value: Any) -> list[str]:
     if not isinstance(parsed, list):
         return []
     return [str(item) for item in parsed if str(item).strip()]
+
+
+def _smart_inbox_row_from_row(row, *, user_id: str) -> SmartInboxRowRecord:
+    storage_id = str(row["id"])
+    storage_prefix = f"{user_id}:"
+    public_id = storage_id.removeprefix(storage_prefix)
+    return SmartInboxRowRecord(
+        id=storage_id,
+        public_id=public_id,
+        user_id=str(row["user_id"]),
+        row_key=str(row["row_key"]),
+        row_type=str(row["row_type"]),
+        title=str(row["title"]),
+        summary=str(row["summary"] or ""),
+        source_thread_ids=_json_list(row["source_thread_ids_json"]),
+        source_message_ids=_json_list(row["source_message_ids_json"]),
+        latest_message_at=_iso(row["latest_message_at"]) if row["latest_message_at"] is not None else None,
+        latest_message_id=str(row["latest_message_id"]) if row["latest_message_id"] is not None else None,
+        action_type=str(row["action_type"]),
+    )
 
 
 def _json_dict(value: Any) -> dict[str, Any]:
@@ -2598,6 +3511,8 @@ def _state_from_row(row) -> GmailImportState:
         full_backfill_cursor=str(row["full_backfill_cursor"]) if row["full_backfill_cursor"] is not None else None,
         full_backfill_started_at=_iso(row["full_backfill_started_at"]) if "full_backfill_started_at" in row and row["full_backfill_started_at"] is not None else None,
         full_backfill_completed_at=_iso(row["full_backfill_completed_at"]) if "full_backfill_completed_at" in row and row["full_backfill_completed_at"] is not None else None,
+        hot_window_started_at=_iso(row["hot_window_started_at"]) if "hot_window_started_at" in row and row["hot_window_started_at"] is not None else None,
+        hot_window_completed_at=_iso(row["hot_window_completed_at"]) if "hot_window_completed_at" in row and row["hot_window_completed_at"] is not None else None,
         first_batch_imported_at=_iso(row["first_batch_imported_at"]) if row["first_batch_imported_at"] is not None else None,
         first_groups_ready_at=_iso(row["first_groups_ready_at"]) if row["first_groups_ready_at"] is not None else None,
         first_dashboard_ready_at=_iso(row["first_dashboard_ready_at"]) if row["first_dashboard_ready_at"] is not None else None,

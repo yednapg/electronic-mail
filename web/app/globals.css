@@ -2288,6 +2288,41 @@ body:has(.thread-reader-shell) [title="Open Next.js Dev Tools"] {
   letter-spacing: 0;
 }
 
+.thread-reader-summary-button {
+  appearance: none;
+  width: fit-content;
+  min-height: 32px;
+  padding: 0 11px;
+  border: 1px solid var(--dashboard-control-border);
+  border-radius: 999px;
+  background: var(--dashboard-control-bg);
+  color: var(--page-text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.thread-reader-summary-button:hover,
+.thread-reader-summary-button:focus-visible {
+  background: var(--dashboard-control-bg-hover);
+}
+
+.thread-reader-summary-button:disabled {
+  cursor: default;
+  opacity: 0.62;
+}
+
+.thread-reader-summary-error {
+  margin: 0;
+  color: var(--page-text-muted);
+  font-size: var(--type-detail-source);
+  line-height: 1.4;
+  letter-spacing: 0;
+}
+
 .thread-reader-meta,
 .thread-reader-empty {
   margin: 0;

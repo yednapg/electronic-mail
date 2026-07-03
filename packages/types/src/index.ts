@@ -203,6 +203,7 @@ export interface FirstRunImportJobResponse {
   readonly first_groups_ready_at?: string | null;
   readonly dashboard_ready_at?: string | null;
   readonly canonical_dashboard_ready_at?: string | null;
+  readonly hot_window_ready_at?: string | null;
   readonly quality_status?: 'pending' | 'ready' | 'failed';
   readonly quality_error?: string | null;
   readonly full_import_started_at?: string | null;
@@ -222,7 +223,7 @@ export interface PostLoginReadinessResponse {
     | 'importing_recent_gmail'
     | 'grouping_threads'
     | 'writing_titles'
-    | 'building_dashboard'
+    | 'preparing_inbox'
     | 'ready'
     | 'failed';
   readonly ready_to_enter: boolean;
@@ -407,6 +408,108 @@ export interface MailboxResponse {
   readonly full_import_completed?: boolean;
 }
 
+export type SmartInboxRowType = 'verified_group' | 'summarized_thread' | 'related_bundle' | 'waiting' | 'update' | 'normal';
+export type SmartConfidenceTier = 'exact' | 'strong' | 'medium' | 'weak' | 'unknown';
+export type SmartReadinessState = 'partial' | 'ready' | 'stale' | 'failed';
+
+export interface SmartInboxRow {
+  readonly id: string;
+  readonly row_key: string;
+  readonly row_type: SmartInboxRowType;
+  readonly title: string;
+  readonly summary: string;
+  readonly primary_sender?: string | null;
+  readonly latest_message_at?: string | null;
+  readonly latest_message_id?: string | null;
+  readonly reader_thread_id?: string | null;
+  readonly source_thread_ids: string[];
+  readonly source_message_ids: string[];
+  readonly confidence_tier: SmartConfidenceTier;
+  readonly confidence: number;
+  readonly grouping_reason: Record<string, unknown>;
+  readonly offline_status: SmartReadinessState;
+  readonly readiness: SmartReadinessState;
+  readonly action_type: 'pay' | 'reply' | 'confirm' | 'track' | 'review' | 'read' | 'open' | 'none';
+  readonly priority: number;
+}
+
+export interface SmartInboxSection {
+  readonly id: string;
+  readonly title: string;
+  readonly rows: SmartInboxRow[];
+}
+
+export interface SmartRelatedSuggestion {
+  readonly id: string;
+  readonly suggestion_key: string;
+  readonly source_row_id: string;
+  readonly related_row_id: string;
+  readonly title: string;
+  readonly reason: string;
+  readonly confidence: number;
+  readonly evidence: Record<string, unknown>;
+  readonly status: 'active' | 'dismissed' | 'accepted';
+}
+
+export interface SmartInboxResponse {
+  readonly total_rows: number;
+  readonly sections: SmartInboxSection[];
+  readonly related_suggestions: SmartRelatedSuggestion[];
+  readonly ready_count: number;
+  readonly partial_count: number;
+  readonly failed_count: number;
+  readonly generated_at?: string | null;
+  readonly hot_window_days: number;
+  readonly hot_window_message_cap: number;
+  readonly hot_window_thread_cap: number;
+}
+
+export interface SmartWorkItem {
+  readonly id: string;
+  readonly kind: 'needs_action' | 'waiting' | 'active_conversation' | 'important_update' | 'manual_reminder';
+  readonly title: string;
+  readonly summary: string;
+  readonly status: 'open' | 'done' | 'snoozed' | 'dismissed';
+  readonly smart_row_id?: string | null;
+  readonly source_thread_ids: string[];
+  readonly source_message_ids: string[];
+  readonly due_at?: string | null;
+  readonly priority: number;
+  readonly confidence: number;
+  readonly reason: Record<string, unknown>;
+  readonly created_at?: string | null;
+  readonly updated_at?: string | null;
+}
+
+export interface SmartWorkQueueResponse {
+  readonly needs_action: SmartWorkItem[];
+  readonly waiting: SmartWorkItem[];
+  readonly active_conversations: SmartWorkItem[];
+  readonly important_updates: SmartWorkItem[];
+  readonly manual_reminders: SmartWorkItem[];
+  readonly total_open: number;
+  readonly generated_at?: string | null;
+}
+
+export interface SmartReadinessResponse {
+  readonly stage: 'empty' | 'syncing' | 'classifying' | 'grouping' | 'snapshot_ready' | 'offline_ready' | 'failed';
+  readonly first_ready_complete: boolean;
+  readonly hot_window_complete: boolean;
+  readonly offline_ready: boolean;
+  readonly first_ready_target_messages: number;
+  readonly hot_window_message_cap: number;
+  readonly hot_window_thread_cap: number;
+  readonly processed_messages: number;
+  readonly processed_threads: number;
+  readonly ready_rows: number;
+  readonly partial_rows: number;
+  readonly failed_rows: number;
+  readonly offline_ready_rows: number;
+  readonly offline_partial_rows: number;
+  readonly offline_failed_rows: number;
+  readonly last_error?: string | null;
+}
+
 export interface MailboxSyncStateResponse {
   readonly connected: boolean;
   readonly last_history_id?: string | null;
@@ -469,6 +572,8 @@ export interface ThreadReaderResponse {
   readonly source?: SourceType | null;
   readonly gmail_thread_id?: string | null;
   readonly subject?: string | null;
+  readonly title?: string | null;
+  readonly summary?: string | null;
   readonly total_messages: number;
   readonly limit: number;
   readonly offset: number;
@@ -508,6 +613,9 @@ export interface AppSessionStateResponse {
   readonly dashboard: DashboardResponse;
   readonly mailbox: MailboxResponse;
   readonly sync: AppSessionSyncState;
+  readonly smart_inbox?: SmartInboxResponse;
+  readonly smart_work_queue?: SmartWorkQueueResponse;
+  readonly smart_readiness?: SmartReadinessResponse;
 }
 
 export interface BackgroundJobResponse {

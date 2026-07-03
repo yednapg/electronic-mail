@@ -76,6 +76,8 @@ public final class InboxStore: ObservableObject {
     @Published private(set) var readerThread: ThreadReaderResponse?
     @Published private(set) var readerRow: InboxRowViewModel?
     @Published private(set) var readerError: String?
+    @Published private(set) var readerSummaryLoading = false
+    @Published private(set) var readerSummaryError: String?
     @Published private(set) var threadErrors: [String: String] = [:]
     @Published private(set) var openedThreads: [String: ThreadReaderResponse] = [:]
     @Published private(set) var mailboxPageLoading = false
@@ -98,6 +100,7 @@ public final class InboxStore: ObservableObject {
     private var inFlightSessionRefresh: Task<AppSessionResponse, Error>?
     private var inFlightMailboxRefresh: Task<MailboxResponse, Error>?
     private var inFlightThreads: [String: Task<ThreadReaderResponse, Error>] = [:]
+    private var inFlightThreadSummaries: [String: Task<ThreadReaderResponse, Error>] = [:]
     private var selectionPrefetchTask: Task<Void, Never>?
     private var syncLoopTask: Task<Void, Never>?
     private var eventStreamTask: Task<Void, Never>?
@@ -106,6 +109,8 @@ public final class InboxStore: ObservableObject {
     private var lastMailboxRefreshAt: [MailboxLabel: Date] = [:]
     private var lastAutomaticMailboxCursor: String?
     private var bodyRefreshAttempts: [String: Int] = [:]
+    private var summaryRequestedThreadIDs: Set<String> = []
+    private var threadSummaryErrors: [String: String] = [:]
     private var readActionQueuedKeys: Set<String> = []
     private var lastMailboxEventID: String?
     private var lastSeenMailboxRevision: String?
@@ -171,14 +176,20 @@ public final class InboxStore: ObservableObject {
             readerThread = nil
             readerRow = nil
             readerError = nil
+            readerSummaryLoading = false
+            readerSummaryError = nil
             openedThreads = [:]
             expandedThreadIDs = []
             threadErrors = [:]
             bodyRefreshAttempts = [:]
+            summaryRequestedThreadIDs = []
+            threadSummaryErrors = [:]
             readActionQueuedKeys = []
             lastMailboxRefreshAt = [:]
             inFlightMailboxRefresh?.cancel()
             inFlightMailboxRefresh = nil
+            inFlightThreadSummaries.values.forEach { $0.cancel() }
+            inFlightThreadSummaries = [:]
             selectionPrefetchTask?.cancel()
             selectionPrefetchTask = nil
             stopMailboxEventStream()
@@ -212,58 +223,16 @@ public final class InboxStore: ObservableObject {
     }
 
     public var sections: [InboxSectionViewModel] {
+        if activeMailboxLabel == .inbox, let smartInbox = visibleSmartInbox {
+            return mergedSmartInboxSections(smartInbox)
+        }
+
         guard let mailbox = visibleMailbox else {
             return []
         }
         return mailbox.sections.compactMap { section in
             let rows = visibleRows(in: section).flatMap { row in
-                let childRows = visibleChildren(for: row)
-                let parent = InboxRowViewModel(
-                    id: row.threadID,
-                    sender: row.displaySender,
-                    title: row.displayTitle,
-                    summary: row.displaySummary,
-                    receivedAt: row.latestReceivedAt,
-                    section: section.title,
-                    isUnread: row.isUnread,
-                    isGrouped: row.isGrouped,
-                    isSelected: selectedThreadID == row.threadID && selectedMessageID == nil,
-                    threadID: row.threadID,
-                    focusedMessageID: nil,
-                    messageCount: row.messageCount,
-                    timeLabel: Self.timeLabel(for: row.latestReceivedAt, sectionTitle: section.title),
-                    hasAttachments: row.hasAttachments == true || (row.attachmentCount ?? 0) > 0,
-                    presentationStatus: row.presentationStatus,
-                    isChild: false,
-                    isExpandable: childRows.count > 1,
-                    isExpanded: expandedThreadIDs.contains(row.threadID)
-                )
-                guard expandedThreadIDs.contains(row.threadID) else {
-                    return [parent]
-                }
-                let children = childRows.map { child in
-                    InboxRowViewModel(
-                        id: "\(row.threadID)::message::\(child.messageID)",
-                        sender: child.displaySender,
-                        title: child.displayTitle,
-                        summary: child.snippet,
-                        receivedAt: child.receivedAt,
-                        section: section.title,
-                        isUnread: child.isUnread,
-                        isGrouped: false,
-                        isSelected: selectedThreadID == row.threadID && selectedMessageID == child.messageID,
-                        threadID: row.threadID,
-                        focusedMessageID: child.messageID,
-                        messageCount: 1,
-                        timeLabel: Self.timeLabel(for: child.receivedAt, sectionTitle: section.title),
-                        hasAttachments: false,
-                        presentationStatus: row.presentationStatus,
-                        isChild: true,
-                        isExpandable: false,
-                        isExpanded: false
-                    )
-                }
-                return [parent] + children
+                mailboxViewModels(for: row, sectionTitle: section.title)
             }
             guard !rows.isEmpty else {
                 return nil
@@ -288,25 +257,21 @@ public final class InboxStore: ObservableObject {
     }
 
     public var mailboxVisibleRowCount: Int {
-        visibleMailbox?.sections.reduce(0) { $0 + $1.rows.count } ?? 0
+        sections.reduce(0) { $0 + $1.rows.count }
     }
 
     public var isReadyForMainInterface: Bool {
         guard let readiness = session?.readiness else {
             return false
         }
-        return readiness.readyToEnter && mailboxVisibleRowCount > 0 && dashboardFeedCount > 0
-    }
-
-    public var canEnterWithBuildingDashboard: Bool {
-        guard let readiness = session?.readiness else {
-            return false
-        }
-        return readiness.mailboxReady && mailboxVisibleRowCount > 0
+        return readiness.readyToEnter && mailboxVisibleRowCount > 0
     }
 
     public var canLoadMoreMailbox: Bool {
-        visibleMailbox?.nextCursor?.isEmpty == false
+        if activeMailboxLabel == .inbox, visibleSmartInbox != nil {
+            return false
+        }
+        return visibleMailbox?.nextCursor?.isEmpty == false
     }
 
     public var mailboxFooterText: String? {
@@ -333,6 +298,23 @@ public final class InboxStore: ObservableObject {
     }
 
     public var mailboxFooter: InboxMailboxFooterViewModel? {
+        if activeMailboxLabel == .inbox, let smartInbox = visibleSmartInbox {
+            let totalRows = max(smartInbox.totalRows, smartInbox.sections.reduce(0) { $0 + $1.rows.count })
+            let progress = totalRows > 0 ? min(1, Double(smartInbox.readyCount) / Double(totalRows)) : nil
+            if let readiness = session?.smartReadiness, readiness.offlineReady == false {
+                return InboxMailboxFooterViewModel(
+                    text: "Preparing offline smart inbox: \(smartInbox.readyCount) of \(totalRows) ready.",
+                    progress: progress,
+                    canLoadMore: false
+                )
+            }
+            return nil
+        }
+
+        return mailboxPaginationFooter
+    }
+
+    private var mailboxPaginationFooter: InboxMailboxFooterViewModel? {
         guard let mailbox = visibleMailbox else {
             return nil
         }
@@ -374,7 +356,7 @@ public final class InboxStore: ObservableObject {
             phase = .failed("Sign in with Google to load your mailbox.")
             return
         }
-        if let cached = sessionCache.read() ?? localMailStore.readSession() {
+        if let cached = displayableCachedSession() {
             session = cached
             activeMailbox = localMailStore.readMailbox(userID: cached.user.id, label: activeMailboxLabel)
             phase = activeMailbox == nil ? .loading : .loaded
@@ -466,7 +448,7 @@ public final class InboxStore: ObservableObject {
 
     private func refreshAfterSend(_ response: MailSendResponse) async {
         if response.state == .sent || response.state == .queued || response.state == .sending {
-            await refresh(allowEmptyDashboard: true)
+            await refresh(allowEmptyDashboard: true, forceMailbox: true)
             if let threadID = response.mailboxThreadID ?? readerThreadID {
                 await prefetchThread(threadID: threadID, force: true, silent: true)
             }
@@ -510,7 +492,7 @@ public final class InboxStore: ObservableObject {
                 return
             }
             refreshFailed = true
-            if session == nil, let cached = sessionCache.read() ?? localMailStore.readSession() {
+            if session == nil, let cached = displayableCachedSession() {
                 session = cached
                 activeMailbox = localMailStore.readMailbox(userID: cached.user.id, label: activeMailboxLabel)
                 phase = activeMailbox == nil ? .failed(error.localizedDescription) : .loaded
@@ -518,6 +500,23 @@ public final class InboxStore: ObservableObject {
                 phase = .failed(error.localizedDescription)
             }
         }
+    }
+
+    private func displayableCachedSession() -> AppSessionResponse? {
+        guard let cached = sessionCache.read() ?? localMailStore.readSession() else {
+            return nil
+        }
+        guard canDisplayCachedSession(cached) else {
+            return nil
+        }
+        return cached
+    }
+
+    private func canDisplayCachedSession(_ cached: AppSessionResponse) -> Bool {
+        guard activeMailboxLabel == .inbox, client.mode == .localBackend else {
+            return true
+        }
+        return cached.smartInbox?.isEmpty == false
     }
 
     private static func isAuthenticationFailure(_ error: Error) -> Bool {
@@ -552,7 +551,7 @@ public final class InboxStore: ObservableObject {
             }
             lastMailboxRefreshAt[label] = now
 
-            let merged = activeMailbox?.preservingLoadedPages(afterRefreshingFirstPage: mailbox) ?? mailbox
+            let merged = force ? mailbox : activeMailbox?.preservingLoadedPages(afterRefreshingFirstPage: mailbox) ?? mailbox
             activeMailbox = merged
             if let revision = merged.mailboxRevision, !revision.isEmpty {
                 lastSeenMailboxRevision = revision
@@ -586,6 +585,9 @@ public final class InboxStore: ObservableObject {
     }
 
     public func loadMoreMailbox(automatic: Bool = false) async {
+        if activeMailboxLabel == .inbox, visibleSmartInbox != nil {
+            return
+        }
         guard !mailboxPageLoading, let cursor = visibleMailbox?.nextCursor, !cursor.isEmpty, let userID = session?.user.id else {
             return
         }
@@ -653,10 +655,11 @@ public final class InboxStore: ObservableObject {
         activeMessageID = focusedMessageID
         readerThreadID = threadID
         readerFocusedMessageID = focusedMessageID
-        readerThread = openedThreads[threadID]
+        readerThread = openedThreads[threadID].map { displayThread($0, threadID: threadID) }
         readerRow = rowViewModel(threadID: threadID)
         readerError = nil
         threadErrors[threadID] = nil
+        refreshReaderSummaryState()
         markReadAfterOpening(threadID: threadID, focusedMessageID: focusedMessageID)
 
         return Task { [weak self] in
@@ -667,6 +670,7 @@ public final class InboxStore: ObservableObject {
     public func closeReader() {
         readerThreadID = nil
         readerFocusedMessageID = nil
+        refreshReaderSummaryState()
     }
 
     public func toggleExpansion(threadID: String) {
@@ -695,6 +699,8 @@ public final class InboxStore: ObservableObject {
         readerThread = nil
         readerRow = nil
         readerError = nil
+        readerSummaryLoading = false
+        readerSummaryError = nil
         expandedThreadIDs = []
         inFlightMailboxRefresh?.cancel()
         inFlightMailboxRefresh = nil
@@ -795,11 +801,12 @@ public final class InboxStore: ObservableObject {
         }
         let cachedThread = force ? nil : (localMailStore.readThread(userID: userID, threadID: threadID) ?? threadCache.read(userID: userID, threadID: threadID))
         if let cached = cachedThread {
-            openedThreads[threadID] = cached
-            updateReader(threadID: threadID, thread: cached, error: nil)
-            scheduleBodyRefreshIfNeeded(threadID: threadID, thread: cached)
+            let displayCached = displayThread(cached, threadID: threadID)
+            openedThreads[threadID] = displayCached
+            updateReader(threadID: threadID, thread: displayCached, error: nil)
+            scheduleBodyRefreshIfNeeded(threadID: threadID, thread: displayCached)
             if threadCache.read(userID: userID, threadID: threadID) != nil {
-                localMailStore.writeThread(cached, userID: userID, threadID: threadID)
+                localMailStore.writeThread(displayCached, userID: userID, threadID: threadID)
             }
             if silent {
                 return
@@ -808,8 +815,9 @@ public final class InboxStore: ObservableObject {
         if let inFlight = inFlightThreads[threadID] {
             do {
                 let thread = try await inFlight.value
-                openedThreads[threadID] = thread
-                updateReader(threadID: threadID, thread: thread, error: nil)
+                let visibleThread = displayThread(thread, threadID: threadID)
+                openedThreads[threadID] = visibleThread
+                updateReader(threadID: threadID, thread: visibleThread, error: nil)
             } catch {
                 if !silent {
                     recordThreadError(error.localizedDescription, threadID: threadID)
@@ -825,17 +833,70 @@ public final class InboxStore: ObservableObject {
         do {
             let thread = try await task.value
             inFlightThreads[threadID] = nil
-            openedThreads[threadID] = thread
-            threadCache.write(thread, userID: userID, threadID: threadID)
-            localMailStore.writeThread(thread, userID: userID, threadID: threadID)
+            let visibleThread = displayThread(thread, threadID: threadID)
+            openedThreads[threadID] = visibleThread
+            threadCache.write(visibleThread, userID: userID, threadID: threadID)
+            localMailStore.writeThread(visibleThread, userID: userID, threadID: threadID)
             threadErrors[threadID] = nil
-            updateReader(threadID: threadID, thread: thread, error: nil)
-            scheduleBodyRefreshIfNeeded(threadID: threadID, thread: thread)
+            updateReader(threadID: threadID, thread: visibleThread, error: nil)
+            scheduleBodyRefreshIfNeeded(threadID: threadID, thread: visibleThread)
         } catch {
             inFlightThreads[threadID] = nil
             if cachedThread == nil, !silent {
                 recordThreadError(error.localizedDescription, threadID: threadID)
             }
+        }
+    }
+
+    public func requestReaderSummary(threadID: String) async {
+        guard let userID = session?.user.id else {
+            threadSummaryErrors[threadID] = "Sign in with Google to load this summary."
+            refreshReaderSummaryState()
+            return
+        }
+
+        summaryRequestedThreadIDs.insert(threadID)
+        threadSummaryErrors[threadID] = nil
+        refreshReaderSummaryState()
+
+        if let existing = openedThreads[threadID], existing.hasSummary {
+            updateReader(threadID: threadID, thread: existing, error: nil)
+            return
+        }
+
+        if let inFlight = inFlightThreadSummaries[threadID] {
+            await finishSummaryRequest(inFlight, threadID: threadID, userID: userID)
+            return
+        }
+
+        let task = Task { [client, threadFetchLimit] in
+            try await client.threadSummary(threadID: threadID, limit: threadFetchLimit, offset: 0)
+        }
+        inFlightThreadSummaries[threadID] = task
+        refreshReaderSummaryState()
+        await finishSummaryRequest(task, threadID: threadID, userID: userID)
+    }
+
+    private func finishSummaryRequest(_ task: Task<ThreadReaderResponse, Error>, threadID: String, userID: String) async {
+        do {
+            let response = try await task.value
+            inFlightThreadSummaries[threadID] = nil
+            let summary = response.summary?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let summary, !summary.isEmpty else {
+                threadSummaryErrors[threadID] = "Summary is not ready yet."
+                refreshReaderSummaryState()
+                return
+            }
+            let merged = (openedThreads[threadID] ?? response).replacingSummary(summary)
+            openedThreads[threadID] = merged
+            threadCache.write(merged, userID: userID, threadID: threadID)
+            localMailStore.writeThread(merged, userID: userID, threadID: threadID)
+            threadSummaryErrors[threadID] = nil
+            updateReader(threadID: threadID, thread: merged, error: nil)
+        } catch {
+            inFlightThreadSummaries[threadID] = nil
+            threadSummaryErrors[threadID] = error.localizedDescription
+            refreshReaderSummaryState()
         }
     }
 
@@ -1150,9 +1211,10 @@ public final class InboxStore: ObservableObject {
         guard readerThreadID == threadID else {
             return
         }
-        readerThread = thread
+        readerThread = displayThread(thread, threadID: threadID)
         readerRow = rowViewModel(threadID: threadID)
         readerError = error
+        refreshReaderSummaryState()
     }
 
     private func recordThreadError(_ message: String, threadID: String) {
@@ -1162,6 +1224,20 @@ public final class InboxStore: ObservableObject {
         }
         readerError = message
         readerRow = rowViewModel(threadID: threadID)
+    }
+
+    private func displayThread(_ thread: ThreadReaderResponse, threadID: String) -> ThreadReaderResponse {
+        summaryRequestedThreadIDs.contains(threadID) ? thread : thread.replacingSummary(nil)
+    }
+
+    private func refreshReaderSummaryState() {
+        guard let readerThreadID else {
+            readerSummaryLoading = false
+            readerSummaryError = nil
+            return
+        }
+        readerSummaryLoading = inFlightThreadSummaries[readerThreadID] != nil
+        readerSummaryError = threadSummaryErrors[readerThreadID]
     }
 
     private func scheduleBodyRefreshIfNeeded(threadID: String, thread: ThreadReaderResponse) {
@@ -1290,6 +1366,325 @@ public final class InboxStore: ObservableObject {
         return nil
     }
 
+    private var visibleSmartInbox: SmartInboxResponse? {
+        guard activeMailboxLabel == .inbox, let smartInbox = session?.smartInbox, !smartInbox.isEmpty else {
+            return nil
+        }
+        return smartInbox
+    }
+
+    private func mergedSmartInboxSections(_ smartInbox: SmartInboxResponse) -> [InboxSectionViewModel] {
+        var output: [InboxSectionViewModel] = []
+        let backingRowsByID = visibleMailboxRowsByLookupID()
+
+        for section in smartInbox.sections {
+            let rows = section.rows.flatMap { row -> [InboxRowViewModel] in
+                let backingRows = backingMailboxRows(for: row, rowsByID: backingRowsByID)
+                return smartViewModels(for: row, backingRows: backingRows, sectionTitle: section.title)
+            }
+            appendSection(id: section.id, title: section.title, rows: rows, to: &output)
+        }
+
+        return output
+    }
+
+    private func smartViewModels(
+        for row: SmartInboxRow,
+        backingRows: [GmailThreadRow],
+        sectionTitle: String
+    ) -> [InboxRowViewModel] {
+        let childRows = visibleSmartChildren(for: row, backingRows: backingRows)
+        let parentThreadID = smartParentThreadID(for: row, backingRows: backingRows)
+        let parent = InboxRowViewModel(
+            id: row.id,
+            sender: row.displaySender,
+            title: row.displayTitle,
+            summary: nil,
+            receivedAt: row.latestMessageAt ?? "",
+            section: sectionTitle,
+            isUnread: backingRows.contains(where: \.isUnread),
+            isGrouped: row.isGrouped,
+            isSelected: selectedThreadID == parentThreadID && selectedMessageID == nil,
+            threadID: parentThreadID,
+            focusedMessageID: nil,
+            messageCount: smartMessageCount(for: row, backingRows: backingRows, childRows: childRows),
+            timeLabel: Self.timeLabel(for: row.latestMessageAt ?? "", sectionTitle: sectionTitle),
+            hasAttachments: backingRows.contains { $0.hasAttachments == true || ($0.attachmentCount ?? 0) > 0 },
+            presentationStatus: row.readiness == "ready" ? "ai_ready" : "ai_pending",
+            isChild: false,
+            isExpandable: childRows.count > 1,
+            isExpanded: expandedThreadIDs.contains(parentThreadID)
+        )
+        guard expandedThreadIDs.contains(parentThreadID) else {
+            return [parent]
+        }
+        let children = childRows.map { child in
+            InboxRowViewModel(
+                id: "\(parentThreadID)::message::\(child.messageID)",
+                sender: child.displaySender,
+                title: child.displayTitle,
+                summary: nil,
+                receivedAt: child.receivedAt,
+                section: sectionTitle,
+                isUnread: child.isUnread,
+                isGrouped: false,
+                isSelected: selectedThreadID == parentThreadID && selectedMessageID == child.messageID,
+                threadID: parentThreadID,
+                focusedMessageID: child.messageID,
+                messageCount: 1,
+                timeLabel: Self.timeLabel(for: child.receivedAt, sectionTitle: sectionTitle),
+                hasAttachments: false,
+                presentationStatus: parent.presentationStatus,
+                isChild: true,
+                isExpandable: false,
+                isExpanded: false
+            )
+        }
+        return [parent] + children
+    }
+
+    private func mailboxViewModels(for row: GmailThreadRow, sectionTitle: String) -> [InboxRowViewModel] {
+        let childRows = visibleChildren(for: row)
+        let parent = InboxRowViewModel(
+            id: row.threadID,
+            sender: row.displaySender,
+            title: row.displayTitle,
+            summary: nil,
+            receivedAt: row.latestReceivedAt,
+            section: sectionTitle,
+            isUnread: row.isUnread,
+            isGrouped: row.isGrouped,
+            isSelected: selectedThreadID == row.threadID && selectedMessageID == nil,
+            threadID: row.threadID,
+            focusedMessageID: nil,
+            messageCount: row.messageCount,
+            timeLabel: Self.timeLabel(for: row.latestReceivedAt, sectionTitle: sectionTitle),
+            hasAttachments: row.hasAttachments == true || (row.attachmentCount ?? 0) > 0,
+            presentationStatus: row.presentationStatus,
+            isChild: false,
+            isExpandable: childRows.count > 1,
+            isExpanded: expandedThreadIDs.contains(row.threadID)
+        )
+        guard expandedThreadIDs.contains(row.threadID) else {
+            return [parent]
+        }
+        let children = childRows.map { child in
+            InboxRowViewModel(
+                id: "\(row.threadID)::message::\(child.messageID)",
+                sender: child.displaySender,
+                title: child.displayTitle,
+                summary: nil,
+                receivedAt: child.receivedAt,
+                section: sectionTitle,
+                isUnread: child.isUnread,
+                isGrouped: false,
+                isSelected: selectedThreadID == row.threadID && selectedMessageID == child.messageID,
+                threadID: row.threadID,
+                focusedMessageID: child.messageID,
+                messageCount: 1,
+                timeLabel: Self.timeLabel(for: child.receivedAt, sectionTitle: sectionTitle),
+                hasAttachments: false,
+                presentationStatus: row.presentationStatus,
+                isChild: true,
+                isExpandable: false,
+                isExpanded: false
+            )
+        }
+        return [parent] + children
+    }
+
+    private func visibleMailboxRowsByLookupID() -> [String: GmailThreadRow] {
+        guard let mailbox = visibleMailbox else {
+            return [:]
+        }
+        var rowsByID: [String: GmailThreadRow] = [:]
+        for row in mailbox.sections.flatMap({ visibleRows(in: $0) }) {
+            indexMailboxRow(row, by: row.threadID, in: &rowsByID)
+            indexMailboxRow(row, by: row.latestSourceRecordID, in: &rowsByID)
+            for update in row.lifecycleUpdates {
+                indexMailboxRow(row, by: update.sourceRecordID, in: &rowsByID)
+            }
+            for child in visibleChildren(for: row) {
+                indexMailboxRow(row, by: child.gmailThreadID, in: &rowsByID)
+                indexMailboxRow(row, by: child.messageID, in: &rowsByID)
+            }
+        }
+        return rowsByID
+    }
+
+    private func backingMailboxRows(for smartRow: SmartInboxRow, rowsByID: [String: GmailThreadRow]) -> [GmailThreadRow] {
+        let lookupKeys = ([smartRow.rowKey, smartRow.primaryThreadID, smartRow.primaryMessageID]
+            + smartRow.sourceThreadIDs
+            + smartRow.sourceMessageIDs)
+            .filter { !$0.isEmpty }
+        var seenThreadIDs = Set<String>()
+        var rows: [GmailThreadRow] = []
+        for key in lookupKeys {
+            guard let row = rowsByID[key], seenThreadIDs.insert(row.threadID).inserted else {
+                continue
+            }
+            rows.append(row)
+        }
+        return rows
+    }
+
+    private func indexMailboxRow(_ row: GmailThreadRow, by key: String?, in rowsByID: inout [String: GmailThreadRow]) {
+        guard let key, !key.isEmpty, rowsByID[key] == nil else {
+            return
+        }
+        rowsByID[key] = row
+    }
+
+    private func addSmartCoverage(
+        smartRow: SmartInboxRow,
+        backingRows: [GmailThreadRow],
+        coveredThreadIDs: inout Set<String>,
+        coveredMessageIDs: inout Set<String>
+    ) {
+        ([smartRow.rowKey, smartRow.primaryThreadID] + smartRow.sourceThreadIDs)
+            .filter { !$0.isEmpty }
+            .forEach { coveredThreadIDs.insert($0) }
+        ([smartRow.primaryMessageID] + smartRow.sourceMessageIDs)
+            .filter { !$0.isEmpty }
+            .forEach { coveredMessageIDs.insert($0) }
+
+        for backingRow in backingRows where smartRowCoversWholeBackingRow(smartRow, backingRow: backingRow) {
+            coveredThreadIDs.insert(backingRow.threadID)
+            coveredMessageIDs.insert(backingRow.latestSourceRecordID)
+            backingRow.lifecycleUpdates.forEach { coveredMessageIDs.insert($0.sourceRecordID) }
+            visibleChildren(for: backingRow).forEach { child in
+                if let gmailThreadID = child.gmailThreadID, !gmailThreadID.isEmpty {
+                    coveredThreadIDs.insert(gmailThreadID)
+                }
+                coveredMessageIDs.insert(child.messageID)
+            }
+        }
+    }
+
+    private func isMailboxRowCovered(
+        _ row: GmailThreadRow,
+        coveredThreadIDs: Set<String>,
+        coveredMessageIDs: Set<String>
+    ) -> Bool {
+        if coveredThreadIDs.contains(row.threadID) {
+            return true
+        }
+        let children = visibleChildren(for: row)
+        if !children.isEmpty {
+            return children.allSatisfy { child in
+                coveredMessageIDs.contains(child.messageID)
+                    || (child.gmailThreadID.map { coveredThreadIDs.contains($0) } ?? false)
+            }
+        }
+        if coveredMessageIDs.contains(row.latestSourceRecordID) {
+            return true
+        }
+        return !row.lifecycleUpdates.isEmpty && row.lifecycleUpdates.allSatisfy { coveredMessageIDs.contains($0.sourceRecordID) }
+    }
+
+    private func appendSection(
+        id: String,
+        title: String,
+        rows: [InboxRowViewModel],
+        to sections: inout [InboxSectionViewModel]
+    ) {
+        guard !rows.isEmpty else {
+            return
+        }
+        if let index = sections.firstIndex(where: { $0.id == id || $0.title == title }) {
+            let section = sections[index]
+            sections[index] = InboxSectionViewModel(id: section.id, title: section.title, rows: section.rows + rows)
+        } else {
+            sections.append(InboxSectionViewModel(id: id, title: title, rows: rows))
+        }
+    }
+
+    private func smartParentThreadID(for smartRow: SmartInboxRow, backingRows: [GmailThreadRow]) -> String {
+        if let readerThreadID = smartRow.readerThreadID, !readerThreadID.isEmpty {
+            return readerThreadID
+        }
+        guard backingRows.count == 1, let backingRow = backingRows.first, smartRowCoversWholeBackingRow(smartRow, backingRow: backingRow) else {
+            return smartRow.primaryThreadID
+        }
+        return backingRow.threadID
+    }
+
+    private func visibleSmartChildren(for smartRow: SmartInboxRow, backingRows: [GmailThreadRow]) -> [GmailThreadChildRow] {
+        guard !backingRows.isEmpty else {
+            return []
+        }
+        let sourceMessageIDs = Set(smartRow.sourceMessageIDs)
+        var children: [GmailThreadChildRow] = []
+        var seenMessageIDs = Set<String>()
+        for backingRow in backingRows {
+            let rowChildren = visibleChildren(for: backingRow)
+            let matchingChildren = sourceMessageIDs.isEmpty
+                ? rowChildren
+                : rowChildren.filter { sourceMessageIDs.contains($0.messageID) }
+            let nextChildren = matchingChildren.isEmpty
+                ? syntheticSmartChildren(for: smartRow, backingRow: backingRow, sourceMessageIDs: sourceMessageIDs)
+                : matchingChildren
+            for child in nextChildren where seenMessageIDs.insert(child.messageID).inserted {
+                children.append(child)
+            }
+        }
+        return children
+    }
+
+    private func syntheticSmartChildren(
+        for smartRow: SmartInboxRow,
+        backingRow: GmailThreadRow,
+        sourceMessageIDs: Set<String>
+    ) -> [GmailThreadChildRow] {
+        guard sourceMessageIDs.isEmpty
+            || sourceMessageIDs.contains(backingRow.latestSourceRecordID)
+            || smartRow.sourceThreadIDs.contains(backingRow.threadID)
+            || backingRow.threadID == smartRow.primaryThreadID
+        else {
+            return []
+        }
+        return [
+            GmailThreadChildRow(
+                messageID: backingRow.latestSourceRecordID,
+                gmailThreadID: backingRow.threadID,
+                sender: backingRow.sender ?? backingRow.latestSender ?? backingRow.participants.first,
+                subject: backingRow.displayTitle,
+                aiTitle: backingRow.aiTitle,
+                snippet: backingRow.displaySummary,
+                receivedAt: backingRow.latestReceivedAt,
+                labelIDs: backingRow.labelIDs,
+                labels: backingRow.labels,
+                unread: backingRow.isUnread
+            )
+        ]
+    }
+
+    private func smartMessageCount(
+        for smartRow: SmartInboxRow,
+        backingRows: [GmailThreadRow],
+        childRows: [GmailThreadChildRow]
+    ) -> Int {
+        let backingCount = backingRows.reduce(0) { total, row in
+            total + max(row.messageCount, visibleChildren(for: row).count, 1)
+        }
+        return max(smartRow.sourceMessageIDs.count, childRows.count, backingCount, 1)
+    }
+
+    private func smartRowCoversWholeBackingRow(_ smartRow: SmartInboxRow, backingRow: GmailThreadRow) -> Bool {
+        if backingRow.threadID == smartRow.rowKey {
+            return true
+        }
+        let sourceMessageIDs = Set(smartRow.sourceMessageIDs)
+        if sourceMessageIDs.isEmpty && smartRow.sourceThreadIDs.contains(backingRow.threadID) {
+            return true
+        }
+        let children = visibleChildren(for: backingRow)
+        if !children.isEmpty {
+            return children.allSatisfy { sourceMessageIDs.contains($0.messageID) }
+        }
+        return sourceMessageIDs.contains(backingRow.latestSourceRecordID)
+    }
+
     private func visibleRows(in section: GmailThreadSection) -> [GmailThreadRow] {
         section.rows.filter { $0.isVisible(in: activeMailboxLabel) }
     }
@@ -1361,6 +1756,27 @@ private extension Array where Element: Hashable {
 }
 
 private extension ThreadReaderResponse {
+    var hasSummary: Bool {
+        summary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    func replacingSummary(_ summary: String?) -> ThreadReaderResponse {
+        ThreadReaderResponse(
+            entityID: entityID,
+            userID: userID,
+            source: source,
+            gmailThreadID: gmailThreadID,
+            subject: subject,
+            title: title,
+            summary: summary,
+            totalMessages: totalMessages,
+            limit: limit,
+            offset: offset,
+            hasMore: hasMore,
+            messages: messages
+        )
+    }
+
     var needsHTMLRenderDocumentRefresh: Bool {
         messages.contains { $0.needsHTMLRenderDocumentRefresh }
     }

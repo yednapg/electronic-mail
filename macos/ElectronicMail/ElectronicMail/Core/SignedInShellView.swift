@@ -18,7 +18,7 @@ public struct SignedInShellView: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var store: InboxStore
     private let onReauthorizeGoogle: () async throws -> Void
-    @State private var selection: SignedInDestination = .todo
+    @State private var selection: SignedInDestination = .inbox
     @State private var commandPaletteOpen = false
     @State private var composer: MailComposerPresentation?
 
@@ -312,22 +312,22 @@ private enum CommandPaletteBuilder {
     private static func navigationCommands() -> [CommandPaletteItem] {
         [
             CommandPaletteItem(
-                id: "nav:todo",
-                title: "To-do's",
-                subtitle: "Go to current work",
-                keywords: ["home", "today", "now", "work", "tasks"],
-                priority: 20,
-                kind: .navigation,
-                action: .navigate(.todo)
-            ),
-            CommandPaletteItem(
                 id: "nav:inbox",
                 title: "Inbox",
                 subtitle: "Open email list",
                 keywords: ["gmail", "mail", "email", "threads"],
-                priority: 24,
+                priority: 20,
                 kind: .navigation,
                 action: .navigate(.inbox)
+            ),
+            CommandPaletteItem(
+                id: "nav:todo",
+                title: "To-do's",
+                subtitle: "Go to current work",
+                keywords: ["home", "today", "now", "work", "tasks"],
+                priority: 24,
+                kind: .navigation,
+                action: .navigate(.todo)
             ),
             CommandPaletteItem(
                 id: "nav:drafts",

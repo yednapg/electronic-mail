@@ -98,6 +98,7 @@ def sample_message(
     sender: str,
     snippet: str,
     internal_date: str,
+    signals: dict | None = None,
 ) -> GmailMessageRecord:
     return GmailMessageRecord(
         user_id="user-1",
@@ -115,7 +116,7 @@ def sample_message(
         html_body_sanitized=None,
         html_render_document=None,
         text_body=snippet,
-        extracted_signals={"sender_domain": sender.split("@")[-1].strip(">")},
+        extracted_signals=signals or {"sender_domain": sender.split("@")[-1].strip(">")},
         body_hash=f"body-{id}",
         created_at=internal_date,
         updated_at=internal_date,
@@ -249,6 +250,7 @@ class DashboardManualTaskTests(unittest.TestCase):
                     sender="cputrade.swiftmanagement@northstarbank.example",
                     snippet="FX Retail Trade No:202606020000001",
                     internal_date=deal.latest_message_at or "",
+                    signals={"sender_domain": "bank.example.com", "ticket_id": "900000002"},
                 )
             ],
             acknowledgement.id: [
@@ -259,6 +261,7 @@ class DashboardManualTaskTests(unittest.TestCase):
                     sender="grievance.redressal@northstar.example",
                     snippet="Acknowledged receipt of your international wire transfer status inquiry.",
                     internal_date=acknowledgement.latest_message_at or "",
+                    signals={"sender_domain": "bank.example.com", "ticket_id": "900000002"},
                 )
             ],
             processed.id: [
@@ -269,6 +272,7 @@ class DashboardManualTaskTests(unittest.TestCase):
                     sender="TradeQualityUnit@northstarbank.example",
                     snippet="We have processed your Outward remittance. SWIFT payment message is appended.",
                     internal_date=processed.latest_message_at or "",
+                    signals={"sender_domain": "bank.example.com", "ticket_id": "900000002"},
                 )
             ],
             follow_up.id: [
@@ -279,6 +283,7 @@ class DashboardManualTaskTests(unittest.TestCase):
                     sender="support@northstar.example",
                     snippet="Reference number 900000002. We will respond by June 10, 2026.",
                     internal_date=follow_up.latest_message_at or "",
+                    signals={"sender_domain": "bank.example.com", "ticket_id": "900000002"},
                 )
             ],
             support_case.id: [
@@ -289,6 +294,7 @@ class DashboardManualTaskTests(unittest.TestCase):
                     sender="care@northstarbank.example",
                     snippet="Your query/concern outward remittance support has been registered under Case Reference No.900000002.",
                     internal_date=support_case.latest_message_at or "",
+                    signals={"sender_domain": "bank.example.com", "ticket_id": "900000002"},
                 )
             ],
         }
