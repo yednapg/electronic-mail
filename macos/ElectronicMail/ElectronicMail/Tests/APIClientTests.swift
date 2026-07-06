@@ -286,6 +286,66 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(backend.enqueuedActions.map(\.action), [.archive])
     }
 
+    func testOfflineFirstClientWritesMailboxUnderRefreshedBackendUserAfterSessionSwitch() async throws {
+        let localStore = MemoryLocalMailStore()
+        let userAMailbox = singleRowMailbox(threadID: "user-a-thread", title: "User A row")
+        let userBMailbox = singleRowMailbox(threadID: "user-b-thread", title: "User B row")
+        localStore.writeSession(appSession(userID: "user-a", email: "user-a@example.com", mailbox: userAMailbox))
+        let backend = FixedUserMailboxAppClient(
+            session: appSession(userID: "user-b", email: "user-b@example.com", mailbox: userBMailbox),
+            mailbox: userBMailbox
+        )
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+
+        client.sessionToken = "user-b-token"
+        let mailbox = try await client.mailbox(label: .inbox, limit: 100, cursor: nil)
+
+        XCTAssertEqual(mailbox.sections.first?.rows.first?.threadID, "user-b-thread")
+        XCTAssertEqual(localStore.readSession()?.user.id, "user-b")
+        XCTAssertEqual(localStore.readMailbox(userID: "user-a", label: .inbox)?.sections.first?.rows.first?.threadID, "user-a-thread")
+        XCTAssertEqual(localStore.readMailbox(userID: "user-b", label: .inbox)?.sections.first?.rows.first?.threadID, "user-b-thread")
+        XCTAssertEqual(backend.appSessionCallCount, 1)
+    }
+
+    func testOfflineFirstClientReplaysOnlyCurrentUsersPendingThreadActions() async throws {
+        let localStore = MemoryLocalMailStore()
+        localStore.writeSession(appSession(userID: "user-a", email: "user-a@example.com", mailbox: singleRowMailbox(threadID: "user-a-thread", title: "User A row")))
+        localStore.writePendingThreadAction(
+            LocalPendingThreadAction(
+                clientActionID: "action-user-a",
+                userID: "user-a",
+                mailboxThreadID: "user-a-thread",
+                targetMessageID: nil,
+                action: .archive,
+                createdAt: "2026-07-03T00:00:00Z",
+                error: nil
+            )
+        )
+        localStore.writePendingThreadAction(
+            LocalPendingThreadAction(
+                clientActionID: "action-user-b",
+                userID: "user-b",
+                mailboxThreadID: "user-b-thread",
+                targetMessageID: nil,
+                action: .archive,
+                createdAt: "2026-07-03T00:00:01Z",
+                error: nil
+            )
+        )
+        let userBMailbox = singleRowMailbox(threadID: "user-b-thread", title: "User B row")
+        let backend = FixedUserMailboxAppClient(
+            session: appSession(userID: "user-b", email: "user-b@example.com", mailbox: userBMailbox),
+            mailbox: userBMailbox
+        )
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+
+        client.sessionToken = "user-b-token"
+        _ = try await client.appSession()
+
+        XCTAssertEqual(backend.enqueuedActions.map(\.clientActionID), ["action-user-b"])
+        XCTAssertEqual(localStore.pendingThreadActions().map(\.clientActionID), ["action-user-a"])
+    }
+
     func testCreateTaskUsesBackendEndpoint() async throws {
         let client = makeClient { request in
             XCTAssertEqual(request.httpMethod, "POST")
@@ -436,6 +496,155 @@ final class MockURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+private func appSession(userID: String, email: String, mailbox: MailboxResponse) -> AppSessionResponse {
+    let current = DemoAppFixtures.appSession
+    return AppSessionResponse(
+        user: AppSessionUser(id: userID, email: email, firstName: nil, displayName: userID),
+        readiness: current.readiness,
+        dashboard: current.dashboard,
+        mailbox: mailbox,
+        sync: current.sync
+    )
+}
+
+private func singleRowMailbox(threadID: String, title: String) -> MailboxResponse {
+    MailboxResponse(
+        label: .inbox,
+        totalThreads: 1,
+        loadedThreads: 1,
+        sections: [
+            GmailThreadSection(
+                id: "today",
+                title: "Today",
+                rows: [
+                    GmailThreadRow(
+                        threadID: threadID,
+                        entityID: nil,
+                        title: title,
+                        href: nil,
+                        latestSourceRecordID: "\(threadID)-message",
+                        latestReceivedAt: "2026-07-03T00:00:00+00:00",
+                        latestMessageAt: "2026-07-03T00:00:00+00:00",
+                        latestSubject: title,
+                        latestSender: "\(threadID)@example.com",
+                        sender: "\(threadID)@example.com",
+                        participants: [],
+                        messageCount: 1,
+                        summary: nil,
+                        aiGroupID: nil,
+                        aiTitle: nil,
+                        aiSummary: nil,
+                        snippet: nil,
+                        hasAttachments: false,
+                        attachmentCount: 0,
+                        labelIDs: ["INBOX"],
+                        labels: ["INBOX"],
+                        unread: false,
+                        actionNeeded: false,
+                        actionType: "none",
+                        actionTypeKey: "none",
+                        priority: 0,
+                        dashboardVisible: false,
+                        currentState: nil,
+                        lifecycleState: nil,
+                        outcomeType: nil,
+                        lifecycleUpdates: [],
+                        children: [],
+                        enrichmentStatus: "ready",
+                        presentationStatus: "ai_ready",
+                        pendingAction: nil
+                    )
+                ]
+            )
+        ],
+        fullImportRunning: false,
+        fullImportCompleted: true
+    )
+}
+
+private final class FixedUserMailboxAppClient: AppClient {
+    var baseURL = URL(string: "http://localhost:3001")!
+    var sessionToken: String?
+    let mode: AppRunMode = .localBackend
+    let session: AppSessionResponse
+    let fixedMailbox: MailboxResponse
+    private(set) var appSessionCallCount = 0
+    private(set) var enqueuedActions: [QueuedThreadActionRequest] = []
+
+    init(session: AppSessionResponse, mailbox: MailboxResponse) {
+        self.session = session
+        self.fixedMailbox = mailbox
+    }
+
+    func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
+        MobileSessionExchangeResponse(
+            sessionToken: "session",
+            expiresAt: "2026-08-03T00:00:00+00:00",
+            user: AuthUserResponse(id: session.user.id, email: session.user.email, displayName: session.user.displayName, accessEnabled: true)
+        )
+    }
+
+    func appSession() async throws -> AppSessionResponse {
+        appSessionCallCount += 1
+        return session
+    }
+
+    func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
+        fixedMailbox
+    }
+
+    func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
+        DemoAppFixtures.threads[threadID] ?? DemoAppFixtures.threads["demo-google-today"]!
+    }
+
+    func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
+        try await DemoAppClient().triggerMailboxSync()
+    }
+
+    func syncMailboxNow() async throws -> MailboxSyncTriggerResponse {
+        try await DemoAppClient().syncMailboxNow()
+    }
+
+    func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .archive)
+    }
+
+    func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .unarchive)
+    }
+
+    func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .markRead)
+    }
+
+    func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
+        enqueuedActions.append(request)
+        return QueuedThreadActionResponse(
+            clientActionID: request.clientActionID,
+            serverActionID: "server-\(request.clientActionID)",
+            mailboxThreadID: request.mailboxThreadID,
+            targetMessageID: request.targetMessageID,
+            action: request.action,
+            state: .queued,
+            queuedAt: request.createdAt,
+            appliedAt: nil,
+            error: nil
+        )
+    }
+
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        try await DemoAppClient().createTask(request)
+    }
+
+    func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse {
+        try await DemoAppClient().updateTask(taskID, request: request)
+    }
+
+    func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
+        try await DemoAppClient().completeEntity(entityID, request: request)
+    }
 }
 
 private final class ToggleThreadActionAppClient: AppClient {

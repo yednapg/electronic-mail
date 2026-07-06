@@ -14,17 +14,17 @@ const FIRST_TIME_MINIMUM_MS = 60000;
 
 const firstTimeStatusMessages = [
   'Importing emails ...',
-  'Understanding threads ...',
-  'Writing titles and summaries ...',
-  'Finding what needs action ...',
-  'Building dashboard ...',
+  'Loading your inbox ...',
+  'Preparing Gmail ...',
+  'Checking for new mail ...',
+  'Preparing your inbox ...',
   'Almost ready!',
 ];
 
 const returningStatusMessages = [
   'Welcome back ...',
   'Checking your latest Gmail ...',
-  'Refreshing your dashboard ...',
+  'Refreshing your inbox ...',
   'Almost ready!',
 ];
 

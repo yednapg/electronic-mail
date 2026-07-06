@@ -3,18 +3,15 @@ import type { FirstRunImportJobResponse } from './types';
 const FIRST_RUN_POLL_MS = 1200;
 
 export function isFirstRunImportReady(job: FirstRunImportJobResponse): boolean {
-  return Boolean(job.inbox_ready_at && job.first_groups_ready_at && job.dashboard_ready_at);
+  return Boolean(job.inbox_ready_at);
 }
 
 export function formatFirstRunImportStatus(job: FirstRunImportJobResponse): string {
   if (isFirstRunImportReady(job)) {
-    return 'Dashboard is ready. Opening the app...';
-  }
-  if (job.first_groups_ready_at) {
-    return 'Finding what needs action...';
+    return 'Inbox is ready. Opening the app...';
   }
   if (job.inbox_ready_at) {
-    return 'Writing titles and summaries...';
+    return 'Opening your inbox...';
   }
 
   switch (job.stage) {
@@ -31,15 +28,15 @@ export function formatFirstRunImportStatus(job: FirstRunImportJobResponse): stri
     case 'inbox_projection':
       return 'Preparing your 90-day Inbox...';
     case 'dashboard_fast_feed':
-      return 'Building your 7-day work dashboard...';
+      return 'Preparing your inbox...';
     case 'mail_group_enrich':
     case 'ai_grouping':
     case 'ai_summarizing':
-      return 'Grouping Gmail into real-life work...';
+      return 'Preparing your inbox...';
     case 'dashboard_filtering':
-      return 'Building your dashboard...';
+      return 'Preparing your inbox...';
     case 'ready':
-      return 'Dashboard and Inbox are ready...';
+      return 'Inbox is ready...';
     default:
       return 'Preparing your workspace...';
   }

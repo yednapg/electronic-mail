@@ -47,6 +47,7 @@ class Settings:
     openai_reasoning_effort: Literal["low", "medium", "high"]
     openai_required: bool
     openai_debug_logs: bool
+    ai_grouping_enabled: bool
 
     @property
     def google_configured(self) -> bool:
@@ -184,6 +185,7 @@ def load_settings() -> Settings:
         openai_reasoning_effort=_resolve_openai_reasoning_effort(),
         openai_required=os.getenv("OPENAI_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"},
         openai_debug_logs=os.getenv("OPENAI_DEBUG_LOGS", "").strip().lower() in {"1", "true", "yes", "on"},
+        ai_grouping_enabled=os.getenv("AI_GROUPING_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"},
     )
 
 

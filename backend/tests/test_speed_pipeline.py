@@ -118,6 +118,7 @@ class SpeedPipelineTests(unittest.TestCase):
             gmail_pubsub_topic="projects/example/topics/gmail",
             gmail_watch_renewal_hours=24,
             gmail_recent_days=90,
+            ai_grouping_enabled=False,
         )
         self.importer_event_patch = patch("app.services.gmail_importer.emit_mailbox_event")
         self.worker_event_patch = patch("app.workers.main.emit_mailbox_event")
@@ -167,7 +168,7 @@ class SpeedPipelineTests(unittest.TestCase):
             message_ids=["msg-1", "draft-1"],
             use_ai=False,
         )
-        mock_projection.assert_called_once_with(self.settings, user_id="user-1", priority=20)
+        mock_projection.assert_not_called()
 
     @patch("app.services.gmail_importer._hydrate_thread_metadata_for_messages")
     @patch("app.services.gmail_importer.enqueue_job")
@@ -219,7 +220,7 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertFalse(mock_completed.call_args.kwargs["clear_full_backfill_cursor"])
         self.assertTrue(mock_completed.call_args.kwargs["full_backfill_started"])
         self.assertTrue(any(call.kwargs.get("kind") == "gmail_backfill" for call in mock_enqueue.call_args_list))
-        self.assertTrue(any(call.kwargs.get("kind") == "first_run_ai_grouping" for call in mock_enqueue.call_args_list))
+        self.assertFalse(any(call.kwargs.get("kind") == "first_run_ai_grouping" for call in mock_enqueue.call_args_list))
 
     @patch("app.services.gmail_importer._list_messages")
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
@@ -309,8 +310,8 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_list_messages.assert_not_called()
         mock_hydrate_ids.assert_called_once_with(self.settings, user_id="user-1", message_ids=["msg-2"], format="metadata")
         mock_rebuild.assert_called_once_with(self.settings, user_id="user-1", message_ids=["msg-2"], use_ai=False)
-        self.assertTrue(any(call.kwargs.get("kind") == "mail_group_enrich" for call in mock_enqueue.call_args_list))
-        mock_projection.assert_called_once_with(self.settings, user_id="user-1", priority=20)
+        self.assertFalse(any(call.kwargs.get("kind") == "mail_group_enrich" for call in mock_enqueue.call_args_list))
+        mock_projection.assert_not_called()
 
     @patch("app.services.gmail_importer._run_recent_metadata_sync", return_value=2)
     @patch("app.services.gmail_importer._list_history_delta")
@@ -371,8 +372,8 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_delete.assert_called_once_with(self.settings.database_path, user_id="user-1", message_ids=["msg-1"])
         mock_prune.assert_called_once_with(self.settings.database_path, user_id="user-1", group_ids=["group-1"])
         mock_pending.assert_called_once_with(self.settings.database_path, user_id="user-1", group_ids=["group-1"])
-        self.assertTrue(any(call.kwargs.get("kind") == "mail_group_enrich" for call in mock_enqueue.call_args_list))
-        mock_projection.assert_called_once_with(self.settings, user_id="user-1", priority=20)
+        self.assertFalse(any(call.kwargs.get("kind") == "mail_group_enrich" for call in mock_enqueue.call_args_list))
+        mock_projection.assert_not_called()
 
     @patch("app.services.mail_groups.ensure_background_import_work")
     @patch("app.services.mail_groups.enqueue_job")
@@ -682,13 +683,13 @@ class SpeedPipelineTests(unittest.TestCase):
             message_ids=["msg-1"],
             use_ai=False,
         )
-        self.assertTrue(
+        self.assertFalse(
             any(
                 call.kwargs.get("kind") == "mail_group_enrich" and call.kwargs.get("queue") == "default"
                 for call in mock_enqueue.call_args_list
             )
         )
-        mock_projection.assert_called_once_with(self.settings, user_id="user-1", priority=1)
+        mock_projection.assert_not_called()
 
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
     @patch("app.services.gmail_importer.enqueue_job")
@@ -867,6 +868,7 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual([message.message_id for message in candidates["ticket_id:northstar-bank:900000003"]], ["northstar-grievance", "northstar-service"])
 
     def test_mailbox_uses_compatible_ai_group_for_title_and_summary_without_replacing_thread_id(self) -> None:
+        self.settings.ai_grouping_enabled = True
         first = replace(
             sample_message("msg-1"),
             gmail_thread_id="thread-1",
@@ -949,6 +951,7 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual(rows[0].children[1].ai_title, "Clean second title")
 
     def test_mailbox_uses_thread_ai_group_for_plain_gmail_thread_rows(self) -> None:
+        self.settings.ai_grouping_enabled = True
         message = replace(
             sample_message("msg-plain"),
             gmail_thread_id="thread-plain",
@@ -995,6 +998,7 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual(rows[0].presentation_status, "ai_ready")
 
     def test_mailbox_display_clusters_safe_newsletter_threads(self) -> None:
+        self.settings.ai_grouping_enabled = True
         first = replace(
             sample_message("claude-1"),
             gmail_thread_id="thread-claude-1",
@@ -1057,6 +1061,7 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual([child.message_id for child in rows[0].children], ["claude-3", "claude-1", "claude-2"])
 
     def test_mailbox_display_clusters_safe_provider_stream_with_sender_variants(self) -> None:
+        self.settings.ai_grouping_enabled = True
         weekly = replace(
             sample_message("slashy-weekly"),
             gmail_thread_id="thread-slashy-weekly",
@@ -1191,6 +1196,7 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual(row.children[0].sender, "recipient@example.com")
 
     def test_mailbox_renders_northstar_workflow_ai_group_across_gmail_threads(self) -> None:
+        self.settings.ai_grouping_enabled = True
         first = replace(
             sample_message("northstar-ack"),
             gmail_thread_id="thread-northstar-ack",
@@ -1255,6 +1261,7 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual([child.gmail_thread_id for child in rows[0].children], ["thread-northstar-ack", "thread-northstar-update"])
 
     def test_visible_group_sender_falls_back_to_inbound_sender_when_projection_entity_is_user(self) -> None:
+        self.settings.ai_grouping_enabled = True
         sent = replace(
             sample_message("psu-sent"),
             gmail_thread_id="thread-psu-sent",
@@ -1591,8 +1598,8 @@ class SpeedPipelineTests(unittest.TestCase):
 
         kinds = [call.kwargs.get("kind") for call in mock_enqueue.call_args_list]
         self.assertIn("gmail_import_batch", kinds)
-        self.assertIn("mail_group_enrich", kinds)
-        mock_projection.assert_called_once_with(self.settings, user_id="user-1", priority=20)
+        self.assertNotIn("mail_group_enrich", kinds)
+        mock_projection.assert_not_called()
 
     @patch("app.services.mail_groups.get_queue_health", return_value=SimpleNamespace(queue_depth={}, worker_online=False, required_queues_ready=False))
     @patch("app.services.mail_groups.latest_mail_group_ai_error", return_value=None)

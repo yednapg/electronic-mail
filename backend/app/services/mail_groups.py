@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Mail group product pipeline: grouping, enrichment, dashboard mapping."""
+"""Mailbox product pipeline with optional AI grouping/enrichment."""
 
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
@@ -157,6 +157,10 @@ TOPIC_STOP_WORDS = {
 }
 
 
+def _ai_grouping_enabled(settings: Settings) -> bool:
+    return bool(getattr(settings, "ai_grouping_enabled", False))
+
+
 @dataclass(frozen=True)
 class MailboxDisplayClusterEntry:
     thread_id: str
@@ -233,7 +237,7 @@ def ensure_background_import_work(settings: Settings, *, user_id: str) -> None:
             priority=100,
             payload={"user_id": user_id, "batch_size": FIRST_BATCH_SIZE, "first_run": True},
         )
-    elif not state.first_groups_ready_at:
+    elif _ai_grouping_enabled(settings) and not state.first_groups_ready_at:
         enqueue_job(
             database_url,
             kind="first_run_ai_grouping",
@@ -257,7 +261,7 @@ def ensure_background_import_work(settings: Settings, *, user_id: str) -> None:
             payload={"user_id": user_id, "batch_size": BACKFILL_BATCH_SIZE},
         )
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user_id)
-    if status_counts.get("pending", 0) > 0:
+    if _ai_grouping_enabled(settings) and status_counts.get("pending", 0) > 0:
         enqueue_job(
             database_url,
             kind="mail_group_enrich",
@@ -287,7 +291,8 @@ def build_app_session_response(settings: Settings, *, user) -> AppSessionRespons
     mailbox = MailboxResponse.model_validate(snapshot.mailbox)
     sync = AppSessionSyncState.model_validate(snapshot.sync)
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user.id)
-    last_ai_error = latest_mail_group_ai_error(database_url, user_id=user.id)
+    ai_grouping_enabled = _ai_grouping_enabled(settings)
+    last_ai_error = latest_mail_group_ai_error(database_url, user_id=user.id) if ai_grouping_enabled else None
     live_runtime = _mail_runtime_status(database_url, status_counts=status_counts, last_ai_error=last_ai_error)
     dashboard.runtime_status = {**dashboard.runtime_status, **live_runtime}
     sync = sync.model_copy(
@@ -295,7 +300,7 @@ def build_app_session_response(settings: Settings, *, user) -> AppSessionRespons
             "enrichment_pending_count": status_counts.get("pending", 0),
             "ready_group_count": status_counts.get("ready", 0),
             "last_ai_error": last_ai_error,
-            "last_error": sync.last_error or (last_ai_error if status_counts.get("ready", 0) == 0 else None),
+            "last_error": sync.last_error or (last_ai_error if ai_grouping_enabled and status_counts.get("ready", 0) == 0 else None),
         }
     )
     readiness = _readiness_from_snapshot(settings, user=user, dashboard=dashboard, mailbox=mailbox, sync=sync)
@@ -350,20 +355,12 @@ def _readiness_from_snapshot(
 ) -> PostLoginReadinessResponse:
     state = get_import_state(str(settings.database_path), user_id=user.id)
     ready_dashboard_count = len(dashboard.feed.now) + len(dashboard.feed.today) + len(dashboard.feed.worth_knowing)
-    has_prior_product = bool((state and state.first_groups_ready_at) or sync.ready_group_count)
+    has_prior_product = bool((state and state.first_batch_imported_at) or mailbox.total_threads > 0)
     mode = "returning" if has_prior_product else "first_time"
-    mailbox_ready = mailbox.total_threads > 0 or sync.ready_group_count > 0
-    dashboard_ready = bool(ready_dashboard_count > 0 and ((state and state.first_dashboard_ready_at) or sync.ready_group_count > 0))
-    if mode == "returning":
-        ready_to_enter = mailbox_ready and dashboard_ready
-    else:
-        ready_to_enter = bool(
-            state
-            and state.first_batch_imported_at
-            and state.first_groups_ready_at
-            and state.first_dashboard_ready_at
-            and mailbox_ready
-        )
+    mailbox_ready = mailbox.total_threads > 0
+    ai_grouping_enabled = _ai_grouping_enabled(settings)
+    dashboard_ready = bool(ready_dashboard_count > 0) if ai_grouping_enabled else mailbox_ready
+    ready_to_enter = bool(mailbox_ready and ((state and state.first_batch_imported_at) or mode == "returning"))
     stage = _post_login_stage(
         mode=mode,
         ready_to_enter=ready_to_enter,
@@ -371,6 +368,7 @@ def _readiness_from_snapshot(
         active_setup_jobs=0,
         mailbox_ready=mailbox_ready,
         dashboard_ready=dashboard_ready,
+        ai_grouping_enabled=ai_grouping_enabled,
     )
     display_name = _first_name(user.profile) or user.profile.display_name or user.email
     return PostLoginReadinessResponse(
@@ -402,12 +400,13 @@ def refresh_app_session_snapshot(settings: Settings, *, user_id: str) -> AppSess
     mailbox = build_mailbox_response(settings, user_id=user.id, label="inbox", limit=100)
     _enqueue_body_fetch_for_mailbox_rows(settings, user_id=user.id, mailbox=mailbox, limit=BODY_WARMUP_GROUP_LIMIT, priority=70)
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user.id)
-    last_ai_error = latest_mail_group_ai_error(database_url, user_id=user.id)
+    ai_grouping_enabled = _ai_grouping_enabled(settings)
+    last_ai_error = latest_mail_group_ai_error(database_url, user_id=user.id) if ai_grouping_enabled else None
     state = get_import_state(database_url, user_id=user.id)
     full_backfill_completed_at = getattr(state, "full_backfill_completed_at", None) if state is not None else None
     sync = AppSessionSyncState(
         last_sync_at=state.last_import_completed_at if state else None,
-        last_error=(state.last_sync_error if state else None) or (last_ai_error if status_counts.get("ready", 0) == 0 else None),
+        last_error=(state.last_sync_error if state else None) or (last_ai_error if ai_grouping_enabled and status_counts.get("ready", 0) == 0 else None),
         enrichment_pending_count=status_counts.get("pending", 0),
         ready_group_count=status_counts.get("ready", 0),
         oldest_imported_at=oldest_imported_message_at(database_url, user_id=user.id),
@@ -506,10 +505,9 @@ def build_post_login_readiness_response(
 ) -> PostLoginReadinessResponse:
     database_url = str(settings.database_path)
     state = get_import_state(database_url, user_id=user.id)
-    recent_since = (datetime.now(timezone.utc) - timedelta(days=_recent_visible_days(settings))).isoformat()
     dashboard_since = (datetime.now(timezone.utc) - timedelta(days=DASHBOARD_DAYS)).isoformat()
     ready_mail_group_count = count_mail_groups(database_url, user_id=user.id)
-    recent_ready_count = count_ready_mail_groups_since(database_url, user_id=user.id, since_iso=recent_since)
+    mailbox_thread_count = mailbox.total_threads if mailbox is not None else count_mailbox_threads(database_url, user_id=user.id, label="all")
     ready_dashboard_count = (
         sum(len(section) for section in [dashboard.feed.now, dashboard.feed.today, dashboard.feed.worth_knowing])
         if dashboard is not None
@@ -519,25 +517,17 @@ def build_post_login_readiness_response(
     active_setup_jobs = count_active_jobs(
         database_url,
         user_id=user.id,
-        kinds=["gmail_import_batch", "first_run_ai_grouping", "mail_group_enrich"],
+        kinds=["gmail_import_batch", *([] if not _ai_grouping_enabled(settings) else ["first_run_ai_grouping", "mail_group_enrich"])],
     )
     full_backfill_completed_at = getattr(state, "full_backfill_completed_at", None) if state is not None else None
     full_import_running = bool(state and state.first_batch_imported_at and not full_backfill_completed_at and (active_backfill_jobs or state.full_backfill_cursor))
     full_import_completed = bool(full_backfill_completed_at)
-    has_prior_product = bool((state and state.first_groups_ready_at) or ready_mail_group_count)
+    has_prior_product = bool((state and state.first_batch_imported_at) or mailbox_thread_count > 0)
     mode = "returning" if has_prior_product else "first_time"
-    mailbox_ready = (mailbox.total_threads > 0 if mailbox is not None else recent_ready_count > 0) or ready_mail_group_count > 0
-    dashboard_ready = bool(ready_dashboard_count > 0 and ((state and state.first_dashboard_ready_at) or ready_mail_group_count > 0))
-    if mode == "returning":
-        ready_to_enter = mailbox_ready and dashboard_ready
-    else:
-        ready_to_enter = bool(
-            state
-            and state.first_batch_imported_at
-            and state.first_groups_ready_at
-            and state.first_dashboard_ready_at
-            and recent_ready_count > 0
-        )
+    mailbox_ready = mailbox_thread_count > 0
+    ai_grouping_enabled = _ai_grouping_enabled(settings)
+    dashboard_ready = bool(ready_dashboard_count > 0) if ai_grouping_enabled else mailbox_ready
+    ready_to_enter = bool(mailbox_ready and ((state and state.first_batch_imported_at) or mode == "returning"))
     stage = _post_login_stage(
         mode=mode,
         ready_to_enter=ready_to_enter,
@@ -545,6 +535,7 @@ def build_post_login_readiness_response(
         active_setup_jobs=active_setup_jobs,
         mailbox_ready=mailbox_ready,
         dashboard_ready=dashboard_ready,
+        ai_grouping_enabled=ai_grouping_enabled,
     )
     display_name = _first_name(user.profile) or user.profile.display_name or user.email
     return PostLoginReadinessResponse(
@@ -554,7 +545,7 @@ def build_post_login_readiness_response(
         dashboard_ready=dashboard_ready,
         mailbox_ready=mailbox_ready,
         ready_dashboard_count=ready_dashboard_count,
-        ready_mail_group_count=ready_mail_group_count,
+        ready_mail_group_count=ready_mail_group_count if ai_grouping_enabled else mailbox_thread_count,
         full_import_running=full_import_running,
         full_import_completed=full_import_completed,
         user_display_name=display_name,
@@ -570,6 +561,7 @@ def _post_login_stage(
     active_setup_jobs: int,
     mailbox_ready: bool,
     dashboard_ready: bool,
+    ai_grouping_enabled: bool,
 ) -> str:
     if ready_to_enter:
         return "welcome_back" if mode == "returning" else "ready"
@@ -580,7 +572,9 @@ def _post_login_stage(
     if not state.first_batch_imported_at:
         return "importing_recent_gmail"
     if not mailbox_ready:
-        return "grouping_threads"
+        return "importing_recent_gmail"
+    if not ai_grouping_enabled:
+        return "ready"
     if not state.first_groups_ready_at:
         return "writing_titles"
     if mode == "first_time" and not state.first_dashboard_ready_at:
@@ -905,7 +899,7 @@ def build_dashboard_response(
     groups = _dedupe_groups_by_messages(groups, group_messages)
     groups = _collapse_dashboard_workflow_groups(groups, group_messages)
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user_id)
-    last_ai_error = latest_mail_group_ai_error(database_url, user_id=user_id)
+    last_ai_error = latest_mail_group_ai_error(database_url, user_id=user_id) if _ai_grouping_enabled(settings) else None
     feed = FeedResponse()
     for group in groups:
         _append_feed_item(feed, _attention_item_from_group(group))
@@ -1166,10 +1160,14 @@ def build_mailbox_response(settings: Settings, *, user_id: str, label: str = "in
         since_iso=None,
     )
     threads = page.threads
-    thread_ai_groups = list_mail_groups_for_gmail_threads(
-        database_url,
-        user_id=user_id,
-        gmail_thread_ids=[thread_id for thread_id, _ in threads],
+    thread_ai_groups = (
+        list_mail_groups_for_gmail_threads(
+            database_url,
+            user_id=user_id,
+            gmail_thread_ids=[thread_id for thread_id, _ in threads],
+        )
+        if _ai_grouping_enabled(settings)
+        else {}
     )
     projected_groups = (
         list_visible_groups_for_gmail_threads(
@@ -1178,11 +1176,15 @@ def build_mailbox_response(settings: Settings, *, user_id: str, label: str = "in
             visibility="inbox",
             gmail_thread_ids=[thread_id for thread_id, _ in threads],
         )
-        if mailbox_label in {"inbox", "all"}
+        if _ai_grouping_enabled(settings) and mailbox_label in {"inbox", "all"}
         else {}
     )
     projected_group_ids = list(dict.fromkeys(group.id for group in projected_groups.values()))
-    projected_group_messages = list_messages_for_visible_groups(database_url, user_id=user_id, visible_group_ids=projected_group_ids)
+    projected_group_messages = (
+        list_messages_for_visible_groups(database_url, user_id=user_id, visible_group_ids=projected_group_ids)
+        if projected_group_ids
+        else {}
+    )
     rows: list[GmailThreadRow] = []
     entries: list[MailboxDisplayClusterEntry] = []
     rendered_thread_ids: set[str] = set()
@@ -1202,17 +1204,22 @@ def build_mailbox_response(settings: Settings, *, user_id: str, label: str = "in
                 continue
         rendered_thread_ids.add(thread_id)
         row = _gmail_row_from_canonical_thread(thread_id, messages, mailbox_label, thread_ai_groups.get(thread_id))
-        entries.append(
-            MailboxDisplayClusterEntry(
-                thread_id=thread_id,
-                messages=messages,
-                row=row,
-                cluster_key=_mailbox_display_cluster_key(thread_id=thread_id, messages=messages, mailbox_label=mailbox_label),
+        if _ai_grouping_enabled(settings):
+            entries.append(
+                MailboxDisplayClusterEntry(
+                    thread_id=thread_id,
+                    messages=messages,
+                    row=row,
+                    cluster_key=_mailbox_display_cluster_key(thread_id=thread_id, messages=messages, mailbox_label=mailbox_label),
+                )
             )
-        )
-    rows.extend(_mailbox_display_cluster_rows(entries, mailbox_label=mailbox_label))
+        else:
+            rows.append(row)
+    if _ai_grouping_enabled(settings):
+        rows.extend(_mailbox_display_cluster_rows(entries, mailbox_label=mailbox_label))
     rows = _sort_mailbox_rows(rows)
-    _enqueue_visible_enrichment(settings, user_id=user_id, rows=rows)
+    if _ai_grouping_enabled(settings):
+        _enqueue_visible_enrichment(settings, user_id=user_id, rows=rows)
     return MailboxResponse(
         label=mailbox_label,
         total_threads=count_mailbox_threads(database_url, user_id=user_id, label=mailbox_label, since_iso=None),
@@ -1292,7 +1299,7 @@ def build_mailbox_sync_state(settings: Settings, *, user_id: str) -> MailboxSync
     last_sync_error = (
         credential_error
         or ((state.last_sync_error or getattr(state, "gmail_watch_error", None)) if state else None)
-        or (last_ai_error if status_counts.get("ready", 0) == 0 else None)
+        or (last_ai_error if _ai_grouping_enabled(settings) and status_counts.get("ready", 0) == 0 else None)
     )
     return MailboxSyncStateResponse(
         connected=connected,
@@ -1344,7 +1351,11 @@ def build_group_detail_response(settings: Settings, *, user_id: str, group_id: s
         return _build_mailbox_display_cluster_detail_response(settings, user_id=user_id, cluster_id=group_id, limit=limit, offset=offset)
     canonical_messages = list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=group_id)
     if canonical_messages:
-        ai_group = list_mail_groups_for_gmail_threads(database_url, user_id=user_id, gmail_thread_ids=[group_id]).get(group_id)
+        ai_group = (
+            list_mail_groups_for_gmail_threads(database_url, user_id=user_id, gmail_thread_ids=[group_id]).get(group_id)
+            if _ai_grouping_enabled(settings)
+            else None
+        )
         if _rebuild_missing_render_documents(settings, user_id=user_id, messages=canonical_messages):
             canonical_messages = list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=group_id) or canonical_messages
         if any(_needs_body_fetch(message) for message in canonical_messages):

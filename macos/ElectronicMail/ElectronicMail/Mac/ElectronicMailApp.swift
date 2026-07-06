@@ -389,11 +389,11 @@ private struct SetupAnimationView: View {
         case "starting_full_import", "importing_recent_gmail":
             return "Importing 90 days of email ..."
         case "grouping_threads":
-            return "Grouping related emails ..."
+            return "Preparing your inbox ..."
         case "writing_titles":
-            return "Writing useful titles ..."
+            return "Preparing your inbox ..."
         case "building_dashboard":
-            return "Building dashboard ..."
+            return "Preparing your inbox ..."
         case "ready", "welcome_back":
             return "Almost ready!"
         default:

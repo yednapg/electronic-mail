@@ -1239,11 +1239,11 @@ enum TodoHomeMapper {
         }
         switch readiness.stage {
         case "starting_full_import", "importing_recent_gmail":
-            return "Syncing Gmail to build your dashboard"
+            return "Syncing Gmail"
         case "grouping_threads", "writing_titles":
-            return "Grouping your inbox into useful work"
+            return "Preparing your inbox"
         default:
-            return "Building your dashboard"
+            return "Syncing Gmail"
         }
     }
 
