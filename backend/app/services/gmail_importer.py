@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Durable Gmail raw import jobs for the mail-groups product path."""
+"""Durable Gmail raw import jobs for the mailbox product path."""
 
 import base64
 import json
@@ -46,8 +46,12 @@ GMAIL_METADATA_HEADERS = ["Subject", "From", "To", "Cc", "Bcc", "Date", "Message
 logger = logging.getLogger(__name__)
 
 
+def _ai_grouping_enabled(settings: Settings) -> bool:
+    return bool(getattr(settings, "ai_grouping_enabled", False))
+
+
 def run_gmail_import_batch(settings: Settings, *, user_id: str, batch_size: int, first_run: bool = False) -> int:
-    """Import a bounded newest Gmail batch, then queue AI grouping for visible product output."""
+    """Import a bounded newest Gmail batch for the raw mailbox launch path."""
     database_url = str(settings.database_path)
     if not user_can_write_gmail(database_url, user_id=user_id):
         return 0
@@ -83,15 +87,16 @@ def run_gmail_import_batch(settings: Settings, *, user_id: str, batch_size: int,
             priority=80,
             payload={"user_id": user_id, "batch_size": BACKFILL_BATCH_SIZE},
         )
-        enqueue_job(
-            database_url,
-            kind="first_run_ai_grouping",
-            queue="critical",
-            user_id=user_id,
-            dedupe_key=f"first-run-ai-grouping:{user_id}",
-            priority=95,
-            payload={"user_id": user_id, "batch_size": FIRST_BATCH_SIZE},
-        )
+        if _ai_grouping_enabled(settings):
+            enqueue_job(
+                database_url,
+                kind="first_run_ai_grouping",
+                queue="critical",
+                user_id=user_id,
+                dedupe_key=f"first-run-ai-grouping:{user_id}",
+                priority=95,
+                payload={"user_id": user_id, "batch_size": FIRST_BATCH_SIZE},
+            )
         if messages:
             emit_mailbox_event(
                 settings,
@@ -176,7 +181,8 @@ def run_gmail_delta_sync(
                 },
             )
         elif deleted_empty_group_ids:
-            enqueue_projection_refresh(settings, user_id=user_id, priority=20)
+            if _ai_grouping_enabled(settings):
+                enqueue_projection_refresh(settings, user_id=user_id, priority=20)
             emit_mailbox_event(
                 settings,
                 user_id=user_id,
@@ -278,16 +284,17 @@ def run_gmail_backfill(settings: Settings, *, user_id: str, batch_size: int = BA
                 payload={"user_id": user_id, "batch_size": batch_size},
             )
         if messages:
-            enqueue_job(
-                database_url,
-                kind="mail_group_enrich",
-                queue="default",
-                user_id=user_id,
-                dedupe_key=f"mail-group-enrich:{user_id}",
-                priority=40,
-                payload={"user_id": user_id},
-            )
-            enqueue_projection_refresh(settings, user_id=user_id, priority=1)
+            if _ai_grouping_enabled(settings):
+                enqueue_job(
+                    database_url,
+                    kind="mail_group_enrich",
+                    queue="default",
+                    user_id=user_id,
+                    dedupe_key=f"mail-group-enrich:{user_id}",
+                    priority=40,
+                    payload={"user_id": user_id},
+                )
+                enqueue_projection_refresh(settings, user_id=user_id, priority=1)
             emit_mailbox_event(
                 settings,
                 user_id=user_id,
@@ -408,7 +415,8 @@ def run_gmail_body_fetch(settings: Settings, *, user_id: str, group_id: str = ""
         raise
     upsert_gmail_messages(database_url, parsed_messages)
     rebuild_touched_mail_groups(settings, user_id=user_id, message_ids=[message.message_id for message in parsed_messages], use_ai=False)
-    enqueue_projection_refresh(settings, user_id=user_id)
+    if _ai_grouping_enabled(settings):
+        enqueue_projection_refresh(settings, user_id=user_id)
     return len(parsed_messages)
 
 
@@ -894,6 +902,8 @@ def _batch_get_message_payloads(service: Any, message_ids: list[str], *, format:
 
 
 def _enqueue_enrichment_and_projection(settings: Settings, *, user_id: str, priority: int) -> None:
+    if not _ai_grouping_enabled(settings):
+        return
     enqueue_job(
         str(settings.database_path),
         kind="mail_group_enrich",

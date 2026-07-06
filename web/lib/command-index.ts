@@ -22,18 +22,18 @@ export type CommandIndexResponse = {
 const DEFAULT_RESULT_LIMIT = 8;
 const STATIC_COMMANDS: Array<Omit<CommandItem, 'searchText'>> = [
   {
-    id: 'nav:dashboard',
+    id: 'nav:inbox-home',
     kind: 'navigation',
-    title: 'Dashboard',
-    subtitle: 'Go to current work',
-    keywords: ['home', 'today', 'now', 'work'],
+    title: 'Inbox',
+    subtitle: 'Open Gmail-style thread list',
+    keywords: ['home', 'gmail', 'mail', 'inbox', 'threads'],
     priority: 20,
-    href: '/dashboard',
+    href: '/gmail',
   },
   {
     id: 'nav:gmail',
     kind: 'navigation',
-    title: 'Inbox',
+    title: 'Mail',
     subtitle: 'Open Gmail-style thread list',
     keywords: ['gmail', 'mail', 'inbox', 'threads'],
     priority: 24,
@@ -155,13 +155,13 @@ function toWorkCommand(
     ? `/gmail/threads/${encodeURIComponent(gmailThreadId)}`
     : entityId
       ? `/gmail/threads/${encodeURIComponent(entityId)}`
-      : '/dashboard';
+      : '/gmail';
 
   return withSearchText({
     id: `work:${item.id}`,
     kind: 'work',
     title,
-    subtitle: entityId ? `${sectionTitle} - Open related thread` : `${sectionTitle} - Open dashboard`,
+    subtitle: entityId ? `${sectionTitle} - Open related thread` : `${sectionTitle} - Open inbox`,
     keywords: keywordsForItem(item, sectionTitle),
     priority,
     href,

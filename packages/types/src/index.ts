@@ -293,6 +293,8 @@ export interface GmailThreadRow {
   readonly ai_title?: string | null;
   readonly ai_summary?: string | null;
   readonly snippet?: string | null;
+  readonly has_attachments?: boolean;
+  readonly attachment_count?: number;
   readonly label_ids?: string[];
   readonly labels?: string[];
   readonly unread?: boolean;

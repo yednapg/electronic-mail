@@ -86,11 +86,15 @@ def _run_job(settings, job) -> None:
             batch_size=int(payload.get("batch_size") or 30),
             first_run=bool(payload.get("first_run")),
         )
+        refresh_app_session_snapshot(settings, user_id=user_id)
+        emit_mailbox_event(settings, user_id=user_id, event_type=DASHBOARD_CHANGED, payload={"source": "gmail_import_batch"})
         return
     if job.kind == "gmail_backfill":
         if not isinstance(user_id, str):
             raise RuntimeError("gmail_backfill missing user_id")
         run_gmail_backfill(settings, user_id=user_id, batch_size=int(payload.get("batch_size") or 100))
+        refresh_app_session_snapshot(settings, user_id=user_id)
+        emit_mailbox_event(settings, user_id=user_id, event_type=DASHBOARD_CHANGED, payload={"source": "gmail_backfill"})
         return
     if job.kind == "gmail_delta_sync":
         if not isinstance(user_id, str):
@@ -101,6 +105,8 @@ def _run_job(settings, job) -> None:
             batch_size=int(payload.get("batch_size") or 100),
             target_history_id=str(payload.get("target_history_id") or "") or None,
         )
+        refresh_app_session_snapshot(settings, user_id=user_id)
+        emit_mailbox_event(settings, user_id=user_id, event_type=DASHBOARD_CHANGED, payload={"source": "gmail_delta_sync"})
         return
     if job.kind == "gmail_body_fetch":
         if not isinstance(user_id, str):

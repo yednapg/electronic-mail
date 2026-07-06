@@ -3,6 +3,7 @@ import Foundation
 public final class OfflineFirstAppClient: AppClient {
     private let backend: AppClient
     private let localMailStore: LocalMailStore
+    private var currentBackendUserID: String?
 
     public init(backend: AppClient, localMailStore: LocalMailStore) {
         self.backend = backend
@@ -16,7 +17,12 @@ public final class OfflineFirstAppClient: AppClient {
 
     public var sessionToken: String? {
         get { backend.sessionToken }
-        set { backend.sessionToken = newValue }
+        set {
+            if backend.sessionToken != newValue {
+                currentBackendUserID = nil
+            }
+            backend.sessionToken = newValue
+        }
     }
 
     public var mode: AppRunMode {
@@ -28,14 +34,13 @@ public final class OfflineFirstAppClient: AppClient {
     }
 
     public func appSession() async throws -> AppSessionResponse {
-        await replayPendingThreadActions()
-        let response = try await backend.appSession()
-        localMailStore.writeSession(response)
+        let response = try await refreshLocalSession()
+        await replayPendingThreadActions(for: response.user.id)
         return response
     }
 
     public func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
-        let userID = localMailStore.readSession()?.user.id
+        let userID = await resolvedBackendUserID()
         do {
             let response = try await backend.mailbox(label: label, limit: limit, cursor: cursor)
             if let userID {
@@ -61,12 +66,12 @@ public final class OfflineFirstAppClient: AppClient {
     }
 
     public func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
-        await replayPendingThreadActions()
+        await replayPendingThreadActionsForCurrentUser()
         return try await backend.triggerMailboxSync()
     }
 
     public func syncMailboxNow() async throws -> MailboxSyncTriggerResponse {
-        await replayPendingThreadActions()
+        await replayPendingThreadActionsForCurrentUser()
         return try await backend.syncMailboxNow()
     }
 
@@ -152,8 +157,32 @@ public final class OfflineFirstAppClient: AppClient {
         return GmailThreadMutationResponse(threadID: threadID, action: action)
     }
 
-    private func replayPendingThreadActions() async {
+    private func refreshLocalSession() async throws -> AppSessionResponse {
+        let response = try await backend.appSession()
+        currentBackendUserID = response.user.id
+        localMailStore.writeSession(response)
+        return response
+    }
+
+    private func resolvedBackendUserID() async -> String? {
+        if let currentBackendUserID {
+            return currentBackendUserID
+        }
+        return try? await refreshLocalSession().user.id
+    }
+
+    private func replayPendingThreadActionsForCurrentUser() async {
+        guard let userID = await resolvedBackendUserID() else {
+            return
+        }
+        await replayPendingThreadActions(for: userID)
+    }
+
+    private func replayPendingThreadActions(for userID: String) async {
         for action in localMailStore.pendingThreadActions() {
+            guard action.userID == userID else {
+                continue
+            }
             do {
                 _ = try await backend.enqueueThreadAction(action.request)
                 localMailStore.removePendingThreadAction(clientActionID: action.clientActionID)

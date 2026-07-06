@@ -33,6 +33,7 @@ export function GmailInboxClient({ initialThreadId = null, initialMailbox = null
   const [threadErrors, setThreadErrors] = useState<Record<string, string>>({});
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [refreshFailed, setRefreshFailed] = useState(false);
+  const [manualSyncing, setManualSyncing] = useState(false);
   const [cacheUserKey, setCacheUserKey] = useState<string | null>(() => session?.user.id ?? null);
   const threadCacheRef = useRef(threadCache);
   const gmailRef = useRef(gmail);
@@ -61,10 +62,6 @@ export function GmailInboxClient({ initialThreadId = null, initialMailbox = null
       }
     };
   }, []);
-
-  useEffect(() => {
-    router.prefetch('/dashboard');
-  }, [router]);
 
   useEffect(() => {
     if (session === null && appSessionRefreshFailed) {
@@ -182,7 +179,7 @@ export function GmailInboxClient({ initialThreadId = null, initialMailbox = null
       if (current !== null && mailboxRows.some((row) => row.thread_id === current)) {
         return current;
       }
-      return null;
+      return mailboxRows[0]?.thread_id ?? null;
     });
   }, [mailboxRows]);
 
@@ -274,6 +271,50 @@ export function GmailInboxClient({ initialThreadId = null, initialMailbox = null
     pushMailboxURL(null);
   }, []);
 
+  const syncMailbox = useCallback(() => {
+    if (manualSyncing) {
+      return;
+    }
+
+    setManualSyncing(true);
+    fetch('/api/mailbox/sync', {
+      method: 'POST',
+      cache: 'no-store',
+      credentials: 'include',
+      headers: {
+        Accept: 'application/json',
+      },
+    })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error('Sync could not start.');
+        }
+        return fetch('/api/mailbox?label=inbox&limit=100', {
+          cache: 'no-store',
+          credentials: 'include',
+          headers: {
+            Accept: 'application/json',
+          },
+        });
+      })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error('Inbox could not refresh.');
+        }
+        return response.json() as Promise<MailboxResponse>;
+      })
+      .then((mailbox) => {
+        setGmail(mailbox);
+        setRefreshFailed(false);
+      })
+      .catch(() => {
+        setRefreshFailed(true);
+      })
+      .finally(() => {
+        setManualSyncing(false);
+      });
+  }, [manualSyncing]);
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (isEditableTarget(event.target)) {
@@ -346,21 +387,14 @@ export function GmailInboxClient({ initialThreadId = null, initialMailbox = null
           <GmailList
             gmail={gmail}
             activeThreadId={activeThreadId}
+            isSyncing={manualSyncing}
+            onSync={syncMailbox}
             onOpenThread={openThread}
             onPrefetchThread={(threadId) => fetchThread(threadId, { silent: true })}
           />
         ) : (
           <MailboxLoadingView />
         )}
-        {session?.mailbox.full_import_running ? (
-          <p className="inbox-refresh-status" role="status">
-            Importing older mail in background.
-          </p>
-        ) : (session?.mailbox.pending_count ?? 0) > 0 ? (
-          <p className="inbox-refresh-status" role="status">
-            Finishing AI titles for older mail.
-          </p>
-        ) : null}
         {refreshFailed || appSessionRefreshFailed ? (
           <p className="inbox-refresh-status" role="status">
             Inbox could not refresh. Showing last saved state.

@@ -19,7 +19,7 @@ settings = load_settings()
 def create_first_run_import_job(request: Request) -> FirstRunImportJobResponse:
     user = require_current_user(settings, request)
     state = get_import_state(str(settings.database_path), user_id=user.id)
-    if state and state.first_batch_imported_at and state.first_groups_ready_at and state.first_dashboard_ready_at:
+    if state and state.first_batch_imported_at:
         return _first_run_response(user.id, job_id=f"first-run:{user.id}")
     job_id = enqueue_first_run(settings, user_id=user.id)
     return _first_run_response(user.id, job_id=job_id)
@@ -40,7 +40,7 @@ def first_run_import_job(request: Request, job_id: str) -> FirstRunImportJobResp
 def _first_run_response(user_id: str, *, job_id: str) -> FirstRunImportJobResponse:
     state = get_import_state(str(settings.database_path), user_id=user_id)
     job = get_job(str(settings.database_path), job_id)
-    ready = bool(state and state.first_batch_imported_at and state.first_groups_ready_at and state.first_dashboard_ready_at)
+    ready = bool(state and state.first_batch_imported_at)
     job_is_active = bool(job and job.status in {"queued", "running"})
     error_message = None if job_is_active else (state.last_sync_error if state else None) or (job.last_error if job else None)
     status = "succeeded" if ready else "failed" if error_message and not ready else (job.status if job else "queued")
@@ -52,12 +52,8 @@ def _first_run_response(user_id: str, *, job_id: str) -> FirstRunImportJobRespon
         stage = "ready"
     elif not state or not state.first_batch_imported_at:
         stage = "importing_gmail"
-    elif not state.first_groups_ready_at:
-        stage = "ai_grouping"
-    elif not state.first_dashboard_ready_at:
-        stage = "dashboard_filtering"
     else:
-        stage = "queued"
+        stage = "ready"
     quality_status = "ready" if ready else "failed" if error_message else "pending"
     return FirstRunImportJobResponse(
         id=job.id if job else job_id,
