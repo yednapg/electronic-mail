@@ -295,7 +295,7 @@ public final class InboxStore: ObservableObject {
         guard let readiness = session?.readiness else {
             return false
         }
-        return readiness.readyToEnter && mailboxVisibleRowCount > 0 && dashboardFeedCount > 0
+        return readiness.readyToEnter && mailboxVisibleRowCount > 0
     }
 
     public var canEnterWithBuildingDashboard: Bool {

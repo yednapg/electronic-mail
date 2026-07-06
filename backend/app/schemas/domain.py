@@ -199,7 +199,7 @@ class FirstRunImportJobResponse(BaseModel):
 
     @property
     def ready(self) -> bool:
-        return self.inbox_ready_at is not None and self.first_groups_ready_at is not None and self.dashboard_ready_at is not None
+        return self.inbox_ready_at is not None
 
 
 class PostLoginReadinessResponse(BaseModel):

@@ -117,8 +117,9 @@ test('gmail thread route uses the mounted mailbox client instead of server threa
 });
 
 test('gmail background processing copy does not imply first-run grouping is blocking', () => {
-  assert.match(gmailInboxClientSource, /Importing older mail in background/);
-  assert.match(gmailInboxClientSource, /Finishing AI titles for older mail/);
+  assert.doesNotMatch(gmailInboxClientSource, /Importing older mail in background/);
+  assert.doesNotMatch(gmailInboxClientSource, /Preparing older mail in background/);
+  assert.doesNotMatch(gmailInboxClientSource, /AI titles/);
   assert.doesNotMatch(gmailInboxClientSource, /Processing older mail: /);
   assert.doesNotMatch(gmailInboxClientSource, /groups left/);
 });

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Mailbox endpoints backed by AI-created mail groups."""
+"""Mailbox endpoints backed by raw Gmail threads."""
 
 from base64 import urlsafe_b64decode
 import asyncio
