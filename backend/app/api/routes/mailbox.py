@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
@@ -14,20 +15,25 @@ from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 
 from app.core.config import load_settings
+from app.core.error_safety import safe_google_error
 from app.db.jobs import enqueue_job
-from app.db.mail_groups import MailboxCursorError, list_messages_by_ids
+from app.db.mail_groups import MailboxCursorError, MailSendIdempotencyConflict, list_messages_by_ids
 from app.db.repository import get_user_by_email
-from app.schemas.domain import MailComposeRequest, MailReplyRequest, MailSendResponse, MailboxRealtimeStateResponse, MailboxResponse, MailboxSyncStateResponse, MailboxSyncTriggerResponse, QueuedThreadActionRequest, QueuedThreadActionResponse, ThreadReaderResponse
+from app.db.user_mail_guard import UserMailWorkBlocked
+from app.schemas.domain import MailComposeRequest, MailDraftResponse, MailDraftSaveRequest, MailDraftSendRequest, MailReplyRequest, MailSendResponse, MailboxRealtimeStateResponse, MailboxResponse, MailboxSyncStateResponse, MailboxSyncTriggerResponse, QueuedThreadActionRequest, QueuedThreadActionResponse, ThreadReaderResponse
 from app.services.auth import require_current_user
-from app.services.gmail_importer import run_gmail_delta_sync, run_gmail_import_batch
+from app.services.gmail_importer import run_gmail_delta_sync
 from app.services.gmail_watch import ensure_gmail_watch
 from app.services.integrations.google import fetch_gmail_attachment
-from app.services.mailbox_actions import enqueue_thread_action
+from app.services.mailbox_actions import ThreadActionIdempotencyConflict, enqueue_thread_action
+from app.services.mailbox_drafts import delete_draft_by_id, get_draft, save_draft, send_saved_draft
 from app.services.mailbox_events import GMAIL_PUBSUB_RECEIVED, HEARTBEAT, SYNC_STATE, emit_mailbox_event, event_payload, format_sse_event, list_events_after, parse_last_event_id
-from app.services.mailbox_sends import send_compose, send_reply
+from app.services.mailbox_search import enqueue_mailbox_search_hydration
+from app.services.mailbox_sends import _validate_subject, _validated_addresses, _validated_attachments, get_send_status, list_outbox_statuses, retry_send, send_compose, send_reply
 from app.services.mail_groups import build_app_session_response, build_group_detail_response, build_mailbox_realtime_state, build_mailbox_response, build_mailbox_sync_state, enqueue_mailbox_sync, gmail_attachments_for_message, refresh_app_session_snapshot
 
 router = APIRouter(tags=["mailbox"])
+MAX_PUBSUB_BODY_BYTES = 64 * 1024
 settings = load_settings()
 logger = logging.getLogger(__name__)
 
@@ -44,6 +50,51 @@ def mailbox(
         return build_mailbox_response(settings, user_id=user.id, label=label, limit=limit, cursor=cursor)
     except MailboxCursorError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.get("/v1/mailbox/search", response_model=MailboxResponse)
+def mailbox_search(
+    request: Request,
+    q: str = Query(min_length=1, max_length=200),
+    label: str = Query(default="all"),
+    limit: int = Query(default=100, ge=1, le=200),
+    cursor: str | None = Query(default=None),
+    hydrate: bool = Query(default=True),
+) -> MailboxResponse:
+    """Search the canonical local mailbox without blocking on Google's API.
+
+    Gmail synchronization continuously hydrates this database in the background.
+    Performing a live Gmail search here made every interactive query wait on an
+    external network round trip plus full-message downloads.
+    """
+    user = require_current_user(settings, request)
+    try:
+        response = build_mailbox_response(
+            settings,
+            user_id=user.id,
+            label=label,
+            limit=limit,
+            cursor=cursor,
+            search_query=q.strip(),
+        )
+    except MailboxCursorError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if hydrate and cursor is None:
+        try:
+            enqueue_mailbox_search_hydration(
+                settings,
+                user_id=user.id,
+                query=q,
+                label=label,
+                limit=limit,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Gmail search hydration could not be queued; local results returned user_id=%s error=%s",
+                user.id,
+                type(exc).__name__,
+            )
+    return response
 
 
 @router.get("/v1/mailbox/threads/{group_id}", response_model=ThreadReaderResponse)
@@ -88,26 +139,98 @@ def mailbox_attachment(request: Request, message_id: str, attachment_id: str) ->
     return Response(
         content=content,
         media_type=attachment.mime_type or "application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": _attachment_content_disposition(filename)},
     )
 
 
 @router.post("/v1/mailbox/thread-actions", response_model=QueuedThreadActionResponse, status_code=202)
 def mailbox_thread_action(request: Request, payload: QueuedThreadActionRequest) -> QueuedThreadActionResponse:
     user = require_current_user(settings, request)
-    return enqueue_thread_action(settings, user_id=user.id, request=payload)
+    try:
+        return enqueue_thread_action(settings, user_id=user.id, request=payload)
+    except ThreadActionIdempotencyConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.post("/v1/mailbox/compose", response_model=MailSendResponse, status_code=202)
 def mailbox_compose(request: Request, payload: MailComposeRequest) -> MailSendResponse:
     user = require_current_user(settings, request)
-    return send_compose(settings, user_id=user.id, request=payload)
+    _validate_outgoing_payload(payload, require_to=True)
+    try:
+        return send_compose(settings, user_id=user.id, request=payload)
+    except MailSendIdempotencyConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.get("/v1/mailbox/outbox", response_model=list[MailSendResponse])
+def mailbox_outbox(request: Request, limit: int = Query(default=100, ge=1, le=200)) -> list[MailSendResponse]:
+    user = require_current_user(settings, request)
+    return list_outbox_statuses(settings, user_id=user.id, limit=limit)
+
+
+@router.get("/v1/mailbox/sends/{server_send_id}", response_model=MailSendResponse)
+def mailbox_send_status(request: Request, server_send_id: str) -> MailSendResponse:
+    user = require_current_user(settings, request)
+    response = get_send_status(settings, user_id=user.id, server_send_id=server_send_id)
+    if response is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Send not found")
+    return response
+
+
+@router.post("/v1/mailbox/sends/{server_send_id}/retry", response_model=MailSendResponse, status_code=202)
+def mailbox_send_retry(request: Request, server_send_id: str) -> MailSendResponse:
+    user = require_current_user(settings, request)
+    response = retry_send(settings, user_id=user.id, server_send_id=server_send_id)
+    if response is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Send not found")
+    return response
 
 
 @router.post("/v1/mailbox/threads/{mailbox_thread_id}/reply", response_model=MailSendResponse, status_code=202)
 def mailbox_reply(request: Request, mailbox_thread_id: str, payload: MailReplyRequest) -> MailSendResponse:
     user = require_current_user(settings, request)
-    return send_reply(settings, user_id=user.id, mailbox_thread_id=mailbox_thread_id, request=payload)
+    _validate_outgoing_payload(payload, require_to=payload.mode == "forward")
+    try:
+        return send_reply(settings, user_id=user.id, mailbox_thread_id=mailbox_thread_id, request=payload)
+    except MailSendIdempotencyConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.post("/v1/mailbox/drafts", response_model=MailDraftResponse, status_code=201)
+def mailbox_draft_create(request: Request, payload: MailDraftSaveRequest) -> MailDraftResponse:
+    user = require_current_user(settings, request)
+    _validate_outgoing_payload(payload, require_to=False)
+    return save_draft(settings, user_id=user.id, request=payload)
+
+
+@router.get("/v1/mailbox/drafts/{mailbox_thread_id}", response_model=MailDraftResponse)
+def mailbox_draft_get(request: Request, mailbox_thread_id: str) -> MailDraftResponse:
+    user = require_current_user(settings, request)
+    response = get_draft(settings, user_id=user.id, mailbox_thread_id=mailbox_thread_id)
+    if response.state == "failed" and response.error == "Draft not found.":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=response.error)
+    return response
+
+
+@router.put("/v1/mailbox/drafts/{gmail_draft_id}", response_model=MailDraftResponse)
+def mailbox_draft_update(request: Request, gmail_draft_id: str, payload: MailDraftSaveRequest) -> MailDraftResponse:
+    user = require_current_user(settings, request)
+    _validate_outgoing_payload(payload, require_to=False)
+    return save_draft(settings, user_id=user.id, request=payload.model_copy(update={"gmail_draft_id": gmail_draft_id}))
+
+
+@router.delete("/v1/mailbox/drafts/{gmail_draft_id}", status_code=204)
+def mailbox_draft_delete(request: Request, gmail_draft_id: str) -> Response:
+    user = require_current_user(settings, request)
+    if not delete_draft_by_id(settings, user_id=user.id, gmail_draft_id=gmail_draft_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Google needs full mail permission.")
+    return Response(status_code=204)
+
+
+@router.post("/v1/mailbox/drafts/{gmail_draft_id}/send", response_model=MailSendResponse)
+def mailbox_draft_send(request: Request, gmail_draft_id: str, payload: MailDraftSendRequest) -> MailSendResponse:
+    user = require_current_user(settings, request)
+    return send_saved_draft(settings, user_id=user.id, gmail_draft_id=gmail_draft_id, request=payload)
 
 
 @router.get("/v1/mailbox/sync-state", response_model=MailboxSyncStateResponse)
@@ -141,13 +264,13 @@ def mailbox_sync_now(request: Request) -> MailboxSyncTriggerResponse:
     try:
         ensure_gmail_watch(settings, user_id=user.id)
         run_gmail_delta_sync(settings, user_id=user.id, batch_size=50)
-        run_gmail_import_batch(settings, user_id=user.id, batch_size=100, first_run=False)
         refresh_app_session_snapshot(settings, user_id=user.id)
     except RuntimeError as exc:
         message = str(exc)
         if "credentials" in message.lower() or "not connected" in message.lower():
             return MailboxSyncTriggerResponse(status="not_connected", state=build_mailbox_sync_state(settings, user_id=user.id))
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=message) from exc
+        logger.warning("Gmail sync failed user_id=%s error=%s", user.id, type(exc).__name__)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=safe_google_error(exc, operation="mail sync")) from exc
     return MailboxSyncTriggerResponse(status="synced", state=build_mailbox_sync_state(settings, user_id=user.id))
 
 
@@ -162,13 +285,24 @@ async def mailbox_events(request: Request) -> StreamingResponse:
         while True:
             if await request.is_disconnected():
                 break
-            for record in list_events_after(settings, user_id=user.id, after_id=last_event_id, limit=100):
+            records = await asyncio.to_thread(
+                list_events_after,
+                settings,
+                user_id=user.id,
+                after_id=last_event_id,
+                limit=100,
+            )
+            for record in records:
                 last_event_id = record.id
                 yield format_sse_event(record.event_type, event_payload(record), event_id=record.id)
             heartbeat_ticks += 1
             if heartbeat_ticks >= 15:
                 heartbeat_ticks = 0
-                state = build_mailbox_sync_state(settings, user_id=user.id)
+                state = await asyncio.to_thread(
+                    build_mailbox_sync_state,
+                    settings,
+                    user_id=user.id,
+                )
                 yield format_sse_event(SYNC_STATE, state.model_dump(mode="json"))
             else:
                 yield format_sse_event(HEARTBEAT, {"ok": True})
@@ -191,14 +325,27 @@ def _verify_pubsub_push(request: Request) -> None:
     expected_email = settings.gmail_pubsub_push_service_account_email
     if expected_email:
         actual_email = str(claims.get("email") or "").strip().lower()
-        if actual_email != expected_email or claims.get("email_verified") is False:
+        if actual_email != expected_email or claims.get("email_verified") is not True:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unexpected Pub/Sub push identity")
 
 
 @router.post("/v1/mailbox/pubsub", status_code=202)
 async def mailbox_pubsub(request: Request) -> dict[str, object]:
     _verify_pubsub_push(request)
-    payload = await request.json()
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_PUBSUB_BODY_BYTES:
+                raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Pub/Sub payload is too large")
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Content-Length") from None
+    raw_payload = await request.body()
+    if len(raw_payload) > MAX_PUBSUB_BODY_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail="Pub/Sub payload is too large")
+    try:
+        payload = json.loads(raw_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Pub/Sub JSON payload") from None
     message = payload.get("message") if isinstance(payload, dict) and isinstance(payload.get("message"), dict) else payload
     data = message.get("data") if isinstance(message, dict) else None
     decoded: dict[str, Any] = {}
@@ -210,32 +357,71 @@ async def mailbox_pubsub(request: Request) -> dict[str, object]:
             decoded = {}
     email_address = str(decoded.get("emailAddress") or "").strip().lower()
     history_id = str(decoded.get("historyId") or "")
-    if not email_address or not history_id:
+    if not email_address or not history_id or not history_id.isdigit():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing Pub/Sub Gmail emailAddress or historyId")
     user = get_user_by_email(str(settings.database_path), email_address) if email_address else None
     if user is None:
-        logger.info("Ignoring Gmail Pub/Sub notification for unknown email=%s history_id=%s", email_address, history_id)
+        logger.info("Ignoring Gmail Pub/Sub notification for an unknown account")
         return {"status": "ignored", "reason": "unknown_user"}
-    logger.info("Received Gmail Pub/Sub notification user_id=%s email=%s history_id=%s", user.id, email_address, history_id)
-    emit_mailbox_event(
-        settings,
-        user_id=user.id,
-        event_type=GMAIL_PUBSUB_RECEIVED,
-        payload={"email_address": email_address, "history_id": history_id},
-    )
-    dedupe = f"gmail-pubsub:{user.id}:{history_id}"
-    job = enqueue_job(
-        str(settings.database_path),
-        kind="gmail_pubsub_sync",
-        queue="critical",
-        user_id=user.id,
-        dedupe_key=dedupe,
-        payload={"user_id": user.id, "email_address": email_address, "history_id": history_id, "batch_size": 100, "pubsub": payload},
-        priority=80,
-    )
+    logger.info("Received Gmail Pub/Sub notification user_id=%s", user.id)
+    try:
+        emit_mailbox_event(
+            settings,
+            user_id=user.id,
+            event_type=GMAIL_PUBSUB_RECEIVED,
+            payload={"email_address": email_address, "history_id": history_id},
+        )
+        dedupe = f"gmail-pubsub:{user.id}:{history_id}"
+        job = enqueue_job(
+            str(settings.database_path),
+            kind="gmail_pubsub_sync",
+            queue="critical",
+            user_id=user.id,
+            dedupe_key=dedupe,
+            payload={
+                "user_id": user.id,
+                "history_id": history_id,
+                "batch_size": 100,
+                "source": "pubsub",
+            },
+            priority=80,
+        )
+    except UserMailWorkBlocked:
+        return {"status": "ignored", "reason": "disconnected"}
     return {"status": "queued", "job_id": job.id}
 
 
 def _safe_attachment_filename(filename: str) -> str:
-    cleaned = "".join("_" if character in '/\\:\0\r\n\t' else character for character in filename).strip()
-    return cleaned or "attachment"
+    cleaned = "".join(
+        "_" if character in '/\\:\0\r\n\t";=' or ord(character) < 32 or ord(character) == 127 else character
+        for character in filename
+    ).strip(" .")
+    return (cleaned or "attachment")[:255]
+
+
+def _attachment_content_disposition(filename: str) -> str:
+    safe = _safe_attachment_filename(filename)
+    ascii_fallback = "".join(character if 32 <= ord(character) < 127 else "_" for character in safe)
+    encoded = quote(safe, safe="")
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}"
+
+
+def _validate_outgoing_payload(payload: Any, *, require_to: bool) -> None:
+    try:
+        to = _validated_addresses(list(getattr(payload, "to", []) or []))
+        cc = _validated_addresses(list(getattr(payload, "cc", []) or []))
+        bcc = _validated_addresses(list(getattr(payload, "bcc", []) or []))
+        if len({address.lower() for address in [*to, *cc, *bcc]}) > 100:
+            raise ValueError("A message can have at most 100 total recipients.")
+        if require_to and not to:
+            raise ValueError("Add at least one recipient.")
+        subject = getattr(payload, "subject", None)
+        if subject is not None:
+            _validate_subject(str(subject))
+        attachments = getattr(payload, "attachments", None)
+        if attachments is not None:
+            _validated_attachments(list(attachments))
+    except ValueError as exc:
+        message = str(exc)
+        status_code = status.HTTP_413_CONTENT_TOO_LARGE if "limit" in message.lower() or "exceed" in message.lower() else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=message) from exc

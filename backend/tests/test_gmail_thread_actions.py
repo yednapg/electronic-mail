@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -7,7 +8,7 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from app.api.routes import gmail as gmail_routes
-from app.main import app
+from app.main import create_app, settings
 from app.services.integrations.google import archive_gmail_thread, mark_gmail_message_read, mark_gmail_thread_read, unarchive_gmail_thread
 
 
@@ -78,7 +79,9 @@ class GmailThreadActionServiceTests(unittest.TestCase):
 
 class GmailThreadActionRouteTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.client = TestClient(app)
+        self.client = TestClient(
+            create_app(replace(settings, app_env="local", rate_limit_enabled=False))
+        )
         self.settings_patch = patch.object(gmail_routes, "settings", SimpleNamespace(google_configured=True))
         self.settings_patch.start()
         self.addCleanup(self.settings_patch.stop)
@@ -126,7 +129,7 @@ class GmailThreadActionRouteTests(unittest.TestCase):
         response = self.client.post("/gmail/threads/thread-1/archive")
 
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json(), {"detail": "Google account is not connected"})
+        self.assertEqual(response.json(), {"detail": "Google archive failed."})
 
 
 if __name__ == "__main__":

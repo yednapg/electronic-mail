@@ -11,9 +11,10 @@ from uuid import uuid4
 from sqlalchemy import text
 
 from app.db.repository import get_engine
+from app.db.user_mail_guard import user_mail_write_transaction
 
 ACTIVE_STATUSES = {"queued", "running"}
-REQUIRED_RUNTIME_QUEUES = ("critical", "reader", "default", "slow")
+REQUIRED_RUNTIME_QUEUES = ("critical", "reader", "default", "slow", "gmail_poll")
 FRESH_WORKER_SECONDS = 120
 
 
@@ -49,6 +50,7 @@ class QueueHealth:
     oldest_queued_age_seconds: int | None
     workers: list[dict[str, Any]]
     worker_online: bool
+    worker_releases_match: bool
     required_queues_ready: bool
 
 
@@ -69,7 +71,12 @@ def enqueue_job(
     job_id = str(uuid4())
     payload_json = json.dumps(payload or {}, ensure_ascii=True)
     run_after_seconds = max(0, int(run_after_seconds))
-    with engine.begin() as connection:
+    transaction = (
+        user_mail_write_transaction(engine, user_id=user_id)
+        if user_id is not None
+        else engine.begin()
+    )
+    with transaction as connection:
         if dedupe_key:
             existing = connection.execute(
                 text(
@@ -215,6 +222,7 @@ def renew_heartbeat(
     *,
     worker_id: str,
     queues: list[str],
+    release_sha: str,
     current_job_id: str | None = None,
     lease_seconds: int = 300,
 ) -> None:
@@ -222,15 +230,21 @@ def renew_heartbeat(
         connection.execute(
             text(
                 """
-                INSERT INTO worker_heartbeats (worker_id, queues_json, current_job_id, last_seen_at)
-                VALUES (:worker_id, :queues_json, :current_job_id, now())
+                INSERT INTO worker_heartbeats (worker_id, queues_json, current_job_id, release_sha, last_seen_at)
+                VALUES (:worker_id, :queues_json, :current_job_id, :release_sha, now())
                 ON CONFLICT (worker_id) DO UPDATE SET
                   queues_json = excluded.queues_json,
                   current_job_id = excluded.current_job_id,
+                  release_sha = excluded.release_sha,
                   last_seen_at = now()
                 """
             ),
-            {"worker_id": worker_id, "queues_json": json.dumps(queues), "current_job_id": current_job_id},
+            {
+                "worker_id": worker_id,
+                "queues_json": json.dumps(queues),
+                "current_job_id": current_job_id,
+                "release_sha": release_sha,
+            },
         )
         if current_job_id is not None:
             connection.execute(
@@ -248,51 +262,96 @@ def renew_heartbeat(
             )
 
 
-def complete_job(database_url: str, job_id: str) -> None:
+def complete_job(database_url: str, job_id: str, *, worker_id: str) -> bool:
     with get_engine(database_url).begin() as connection:
-        connection.execute(
+        completed_job_id = connection.execute(
             text(
                 """
                 UPDATE background_jobs
                 SET status = 'succeeded', completed_at = now(), lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
                 WHERE id = :id
+                  AND status = 'running'
+                  AND lease_owner = :worker_id
+                RETURNING id
                 """
             ),
-            {"id": job_id},
-        )
+            {"id": job_id, "worker_id": worker_id},
+        ).scalar_one_or_none()
+        if completed_job_id is None:
+            return False
         _insert_event(connection, job_id, "succeeded", None, {})
+    return True
 
 
-def fail_job(database_url: str, job: BackgroundJob, error: str) -> None:
+def fail_job(database_url: str, job: BackgroundJob, error: str, *, worker_id: str) -> bool:
     final = job.attempt_count >= job.max_attempts
     delay_seconds = _backoff_seconds(job.attempt_count)
     with get_engine(database_url).begin() as connection:
         if final:
-            connection.execute(
+            failed_job_id = connection.execute(
                 text(
                     """
                     UPDATE background_jobs
                     SET status = 'dead', last_error = :error, completed_at = now(), lease_owner = NULL,
                         lease_expires_at = NULL, updated_at = now()
                     WHERE id = :id
+                      AND status = 'running'
+                      AND lease_owner = :worker_id
+                    RETURNING id
                     """
                 ),
-                {"id": job.id, "error": error[:4000]},
-            )
+                {"id": job.id, "error": error[:4000], "worker_id": worker_id},
+            ).scalar_one_or_none()
+            if failed_job_id is None:
+                return False
             _insert_event(connection, job.id, "dead", error, {})
         else:
-            connection.execute(
+            failed_job_id = connection.execute(
                 text(
                     """
                     UPDATE background_jobs
                     SET status = 'queued', last_error = :error, run_after = now() + (:delay_seconds * interval '1 second'),
                         lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
                     WHERE id = :id
+                      AND status = 'running'
+                      AND lease_owner = :worker_id
+                    RETURNING id
                     """
                 ),
-                {"id": job.id, "error": error[:4000], "delay_seconds": delay_seconds},
-            )
+                {
+                    "id": job.id,
+                    "error": error[:4000],
+                    "delay_seconds": delay_seconds,
+                    "worker_id": worker_id,
+                },
+            ).scalar_one_or_none()
+            if failed_job_id is None:
+                return False
             _insert_event(connection, job.id, "retry", error, {"delay_seconds": delay_seconds})
+    return True
+
+
+def cancel_claimed_job(database_url: str, job_id: str, *, worker_id: str) -> bool:
+    """Cancel work that reached a durable user-mail guard after it was claimed."""
+    with get_engine(database_url).begin() as connection:
+        cancelled_job_id = connection.execute(
+            text(
+                """
+                UPDATE background_jobs
+                SET status = 'cancelled', completed_at = now(), lease_owner = NULL,
+                    lease_expires_at = NULL, updated_at = now()
+                WHERE id = :id
+                  AND status = 'running'
+                  AND lease_owner = :worker_id
+                RETURNING id
+                """
+            ),
+            {"id": job_id, "worker_id": worker_id},
+        ).scalar_one_or_none()
+        if cancelled_job_id is None:
+            return False
+        _insert_event(connection, job_id, "cancelled", None, {"reason": "user_mail_guard"})
+    return True
 
 
 def cancel_user_jobs(database_url: str, *, user_id: str) -> int:
@@ -310,7 +369,7 @@ def cancel_user_jobs(database_url: str, *, user_id: str) -> int:
     return int(result.rowcount or 0)
 
 
-def get_queue_health(database_url: str) -> QueueHealth:
+def get_queue_health(database_url: str, *, expected_release_sha: str) -> QueueHealth:
     with get_engine(database_url).connect() as connection:
         depths = connection.execute(
             text("SELECT queue, COUNT(*) AS count FROM background_jobs WHERE status = 'queued' GROUP BY queue")
@@ -329,6 +388,7 @@ def get_queue_health(database_url: str) -> QueueHealth:
                   worker_id,
                   queues_json,
                   current_job_id,
+                  release_sha,
                   last_seen_at,
                   EXTRACT(EPOCH FROM (now() - last_seen_at)) AS age_seconds
                 FROM worker_heartbeats
@@ -341,16 +401,19 @@ def get_queue_health(database_url: str) -> QueueHealth:
             "worker_id": row["worker_id"],
             "queues": json.loads(row["queues_json"] or "[]"),
             "current_job_id": row["current_job_id"],
+            "release_sha": row["release_sha"],
             "last_seen_at": _iso(row["last_seen_at"]),
             "age_seconds": int(row["age_seconds"] or 0),
             "fresh": int(row["age_seconds"] or 0) <= FRESH_WORKER_SECONDS,
+            "release_matches_expected": row["release_sha"] == expected_release_sha,
         }
         for row in workers
     ]
-    fresh_queues = {
+    fresh_workers = [worker for worker in worker_payloads if worker["fresh"]]
+    matching_fresh_queues = {
         queue
-        for worker in worker_payloads
-        if worker["fresh"]
+        for worker in fresh_workers
+        if worker["release_matches_expected"]
         for queue in worker["queues"]
     }
     return QueueHealth(
@@ -359,14 +422,55 @@ def get_queue_health(database_url: str) -> QueueHealth:
         stale_running_jobs=int(stale_running or 0),
         oldest_queued_age_seconds=int(oldest_age) if oldest_age is not None else None,
         workers=worker_payloads,
-        worker_online=bool(fresh_queues),
-        required_queues_ready=all(queue in fresh_queues for queue in REQUIRED_RUNTIME_QUEUES),
+        worker_online=any(worker["queues"] for worker in fresh_workers),
+        worker_releases_match=bool(fresh_workers)
+        and all(worker["release_matches_expected"] for worker in fresh_workers),
+        required_queues_ready=all(queue in matching_fresh_queues for queue in REQUIRED_RUNTIME_QUEUES),
     )
 
 
 def cleanup_old_jobs(database_url: str, *, succeeded_days: int = 30, dead_days: int = 90) -> int:
-    """Delete expired historical job rows and their events."""
+    """Delete expired queue, authentication, event, and idempotency records."""
     with get_engine(database_url).begin() as connection:
+        expired_runtime_rows = 0
+        for statement in (
+            "DELETE FROM oauth_login_sessions WHERE expires_at < now()",
+            "DELETE FROM mobile_login_codes WHERE expires_at < now()",
+            "DELETE FROM mobile_oauth_handoffs WHERE expires_at < now()",
+            """
+            DELETE FROM app_sessions
+            WHERE expires_at < now() - interval '7 days'
+               OR (revoked_at IS NOT NULL AND revoked_at < now() - interval '7 days')
+            """,
+            "DELETE FROM mailbox_events WHERE created_at < now() - interval '7 days'",
+            "DELETE FROM worker_heartbeats WHERE last_seen_at < now() - interval '7 days'",
+            """
+            DELETE FROM gmail_pending_thread_actions
+            WHERE (state = 'applied' AND updated_at < now() - interval '30 days')
+               OR (state = 'failed' AND updated_at < now() - interval '90 days')
+            """,
+            """
+            DELETE FROM gmail_pending_sends
+            WHERE state IN ('sent', 'failed')
+              AND updated_at < now() - interval '90 days'
+            """,
+            """
+            DELETE FROM gmail_client_drafts
+            WHERE state IN ('sent', 'deleted')
+              AND updated_at < now() - interval '30 days'
+            """,
+            """
+            DELETE FROM gmail_reconcile_seen AS seen
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM gmail_import_state AS state
+              WHERE state.user_id = seen.user_id
+                AND state.reconcile_generation = seen.generation_id
+            )
+            """,
+        ):
+            result = connection.execute(text(statement))
+            expired_runtime_rows += int(result.rowcount or 0)
         event_result = connection.execute(
             text(
                 """
@@ -405,7 +509,7 @@ def cleanup_old_jobs(database_url: str, *, succeeded_days: int = 30, dead_days: 
             ),
             {"succeeded_days": succeeded_days, "dead_days": dead_days},
         )
-    return int(event_result.rowcount or 0) + int(job_result.rowcount or 0)
+    return expired_runtime_rows + int(event_result.rowcount or 0) + int(job_result.rowcount or 0)
 
 
 def _insert_event(connection, job_id: str, event_type: str, message: str | None, metadata: dict[str, Any]) -> None:

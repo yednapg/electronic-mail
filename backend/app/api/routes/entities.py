@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from googleapiclient.errors import HttpError
 
 from app.core.config import load_settings
+from app.core.error_safety import safe_google_error
 from app.db.mail_groups import (
     append_entity_outcome,
     get_mail_group_detail,
@@ -48,9 +49,9 @@ def complete_entity(http_request: Request, entity_id: str, request: EntityOutcom
         try:
             archive_gmail_thread_service(settings, thread_id, user_id=user.id)
         except RuntimeError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=safe_google_error(exc, operation="archive")) from exc
         except HttpError as exc:
-            raise HTTPException(status_code=_http_status(exc), detail=f"Gmail archive failed: {exc}") from exc
+            raise HTTPException(status_code=_http_status(exc), detail=safe_google_error(exc, operation="archive")) from exc
 
     outcome = append_entity_outcome(
         database_url,
