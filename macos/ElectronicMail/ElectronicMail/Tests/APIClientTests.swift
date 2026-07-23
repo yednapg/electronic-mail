@@ -41,6 +41,11 @@ final class APIClientTests: XCTestCase {
             XCTAssertEqual(request.httpMethod, "POST")
             XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/auth/mobile/exchange")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+            let body = self.requestBodyData(request)
+            let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+            XCTAssertEqual(payload["login_code"], "one-time-code")
+            XCTAssertEqual(payload["handoff_id"], "handoff-123")
+            XCTAssertEqual(payload["code_verifier"], "verifier-456")
             let response = MobileSessionExchangeResponse(
                 sessionToken: "live-session-token",
                 expiresAt: "2026-06-15T00:00:00+00:00",
@@ -50,20 +55,108 @@ final class APIClientTests: XCTestCase {
             return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
         }
 
-        let response = try await client.exchangeMobileSession(loginCode: "one-time-code")
+        let response = try await client.exchangeMobileSession(
+            grant: MobileAuthenticationGrant(
+                loginCode: "one-time-code",
+                handoffID: "handoff-123",
+                codeVerifier: "verifier-456"
+            )
+        )
 
         XCTAssertEqual(response.sessionToken, "live-session-token")
+    }
+
+    func testLiveClientRejectsUnboundMobileExchangeWithoutCallingBackend() async {
+        let client = makeClient { request in
+            XCTFail("Unbound exchange must not reach the backend: \(request)")
+            throw APIError.httpStatus(500)
+        }
+
+        do {
+            _ = try await client.exchangeMobileSession(loginCode: "interceptable-code")
+            XCTFail("Expected an unbound authentication error")
+        } catch {
+            XCTAssertEqual(error as? APIError, .unboundMobileAuthentication)
+        }
+    }
+
+    func testPermanentAccountDeletionUsesAuthenticatedEndpoint() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "DELETE")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/auth/account")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer live-session-token")
+            XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
+            return (HTTPURLResponse(url: request.url!, statusCode: 204, httpVersion: nil, headerFields: nil)!, Data())
+        }
+        client.sessionToken = "live-session-token"
+
+        try await client.deleteAccount()
     }
 
     func testBearerSessionTokenIsSentToBackend() async throws {
         let client = makeClient { request in
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer live-session-token")
+            XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
             let data = try JSONEncoder.backend.encode(DemoAppFixtures.appSession)
             return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
         }
         client.sessionToken = "live-session-token"
 
         _ = try await client.appSession()
+    }
+
+    func testDefaultAuthenticatedSessionConfigurationDoesNotPersistResponsesOrCredentials() {
+        let configuration = LiveBackendAppClient.authenticatedSessionConfiguration()
+
+        XCTAssertNil(configuration.urlCache)
+        XCTAssertEqual(configuration.requestCachePolicy, .reloadIgnoringLocalCacheData)
+        XCTAssertNil(configuration.urlCredentialStorage)
+        XCTAssertNil(configuration.httpCookieStorage)
+        XCTAssertFalse(configuration.httpShouldSetCookies)
+    }
+
+    func testAttachmentDownloadAllowsSameOriginAbsoluteURLUsingEffectivePort() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.url?.scheme, "https")
+            XCTAssertEqual(request.url?.host?.lowercased(), "localhost")
+            XCTAssertEqual(request.url?.port, 443)
+            XCTAssertEqual(request.url?.path, "/v1/attachments/attachment-1")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer live-session-token")
+            XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("attachment".utf8))
+        }
+        client.baseURL = URL(string: "https://localhost")!
+        client.sessionToken = "live-session-token"
+
+        let attachment = makeAttachment(downloadURL: "https://LOCALHOST:443/v1/attachments/attachment-1")
+        let result = try await client.downloadAttachment(messageID: "message-1", attachment: attachment)
+
+        XCTAssertEqual(result.data, Data("attachment".utf8))
+    }
+
+    func testAttachmentDownloadRejectsCrossOriginURLsBeforeCreatingAuthenticatedRequest() async {
+        let client = makeClient { request in
+            XCTFail("Cross-origin attachment URL must not create a request: \(request)")
+            throw APIError.httpStatus(500)
+        }
+        client.sessionToken = "live-session-token"
+
+        for downloadURL in [
+            "https://localhost:3001/v1/attachments/attachment-1",
+            "http://attacker.example:3001/v1/attachments/attachment-1",
+            "http://localhost:4000/v1/attachments/attachment-1",
+            "//attacker.example/v1/attachments/attachment-1",
+        ] {
+            do {
+                _ = try await client.downloadAttachment(
+                    messageID: "message-1",
+                    attachment: makeAttachment(downloadURL: downloadURL)
+                )
+                XCTFail("Expected \(downloadURL) to be rejected")
+            } catch {
+                XCTAssertEqual(error as? APIError, .invalidURL, downloadURL)
+            }
+        }
     }
 
     func testMailboxRequestUsesLabelAndLimitQuery() async throws {
@@ -77,6 +170,117 @@ final class APIClientTests: XCTestCase {
         let mailbox = try await client.mailbox(label: .inbox, limit: 100, cursor: nil)
 
         XCTAssertEqual(mailbox.sections.map(\.title), ["Today", "Past 7 days", "Earlier this month"])
+    }
+
+    func testMailboxSearchUsesQueryLabelAndCursor() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/search")
+            XCTAssertEqual(request.url?.query(percentEncoded: false), "q=invoice&limit=25&label=sent&cursor=next-page")
+            let data = try JSONEncoder.backend.encode(DemoAppFixtures.mailbox)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+        }
+
+        _ = try await client.searchMailbox(query: "invoice", label: .sent, limit: 25, cursor: "next-page")
+    }
+
+    func testMailboxSearchCanSuppressBackgroundHydration() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/search")
+            let queryItems = try XCTUnwrap(URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems)
+            XCTAssertEqual(
+                Dictionary(uniqueKeysWithValues: queryItems.compactMap { item in
+                    item.value.map { (item.name, $0) }
+                }),
+                ["q": "invoice", "limit": "25", "label": "sent", "hydrate": "false"]
+            )
+            let data = try JSONEncoder.backend.encode(DemoAppFixtures.mailbox)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+        }
+
+        _ = try await client.searchMailbox(
+            query: "invoice",
+            label: .sent,
+            limit: 25,
+            cursor: nil,
+            hydrateInBackground: false
+        )
+    }
+
+    func testDraftUpdateEncodesRetainedAttachments() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "PUT")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/drafts/draft%2Fone")
+            let payload = try JSONDecoder.backend.decode(MailDraftSaveRequest.self, from: self.requestBodyData(request))
+            XCTAssertEqual(payload.retainedAttachmentIDs, ["attachment-1"])
+            XCTAssertEqual(payload.attachments?.first?.filename, "new.txt")
+            let data = Data(
+                #"{"client_draft_id":"client-draft","gmail_draft_id":"draft/one","gmail_message_id":null,"gmail_thread_id":"thread-1","to":["to@example.com"],"cc":[],"bcc":[],"subject":"Subject","body_text":"Body","body_html":null,"attachments":[],"state":"saved","saved_at":"2026-07-13T00:00:00Z","error":null,"reauth_url":null}"#.utf8
+            )
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+        }
+        let request = MailDraftSaveRequest(
+            clientDraftID: "client-draft",
+            gmailDraftID: "draft/one",
+            gmailThreadID: "thread-1",
+            to: ["to@example.com"],
+            cc: [],
+            bcc: [],
+            subject: "Subject",
+            bodyText: "Body",
+            bodyHTML: nil,
+            attachments: [MailAttachmentUpload(filename: "new.txt", mimeType: "text/plain", dataBase64: "bmV3")],
+            retainedAttachmentIDs: ["attachment-1"],
+            createdAt: "2026-07-13T00:00:00Z"
+        )
+
+        let response = try await client.updateDraft(gmailDraftID: "draft/one", request: request)
+
+        XCTAssertEqual(response.state, .saved)
+    }
+
+    func testResponseDraftCreateEncodesThreadContextAndForwardOptions() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/drafts")
+            let body = self.requestBodyData(request)
+            let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            XCTAssertEqual(payload["client_draft_id"] as? String, "stable-response-draft")
+            XCTAssertEqual(payload["response_mode"] as? String, "forward")
+            XCTAssertEqual(payload["mailbox_thread_id"] as? String, "group/thread 1")
+            XCTAssertEqual(payload["source_message_id"] as? String, "message-9")
+            XCTAssertEqual(payload["include_quoted_original"] as? Bool, true)
+            XCTAssertEqual(payload["include_original_attachments"] as? Bool, false)
+            let data = Data(
+                #"{"client_draft_id":"stable-response-draft","gmail_draft_id":"gmail-draft-1","gmail_message_id":"gmail-message-1","gmail_thread_id":"gmail-thread-new","to":["to@example.com"],"cc":[],"bcc":[],"subject":"Fwd: Subject","body_text":"Body","body_html":null,"attachments":[],"state":"saved","saved_at":"2026-07-23T00:00:00Z","error":null,"reauth_url":null}"#.utf8
+            )
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+        }
+        let request = MailDraftSaveRequest(
+            clientDraftID: "stable-response-draft",
+            gmailDraftID: nil,
+            gmailThreadID: nil,
+            to: ["to@example.com"],
+            cc: [],
+            bcc: [],
+            subject: "Fwd: Subject",
+            bodyText: "Body",
+            bodyHTML: nil,
+            attachments: nil,
+            retainedAttachmentIDs: nil,
+            responseMode: .forward,
+            mailboxThreadID: "group/thread 1",
+            sourceMessageID: "message-9",
+            includeQuotedOriginal: true,
+            includeOriginalAttachments: false,
+            createdAt: "2026-07-23T00:00:00Z"
+        )
+
+        let response = try await client.createDraft(request)
+
+        XCTAssertEqual(response.state, .saved)
+        XCTAssertEqual(response.gmailDraftID, "gmail-draft-1")
     }
 
     func testSyncMailboxNowUsesForegroundEndpoint() async throws {
@@ -231,7 +435,9 @@ final class APIClientTests: XCTestCase {
             XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
             let payload = try JSONDecoder.backend.decode(MailReplyRequest.self, from: self.requestBodyData(request))
             XCTAssertEqual(payload.clientSendID, "client-send-1")
+            XCTAssertEqual(payload.sourceMessageID, "message-older-1")
             XCTAssertEqual(payload.bodyText, "Reply body")
+            XCTAssertFalse(payload.includeOriginalAttachments)
             let response = MailSendResponse(
                 clientSendID: payload.clientSendID,
                 serverSendID: "server-send-1",
@@ -252,6 +458,7 @@ final class APIClientTests: XCTestCase {
             threadID: "group/with space",
             request: MailReplyRequest(
                 clientSendID: "client-send-1",
+                sourceMessageID: "message-older-1",
                 cc: [],
                 bcc: [],
                 bodyText: "Reply body",
@@ -262,6 +469,92 @@ final class APIClientTests: XCTestCase {
 
         XCTAssertEqual(response.mailboxThreadID, "group/with space")
         XCTAssertEqual(response.gmailThreadID, "gmail-thread-1")
+    }
+
+    func testOfflineFirstClientOutboxUsesMailboxEndpointAndLimit() async throws {
+        let backend = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/outbox")
+            XCTAssertEqual(request.url?.query(percentEncoded: false), "limit=25")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer live-session-token")
+            let response: MailOutboxResponse = [
+                MailSendResponse(
+                    clientSendID: "client-send-1",
+                    serverSendID: "server-send-1",
+                    mailboxThreadID: nil,
+                    gmailThreadID: nil,
+                    gmailMessageID: nil,
+                    state: .queued,
+                    queuedAt: "2026-05-21T09:00:00Z",
+                    sentAt: nil,
+                    error: nil,
+                    reauthURL: nil
+                )
+            ]
+            let data = try JSONEncoder.backend.encode(response)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+        }
+        backend.sessionToken = "live-session-token"
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: MemoryLocalMailStore())
+
+        let response = try await client.outbox(limit: 25)
+
+        XCTAssertEqual(response.map(\.serverSendID), ["server-send-1"])
+        XCTAssertEqual(response.map(\.state), [.queued])
+    }
+
+    func testSendStatusUsesEncodedServerSendID() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/sends/server%2Fsend%201")
+            XCTAssertEqual(request.timeoutInterval, 3)
+            let response = MailSendResponse(
+                clientSendID: "client-send-1",
+                serverSendID: "server/send 1",
+                mailboxThreadID: "thread-1",
+                gmailThreadID: "gmail-thread-1",
+                gmailMessageID: "gmail-message-1",
+                state: .sent,
+                queuedAt: "2026-05-21T09:00:00Z",
+                sentAt: "2026-05-21T09:00:02Z",
+                error: nil,
+                reauthURL: nil
+            )
+            let data = try JSONEncoder.backend.encode(response)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+        }
+
+        let response = try await client.sendStatus(serverSendID: "server/send 1")
+
+        XCTAssertEqual(response.state, .sent)
+        XCTAssertEqual(response.gmailMessageID, "gmail-message-1")
+    }
+
+    func testRetrySendUsesEncodedMailboxEndpoint() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/sends/server%2Fsend%201/retry")
+            XCTAssertNil(request.httpBody)
+            let response = MailSendResponse(
+                clientSendID: "client-send-1",
+                serverSendID: "server/send 1",
+                mailboxThreadID: nil,
+                gmailThreadID: nil,
+                gmailMessageID: nil,
+                state: .queued,
+                queuedAt: "2026-05-21T09:05:00Z",
+                sentAt: nil,
+                error: nil,
+                reauthURL: nil
+            )
+            let data = try JSONEncoder.backend.encode(response)
+            return (HTTPURLResponse(url: request.url!, statusCode: 202, httpVersion: nil, headerFields: nil)!, data)
+        }
+
+        let response = try await client.retrySend(serverSendID: "server/send 1")
+
+        XCTAssertEqual(response.state, .queued)
+        XCTAssertNil(response.error)
     }
 
     func testOfflineFirstClientStoresAndReplaysQueuedThreadAction() async throws {
@@ -286,6 +579,114 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(backend.enqueuedActions.map(\.action), [.archive])
     }
 
+    func testOfflineFirstClientDoesNotRestoreSessionCacheAfterTokenChangesMidRefresh() async throws {
+        let requestStarted = expectation(description: "Session request started")
+        let allowResponse = DispatchSemaphore(value: 0)
+        let backend = makeClient { request in
+            requestStarted.fulfill()
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer token-a")
+            XCTAssertEqual(allowResponse.wait(timeout: .now() + 2), .success)
+            let data = try JSONEncoder.backend.encode(DemoAppFixtures.appSession)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, data)
+        }
+        let localStore = MemoryLocalMailStore()
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+        client.sessionToken = "token-a"
+
+        let refresh = Task {
+            try await client.appSession()
+        }
+        await fulfillment(of: [requestStarted], timeout: 1)
+        client.sessionToken = nil
+        allowResponse.signal()
+
+        do {
+            _ = try await refresh.value
+            XCTFail("A response from the cleared session must be discarded")
+        } catch is CancellationError {
+            // Expected: the old response cannot repopulate local email data.
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertNil(localStore.readSession())
+        XCTAssertNil(localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox))
+    }
+
+    func testOfflineFirstClientDoesNotQueueNonRetryableThreadActionFailures() async throws {
+        for status in [400, 401, 403] {
+            let backend = ToggleThreadActionAppClient()
+            backend.shouldFailThreadAction = true
+            backend.threadActionFailureStatus = status
+            let localStore = MemoryLocalMailStore()
+            localStore.writeSession(DemoAppFixtures.appSession)
+            let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+
+            do {
+                _ = try await client.archiveThread("group-1")
+                XCTFail("Expected HTTP \(status) to be rethrown")
+            } catch APIError.httpStatus(let receivedStatus) {
+                XCTAssertEqual(receivedStatus, status)
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertTrue(localStore.pendingThreadActions().isEmpty)
+        }
+    }
+
+    func testOfflineFirstClientRetainsPendingActionWhenReplayNeedsAuthenticationOrRetry() async throws {
+        for status in [401, 403, 408, 429, 500, 503] {
+            let backend = ToggleThreadActionAppClient()
+            backend.shouldFailThreadAction = true
+            backend.threadActionFailureStatus = status
+            let localStore = MemoryLocalMailStore()
+            localStore.writeSession(DemoAppFixtures.appSession)
+            localStore.writePendingThreadAction(
+                LocalPendingThreadAction(
+                    clientActionID: "pending-\(status)",
+                    userID: DemoAppFixtures.userID,
+                    mailboxThreadID: "group-1",
+                    targetMessageID: nil,
+                    action: .archive,
+                    createdAt: "2026-07-23T00:00:00.000Z",
+                    error: "offline"
+                )
+            )
+            let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+
+            _ = try await client.appSession()
+
+            let pending = try XCTUnwrap(localStore.pendingThreadActions().first)
+            XCTAssertEqual(pending.clientActionID, "pending-\(status)")
+            XCTAssertNotNil(pending.error)
+        }
+    }
+
+    func testOfflineFirstClientDiscardsPendingActionAfterPermanentReplayFailure() async throws {
+        for status in [400, 404, 409, 410, 413, 422] {
+            let backend = ToggleThreadActionAppClient()
+            backend.shouldFailThreadAction = true
+            backend.threadActionFailureStatus = status
+            let localStore = MemoryLocalMailStore()
+            localStore.writeSession(DemoAppFixtures.appSession)
+            localStore.writePendingThreadAction(
+                LocalPendingThreadAction(
+                    clientActionID: "pending-\(status)",
+                    userID: DemoAppFixtures.userID,
+                    mailboxThreadID: "group-1",
+                    targetMessageID: nil,
+                    action: .archive,
+                    createdAt: "2026-07-23T00:00:00.000Z",
+                    error: "offline"
+                )
+            )
+            let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+
+            _ = try await client.appSession()
+
+            XCTAssertTrue(localStore.pendingThreadActions().isEmpty, "HTTP \(status) should discard a permanently invalid action")
+        }
+    }
+
     func testOfflineFirstClientWritesMailboxUnderRefreshedBackendUserAfterSessionSwitch() async throws {
         let localStore = MemoryLocalMailStore()
         let userAMailbox = singleRowMailbox(threadID: "user-a-thread", title: "User A row")
@@ -305,6 +706,30 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(localStore.readMailbox(userID: "user-a", label: .inbox)?.sections.first?.rows.first?.threadID, "user-a-thread")
         XCTAssertEqual(localStore.readMailbox(userID: "user-b", label: .inbox)?.sections.first?.rows.first?.threadID, "user-b-thread")
         XCTAssertEqual(backend.appSessionCallCount, 1)
+    }
+
+    func testOfflineFirstClientRejectsThreadPayloadFromAnotherUser() async throws {
+        let localStore = MemoryLocalMailStore()
+        let userBMailbox = singleRowMailbox(threadID: "user-b-thread", title: "User B row")
+        let backend = FixedUserMailboxAppClient(
+            session: appSession(userID: "user-b", email: "user-b@example.com", mailbox: userBMailbox),
+            mailbox: userBMailbox
+        )
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+        client.sessionToken = "user-b-token"
+        _ = try await client.appSession()
+
+        do {
+            _ = try await client.thread(threadID: "demo-google-today", limit: 50, offset: 0)
+            XCTFail("A thread payload belonging to another user must be rejected")
+        } catch APIError.emptyResponse {
+            // Expected: never persist cross-account message content.
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertNil(localStore.readThread(userID: DemoAppFixtures.userID, threadID: "demo-google-today"))
+        XCTAssertNil(localStore.readThread(userID: "user-b", threadID: "demo-google-today"))
     }
 
     func testOfflineFirstClientReplaysOnlyCurrentUsersPendingThreadActions() async throws {
@@ -465,6 +890,18 @@ final class APIClientTests: XCTestCase {
             data.append(buffer, count: read)
         }
         return data
+    }
+
+    private func makeAttachment(downloadURL: String?) -> ThreadAttachment {
+        ThreadAttachment(
+            id: "attachment-1",
+            filename: "attachment.txt",
+            mimeType: "text/plain",
+            size: 10,
+            attachmentID: "gmail-attachment-1",
+            partID: "part-1",
+            downloadURL: downloadURL
+        )
     }
 }
 
@@ -652,6 +1089,7 @@ private final class ToggleThreadActionAppClient: AppClient {
     var sessionToken: String?
     let mode: AppRunMode = .localBackend
     var shouldFailThreadAction = false
+    var threadActionFailureStatus = 503
     private(set) var enqueuedActions: [QueuedThreadActionRequest] = []
 
     func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
@@ -696,7 +1134,7 @@ private final class ToggleThreadActionAppClient: AppClient {
 
     func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
         if shouldFailThreadAction {
-            throw APIError.httpStatus(503)
+            throw APIError.httpStatus(threadActionFailureStatus)
         }
         enqueuedActions.append(request)
         return QueuedThreadActionResponse(

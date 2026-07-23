@@ -1,10 +1,29 @@
 import Foundation
 
-public enum MobileAuthFlowError: Error, Equatable {
+public enum MobileAuthFlowError: LocalizedError, Equatable {
     case invalidURL
     case missingLoginCode
+    case authenticationCancelled
     case handoffTimedOut
     case handoffFailed(Int)
+    case handoffRejected(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidURL:
+            return "Google sign-in could not start because the sign-in URL is invalid."
+        case .missingLoginCode:
+            return "Google sign-in did not return a valid login code."
+        case .authenticationCancelled:
+            return "Google sign-in was cancelled."
+        case .handoffTimedOut:
+            return "Google sign-in timed out. Please try again."
+        case .handoffFailed(let statusCode):
+            return "Google sign-in failed with server response \(statusCode)."
+        case .handoffRejected(let message):
+            return message
+        }
+    }
 }
 
 public enum MobileAuthFlow {
@@ -25,12 +44,23 @@ public enum MobileAuthFlow {
     }
 
     public static func loginCode(from callbackURL: URL) throws -> String {
-        guard let components = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false),
-              let code = components.queryItems?.first(where: { $0.name == "login_code" })?.value,
-              !code.isEmpty else {
+        guard let components = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false) else {
             throw MobileAuthFlowError.missingLoginCode
         }
-        return code
+        let queryItems = components.queryItems ?? []
+        if let code = queryItems.first(where: { $0.name == "login_code" })?.value,
+           !code.isEmpty {
+            return code
+        }
+        let status = queryItems.first(where: { $0.name == "status" })?.value?.lowercased()
+        let message = queryItems.first(where: { $0.name == "error" })?.value
+        if status == "cancelled" {
+            throw MobileAuthFlowError.authenticationCancelled
+        }
+        if status == "failed" {
+            throw MobileAuthFlowError.handoffRejected(message ?? "Google sign-in failed. Please try again.")
+        }
+        throw MobileAuthFlowError.missingLoginCode
     }
 
     public static func handoffCompletionRedirectURL(baseURL: URL, handoffID: String) throws -> URL {
@@ -62,21 +92,37 @@ public enum MobileAuthFlow {
         let url = handoffStatusURL(baseURL: baseURL, handoffID: handoffID)
 
         for _ in 0..<maxAttempts {
-            let (data, response) = try await session.data(from: url)
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw MobileAuthFlowError.missingLoginCode
-            }
-
-            if httpResponse.statusCode == 200 {
-                let handoff = try JSONDecoder().decode(MobileHandoffResponse.self, from: data)
-                guard let loginCode = handoff.loginCode, !loginCode.isEmpty else {
+            do {
+                let (data, response) = try await session.data(from: url)
+                guard let httpResponse = response as? HTTPURLResponse else {
                     throw MobileAuthFlowError.missingLoginCode
                 }
-                return loginCode
-            }
 
-            if httpResponse.statusCode != 202 {
-                throw MobileAuthFlowError.handoffFailed(httpResponse.statusCode)
+                if httpResponse.statusCode == 200 {
+                    let handoff = try JSONDecoder().decode(MobileHandoffResponse.self, from: data)
+                    switch handoff.status.lowercased() {
+                    case "ready":
+                        guard let loginCode = handoff.loginCode, !loginCode.isEmpty else {
+                            throw MobileAuthFlowError.missingLoginCode
+                        }
+                        return loginCode
+                    case "cancelled":
+                        throw MobileAuthFlowError.authenticationCancelled
+                    case "failed":
+                        throw MobileAuthFlowError.handoffRejected(handoff.error ?? "Google sign-in failed. Please try again.")
+                    default:
+                        throw MobileAuthFlowError.missingLoginCode
+                    }
+                }
+
+                if httpResponse.statusCode != 202,
+                   !isTransientHTTPStatus(httpResponse.statusCode) {
+                    throw MobileAuthFlowError.handoffFailed(httpResponse.statusCode)
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as URLError where isTransientURLFailure(error) {
+                // Keep the browser callback race alive while connectivity recovers.
             }
 
             try await Task.sleep(nanoseconds: retryDelayNanoseconds)
@@ -84,14 +130,24 @@ public enum MobileAuthFlow {
 
         throw MobileAuthFlowError.handoffTimedOut
     }
+
+    private static func isTransientHTTPStatus(_ status: Int) -> Bool {
+        status == 408 || status == 429 || status >= 500
+    }
+
+    private static func isTransientURLFailure(_ error: URLError) -> Bool {
+        error.code != .cancelled && error.code != .badURL && error.code != .unsupportedURL
+    }
 }
 
 private struct MobileHandoffResponse: Codable {
     let status: String
     let loginCode: String?
+    let error: String?
 
     enum CodingKeys: String, CodingKey {
         case status
         case loginCode = "login_code"
+        case error
     }
 }

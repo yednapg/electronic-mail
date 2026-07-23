@@ -1,37 +1,281 @@
+import AppKit
+import SwiftUI
 import XCTest
+import Security
 @testable import ElectronicMailCore
 
 final class ModelDecodingTests: XCTestCase {
-    func testReaderSummaryDisclosureHidesSummaryByDefault() {
-        let model = EmailReaderSummaryDisclosureModel(
-            summary: "A quiet summary of the thread.",
-            isExpanded: false
+    func testOriginalBrandAccentRemainsElectronicMailBlue() throws {
+        let color = try XCTUnwrap(
+            NSColor(ElectronicMailDesign.appleBlue).usingColorSpace(.sRGB)
         )
 
-        XCTAssertTrue(model.hasSummary)
-        XCTAssertEqual(model.controlTitle, "View summary")
-        XCTAssertNil(model.visibleSummary)
+        XCTAssertEqual(color.redComponent, 0, accuracy: 0.001)
+        XCTAssertEqual(color.greenComponent, 90.0 / 255.0, accuracy: 0.001)
+        XCTAssertEqual(color.blueComponent, 205.0 / 255.0, accuracy: 0.001)
+        XCTAssertEqual(color.alphaComponent, 1, accuracy: 0.001)
     }
 
-    func testReaderSummaryDisclosureShowsOnlySummaryWhenExpanded() {
-        let model = EmailReaderSummaryDisclosureModel(
-            summary: "A quiet summary of the thread.",
-            isExpanded: true
-        )
-
-        XCTAssertTrue(model.hasSummary)
-        XCTAssertEqual(model.controlTitle, "Hide summary")
-        XCTAssertEqual(model.visibleSummary, "A quiet summary of the thread.")
+    func testOriginalTypographyScaleRemainsProductIdentity() {
+        XCTAssertEqual(ElectronicMailType.titleSize, 22)
+        XCTAssertEqual(ElectronicMailType.sectionTitleSize, 22)
+        XCTAssertEqual(ElectronicMailType.bodySize, 20)
+        XCTAssertEqual(ElectronicMailType.bodyLineHeight, 40)
     }
 
-    func testReaderSummaryDisclosureIgnoresEmptySummary() {
-        let model = EmailReaderSummaryDisclosureModel(
-            summary: "   \n\t  ",
-            isExpanded: true
+    func testUnreadTextIsPureWhiteInDarkMode() throws {
+        let color = try XCTUnwrap(
+            NSColor(ElectronicMailDesign.unreadText(for: .dark)).usingColorSpace(.sRGB)
         )
 
-        XCTAssertFalse(model.hasSummary)
-        XCTAssertNil(model.visibleSummary)
+        XCTAssertEqual(color.redComponent, 1, accuracy: 0.001)
+        XCTAssertEqual(color.greenComponent, 1, accuracy: 0.001)
+        XCTAssertEqual(color.blueComponent, 1, accuracy: 0.001)
+        XCTAssertEqual(color.alphaComponent, 1, accuracy: 0.001)
+    }
+
+    func testKeychainSessionPolicyIsNonSynchronizableAndDeviceOnly() {
+        let policy = KeychainSessionTokenStore.securityPolicyAttributes
+
+        XCTAssertEqual(policy[kSecUseDataProtectionKeychain as String] as? Bool, true)
+        XCTAssertEqual(policy[kSecAttrSynchronizable as String] as? Bool, false)
+        XCTAssertEqual(
+            policy[kSecAttrAccessible as String] as? String,
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String
+        )
+    }
+
+    func testClassicMacKeychainFallbackIsDebugOnlyAndNonSynchronizable() {
+        let policy = KeychainSessionTokenStore.classicMacDebugPolicyAttributes
+
+        XCTAssertNil(policy[kSecUseDataProtectionKeychain as String])
+        XCTAssertEqual(policy[kSecAttrSynchronizable as String] as? Bool, false)
+        XCTAssertNil(policy[kSecAttrAccessible as String])
+        XCTAssertTrue(KeychainSessionTokenStore.classicMacFallbackEnabled)
+        XCTAssertTrue(
+            KeychainSessionTokenStore.shouldUseClassicMacFallback(
+                for: errSecMissingEntitlement,
+                debugBuild: true
+            )
+        )
+        XCTAssertFalse(
+            KeychainSessionTokenStore.shouldUseClassicMacFallback(
+                for: errSecAuthFailed,
+                debugBuild: true
+            )
+        )
+    }
+
+    func testReleaseKeychainPolicyNeverAllowsClassicMacFallback() {
+        XCTAssertFalse(
+            KeychainSessionTokenStore.shouldUseClassicMacFallback(
+                for: errSecMissingEntitlement,
+                debugBuild: false
+            )
+        )
+    }
+
+    func testKeychainFailureProvidesAnActionableSystemStatus() {
+        let message = KeychainError.status(errSecMissingEntitlement).localizedDescription
+
+        XCTAssertTrue(message.contains("signing entitlement"))
+        XCTAssertTrue(message.contains(String(errSecMissingEntitlement)))
+        XCTAssertFalse(message.contains("KeychainError error 0"))
+    }
+
+    func testAppSessionCachePurgesAllLegacyPreferencesAndStaysMemoryOnly() throws {
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let encodedSession = try JSONEncoder.backend.encode(DemoAppFixtures.appSession)
+        let legacyKeys = [
+            "electronic-mail-app-session:live:v1:demo-user",
+            "electronic-mail-app-session:preview:v8:other-user",
+            "electronic-mail-current-user:live:v1",
+            "electronic-mail-current-user:preview:v8",
+        ]
+        defaults.set(encodedSession, forKey: legacyKeys[0])
+        defaults.set(encodedSession, forKey: legacyKeys[1])
+        defaults.set("demo-user", forKey: legacyKeys[2])
+        defaults.set("other-user", forKey: legacyKeys[3])
+        defaults.set("keep", forKey: "unrelated-preference")
+
+        let cache = AppSessionCache(defaults: defaults, namespace: "new-namespace")
+
+        XCTAssertNil(cache.read())
+        XCTAssertEqual(defaults.string(forKey: "unrelated-preference"), "keep")
+        XCTAssertFalse(defaults.dictionaryRepresentation().keys.contains(where: isLegacySessionPreference))
+
+        cache.write(DemoAppFixtures.appSession)
+
+        XCTAssertEqual(cache.read(), DemoAppFixtures.appSession)
+        XCTAssertEqual(cache.read(userID: DemoAppFixtures.appSession.user.id), DemoAppFixtures.appSession)
+        XCTAssertNil(cache.read(userID: "different-user"))
+        XCTAssertFalse(defaults.dictionaryRepresentation().keys.contains(where: isLegacySessionPreference))
+
+        defaults.set(encodedSession, forKey: "electronic-mail-app-session:late:v3:demo-user")
+        defaults.set("demo-user", forKey: "electronic-mail-current-user:late:v3")
+        cache.clear()
+
+        XCTAssertNil(cache.read())
+        XCTAssertFalse(defaults.dictionaryRepresentation().keys.contains(where: isLegacySessionPreference))
+    }
+
+    func testThreadCachePurgesEveryLegacyPreferenceAndNeverPersistsBodies() {
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let legacyKeys = [
+            "electronic-mail-thread:live:v1:user-a:thread-a",
+            "electronic-mail-thread:live:v4:user-a:thread-b",
+            "electronic-mail-thread:preview:v99:user-b:thread-c",
+            "electronic-mail-thread:unversioned",
+        ]
+        let bodyMarker = "PRIVATE-THREAD-BODY-MUST-NOT-ENTER-PREFERENCES"
+        for key in legacyKeys {
+            defaults.set(Data(bodyMarker.utf8), forKey: key)
+        }
+        defaults.set("keep", forKey: "unrelated-preference")
+
+        let cache = ThreadCache(defaults: defaults, namespace: "new-namespace")
+
+        XCTAssertEqual(defaults.string(forKey: "unrelated-preference"), "keep")
+        XCTAssertFalse(defaults.dictionaryRepresentation().keys.contains { $0.hasPrefix("electronic-mail-thread:") })
+
+        let thread = makeThreadReader(body: bodyMarker)
+        cache.write(thread, userID: "user-a", threadID: "thread-a")
+
+        XCTAssertEqual(cache.read(userID: "user-a", threadID: "thread-a"), thread)
+        XCTAssertFalse(defaults.dictionaryRepresentation().keys.contains { $0.hasPrefix("electronic-mail-thread:") })
+        XCTAssertNil(preferenceData(defaults).range(of: Data(bodyMarker.utf8)))
+
+        defaults.set(Data(bodyMarker.utf8), forKey: "electronic-mail-thread:late:v2:user-a:thread-a")
+        cache.clearMemory()
+
+        XCTAssertNil(cache.read(userID: "user-a", threadID: "thread-a"))
+        XCTAssertFalse(defaults.dictionaryRepresentation().keys.contains { $0.hasPrefix("electronic-mail-thread:") })
+    }
+
+    func testSQLiteClearAllRemovesRowsAndPurgesCachedBodyBytes() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailStorageTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let databaseURL = directory.appendingPathComponent("LocalMail.sqlite3")
+        let store = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: databaseURL))
+        let bodyMarker = "PRIVATE-BODY-\(UUID().uuidString)-END"
+        let privateBody = Array(repeating: bodyMarker, count: 128).joined(separator: "|")
+        let thread = makeThreadReader(body: privateBody)
+        let userID = DemoAppFixtures.appSession.user.id
+
+        store.writeSession(DemoAppFixtures.appSession)
+        store.writeThread(thread, userID: userID, threadID: thread.entityID)
+        store.writePendingThreadAction(
+            LocalPendingThreadAction(
+                clientActionID: "pending-private-action",
+                userID: userID,
+                mailboxThreadID: thread.entityID,
+                targetMessageID: thread.messages.first?.id,
+                action: .moveTrash,
+                createdAt: "2026-07-13T00:00:00Z",
+                error: nil
+            )
+        )
+
+        XCTAssertNotNil(store.readSession())
+        XCTAssertNotNil(store.readMailbox(userID: userID, label: DemoAppFixtures.appSession.mailbox.label))
+        XCTAssertEqual(store.readThread(userID: userID, threadID: thread.entityID), thread)
+        XCTAssertEqual(store.pendingThreadActions().count, 1)
+        XCTAssertNotNil(sqliteArtifactData(databaseURL: databaseURL).range(of: Data(bodyMarker.utf8)))
+
+        store.clearAll()
+
+        XCTAssertNil(store.readSession())
+        XCTAssertNil(store.readMailbox(userID: userID, label: DemoAppFixtures.appSession.mailbox.label))
+        XCTAssertNil(store.readThread(userID: userID, threadID: thread.entityID))
+        XCTAssertTrue(store.pendingThreadActions().isEmpty)
+        XCTAssertNil(sqliteArtifactData(databaseURL: databaseURL).range(of: Data(bodyMarker.utf8)))
+
+        // Clearing must leave the same connection usable after checkpointing and VACUUM.
+        store.writeThread(thread, userID: userID, threadID: thread.entityID)
+        XCTAssertEqual(store.readThread(userID: userID, threadID: thread.entityID), thread)
+    }
+
+    func testSQLiteMailboxCachePreservesAuthoritativeNonDateOrder() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailMailboxOrderTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3")))
+        let demoRows = DemoAppFixtures.sections[0].rows
+        let mailbox = MailboxResponse(
+            label: .inbox,
+            totalThreads: 4,
+            nextCursor: "generation-cursor-2",
+            loadedThreads: 4,
+            sections: [
+                GmailThreadSection(
+                    id: "today:rank-rbi",
+                    title: "Today",
+                    rows: [demoRows[3], demoRows[0]]
+                ),
+                GmailThreadSection(
+                    id: "yesterday:rank-github",
+                    title: "Yesterday",
+                    rows: [demoRows[1]]
+                ),
+                GmailThreadSection(
+                    id: "today:rank-apple",
+                    title: "Today",
+                    rows: [demoRows[2]]
+                )
+            ],
+            mailboxRevision: "revision-ranked"
+        )
+        let base = DemoAppFixtures.appSession
+        let session = AppSessionResponse(
+            user: base.user,
+            readiness: base.readiness,
+            dashboard: base.dashboard,
+            mailbox: mailbox,
+            sync: base.sync
+        )
+
+        store.writeSession(session)
+
+        let cachedSession = try XCTUnwrap(store.readSession())
+        let cachedMailbox = try XCTUnwrap(store.readMailbox(userID: base.user.id, label: .inbox))
+        let expectedIDs = ["demo-rbi-today", "demo-google-today", "demo-github-today", "demo-apple-today"]
+        XCTAssertEqual(cachedSession.mailbox.sections.flatMap(\.rows).map(\.threadID), expectedIDs)
+        XCTAssertEqual(cachedMailbox.sections.map(\.title), ["Today", "Yesterday", "Today"])
+        XCTAssertEqual(cachedMailbox.sections.flatMap(\.rows).map(\.threadID), expectedIDs)
+        XCTAssertEqual(cachedMailbox.nextCursor, "generation-cursor-2")
+    }
+
+    func testRemoteImagesAreBlockedByDefault() {
+        let html = #"<html><head></head><body><img src="https://tracker.example/pixel.png"><img src="data:image/png;base64,AA=="></body></html>"#
+
+        XCTAssertTrue(EmailRemoteImagePrivacy.hasRemoteContent(in: html))
+        let protected = EmailRemoteImagePrivacy.applyingPolicy(to: html, allowsRemoteImages: false)
+
+        XCTAssertTrue(protected.contains("Content-Security-Policy"))
+        XCTAssertTrue(protected.contains("img-src data: cid:"))
+        XCTAssertFalse(protected.contains("img-src http: https:"))
+    }
+
+    func testRemoteImagesRequireExplicitOptIn() {
+        let html = #"<html><body style="background-image:url('https://images.example/background.png')"></body></html>"#
+
+        XCTAssertTrue(EmailRemoteImagePrivacy.hasRemoteContent(in: html))
+        let allowed = EmailRemoteImagePrivacy.applyingPolicy(to: html, allowsRemoteImages: true)
+        XCTAssertTrue(allowed.contains("img-src http: https: data: cid:"))
+        XCTAssertTrue(allowed.contains("script-src 'none'"))
+    }
+
+    func testExternalLinkPolicyAllowsOnlySafeSchemes() {
+        XCTAssertTrue(EmailExternalLinkPolicy.canOpen(URL(string: "https://example.com")!))
+        XCTAssertTrue(EmailExternalLinkPolicy.canOpen(URL(string: "mailto:person@example.com")!))
+        XCTAssertFalse(EmailExternalLinkPolicy.canOpen(URL(string: "javascript:alert(1)")!))
+        XCTAssertFalse(EmailExternalLinkPolicy.canOpen(URL(string: "file:///etc/passwd")!))
+        XCTAssertFalse(EmailExternalLinkPolicy.canOpen(URL(string: "data:text/html,hello")!))
     }
 
     func testThreadReaderResponseDecodesSharedContractFixture() throws {
@@ -104,7 +348,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(archive.action, .archive)
     }
 
-    func testMailboxRowPresentationPrefersAITitleAndSummary() {
+    func testMailboxRowPresentationUsesOriginalSubjectAndSnippet() {
         let row = GmailThreadRow(
             threadID: "group-1",
             entityID: "group-1",
@@ -138,8 +382,201 @@ final class ModelDecodingTests: XCTestCase {
             enrichmentStatus: "ready"
         )
 
-        XCTAssertEqual(row.displayTitle, "AI grouped title")
-        XCTAssertEqual(row.displaySummary, "AI grouped summary")
+        XCTAssertEqual(row.displayTitle, "Raw Gmail subject")
+        XCTAssertEqual(row.displaySummary, "Raw Gmail snippet")
+    }
+
+    func testComposerPolicyProtectsDraftContentAndBlankSubjects() {
+        XCTAssertFalse(MailComposerPolicy.hasDraftContent(textFields: [" ", "\n"], attachmentCount: 0))
+        XCTAssertTrue(MailComposerPolicy.hasDraftContent(textFields: ["", "Draft body"], attachmentCount: 0))
+        XCTAssertTrue(MailComposerPolicy.hasDraftContent(textFields: [""], attachmentCount: 1))
+        XCTAssertTrue(MailComposerPolicy.requiresEmptySubjectConfirmation("  "))
+        XCTAssertFalse(MailComposerPolicy.requiresEmptySubjectConfirmation("Hello"))
+    }
+
+    func testComposerPolicyEnforcesAttachmentLimits() {
+        XCTAssertTrue(MailComposerPolicy.acceptsAttachment(byteCount: 10 * 1_024 * 1_024, currentTotalBytes: 8 * 1_024 * 1_024))
+        XCTAssertFalse(MailComposerPolicy.acceptsAttachment(byteCount: 10 * 1_024 * 1_024 + 1, currentTotalBytes: 0))
+        XCTAssertFalse(MailComposerPolicy.acceptsAttachment(byteCount: 2 * 1_024 * 1_024, currentTotalBytes: 17 * 1_024 * 1_024))
+    }
+
+    func testComposerPolicyOnlyAppliesSuccessfulDraftSaveResponses() {
+        XCTAssertTrue(MailComposerPolicy.shouldApplyDraftSaveResponse(state: .saved))
+        XCTAssertFalse(MailComposerPolicy.shouldApplyDraftSaveResponse(state: .failed))
+        XCTAssertFalse(MailComposerPolicy.shouldApplyDraftSaveResponse(state: .reauthRequired))
+    }
+
+    func testComposerPolicyPersistsEditedResponsesAsGmailDrafts() {
+        XCTAssertNil(MailComposerPolicy.responseMode(for: .compose))
+        XCTAssertNil(MailComposerPolicy.responseMode(for: .draft))
+        XCTAssertEqual(MailComposerPolicy.responseMode(for: .reply), .reply)
+        XCTAssertEqual(MailComposerPolicy.responseMode(for: .replyAll), .replyAll)
+        XCTAssertEqual(MailComposerPolicy.responseMode(for: .forward), .forward)
+
+        XCTAssertFalse(
+            MailComposerPolicy.shouldPersistDraft(
+                mode: .reply,
+                hasContent: true,
+                responseChanged: false,
+                hasGmailDraft: false
+            )
+        )
+        XCTAssertTrue(
+            MailComposerPolicy.shouldPersistDraft(
+                mode: .reply,
+                hasContent: true,
+                responseChanged: true,
+                hasGmailDraft: false
+            )
+        )
+        XCTAssertTrue(
+            MailComposerPolicy.shouldPersistDraft(
+                mode: .forward,
+                hasContent: false,
+                responseChanged: false,
+                hasGmailDraft: true
+            )
+        )
+    }
+
+    func testDraftSaveRequestDecodesResponseFieldsWithBackwardCompatibleDefaults() throws {
+        let data = Data(
+            #"{"client_draft_id":"legacy-draft","gmail_draft_id":null,"gmail_thread_id":null,"to":[],"cc":[],"bcc":[],"subject":"","body_text":"","body_html":null,"attachments":null,"retained_attachment_ids":null,"created_at":"2026-07-23T00:00:00Z"}"#.utf8
+        )
+
+        let request = try JSONDecoder.backend.decode(MailDraftSaveRequest.self, from: data)
+
+        XCTAssertNil(request.responseMode)
+        XCTAssertNil(request.mailboxThreadID)
+        XCTAssertNil(request.sourceMessageID)
+        XCTAssertTrue(request.includeQuotedOriginal)
+        XCTAssertTrue(request.includeOriginalAttachments)
+    }
+
+    func testComposerPolicyNeverClearsUnchangedResponseRecoveryDuringUnresolvedSend() {
+        XCTAssertTrue(
+            MailComposerPolicy.shouldClearUnchangedResponseRecovery(
+                force: false,
+                hasUnresolvedSendAttempt: false,
+                mode: .reply,
+                restoredFromRecovery: false,
+                responseIsUnchanged: true
+            )
+        )
+        XCTAssertFalse(
+            MailComposerPolicy.shouldClearUnchangedResponseRecovery(
+                force: false,
+                hasUnresolvedSendAttempt: true,
+                mode: .reply,
+                restoredFromRecovery: false,
+                responseIsUnchanged: true
+            )
+        )
+    }
+
+    func testDurableSendConfirmationPolicyOnlyClosesForConfirmedSent() {
+        let queued = makeSendResponse(state: .queued, serverSendID: "server-send-1")
+        let sending = makeSendResponse(state: .sending, serverSendID: "server-send-1")
+        let sent = makeSendResponse(state: .sent, serverSendID: "server-send-1")
+        let failed = makeSendResponse(state: .failed, serverSendID: "server-send-1", error: "Try again.")
+        let untrackedQueue = makeSendResponse(state: .queued, serverSendID: nil)
+
+        XCTAssertEqual(
+            DurableSendConfirmationPolicy.decision(for: queued),
+            .poll(serverSendID: "server-send-1")
+        )
+        XCTAssertEqual(
+            DurableSendConfirmationPolicy.decision(for: sending),
+            .poll(serverSendID: "server-send-1")
+        )
+        XCTAssertEqual(DurableSendConfirmationPolicy.decision(for: sent), .confirmedSent)
+        XCTAssertEqual(
+            DurableSendConfirmationPolicy.decision(for: failed),
+            .preserveForRetry(message: "Try again.")
+        )
+        guard case .preserveForRetry = DurableSendConfirmationPolicy.decision(for: untrackedQueue) else {
+            return XCTFail("A queued response without a durable server ID must stay recoverable.")
+        }
+    }
+
+    func testDurableSendConfirmationPolicyUsesBoundedBackoffAndMatchingIdentity() {
+        let response = makeSendResponse(state: .sending, serverSendID: "server-send-1")
+        let delays = DurableSendConfirmationPolicy.pollDelayNanoseconds
+
+        XCTAssertEqual(delays.count, 5)
+        XCTAssertEqual(delays, delays.sorted())
+        XCTAssertLessThanOrEqual(delays.reduce(0, +), 7_000_000_000)
+        XCTAssertTrue(
+            DurableSendConfirmationPolicy.matches(
+                response,
+                expectedClientSendID: "client-send-1",
+                expectedServerSendID: "server-send-1"
+            )
+        )
+        XCTAssertFalse(
+            DurableSendConfirmationPolicy.matches(
+                response,
+                expectedClientSendID: "different-client",
+                expectedServerSendID: "server-send-1"
+            )
+        )
+        XCTAssertFalse(
+            DurableSendConfirmationPolicy.matches(
+                response,
+                expectedClientSendID: "client-send-1",
+                expectedServerSendID: "different-server"
+            )
+        )
+    }
+
+    func testSignedInDestinationsCoverMailboxLabelsInSidebarOrder() {
+        let labels: [MailboxLabel] = [.inbox, .starred, .drafts, .sent, .spam, .trash, .archive, .all]
+        let titles = ["Inbox", "Starred", "Drafts", "Sent", "Spam", "Trash", "Archive", "All Mail"]
+
+        XCTAssertEqual(SignedInDestination.allCases.map(\.mailboxLabel), labels)
+        XCTAssertEqual(SignedInDestination.allCases.map(\.title), titles)
+        XCTAssertEqual(labels.map(SignedInDestination.init(mailboxLabel:)), SignedInDestination.allCases)
+    }
+
+    func testReplyAllPrefillKeepsSenderInToAndCopiesOtherRecipients() {
+        let recipients = MailReplyPrefillPolicy.recipients(
+            mode: .replyAll,
+            currentUser: "me@example.com",
+            sender: "sender@example.com",
+            originalTo: ["me@example.com", "other@example.com"],
+            originalCC: ["sender@example.com", "copy@example.com", "other@example.com"]
+        )
+
+        XCTAssertEqual(recipients.to, ["sender@example.com"])
+        XCTAssertEqual(recipients.cc, ["other@example.com", "copy@example.com"])
+    }
+
+    func testReplyPrefillForSentMessageTargetsOriginalRecipients() {
+        let reply = MailReplyPrefillPolicy.recipients(
+            mode: .reply,
+            currentUser: "me@example.com",
+            sender: "me@example.com",
+            originalTo: ["person@example.com"],
+            originalCC: ["copy@example.com"]
+        )
+        let replyAll = MailReplyPrefillPolicy.recipients(
+            mode: .replyAll,
+            currentUser: "me@example.com",
+            sender: "me@example.com",
+            originalTo: ["person@example.com"],
+            originalCC: ["copy@example.com"]
+        )
+        let selfOnly = MailReplyPrefillPolicy.recipients(
+            mode: .reply,
+            currentUser: "me@example.com",
+            sender: "me@example.com",
+            originalTo: ["me@example.com"],
+            originalCC: []
+        )
+
+        XCTAssertEqual(reply, MailReplyPrefillRecipients(to: ["person@example.com"], cc: []))
+        XCTAssertEqual(replyAll, MailReplyPrefillRecipients(to: ["person@example.com"], cc: ["copy@example.com"]))
+        XCTAssertEqual(selfOnly, MailReplyPrefillRecipients(to: ["me@example.com"], cc: []))
     }
 
     func testMailboxRowDisplaySenderCleansQuotedDisplayName() {
@@ -179,7 +616,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(row.displaySender, "No Reply Statements - mailer.example.com")
     }
 
-    func testMailboxRowPresentationShowsPendingTitleState() throws {
+    func testMailboxRowPresentationIgnoresPendingAITitleState() throws {
         let data = """
         {
           "thread_id": "group-1",
@@ -218,7 +655,7 @@ final class ModelDecodingTests: XCTestCase {
 
         let row = try JSONDecoder.backend.decode(GmailThreadRow.self, from: data)
 
-        XCTAssertEqual(row.displayTitle, "Building title... Raw Gmail subject")
+        XCTAssertEqual(row.displayTitle, "Raw Gmail subject")
         XCTAssertEqual(row.childRows, [])
     }
 
@@ -285,7 +722,7 @@ final class ModelDecodingTests: XCTestCase {
 
         XCTAssertEqual(row.childRows.map(\.messageID), ["msg-1", "msg-2"])
         XCTAssertEqual(row.childRows[0].displaySender, "First")
-        XCTAssertEqual(row.childRows[1].displayTitle, "Clean second title")
+        XCTAssertEqual(row.childRows[1].displayTitle, "Second subject")
         XCTAssertTrue(row.childRows[1].isUnread)
     }
 
@@ -338,6 +775,44 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(response.reauthURL, "http://127.0.0.1:3001/auth/google")
     }
 
+    func testMailOutboxResponseDecodesDurableSendStates() throws {
+        let data = """
+        [
+          {
+            "client_send_id": "client-send-queued",
+            "server_send_id": "server-send-queued",
+            "mailbox_thread_id": null,
+            "gmail_thread_id": null,
+            "gmail_message_id": null,
+            "state": "queued",
+            "queued_at": "2026-05-21T09:00:00Z",
+            "sent_at": null,
+            "error": null,
+            "reauth_url": null
+          },
+          {
+            "client_send_id": "client-send-failed",
+            "server_send_id": "server-send-failed",
+            "mailbox_thread_id": "thread-1",
+            "gmail_thread_id": null,
+            "gmail_message_id": null,
+            "state": "failed",
+            "queued_at": "2026-05-21T09:01:00Z",
+            "sent_at": null,
+            "error": "Temporary Gmail failure.",
+            "reauth_url": null
+          }
+        ]
+        """.data(using: .utf8)!
+
+        let response = try JSONDecoder.backend.decode(MailOutboxResponse.self, from: data)
+
+        XCTAssertEqual(response.map(\.serverSendID), ["server-send-queued", "server-send-failed"])
+        XCTAssertEqual(response.map(\.state), [.queued, .failed])
+        XCTAssertEqual(response[1].mailboxThreadID, "thread-1")
+        XCTAssertEqual(response[1].error, "Temporary Gmail failure.")
+    }
+
     func testMailboxResponseDecodesPaginationProgressFields() throws {
         let data = """
         {
@@ -361,9 +836,28 @@ final class ModelDecodingTests: XCTestCase {
     }
 
     func testGoogleOAuthServiceParsesCustomCallbackLoginCode() throws {
-        let url = try XCTUnwrap(URL(string: "electronicmail://auth/callback?login_code=abc123"))
+        let url = try XCTUnwrap(URL(string: "electronicmail://auth/callback?login_code=abc123&handoff_id=handoff-1"))
 
         XCTAssertEqual(try GoogleOAuthService.loginCode(from: url), "abc123")
+        XCTAssertEqual(GoogleOAuthService.handoffID(from: url), "handoff-1")
+    }
+
+    func testGoogleOAuthServiceBuildsVerifierBoundHandoffRedirect() throws {
+        let pkce = GoogleOAuthService.makePKCEPair()
+
+        XCTAssertGreaterThanOrEqual(pkce.verifier.count, 43)
+        XCTAssertFalse(pkce.verifier.contains("="))
+        XCTAssertEqual(pkce.challenge.count, 43)
+        XCTAssertFalse(pkce.challenge.contains("="))
+
+        let redirect = try GoogleOAuthService.mobileHandoffRedirectURL(
+            baseURL: URL(string: "https://mail.example")!,
+            handoffID: "handoff-1",
+            codeChallenge: pkce.challenge
+        )
+        let query = try XCTUnwrap(URLComponents(url: redirect, resolvingAgainstBaseURL: false)?.queryItems)
+        XCTAssertEqual(query.first(where: { $0.name == "handoff_id" })?.value, "handoff-1")
+        XCTAssertEqual(query.first(where: { $0.name == "code_challenge" })?.value, pkce.challenge)
     }
 
     func testEmailBodyResolverRoutesBasicTextLinkHTMLToText() {
@@ -740,6 +1234,43 @@ final class ModelDecodingTests: XCTestCase {
         )
     }
 
+    func testThreadPresentationDecodesCommonNamedHTMLEntities() {
+        let message = makeThreadMessage(subject: "Caf&eacute; &amp; M&uuml;nchen &mdash; d&eacute;j&agrave; vu")
+
+        XCTAssertEqual(
+            EmailThreadPresentation.displaySubject(for: message),
+            "Café & München — déjà vu"
+        )
+    }
+
+    func testThreadMessageRenderRevisionIncludesReaderDetailFields() {
+        let baseReader = ThreadMessageReader(
+            primaryText: "Primary",
+            markers: [],
+            signatureText: "First signature",
+            quotedText: "Quoted",
+            footerText: "Footer",
+            originalHTMLAvailable: true,
+            htmlIsRich: true,
+            quoteDetected: true
+        )
+        let updatedReader = ThreadMessageReader(
+            primaryText: "Primary",
+            markers: [],
+            signatureText: "Updated signature",
+            quotedText: "Quoted",
+            footerText: "Footer",
+            originalHTMLAvailable: true,
+            htmlIsRich: true,
+            quoteDetected: true
+        )
+
+        XCTAssertNotEqual(
+            makeThreadMessage(reader: baseReader).renderRevision,
+            makeThreadMessage(reader: updatedReader).renderRevision
+        )
+    }
+
     func testUserDefaultsSessionTokenStoreSavesLoadsAndClearsToken() throws {
         let defaults = UserDefaults.ephemeralTokenStoreDefaults()
         let store = UserDefaultsSessionTokenStore(defaults: defaults, key: "test-session")
@@ -838,6 +1369,60 @@ final class ModelDecodingTests: XCTestCase {
             labelIDs: ["INBOX"],
             receivedAt: receivedAt
         )
+    }
+
+    private func makeSendResponse(
+        state: MailSendState,
+        serverSendID: String?,
+        error: String? = nil
+    ) -> MailSendResponse {
+        MailSendResponse(
+            clientSendID: "client-send-1",
+            serverSendID: serverSendID,
+            mailboxThreadID: "thread-1",
+            gmailThreadID: nil,
+            gmailMessageID: state == .sent ? "gmail-message-1" : nil,
+            state: state,
+            queuedAt: "2026-05-21T09:00:00Z",
+            sentAt: state == .sent ? "2026-05-21T09:00:01Z" : nil,
+            error: error,
+            reauthURL: nil
+        )
+    }
+
+    private func makeThreadReader(body: String) -> ThreadReaderResponse {
+        ThreadReaderResponse(
+            entityID: "private-thread",
+            userID: "private-user",
+            source: .gmail,
+            gmailThreadID: "gmail-private-thread",
+            subject: "Private subject",
+            totalMessages: 1,
+            messages: [makeThreadMessage(id: "private-message", body: body)]
+        )
+    }
+
+    private func preferenceData(_ defaults: UserDefaults) -> Data {
+        defaults.dictionaryRepresentation().values.reduce(into: Data()) { result, value in
+            if let data = value as? Data {
+                result.append(data)
+            } else if let string = value as? String {
+                result.append(Data(string.utf8))
+            }
+        }
+    }
+
+    private func isLegacySessionPreference(_ key: String) -> Bool {
+        key.hasPrefix("electronic-mail-app-session:") || key.hasPrefix("electronic-mail-current-user:")
+    }
+
+    private func sqliteArtifactData(databaseURL: URL) -> Data {
+        [databaseURL, URL(fileURLWithPath: databaseURL.path + "-wal"), URL(fileURLWithPath: databaseURL.path + "-shm")]
+            .reduce(into: Data()) { result, url in
+                if let data = try? Data(contentsOf: url) {
+                    result.append(data)
+                }
+            }
     }
 }
 

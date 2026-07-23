@@ -216,17 +216,38 @@ public final class SQLiteLocalMailStore: LocalMailStore {
 
     public func clearAll() {
         lock.withLock {
-            _ = execute(sql: "DELETE FROM current_session")
-            _ = execute(sql: "DELETE FROM app_sessions")
-            _ = execute(sql: "DELETE FROM mailboxes")
-            _ = execute(sql: "DELETE FROM thread_details")
-            _ = execute(sql: "DELETE FROM pending_thread_actions")
+            _ = execute(sql: "PRAGMA secure_delete = ON")
+
+            guard execute(sql: "BEGIN IMMEDIATE") else {
+                return
+            }
+
+            let didDeleteEverything = [
+                "DELETE FROM current_session",
+                "DELETE FROM app_sessions",
+                "DELETE FROM mailboxes",
+                "DELETE FROM thread_details",
+                "DELETE FROM pending_thread_actions",
+            ].allSatisfy { execute(sql: $0) }
+
+            guard didDeleteEverything, execute(sql: "COMMIT") else {
+                _ = execute(sql: "ROLLBACK")
+                return
+            }
+
+            // A normal DELETE leaves recoverable content in free pages and old WAL
+            // frames. Secure deletion overwrites the cells, checkpoint truncation
+            // removes the frames, and VACUUM rebuilds the database without free pages.
+            _ = execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
+            _ = execute(sql: "VACUUM")
+            _ = execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
         }
     }
 
     private func migrate() -> Bool {
         lock.withLock {
             execute(sql: "PRAGMA journal_mode = WAL")
+            execute(sql: "PRAGMA secure_delete = ON")
             execute(sql: "PRAGMA foreign_keys = ON")
             execute(
                 sql: """
@@ -282,9 +303,25 @@ public final class SQLiteLocalMailStore: LocalMailStore {
                 )
                 """
             )
-            execute(sql: "ALTER TABLE pending_thread_actions ADD COLUMN target_message_id TEXT")
+            if !table("pending_thread_actions", hasColumn: "target_message_id") {
+                execute(sql: "ALTER TABLE pending_thread_actions ADD COLUMN target_message_id TEXT")
+            }
             return true
         }
+    }
+
+    private func table(_ tableName: String, hasColumn columnName: String) -> Bool {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "PRAGMA table_info(\(tableName))", -1, &statement, nil) == SQLITE_OK else {
+            return false
+        }
+        defer { sqlite3_finalize(statement) }
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if sqliteText(statement, 1) == columnName {
+                return true
+            }
+        }
+        return false
     }
 
     private func currentUserID() -> String? {

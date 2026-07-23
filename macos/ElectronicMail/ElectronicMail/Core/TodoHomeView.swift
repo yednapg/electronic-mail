@@ -1213,13 +1213,7 @@ enum TodoHomeMapper {
     }
 
     private static func aiBuildStatus(from session: AppSessionResponse) -> String? {
-        if let error = session.sync.lastAIError?.trimmingCharacters(in: .whitespacesAndNewlines), !error.isEmpty, session.sync.readyGroupCount == 0 {
-            return "AI summaries need attention. \(error)"
-        }
-        guard session.sync.enrichmentPendingCount > 0, session.sync.readyGroupCount == 0 else {
-            return nil
-        }
-        return "Building AI summaries from your inbox"
+        nil
     }
 
     private static func dashboardBuildStatus(from session: AppSessionResponse) -> String? {
@@ -1417,7 +1411,9 @@ private extension DateFormatter {
     }()
 }
 
+#if DEBUG
 #Preview {
     TodoHomeView(store: InboxStore(client: DemoAppClient()))
         .frame(width: 1100, height: 760)
 }
+#endif

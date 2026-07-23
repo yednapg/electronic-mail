@@ -65,6 +65,7 @@ extension MailboxResponse {
         return MailboxResponse(
             label: label,
             totalThreads: totalThreads,
+            unreadThreads: unreadThreads,
             nextCursor: nextCursor,
             loadedThreads: loadedThreads,
             windowDays: windowDays,
@@ -97,7 +98,7 @@ extension MailboxResponse {
         }
 
         let nextSections = sectionOrder.map { id in
-            GmailThreadSection(id: id, title: titlesBySection[id] ?? "", rows: Self.sortedRows(rowsBySection[id] ?? []))
+            GmailThreadSection(id: id, title: titlesBySection[id] ?? "", rows: rowsBySection[id] ?? [])
         }
         let visibleRows = nextSections.reduce(0) { $0 + $1.rows.count }
         let currentVisibleRows = sections.reduce(0) { $0 + $1.rows.count }
@@ -112,6 +113,7 @@ extension MailboxResponse {
         return MailboxResponse(
             label: label,
             totalThreads: page.totalThreads,
+            unreadThreads: page.unreadThreads ?? unreadThreads,
             nextCursor: page.nextCursor,
             loadedThreads: loaded,
             windowDays: page.windowDays ?? windowDays,
@@ -126,7 +128,16 @@ extension MailboxResponse {
         )
     }
 
-    func preservingLoadedPages(afterRefreshingFirstPage firstPage: MailboxResponse) -> MailboxResponse {
+    func preservingLoadedPages(
+        afterRefreshingFirstPage firstPage: MailboxResponse,
+        discardStalePages: Bool = false
+    ) -> MailboxResponse {
+        let revisionChanged = mailboxRevision?.isEmpty == false
+            && firstPage.mailboxRevision?.isEmpty == false
+            && mailboxRevision != firstPage.mailboxRevision
+        if discardStalePages || revisionChanged {
+            return firstPage
+        }
         var sectionOrder = firstPage.sections.map(\.id)
         var rowsBySection = Dictionary(uniqueKeysWithValues: firstPage.sections.map { ($0.id, $0.rows) })
         var titlesBySection = Dictionary(uniqueKeysWithValues: firstPage.sections.map { ($0.id, $0.title) })
@@ -144,7 +155,7 @@ extension MailboxResponse {
         }
 
         let nextSections = sectionOrder.map { id in
-            GmailThreadSection(id: id, title: titlesBySection[id] ?? "", rows: Self.sortedRows(rowsBySection[id] ?? []))
+            GmailThreadSection(id: id, title: titlesBySection[id] ?? "", rows: rowsBySection[id] ?? [])
         }
         let loaded = nextSections.reduce(0) { $0 + $1.rows.count }
         let firstPageLoaded = firstPage.loadedThreads ?? firstPage.sections.reduce(0) { $0 + $1.rows.count }
@@ -154,6 +165,7 @@ extension MailboxResponse {
         return MailboxResponse(
             label: firstPage.label,
             totalThreads: firstPage.totalThreads,
+            unreadThreads: firstPage.unreadThreads ?? unreadThreads,
             nextCursor: nextCursor,
             loadedThreads: max(firstPage.loadedThreads ?? 0, loadedThreads ?? 0, loaded),
             windowDays: firstPage.windowDays ?? windowDays,
@@ -195,29 +207,6 @@ extension MailboxResponse {
         return keys
     }
 
-    private static func sortedRows(_ rows: [GmailThreadRow]) -> [GmailThreadRow] {
-        rows.sorted { lhs, rhs in
-            let leftDate = sortDate(for: lhs)
-            let rightDate = sortDate(for: rhs)
-            if leftDate != rightDate {
-                return leftDate > rightDate
-            }
-            return lhs.threadID > rhs.threadID
-        }
-    }
-
-    private static func sortDate(for row: GmailThreadRow) -> Date {
-        let value = row.latestMessageAt ?? row.latestReceivedAt
-        return ISO8601DateFormatter.mailboxMerge.date(from: value) ?? .distantPast
-    }
-}
-
-private extension ISO8601DateFormatter {
-    static let mailboxMerge: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withColonSeparatorInTimeZone]
-        return formatter
-    }()
 }
 
 extension GmailThreadRow {
@@ -241,6 +230,27 @@ extension GmailThreadRow {
             unread: false,
             labelIDs: labelIDs.removingUnreadLabel(),
             labels: labels.removingUnreadLabel(),
+            children: nextChildren
+        )
+    }
+
+    func markedUnread(targetMessageID: String? = nil) -> GmailThreadRow {
+        guard let targetMessageID else {
+            return copy(
+                unread: true,
+                labelIDs: labelIDs.addingUnreadLabel(),
+                labels: labels.addingUnreadLabel(),
+                children: children?.map { $0.markedUnread() }
+            )
+        }
+
+        let nextChildren = children?.map { child in
+            child.messageID == targetMessageID ? child.markedUnread() : child
+        }
+        return copy(
+            unread: true,
+            labelIDs: labelIDs.addingUnreadLabel(),
+            labels: labels.addingUnreadLabel(),
             children: nextChildren
         )
     }
@@ -300,6 +310,14 @@ extension GmailThreadChildRow {
         )
     }
 
+    func markedUnread() -> GmailThreadChildRow {
+        copy(
+            unread: true,
+            labelIDs: labelIDs.addingUnreadLabel(),
+            labels: labels.addingUnreadLabel()
+        )
+    }
+
     func copy(unread: Bool? = nil, labelIDs: [String]? = nil, labels: [String]? = nil) -> GmailThreadChildRow {
         GmailThreadChildRow(
             messageID: messageID,
@@ -319,5 +337,30 @@ extension GmailThreadChildRow {
 private extension Array where Element == String {
     func removingUnreadLabel() -> [String] {
         filter { $0.uppercased() != "UNREAD" }
+    }
+
+    func addingUnreadLabel() -> [String] {
+        contains(where: { $0.uppercased() == "UNREAD" }) ? self : self + ["UNREAD"]
+    }
+}
+
+extension ThreadReaderResponse {
+    func appendingPage(_ page: ThreadReaderResponse) -> ThreadReaderResponse {
+        var seen = Set(messages.map(\.id))
+        let appendedMessages = messages + page.messages.filter { seen.insert($0.id).inserted }
+        return ThreadReaderResponse(
+            entityID: entityID,
+            userID: userID,
+            source: source ?? page.source,
+            gmailThreadID: gmailThreadID ?? page.gmailThreadID,
+            subject: subject ?? page.subject,
+            title: title ?? page.title,
+            summary: nil,
+            totalMessages: max(totalMessages, page.totalMessages, appendedMessages.count),
+            limit: max(limit, page.limit),
+            offset: 0,
+            hasMore: page.hasMore,
+            messages: appendedMessages
+        )
     }
 }
