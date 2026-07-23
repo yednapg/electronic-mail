@@ -1,30 +1,22 @@
-/** Landing screen that starts the real Google connection flow. */
+/** Public landing page for the native macOS product. */
 import Link from 'next/link';
-import { redirect } from 'next/navigation';
+import React from 'react';
 
 import { AppMark } from '../components/AppMark';
-import { getBackendURL, getDashboard, getLatestFirstRunImportJob } from '../lib/api';
-import { getServerCookieHeader } from '../lib/server-cookies';
-import type { DashboardResponse } from '../lib/types';
+import {
+  downloadConfigIssues,
+  loadDownloadConfig,
+  type DownloadConfig,
+} from '../lib/download-config';
 
-export default async function HomePage() {
-  let signInHref = `${getBackendURL()}/auth/google`;
-  let dashboard: DashboardResponse | null = null;
-  const cookie = await getServerCookieHeader();
+export const dynamic = 'force-dynamic';
 
-  try {
-    dashboard = await getDashboard({ cookie });
-  } catch {
-    signInHref = `${getBackendURL()}/auth/google`;
-  }
+export default function HomePage() {
+  return <HomePageContent downloadConfig={loadDownloadConfig()} />;
+}
 
-  if (dashboard?.auth.connected) {
-    const latestImportJob = await getLatestFirstRunImportJob({ cookie });
-    const firstRunReady = Boolean(latestImportJob?.inbox_ready_at);
-    redirect(firstRunReady ? '/gmail' : '/post-login');
-  }
-
-  signInHref = dashboard?.auth.connect_url ?? signInHref;
+export function HomePageContent({ downloadConfig }: { downloadConfig: DownloadConfig }) {
+  const downloadReady = downloadConfigIssues(downloadConfig).length === 0;
 
   return (
     <main className="login-page">
@@ -33,34 +25,28 @@ export default async function HomePage() {
 
         <div className="login-copy">
           <h1 className="login-title">
-            <span className="login-title-line">Work first.</span>
-            <span className="login-title-line">Emails underneath.</span>
+            <span className="login-title-line">Electronic Mail.</span>
+            <span className="login-title-line">Built for your Mac.</span>
           </h1>
+          <p className="login-native-description">
+            A focused, native Gmail client for macOS. Open the installed app to connect Google and manage your mail.
+          </p>
         </div>
 
-        <Link className="login-google-button" href={signInHref}>
-          <span className="login-google-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" role="img" aria-hidden="true">
-              <path
-                fill="#4285F4"
-                d="M23.49 12.27c0-.79-.07-1.55-.2-2.27H12v4.3h6.44a5.5 5.5 0 0 1-2.39 3.61v3h3.87c2.27-2.09 3.57-5.17 3.57-8.64Z"
-              />
-              <path
-                fill="#34A853"
-                d="M12 24c3.24 0 5.96-1.07 7.95-2.9l-3.87-3c-1.07.72-2.43 1.14-4.08 1.14-3.14 0-5.8-2.12-6.76-4.97H1.24v3.09A12 12 0 0 0 12 24Z"
-              />
-              <path
-                fill="#FBBC05"
-                d="M5.24 14.27A7.2 7.2 0 0 1 4.86 12c0-.79.14-1.55.38-2.27V6.64H1.24A12 12 0 0 0 0 12c0 1.93.46 3.76 1.24 5.36l4-3.09Z"
-              />
-              <path
-                fill="#EA4335"
-                d="M12 4.77c1.76 0 3.33.61 4.57 1.8l3.43-3.43C17.95 1.19 15.23 0 12 0A12 12 0 0 0 1.24 6.64l4 3.09c.96-2.85 3.62-4.96 6.76-4.96Z"
-              />
-            </svg>
-          </span>
-          <span>Continue with Google</span>
-        </Link>
+        {downloadReady ? (
+          <a className="login-primary-link" href={downloadConfig.url}>
+            Download for macOS
+          </a>
+        ) : (
+          <Link className="login-primary-link" href="/support">
+            Downloads paused — get support
+          </Link>
+        )}
+        <nav className="login-legal-links" aria-label="Legal and support">
+          <Link href="/product-info">Product information</Link>
+          <Link href="/product-info">Usage</Link>
+          <Link href="/support">Support</Link>
+        </nav>
       </div>
     </main>
   );

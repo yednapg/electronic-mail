@@ -1,3 +1,5 @@
+import React from 'react';
+
 type AppMarkProps = {
   className?: string;
   label?: string;
