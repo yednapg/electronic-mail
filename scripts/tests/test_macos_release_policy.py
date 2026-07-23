@@ -74,6 +74,21 @@ class MacOSReleaseToolchainPolicyTests(unittest.TestCase):
                 self.assertIn(field, launch)
         self.assertIn('source "$ROOT_DIR/scripts/macos-release-toolchain.env"', launch)
 
+    def test_app_and_embedded_framework_require_hardened_runtime(self) -> None:
+        project = self.text("macos/ElectronicMail/Project.swift")
+        generated_project = self.text(
+            "macos/ElectronicMail/ElectronicMail.xcodeproj/project.pbxproj"
+        )
+        verifier = self.text("scripts/verify-macos-release.sh")
+
+        self.assertGreaterEqual(project.count('"ENABLE_HARDENED_RUNTIME": "YES"'), 2)
+        self.assertEqual(generated_project.count("ENABLE_HARDENED_RUNTIME = YES;"), 4)
+        self.assertIn('for code_path in "$APP_PATH" "$FRAMEWORK"; do', verifier)
+        self.assertIn(
+            'fail "Hardened Runtime is missing from signed code: $code_path"',
+            verifier,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
