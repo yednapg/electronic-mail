@@ -169,6 +169,7 @@ public struct InboxView: View {
                         ForEach(section.rows) { row in
                             InboxRowView(
                                 row: row,
+                                isSelected: snapshot.selectedRowID == row.id,
                                 metrics: metrics,
                                 colorScheme: colorScheme,
                                 actionHint: snapshot.mailboxLabel == .drafts ? "Open draft" : "Open email",
@@ -360,7 +361,15 @@ private struct InboxRenderSnapshot {
 
         self.sections = renderSections
         self.flatRows = flatRows
-        self.selectedRowID = flatRows.first(where: \.isSelected)?.id
+        if let selectedThreadID = store.selectedThreadID {
+            if let selectedMessageID = store.selectedMessageID {
+                self.selectedRowID = "\(selectedThreadID)::message::\(selectedMessageID)"
+            } else {
+                self.selectedRowID = selectedThreadID
+            }
+        } else {
+            self.selectedRowID = nil
+        }
         self.hasRows = !flatRows.isEmpty
         self.footer = store.mailboxFooter
         self.mailboxPageLoading = store.mailboxPageLoading
@@ -526,6 +535,7 @@ private struct InboxSectionHeader: View, Equatable {
 
 private struct InboxRowView: View, Equatable {
     let row: InboxRowViewModel
+    let isSelected: Bool
     let metrics: InboxLayoutMetrics
     let colorScheme: ColorScheme
     let actionHint: String
@@ -534,6 +544,7 @@ private struct InboxRowView: View, Equatable {
 
     static func == (lhs: InboxRowView, rhs: InboxRowView) -> Bool {
         lhs.row == rhs.row
+            && lhs.isSelected == rhs.isSelected
             && lhs.metrics == rhs.metrics
             && lhs.colorScheme == rhs.colorScheme
             && lhs.actionHint == rhs.actionHint
@@ -596,13 +607,13 @@ private struct InboxRowView: View, Equatable {
                     Color.clear.frame(width: metrics.trailingInset)
                 }
                 .frame(width: metrics.windowWidth, height: ElectronicMailTypography.bodyLineHeight)
-                .background(row.isSelected ? ElectronicMailDesign.appleBlue : Color.clear)
+                .background(isSelected ? ElectronicMailDesign.appleBlue : Color.clear)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel(accessibilityLabel)
             .accessibilityHint(actionHint)
-            .accessibilityAddTraits(row.isSelected ? .isSelected : [])
+            .accessibilityAddTraits(isSelected ? .isSelected : [])
 
             if row.isExpandable, let onToggleExpansion {
                 Button(action: onToggleExpansion) {
@@ -610,7 +621,7 @@ private struct InboxRowView: View, Equatable {
                         .font(.system(size: 11, weight: .semibold))
                         .symbolRenderingMode(.monochrome)
                         .foregroundStyle(
-                            row.isSelected
+                            isSelected
                                 ? ElectronicMailDesign.selectedText(for: colorScheme)
                                 : ElectronicMailDesign.appleBlue
                         )
@@ -650,7 +661,7 @@ private struct InboxRowView: View, Equatable {
     }
 
     private var senderTextColor: Color {
-        if row.isSelected {
+        if isSelected {
             return ElectronicMailDesign.selectedText(for: colorScheme)
         }
         return row.isUnread
@@ -659,7 +670,7 @@ private struct InboxRowView: View, Equatable {
     }
 
     private var subjectTextColor: Color {
-        if row.isSelected {
+        if isSelected {
             return ElectronicMailDesign.selectedText(for: colorScheme)
         }
         return row.isUnread
@@ -668,14 +679,14 @@ private struct InboxRowView: View, Equatable {
     }
 
     private var metadataTextColor: Color {
-        if row.isSelected {
+        if isSelected {
             return ElectronicMailDesign.selectedText(for: colorScheme).opacity(0.82)
         }
         return ElectronicMailDesign.tertiaryText(for: colorScheme)
     }
 
     private var attachmentIconColor: Color {
-        if row.isSelected {
+        if isSelected {
             return ElectronicMailDesign.selectedText(for: colorScheme).opacity(0.86)
         }
 

@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import ElectronicMailCore
 
@@ -9,6 +10,32 @@ final class InboxStoreTests: XCTestCase {
 
         XCTAssertEqual(decoded.user.id, "demo-user")
         XCTAssertEqual(decoded.mailbox.totalThreads, 16)
+    }
+
+    func testLabelOnlyMessageCopyPreservesRenderRevision() {
+        let message = ThreadMessage(
+            id: "message-1",
+            source: .gmail,
+            threadID: "thread-1",
+            fromAddress: "sender@example.com",
+            to: "reader@example.com",
+            cc: nil,
+            bcc: nil,
+            subject: "Large message",
+            body: String(repeating: "body", count: 25_000),
+            htmlBody: "<p>Body</p>",
+            htmlRenderDocument: "<html><body><p>Body</p></body></html>",
+            snippet: "Body",
+            labelIDs: ["INBOX"],
+            receivedAt: "2026-07-23T12:00:00Z"
+        )
+
+        let copy = ThreadMessage(copying: message, labelIDs: ["INBOX", "STARRED"])
+
+        XCTAssertEqual(copy.renderRevision, message.renderRevision)
+        XCTAssertEqual(copy.labelIDs, ["INBOX", "STARRED"])
+        XCTAssertEqual(copy.body, message.body)
+        XCTAssertEqual(copy.htmlRenderDocument, message.htmlRenderDocument)
     }
 
     func testSectionOrderMatchesInboxBuckets() async {
@@ -258,6 +285,32 @@ final class InboxStoreTests: XCTestCase {
         await store.refreshFolderCounts()
 
         XCTAssertEqual(client.mailboxLabels.count, 8)
+    }
+
+    func testVisibleSidebarPublishesCompletedFolderCountSweepOnce() async {
+        let mailbox = makeSingleRowMailbox(threadID: "visible-thread", title: "Visible row")
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [mailbox],
+            supportsFolderCountPrefetch: true
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+
+        await store.load()
+        var publishedCounts: [[MailboxLabel: MailboxFolderCount]] = []
+        let cancellable = store.$mailboxCounts
+            .dropFirst()
+            .sink { publishedCounts.append($0) }
+
+        await store.setFolderCountPrefetchEnabled(true)
+
+        XCTAssertEqual(publishedCounts.count, 1)
+        XCTAssertEqual(publishedCounts[0].count, 8)
+        withExtendedLifetime(cancellable) {}
     }
 
     func testHidingSidebarCancelsInFlightFolderCountSweep() async {
@@ -1151,7 +1204,7 @@ final class InboxStoreTests: XCTestCase {
             "parent-thread::message::msg-2"
         ])
         XCTAssertEqual(store.flatRows[1].sender, "First")
-        XCTAssertEqual(store.flatRows[2].visualTone, .unread)
+        XCTAssertEqual(store.flatRows[2].visualTone(), .unread)
 
         store.select(threadID: "parent-thread", focusedMessageID: "msg-2", prefetch: false)
         store.openActiveSelection()
@@ -1171,9 +1224,9 @@ final class InboxStoreTests: XCTestCase {
         store.select(threadID: "demo-rbi-today")
 
         let rows = Dictionary(uniqueKeysWithValues: store.flatRows.map { ($0.threadID, $0) })
-        XCTAssertEqual(rows["demo-google-today"]?.visualTone, .unread)
-        XCTAssertEqual(rows["demo-github-today"]?.visualTone, .read)
-        XCTAssertEqual(rows["demo-rbi-today"]?.visualTone, .selected)
+        XCTAssertEqual(rows["demo-google-today"]?.visualTone(), .unread)
+        XCTAssertEqual(rows["demo-github-today"]?.visualTone(), .read)
+        XCTAssertEqual(rows["demo-rbi-today"]?.visualTone(isSelected: true), .selected)
         XCTAssertEqual(rows["demo-apple-today"]?.isGrouped, true)
     }
 

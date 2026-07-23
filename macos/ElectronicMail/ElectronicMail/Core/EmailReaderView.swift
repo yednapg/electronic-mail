@@ -19,7 +19,7 @@ struct EmailReaderView: View {
     let onThreadAction: (GmailThreadAction, String?) -> Void
     let onOpenAttachment: (ThreadAttachment, String) -> Void
 
-    @State private var expandedMessageKeys: Set<String> = []
+    @State private var expandedMessageKeys: Set<EmailThreadPresentationItem.ID> = []
     @State private var summaryExpanded = false
 
     var body: some View {
@@ -204,14 +204,19 @@ private struct GroupedEmailContent: View {
     let currentUserEmail: String?
     let colorScheme: ColorScheme
     let mailboxLabel: MailboxLabel
-    @Binding var expandedMessageKeys: Set<String>
+    @Binding var expandedMessageKeys: Set<EmailThreadPresentationItem.ID>
     let onRetry: () -> Void
     let onRespond: (MailComposerMode, String) -> Void
     let onThreadAction: (GmailThreadAction, String?) -> Void
     let onOpenAttachment: (ThreadAttachment, String) -> Void
-    let onFocusedMessageKey: (String) -> Void
+    let onFocusedMessageKey: (EmailThreadPresentationItem.ID) -> Void
 
     var body: some View {
+        let presentation = EmailThreadPresentation.snapshot(from: messages)
+        let renderIdentities = messages.map {
+            EmailMessageRenderIdentity(id: $0.id, renderRevision: $0.renderRevision)
+        }
+
         VStack(alignment: .leading, spacing: 0) {
             EmailReaderTitleHeader(
                 title: title,
@@ -232,13 +237,13 @@ private struct GroupedEmailContent: View {
                     .padding(.top, 52)
             } else {
                 VStack(alignment: .leading, spacing: 20) {
-                    ForEach(presentationItems) { item in
+                    ForEach(presentation.items) { item in
                         EmailMessageCard(
                             threadID: threadID,
                             message: item.message,
                             expanded: EmailThreadPresentation.isExpanded(
                                 messageKey: item.id,
-                                latestMessageKey: latestMessageKey,
+                                latestMessageKey: presentation.latestMessageKey,
                                 userExpandedMessageKeys: expandedMessageKeys
                             ),
                             currentUserDisplayName: currentUserDisplayName,
@@ -249,7 +254,7 @@ private struct GroupedEmailContent: View {
                             onThreadAction: onThreadAction,
                             onOpenAttachment: onOpenAttachment
                         ) {
-                            toggle(item.id)
+                            toggle(item.id, latestMessageKey: presentation.latestMessageKey)
                         }
                         .id(item.id)
                     }
@@ -257,29 +262,15 @@ private struct GroupedEmailContent: View {
                 .padding(.top, 52)
             }
         }
-        .onAppear(perform: focusRequestedMessage)
+        .onAppear {
+            focusRequestedMessage(in: presentation)
+        }
         .onChange(of: focusedMessageID) { _, _ in
-            focusRequestedMessage()
+            focusRequestedMessage(in: presentation)
         }
-        .onChange(of: messageRenderIdentities) { _, _ in
-            focusRequestedMessage()
+        .onChange(of: renderIdentities) { _, _ in
+            focusRequestedMessage(in: presentation)
         }
-    }
-
-    private var orderedMessages: [ThreadMessage] {
-        EmailThreadPresentation.orderedMessages(messages)
-    }
-
-    private var presentationItems: [EmailThreadPresentationItem] {
-        EmailThreadPresentation.items(from: orderedMessages)
-    }
-
-    private var messageRenderIdentities: [EmailMessageRenderIdentity] {
-        messages.map { EmailMessageRenderIdentity(id: $0.id, renderRevision: $0.renderRevision) }
-    }
-
-    private var latestMessageKey: String? {
-        EmailThreadPresentation.latestMessageKey(in: presentationItems)
     }
 
     private var loadingCards: some View {
@@ -303,7 +294,10 @@ private struct GroupedEmailContent: View {
         }
     }
 
-    private func toggle(_ messageKey: String) {
+    private func toggle(
+        _ messageKey: EmailThreadPresentationItem.ID,
+        latestMessageKey: EmailThreadPresentationItem.ID?
+    ) {
         if messageKey == latestMessageKey {
             return
         }
@@ -314,12 +308,12 @@ private struct GroupedEmailContent: View {
         }
     }
 
-    private func focusRequestedMessage() {
+    private func focusRequestedMessage(in presentation: EmailThreadPresentationSnapshot) {
         guard let focusedMessageID,
-              let item = presentationItems.first(where: { $0.message.id == focusedMessageID }) else {
+              let item = presentation.items.first(where: { $0.message.id == focusedMessageID }) else {
             return
         }
-        if item.id != latestMessageKey {
+        if item.id != presentation.latestMessageKey {
             expandedMessageKeys.insert(item.id)
         }
         DispatchQueue.main.async {
@@ -1486,11 +1480,39 @@ private final class EmailScrollPassthroughWebView: WKWebView {
 }
 
 struct EmailThreadPresentationItem: Identifiable, Equatable {
-    let id: String
+    let id: EmailThreadPresentationItemID
     let message: ThreadMessage
 }
 
+struct EmailThreadPresentationItemID: Hashable {
+    let messageID: String
+    let duplicateDiscriminator: EmailThreadPresentationDuplicateDiscriminator?
+
+    static func unique(messageID: String) -> EmailThreadPresentationItemID {
+        EmailThreadPresentationItemID(messageID: messageID, duplicateDiscriminator: nil)
+    }
+}
+
+struct EmailThreadPresentationDuplicateDiscriminator: Hashable {
+    let renderRevision: UInt64
+    let receivedAt: String
+    let occurrence: Int
+}
+
+struct EmailThreadPresentationSnapshot: Equatable {
+    let items: [EmailThreadPresentationItem]
+    let latestMessageKey: EmailThreadPresentationItem.ID?
+}
+
 enum EmailThreadPresentation {
+    static func snapshot(from messages: [ThreadMessage]) -> EmailThreadPresentationSnapshot {
+        let items = items(from: orderedMessages(messages))
+        return EmailThreadPresentationSnapshot(
+            items: items,
+            latestMessageKey: latestMessageKey(in: items)
+        )
+    }
+
     static func orderedMessages(_ messages: [ThreadMessage]) -> [ThreadMessage] {
         messages.enumerated().sorted { lhs, rhs in
             let lhsDate = EmailReaderText.date(from: lhs.element.receivedAt)
@@ -1511,19 +1533,44 @@ enum EmailThreadPresentation {
     }
 
     static func items(from orderedMessages: [ThreadMessage]) -> [EmailThreadPresentationItem] {
-        orderedMessages.enumerated().map { index, message in
-            EmailThreadPresentationItem(id: "\(index)::\(message.id)", message: message)
+        let countsByMessageID = orderedMessages.reduce(into: [String: Int]()) { counts, message in
+            counts[message.id, default: 0] += 1
+        }
+        var occurrencesByDuplicate = [EmailThreadPresentationDuplicateKey: Int]()
+
+        return orderedMessages.map { message in
+            let id: EmailThreadPresentationItemID
+            if countsByMessageID[message.id] == 1 {
+                id = .unique(messageID: message.id)
+            } else {
+                let duplicateKey = EmailThreadPresentationDuplicateKey(
+                    messageID: message.id,
+                    renderRevision: message.renderRevision,
+                    receivedAt: message.receivedAt
+                )
+                let occurrence = occurrencesByDuplicate[duplicateKey, default: 0]
+                occurrencesByDuplicate[duplicateKey] = occurrence + 1
+                id = EmailThreadPresentationItemID(
+                    messageID: message.id,
+                    duplicateDiscriminator: EmailThreadPresentationDuplicateDiscriminator(
+                        renderRevision: message.renderRevision,
+                        receivedAt: message.receivedAt,
+                        occurrence: occurrence
+                    )
+                )
+            }
+            return EmailThreadPresentationItem(id: id, message: message)
         }
     }
 
-    static func latestMessageKey(in items: [EmailThreadPresentationItem]) -> String? {
+    static func latestMessageKey(in items: [EmailThreadPresentationItem]) -> EmailThreadPresentationItem.ID? {
         items.last?.id
     }
 
     static func isExpanded(
-        messageKey: String,
-        latestMessageKey: String?,
-        userExpandedMessageKeys: Set<String>
+        messageKey: EmailThreadPresentationItem.ID,
+        latestMessageKey: EmailThreadPresentationItem.ID?,
+        userExpandedMessageKeys: Set<EmailThreadPresentationItem.ID>
     ) -> Bool {
         messageKey == latestMessageKey || userExpandedMessageKeys.contains(messageKey)
     }
@@ -1532,6 +1579,12 @@ enum EmailThreadPresentation {
         let value = message.subject?.trimmingCharacters(in: .whitespacesAndNewlines)
         return EmailReaderText.decodingHTML(value?.isEmpty == false ? value! : "No subject")
     }
+}
+
+private struct EmailThreadPresentationDuplicateKey: Hashable {
+    let messageID: String
+    let renderRevision: UInt64
+    let receivedAt: String
 }
 
 private enum EmailHTMLDocument {

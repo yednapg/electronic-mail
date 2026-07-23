@@ -486,6 +486,121 @@ final class ModelDecodingTests: XCTestCase {
         )
     }
 
+    func testComposerClosePreservesLocalRecoveryWhenOfflineDraftSaveFails() {
+        XCTAssertEqual(
+            MailComposerPolicy.closeDecision(
+                recoveryPersisted: true,
+                requiresGmailDraftSave: true,
+                gmailDraftSaveState: .failed
+            ),
+            .finishPreservingRecovery
+        )
+        XCTAssertEqual(
+            MailComposerPolicy.closeDecision(
+                recoveryPersisted: true,
+                requiresGmailDraftSave: true,
+                gmailDraftSaveState: nil
+            ),
+            .finishPreservingRecovery
+        )
+        XCTAssertEqual(
+            MailComposerPolicy.closeDecision(
+                recoveryPersisted: false,
+                requiresGmailDraftSave: true,
+                gmailDraftSaveState: .failed
+            ),
+            .block
+        )
+        XCTAssertEqual(
+            MailComposerPolicy.closeDecision(
+                recoveryPersisted: true,
+                requiresGmailDraftSave: true,
+                gmailDraftSaveState: .saved
+            ),
+            .finishAndClearRecovery
+        )
+    }
+
+    func testPendingOfflineRecoveryTakesPrecedenceOverOpeningAnotherComposer() {
+        XCTAssertTrue(
+            MailComposerPolicy.shouldRestorePendingRecovery(
+                recoveryAccountUserID: "user-1",
+                currentAccountUserID: "user-1"
+            )
+        )
+        XCTAssertFalse(
+            MailComposerPolicy.shouldRestorePendingRecovery(
+                recoveryAccountUserID: "user-1",
+                currentAccountUserID: "user-2"
+            )
+        )
+        XCTAssertFalse(
+            MailComposerPolicy.shouldRestorePendingRecovery(
+                recoveryAccountUserID: "user-1",
+                currentAccountUserID: nil
+            )
+        )
+    }
+
+    func testComposerPresentationWaitsForDelayedRecoveryLoad() {
+        var gate = MailComposerRecoveryLoadGate<String>()
+
+        XCTAssertFalse(gate.isComplete)
+        XCTAssertNil(gate.request("new composer"))
+        XCTAssertNil(gate.request("later command"))
+        XCTAssertEqual(
+            gate.complete(recoveredPresentation: "offline recovered draft"),
+            "offline recovered draft"
+        )
+        XCTAssertTrue(gate.isComplete)
+        XCTAssertEqual(gate.request("new composer after recovery"), "new composer after recovery")
+    }
+
+    func testDeferredComposerOpensAfterRecoveryLoadFindsNothing() {
+        var gate = MailComposerRecoveryLoadGate<String>()
+
+        XCTAssertNil(gate.request("queued composer"))
+        XCTAssertEqual(
+            gate.complete(recoveredPresentation: nil),
+            "queued composer"
+        )
+    }
+
+    func testComposerShutdownAllowsOfflineExitOnlyAfterLocalRecovery() {
+        XCTAssertEqual(
+            MailComposerPolicy.shutdownDecision(
+                recoveryPersisted: true,
+                requiresGmailDraftSave: true,
+                gmailDraftSaveState: .reauthRequired
+            ),
+            .finishPreservingRecovery
+        )
+        XCTAssertEqual(
+            MailComposerPolicy.shutdownDecision(
+                recoveryPersisted: true,
+                requiresGmailDraftSave: true,
+                gmailDraftSaveState: .saved
+            ),
+            .finishAndClearRecovery
+        )
+        XCTAssertEqual(
+            MailComposerPolicy.shutdownDecision(
+                recoveryPersisted: false,
+                requiresGmailDraftSave: true,
+                gmailDraftSaveState: nil
+            ),
+            .block
+        )
+        XCTAssertEqual(
+            MailComposerPolicy.shutdownDecision(
+                recoveryPersisted: true,
+                requiresGmailDraftSave: false,
+                gmailDraftSaveState: nil
+            ),
+            .finishAndClearRecovery
+        )
+    }
+
     func testDraftSaveRequestDecodesResponseFieldsWithBackwardCompatibleDefaults() throws {
         let data = Data(
             #"{"client_draft_id":"legacy-draft","gmail_draft_id":null,"gmail_thread_id":null,"to":[],"cc":[],"bcc":[],"subject":"","body_text":"","body_html":null,"attachments":null,"retained_attachment_ids":null,"created_at":"2026-07-23T00:00:00Z"}"#.utf8
@@ -596,6 +711,29 @@ final class ModelDecodingTests: XCTestCase {
 
         XCTAssertEqual(recipients.to, ["sender@example.com"])
         XCTAssertEqual(recipients.cc, ["other@example.com", "copy@example.com"])
+    }
+
+    func testMailAddressParserPreservesQuotedNamesEscapesAndPlainSeparators() {
+        let addresses = MailAddressParser.addresses(
+            in: #""Doe, \"Johnny\" John" <john@example.com>, jane@example.com; "Smith, Alice" <alice@example.com>"#
+        )
+
+        XCTAssertEqual(addresses, ["john@example.com", "jane@example.com", "alice@example.com"])
+        XCTAssertFalse(addresses.contains { !$0.contains("@") })
+    }
+
+    func testReplyAllHeaderPrefillDoesNotCreateDisplayNameFragments() {
+        let recipients = MailReplyPrefillPolicy.recipients(
+            mode: .replyAll,
+            currentUser: "me@example.com",
+            senderHeader: #""Sender, Sam" <sender@example.com>"#,
+            originalToHeader: #""Doe, John" <john@example.com>, me@example.com"#,
+            originalCCHeader: #""Smith, Alice" <alice@example.com>; copy@example.com"#
+        )
+
+        XCTAssertEqual(recipients.to, ["sender@example.com"])
+        XCTAssertEqual(recipients.cc, ["john@example.com", "alice@example.com", "copy@example.com"])
+        XCTAssertFalse((recipients.to + recipients.cc).contains { !$0.contains("@") })
     }
 
     func testReplyPrefillForSentMessageTargetsOriginalRecipients() {
@@ -1226,22 +1364,21 @@ final class ModelDecodingTests: XCTestCase {
         let newest = makeThreadMessage(id: "newest", receivedAt: "2026-05-19T19:33:06+00:00")
         let oldest = makeThreadMessage(id: "oldest", receivedAt: "2026-05-19T19:31:42+00:00")
 
-        let ordered = EmailThreadPresentation.orderedMessages([newest, oldest])
-        let items = EmailThreadPresentation.items(from: ordered)
-        let latestKey = EmailThreadPresentation.latestMessageKey(in: items)
+        let presentation = EmailThreadPresentation.snapshot(from: [newest, oldest])
+        let latestKey = presentation.latestMessageKey
 
-        XCTAssertEqual(ordered.map(\.id), ["oldest", "newest"])
-        XCTAssertEqual(latestKey, "1::newest")
+        XCTAssertEqual(presentation.items.map(\.message.id), ["oldest", "newest"])
+        XCTAssertEqual(latestKey, .unique(messageID: "newest"))
         XCTAssertFalse(
             EmailThreadPresentation.isExpanded(
-                messageKey: "0::oldest",
+                messageKey: .unique(messageID: "oldest"),
                 latestMessageKey: latestKey,
                 userExpandedMessageKeys: []
             )
         )
         XCTAssertTrue(
             EmailThreadPresentation.isExpanded(
-                messageKey: "1::newest",
+                messageKey: .unique(messageID: "newest"),
                 latestMessageKey: latestKey,
                 userExpandedMessageKeys: []
             )
@@ -1252,24 +1389,63 @@ final class ModelDecodingTests: XCTestCase {
         let older = makeThreadMessage(id: "duplicate", receivedAt: "2026-05-19T19:31:42+00:00")
         let newer = makeThreadMessage(id: "duplicate", receivedAt: "2026-05-19T19:33:06+00:00")
 
-        let items = EmailThreadPresentation.items(from: EmailThreadPresentation.orderedMessages([newer, older]))
-        let latestKey = EmailThreadPresentation.latestMessageKey(in: items)
+        let presentation = EmailThreadPresentation.snapshot(from: [newer, older])
+        let items = presentation.items
+        let latestKey = presentation.latestMessageKey
 
-        XCTAssertEqual(items.map(\.id), ["0::duplicate", "1::duplicate"])
+        XCTAssertEqual(items.map(\.id.messageID), ["duplicate", "duplicate"])
+        XCTAssertEqual(Set(items.map(\.id)).count, 2)
         XCTAssertFalse(
             EmailThreadPresentation.isExpanded(
-                messageKey: "0::duplicate",
+                messageKey: items[0].id,
                 latestMessageKey: latestKey,
                 userExpandedMessageKeys: []
             )
         )
         XCTAssertTrue(
             EmailThreadPresentation.isExpanded(
-                messageKey: "1::duplicate",
+                messageKey: items[1].id,
                 latestMessageKey: latestKey,
                 userExpandedMessageKeys: []
             )
         )
+    }
+
+    func testThreadPresentationKeepsExistingKeysStableAcrossInsertionAndInputReordering() {
+        let oldest = makeThreadMessage(id: "oldest", receivedAt: "2026-05-19T19:31:42+00:00")
+        let newest = makeThreadMessage(id: "newest", receivedAt: "2026-05-19T19:33:06+00:00")
+        let inserted = makeThreadMessage(id: "inserted", receivedAt: "2026-05-19T19:30:00+00:00")
+
+        let initial = EmailThreadPresentation.snapshot(from: [newest, oldest])
+        let updated = EmailThreadPresentation.snapshot(from: [oldest, inserted, newest])
+        let initialIDs = Dictionary(uniqueKeysWithValues: initial.items.map { ($0.message.id, $0.id) })
+        let updatedIDs = Dictionary(uniqueKeysWithValues: updated.items.map { ($0.message.id, $0.id) })
+
+        XCTAssertEqual(updated.items.map(\.message.id), ["inserted", "oldest", "newest"])
+        XCTAssertEqual(updatedIDs["oldest"], initialIDs["oldest"])
+        XCTAssertEqual(updatedIDs["newest"], initialIDs["newest"])
+    }
+
+    func testThreadPresentationKeepsDuplicateKeysStableWhenUnrelatedMessagesAreInserted() {
+        let older = makeThreadMessage(
+            id: "duplicate",
+            body: "Older body",
+            receivedAt: "2026-05-19T19:31:42+00:00"
+        )
+        let newer = makeThreadMessage(
+            id: "duplicate",
+            body: "Newer body",
+            receivedAt: "2026-05-19T19:33:06+00:00"
+        )
+        let inserted = makeThreadMessage(id: "inserted", receivedAt: "2026-05-19T19:30:00+00:00")
+
+        let initial = EmailThreadPresentation.snapshot(from: [newer, older])
+        let updated = EmailThreadPresentation.snapshot(from: [older, inserted, newer])
+        let initialDuplicateIDs = initial.items.filter { $0.message.id == "duplicate" }.map(\.id)
+        let updatedDuplicateIDs = updated.items.filter { $0.message.id == "duplicate" }.map(\.id)
+
+        XCTAssertEqual(updatedDuplicateIDs, initialDuplicateIDs)
+        XCTAssertEqual(Set(updated.items.map(\.id)).count, updated.items.count)
     }
 
     func testThreadPresentationDecodesNativeSubjectEntities() {
