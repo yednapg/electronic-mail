@@ -15,7 +15,14 @@ from uuid import uuid4
 from app.core.config import load_settings
 from app.core.error_safety import GoogleCredentialsUnavailable, safe_job_error
 from app.core.observability import configure_observability
-from app.db.jobs import cancel_claimed_job, claim_job, cleanup_old_jobs, complete_job, fail_job, renew_heartbeat
+from app.db.jobs import (
+    cancel_claimed_job,
+    claim_job,
+    cleanup_old_jobs,
+    complete_job,
+    fail_job,
+    renew_heartbeat,
+)
 from app.db.repository import get_user_by_email
 from app.db.user_mail_guard import UserMailWorkBlocked
 from app.services.gmail_importer import (
@@ -27,6 +34,7 @@ from app.services.gmail_importer import (
     run_gmail_import_batch,
 )
 from app.services.gmail_watch import ensure_gmail_watch
+from app.services.integrations.google import retry_encrypted_google_token_revocation
 from app.services.mailbox_events import DASHBOARD_CHANGED, MAILBOX_CHANGED, emit_mailbox_event
 from app.services.mailbox_actions import rollback_failed_thread_action, run_pending_thread_action
 from app.services.mailbox_sends import run_pending_send
@@ -157,6 +165,14 @@ def _run_job(settings, job) -> None:
     user_id = payload.get("user_id") or job.user_id
     if job.payload_version != 1:
         raise RuntimeError(f"Unsupported payload version {job.payload_version}")
+    if job.kind == "google_token_revoke":
+        retry_encrypted_google_token_revocation(
+            settings,
+            job_id=job.id,
+            subject_hash=str(payload.get("subject_hash") or ""),
+            token_json_encrypted=str(payload.get("token_json_encrypted") or ""),
+        )
+        return
     if job.kind == "gmail_import_batch":
         if not isinstance(user_id, str):
             raise RuntimeError("gmail_import_batch missing user_id")

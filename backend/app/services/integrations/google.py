@@ -3,9 +3,12 @@ from __future__ import annotations
 """Google OAuth, authorized service creation, and explicit Gmail mutations."""
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from urllib.error import URLError
+from enum import Enum
+from hashlib import sha256
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 
@@ -22,10 +25,23 @@ from app.core.error_safety import GoogleCredentialsUnavailable
 from app.db.repository import (
     delete_oauth_login_session as delete_db_oauth_login_session,
     get_google_oauth_token,
+    record_google_subject_revocation,
     get_oauth_login_session,
     save_oauth_login_session as save_db_oauth_login_session,
 )
-from app.db.user_mail_guard import UserMailWorkBlocked, update_connected_google_oauth_token
+from app.db.jobs import (
+    BackgroundJob,
+    complete_google_token_revocation_job,
+    complete_google_token_revocations_for_subject,
+    enqueue_job,
+    get_job,
+)
+from app.db.user_mail_guard import (
+    UserMailWorkBlocked,
+    exclusive_google_subject_lock,
+    shared_user_mail_lock,
+    update_connected_google_oauth_token,
+)
 from app.schemas.domain import DashboardProfile, GoogleAuthState
 from app.services.token_crypto import decrypt_json, encrypt_json
 
@@ -39,8 +55,16 @@ GOOGLE_PROFILE_SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.ema
 # delete endpoints require it; it also subsumes read, modify, draft, and send.
 GOOGLE_SCOPES = [*GOOGLE_PROFILE_SCOPES, GMAIL_FULL_SCOPE]
 GOOGLE_API_TIMEOUT_SECONDS = 20
+GOOGLE_TOKEN_REVOCATION_MAX_ATTEMPTS = 1_000_000
+GOOGLE_REVOCATION_ERROR_BODY_LIMIT = 4096
 GMAIL_INBOX_LABEL = "INBOX"
 GMAIL_UNREAD_LABEL = "UNREAD"
+
+
+class _GoogleTokenRevocationOutcome(Enum):
+    PROJECT_REVOKED = "project_revoked"
+    CREDENTIAL_INVALID = "credential_invalid"
+    RETRY = "retry"
 
 TOKEN_FILE_PATH = BACKEND_DIR / ".google-oauth.json"
 ACCOUNT_PROFILE_FILE_PATH = BACKEND_DIR / ".google-account.json"
@@ -81,11 +105,75 @@ GOOGLE_REAUTH_REQUIRED_MESSAGE = "Google credentials have expired or were revoke
 GOOGLE_SCOPE_REAUTH_REQUIRED_MESSAGE = "Google mail permissions changed. Please sign in with Google again."
 
 
-def build_google_service(api: str, version: str, credentials: Credentials):
+class _ProviderGuardedHttp:
+    """Hold the deletion barrier across credential refresh and HTTP I/O."""
+
+    def __init__(self, authorized_http, *, database_url: str, user_id: str) -> None:
+        self._authorized_http = authorized_http
+        self._database_url = database_url
+        self._user_id = user_id
+
+    def request(self, *args, **kwargs):
+        with shared_user_mail_lock(self._database_url, user_id=self._user_id):
+            return self._authorized_http.request(*args, **kwargs)
+
+    def close(self) -> None:
+        close = getattr(self._authorized_http, "close", None)
+        if callable(close):
+            close()
+
+    def __getattr__(self, name: str):
+        return getattr(self._authorized_http, name)
+
+
+class _BoundedGoogleAuthRequest(Request):
+    """Cap OAuth refresh latency while a provider barrier is held."""
+
+    def __call__(
+        self,
+        url,
+        method="GET",
+        body=None,
+        headers=None,
+        timeout=GOOGLE_API_TIMEOUT_SECONDS,
+        **kwargs,
+    ):
+        bounded_timeout = (
+            min(float(timeout), float(GOOGLE_API_TIMEOUT_SECONDS))
+            if isinstance(timeout, (int, float))
+            else float(GOOGLE_API_TIMEOUT_SECONDS)
+        )
+        return super().__call__(
+            url,
+            method=method,
+            body=body,
+            headers=headers,
+            timeout=bounded_timeout,
+            **kwargs,
+        )
+
+
+def build_google_service(
+    api: str,
+    version: str,
+    credentials: Credentials,
+    *,
+    database_url: str | None = None,
+    user_id: str | None = None,
+):
     """Build a Google API service with a bounded request timeout."""
+    implicit_guard = getattr(credentials, "_electronic_mail_provider_guard", None)
+    if database_url is None and user_id is None and isinstance(implicit_guard, tuple) and len(implicit_guard) == 2:
+        database_url = str(implicit_guard[0])
+        user_id = str(implicit_guard[1])
     http = httplib2.Http(timeout=GOOGLE_API_TIMEOUT_SECONDS)
     authorized_http = google_auth_httplib2.AuthorizedHttp(credentials, http=http)
-    return build(api, version, http=authorized_http, cache_discovery=False)
+    guarded_http = (
+        _ProviderGuardedHttp(authorized_http, database_url=database_url, user_id=user_id)
+        if database_url is not None and user_id is not None
+        else authorized_http
+    )
+    return build(api, version, http=guarded_http, cache_discovery=False)
 
 
 def get_google_auth_url(settings: Settings, redirect_to: str | None = None) -> str:
@@ -125,18 +213,27 @@ def handle_google_callback(settings: Settings, code: str, state: str | None = No
     flow.fetch_token(code=code)
     credentials = flow.credentials
     tokens = token_payload_from_credentials(credentials)
-    identity = fetch_google_account_identity_from_credentials(credentials)
-    if identity is None:
-        raise RuntimeError("Google account identity could not be verified. Please try again.")
+    try:
+        identity = fetch_google_account_identity_from_credentials(credentials)
+        if identity is None:
+            raise RuntimeError("Google account identity could not be verified. Please try again.")
 
-    delete_db_oauth_login_session(str(settings.database_path), state=state or session.state)
-    return GoogleCallbackResult(
-        redirect_to=session.redirect_to,
-        tokens=tokens,
-        profile=identity.profile,
-        google_sub=identity.google_sub,
-        oauth_started_epoch=session.started_epoch,
-    )
+        # The route owns both this grant and OAuth-session cleanup once the
+        # verified identity is returned. Keeping deletion outside this service
+        # lets a database cleanup failure enter the subject-keyed durable
+        # revocation path instead of hiding token ownership here.
+        return GoogleCallbackResult(
+            redirect_to=session.redirect_to,
+            tokens=tokens,
+            profile=identity.profile,
+            google_sub=identity.google_sub,
+            oauth_started_epoch=session.started_epoch,
+        )
+    except Exception:
+        # Ownership transfers to the route only when the complete result is
+        # returned. Until then, every failure must clean up this new grant.
+        revoke_google_token_payload(tokens)
+        raise
 
 
 def create_flow(settings: Settings) -> Flow:
@@ -156,17 +253,55 @@ def create_flow(settings: Settings) -> Flow:
     )
 
 
-def create_authorized_credentials(settings: Settings, *, user_id: str | None = None) -> Credentials | None:
+def create_authorized_credentials(
+    settings: Settings,
+    *,
+    user_id: str | None = None,
+    refresh_expired: bool = True,
+    persist_updates: bool = True,
+) -> Credentials | None:
     """Load and refresh stored OAuth credentials for the current user."""
-    return _load_authorized_credentials(settings, user_id=user_id, refresh_expired=True).credentials
+    if user_id is None:
+        return _load_authorized_credentials(
+            settings,
+            user_id=None,
+            refresh_expired=refresh_expired,
+            persist_updates=persist_updates,
+        ).credentials
+    with shared_user_mail_lock(str(settings.database_path), user_id=user_id):
+        credentials = _load_authorized_credentials(
+            settings,
+            user_id=user_id,
+            refresh_expired=refresh_expired,
+            persist_updates=persist_updates,
+        ).credentials
+        if credentials is not None:
+            setattr(
+                credentials,
+                "_electronic_mail_provider_guard",
+                (str(settings.database_path), user_id),
+            )
+        return credentials
 
 
 def check_user_google_credentials(settings: Settings, *, user_id: str, refresh_expired: bool = True) -> GoogleCredentialStatus:
     """Return whether stored Google credentials are usable, refreshing only on this explicit check."""
-    return _load_authorized_credentials(settings, user_id=user_id, refresh_expired=refresh_expired).status
+    with shared_user_mail_lock(str(settings.database_path), user_id=user_id):
+        return _load_authorized_credentials(
+            settings,
+            user_id=user_id,
+            refresh_expired=refresh_expired,
+            persist_updates=True,
+        ).status
 
 
-def _load_authorized_credentials(settings: Settings, *, user_id: str | None, refresh_expired: bool) -> _CredentialLoadResult:
+def _load_authorized_credentials(
+    settings: Settings,
+    *,
+    user_id: str | None,
+    refresh_expired: bool,
+    persist_updates: bool,
+) -> _CredentialLoadResult:
     if not settings.google_configured:
         return _credential_result(False, False, error="Google OAuth is not configured")
 
@@ -234,16 +369,27 @@ def _load_authorized_credentials(settings: Settings, *, user_id: str | None, ref
     if credentials.expired and credentials.refresh_token:
         if refresh_expired:
             try:
-                credentials.refresh(Request())
+                credentials.refresh(_BoundedGoogleAuthRequest())
             except Exception:
                 if user_id is None:
                     clear_google_auth_state()
                 return _credential_result(False, True, reauth_required=True, error=GOOGLE_REAUTH_REQUIRED_MESSAGE)
             refreshed_tokens = token_payload_from_credentials(credentials)
-            try:
-                persist_token_payload(settings, refreshed_tokens, user_id=user_id)
-            except UserMailWorkBlocked:
-                return _credential_result(False, False)
+            if persist_updates:
+                try:
+                    persist_token_payload(settings, refreshed_tokens, user_id=user_id)
+                except UserMailWorkBlocked:
+                    revoke_google_token_payload(refreshed_tokens)
+                    return _credential_result(False, False)
+                except Exception:
+                    # Google normally retains the same refresh token. Do not
+                    # turn a transient local database error into an account
+                    # disconnect by revoking that already-tracked grant. A
+                    # genuinely rotated token is untracked and must be cleaned
+                    # up before surfacing the persistence failure.
+                    if refreshed_tokens.get("refresh_token") != tokens.get("refresh_token"):
+                        revoke_google_token_payload(refreshed_tokens)
+                    raise
         else:
             return _CredentialLoadResult(
                 credentials=credentials,
@@ -252,7 +398,7 @@ def _load_authorized_credentials(settings: Settings, *, user_id: str | None, ref
     elif credentials.expired:
         return _credential_result(False, True, reauth_required=True, error=GOOGLE_REAUTH_REQUIRED_MESSAGE)
 
-    if normalized_tokens != tokens and refreshed_tokens is None:
+    if persist_updates and normalized_tokens != tokens and refreshed_tokens is None:
         try:
             persist_token_payload(settings, normalized_tokens, user_id=user_id)
         except UserMailWorkBlocked:
@@ -282,8 +428,38 @@ def _credential_result(
     )
 
 
-def create_gmail_service(settings: Settings, *, user_id: str | None = None):
-    credentials = create_authorized_credentials(settings, user_id=user_id)
+def create_gmail_service(
+    settings: Settings,
+    *,
+    user_id: str | None = None,
+    refresh_expired: bool = True,
+    persist_updates: bool = True,
+):
+    credentials = create_authorized_credentials(
+        settings,
+        user_id=user_id,
+        refresh_expired=refresh_expired,
+        persist_updates=persist_updates,
+    )
+    if credentials is None:
+        raise GoogleCredentialsUnavailable("Google credentials are not connected")
+    return build_google_service(
+        "gmail",
+        "v1",
+        credentials,
+        database_url=str(settings.database_path) if user_id is not None else None,
+        user_id=user_id,
+    )
+
+
+def _create_gmail_service_for_exclusive_cleanup(settings: Settings, *, user_id: str):
+    """Build a service while the caller already owns the exclusive barrier."""
+    credentials = _load_authorized_credentials(
+        settings,
+        user_id=user_id,
+        refresh_expired=False,
+        persist_updates=False,
+    ).credentials
     if credentials is None:
         raise GoogleCredentialsUnavailable("Google credentials are not connected")
     return build_google_service("gmail", "v1", credentials)
@@ -325,8 +501,65 @@ def start_gmail_watch(settings: Settings, *, user_id: str) -> dict[str, object]:
 
 
 def stop_gmail_watch(settings: Settings, *, user_id: str) -> None:
-    gmail_service = create_gmail_service(settings, user_id=user_id)
+    # Deletion holds the exclusive user-mail lock while stopping a watch. Do
+    # not enter the token-refresh persistence path, which acquires a shared
+    # lock on the same user and would self-deadlock. AuthorizedHttp can still
+    # refresh in memory for the provider request when needed.
+    gmail_service = _create_gmail_service_for_exclusive_cleanup(settings, user_id=user_id)
     gmail_service.users().stop(userId="me").execute()
+
+
+def revoke_google_token_payload(tokens: dict[str, object]) -> bool:
+    """Best-effort revoke an OAuth payload without exposing its credentials."""
+    return _revoke_google_token_payload_outcome(tokens) is not _GoogleTokenRevocationOutcome.RETRY
+
+
+def _revoke_google_token_payload_outcome(
+    tokens: dict[str, object],
+) -> _GoogleTokenRevocationOutcome:
+    """Distinguish a project revocation from one credential already being invalid."""
+    token = str(tokens.get("refresh_token") or tokens.get("token") or "").strip()
+    if not token:
+        return _GoogleTokenRevocationOutcome.RETRY
+    try:
+        request = UrlRequest(
+            "https://oauth2.googleapis.com/revoke",
+            data=urlencode({"token": token}).encode("ascii"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urlopen(request, timeout=10) as response:
+            response.read()
+    except HTTPError as exc:
+        try:
+            if exc.code != 400:
+                return _GoogleTokenRevocationOutcome.RETRY
+            raw_error = exc.read(GOOGLE_REVOCATION_ERROR_BODY_LIMIT + 1)
+        except Exception:
+            return _GoogleTokenRevocationOutcome.RETRY
+        finally:
+            try:
+                exc.close()
+            except Exception:
+                pass
+        if len(raw_error) > GOOGLE_REVOCATION_ERROR_BODY_LIMIT:
+            return _GoogleTokenRevocationOutcome.RETRY
+        try:
+            error_payload = json.loads(raw_error.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return _GoogleTokenRevocationOutcome.RETRY
+        if isinstance(error_payload, dict) and error_payload.get("error") == "invalid_token":
+            # This credential needs no further retry, but a 400 response does
+            # not prove Google processed a project-wide revocation. Other
+            # refresh tokens for the same subject must retain their own jobs.
+            return _GoogleTokenRevocationOutcome.CREDENTIAL_INVALID
+        return _GoogleTokenRevocationOutcome.RETRY
+    except Exception:
+        # Revocation is cleanup on an already-failed flow. Provider/network
+        # errors are deliberately neither raised nor logged because their
+        # messages can include request material containing the OAuth token.
+        return _GoogleTokenRevocationOutcome.RETRY
+    return _GoogleTokenRevocationOutcome.PROJECT_REVOKED
 
 
 def revoke_stored_google_token(settings: Settings, *, user_id: str) -> bool:
@@ -335,18 +568,180 @@ def revoke_stored_google_token(settings: Settings, *, user_id: str) -> bool:
     if token_row is None:
         return False
     tokens = decrypt_json(settings, token_row.token_json_encrypted)
-    token = str(tokens.get("refresh_token") or tokens.get("token") or "").strip()
-    if not token:
-        return False
-    request = UrlRequest(
-        "https://oauth2.googleapis.com/revoke",
-        data=urlencode({"token": token}).encode("ascii"),
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
+    return revoke_google_token_payload(tokens)
+
+
+def revoke_or_enqueue_google_token_payload(
+    settings: Settings,
+    *,
+    subject_hash: str,
+    tokens: dict[str, object],
+    on_tracked: Callable[[], None] | None = None,
+) -> bool:
+    """Durably track a transient grant before attempting provider revocation."""
+    encrypted_payload = encrypt_json(settings, tokens)
+    return _revoke_tracked_google_token_payload(
+        settings,
+        subject_hash=subject_hash,
+        tokens=tokens,
+        token_json_encrypted=encrypted_payload,
+        on_tracked=on_tracked,
     )
-    with urlopen(request, timeout=10) as response:
-        response.read()
-    return True
+
+
+def enqueue_google_token_revocation_payload(
+    settings: Settings,
+    *,
+    subject_hash: str,
+    tokens: dict[str, object],
+) -> None:
+    """Durably queue cleanup without attempting provider I/O in this process."""
+    _enqueue_google_token_revocation_job(
+        settings,
+        subject_hash=subject_hash,
+        tokens=tokens,
+        token_json_encrypted=encrypt_json(settings, tokens),
+    )
+
+
+def revoke_or_enqueue_stored_google_token(
+    settings: Settings,
+    *,
+    user_id: str,
+    subject_hash: str,
+) -> bool:
+    """Durably track a stored grant before attempting provider revocation."""
+    database_url = str(settings.database_path)
+    token_row = get_google_oauth_token(database_url, user_id=user_id)
+    if token_row is None:
+        return True
+    try:
+        tokens = decrypt_json(settings, token_row.token_json_encrypted)
+    except Exception as exc:
+        raise RuntimeError("Stored Google credentials could not be prepared for revocation") from exc
+    return _revoke_tracked_google_token_payload(
+        settings,
+        subject_hash=subject_hash,
+        tokens=tokens,
+        token_json_encrypted=token_row.token_json_encrypted,
+    )
+
+
+def _revoke_tracked_google_token_payload(
+    settings: Settings,
+    *,
+    subject_hash: str,
+    tokens: dict[str, object],
+    token_json_encrypted: str,
+    on_tracked: Callable[[], None] | None = None,
+) -> bool:
+    normalized_subject_hash, job = _enqueue_google_token_revocation_job(
+        settings,
+        subject_hash=subject_hash,
+        tokens=tokens,
+        token_json_encrypted=token_json_encrypted,
+    )
+    if on_tracked is not None:
+        on_tracked()
+    database_url = str(settings.database_path)
+    with exclusive_google_subject_lock(database_url, subject_hash=normalized_subject_hash):
+        current = get_job(database_url, job.id)
+        if current is not None and current.status == "succeeded":
+            return True
+        if current is None or current.status not in {"queued", "running"}:
+            raise RuntimeError("Google token revocation is no longer durably tracked")
+        outcome = _revoke_google_token_payload_outcome(tokens)
+        if outcome is _GoogleTokenRevocationOutcome.RETRY:
+            return False
+
+        # The barrier is advanced only after the provider outcome is known and
+        # while callbacks for this subject are excluded. OAuth attempts started
+        # before this point must exchange a new code rather than persisting a
+        # token that the in-flight revocation may have invalidated.
+        record_google_subject_revocation(
+            database_url,
+            subject_hash=normalized_subject_hash,
+        )
+        if outcome is _GoogleTokenRevocationOutcome.PROJECT_REVOKED:
+            # A confirmed 200 invalidates every project grant for this subject.
+            complete_google_token_revocations_for_subject(
+                database_url,
+                subject_hash=normalized_subject_hash,
+            )
+        else:
+            # `invalid_token` resolves only the submitted credential. A sibling
+            # refresh token can still be live and must retain its durable job.
+            complete_google_token_revocation_job(database_url, job_id=job.id)
+        return True
+
+
+def _enqueue_google_token_revocation_job(
+    settings: Settings,
+    *,
+    subject_hash: str,
+    tokens: dict[str, object],
+    token_json_encrypted: str,
+) -> tuple[str, BackgroundJob]:
+    normalized_subject_hash = subject_hash.strip()
+    if not normalized_subject_hash:
+        raise RuntimeError("Google subject hash is required for token revocation")
+    credential = str(tokens.get("refresh_token") or tokens.get("token") or "").strip()
+    if not credential:
+        raise RuntimeError("Google token revocation payload is missing")
+    credential_fingerprint = sha256(credential.encode("utf-8")).hexdigest()
+    job = enqueue_job(
+        str(settings.database_path),
+        kind="google_token_revoke",
+        queue="critical",
+        dedupe_key=f"google-token-revoke:{normalized_subject_hash}:{credential_fingerprint}",
+        priority=100,
+        max_attempts=GOOGLE_TOKEN_REVOCATION_MAX_ATTEMPTS,
+        payload={
+            "subject_hash": normalized_subject_hash,
+            "token_json_encrypted": token_json_encrypted,
+        },
+    )
+    return normalized_subject_hash, job
+
+
+def retry_encrypted_google_token_revocation(
+    settings: Settings,
+    *,
+    job_id: str,
+    subject_hash: str,
+    token_json_encrypted: str,
+) -> None:
+    """Retry one abandoned OAuth grant without logging its token material."""
+    normalized_subject_hash = subject_hash.strip()
+    if not normalized_subject_hash:
+        raise RuntimeError("Google subject hash is required for token revocation")
+    if not token_json_encrypted:
+        raise RuntimeError("Encrypted Google token revocation payload is missing")
+    try:
+        tokens = decrypt_json(settings, token_json_encrypted)
+    except Exception as exc:
+        raise RuntimeError("Encrypted Google token revocation payload could not be read") from exc
+    database_url = str(settings.database_path)
+    with exclusive_google_subject_lock(database_url, subject_hash=normalized_subject_hash):
+        current = get_job(database_url, job_id)
+        if current is None or current.status == "succeeded":
+            return
+        if current.status != "running":
+            raise RuntimeError("Google token revocation job is no longer owned by this worker")
+        outcome = _revoke_google_token_payload_outcome(tokens)
+        if outcome is _GoogleTokenRevocationOutcome.RETRY:
+            raise RuntimeError("Google token revocation could not be confirmed")
+        record_google_subject_revocation(
+            database_url,
+            subject_hash=normalized_subject_hash,
+        )
+        if outcome is _GoogleTokenRevocationOutcome.PROJECT_REVOKED:
+            complete_google_token_revocations_for_subject(
+                database_url,
+                subject_hash=normalized_subject_hash,
+            )
+        else:
+            complete_google_token_revocation_job(database_url, job_id=job_id)
 
 
 def archive_gmail_thread(settings: Settings, thread_id: str, *, user_id: str | None = None) -> dict[str, object]:
@@ -611,23 +1006,46 @@ def find_gmail_draft_by_message_id(
             return None
 
 
-def find_gmail_message_by_rfc822_message_id(
+class MultipleSentGmailMessagesFound(RuntimeError):
+    """Raised when one idempotency Message-ID resolves to multiple deliveries."""
+
+
+def find_sent_gmail_message_by_rfc822_message_id(
     settings: Settings,
     *,
     user_id: str,
     rfc822_message_id: str,
 ) -> dict[str, object] | None:
+    """Return only a provider-verified Sent message for draft-send recovery."""
     gmail_service = create_gmail_service(settings, user_id=user_id)
     response = gmail_service.users().messages().list(
         userId="me",
-        q=f"rfc822msgid:{rfc822_message_id}",
-        maxResults=2,
+        q=f"in:sent rfc822msgid:{rfc822_message_id}",
+        maxResults=10,
         includeSpamTrash=True,
     ).execute()
     messages = response.get("messages") if isinstance(response, dict) else None
     if not isinstance(messages, list):
         return None
-    return next((message for message in messages if isinstance(message, dict) and message.get("id")), None)
+    verified: list[dict[str, object]] = []
+    for candidate in messages:
+        if not isinstance(candidate, dict) or not candidate.get("id"):
+            continue
+        message = gmail_service.users().messages().get(
+            userId="me",
+            id=str(candidate["id"]),
+            format="minimal",
+        ).execute()
+        if not isinstance(message, dict):
+            continue
+        label_ids = {str(label).upper() for label in message.get("labelIds", []) if isinstance(label, str)}
+        if "SENT" in label_ids and "DRAFT" not in label_ids:
+            verified.append(message)
+    if len(verified) > 1:
+        raise MultipleSentGmailMessagesFound(
+            "Multiple Sent messages share the same delivery identity; automatic reconciliation is unsafe."
+        )
+    return verified[0] if verified else None
 
 
 def fetch_gmail_message(settings: Settings, *, user_id: str, message_id: str, format: str = "full") -> dict[str, object]:

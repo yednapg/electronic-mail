@@ -1024,6 +1024,7 @@ public typealias MailOutboxResponse = [MailSendResponse]
 enum DurableSendConfirmationDecision: Equatable {
     case confirmedSent
     case poll(serverSendID: String)
+    case definiteFailure(message: String)
     case preserveForRetry(message: String)
 }
 
@@ -1050,7 +1051,7 @@ enum DurableSendConfirmationPolicy {
             }
             return .poll(serverSendID: serverSendID)
         case .failed:
-            return .preserveForRetry(message: response.error ?? "Send failed. You can retry safely.")
+            return .definiteFailure(message: response.error ?? "Send failed. You can retry safely.")
         case .reauthRequired:
             return .preserveForRetry(
                 message: response.error ?? "Google needs permission to send mail."
@@ -1345,6 +1346,33 @@ enum MailComposerPolicy {
         state == .saved
     }
 
+    static func draftSendPreparation(
+        hasUnchangedUnresolvedSendAttempt: Bool,
+        gmailDraftID: String?,
+        clientSendID: String
+    ) -> MailComposerDraftSendPreparation {
+        guard hasUnchangedUnresolvedSendAttempt,
+              let gmailDraftID,
+              !gmailDraftID.isEmpty else {
+            return .saveDraft
+        }
+        return .retryExistingDraft(
+            gmailDraftID: gmailDraftID,
+            clientSendID: clientSendID
+        )
+    }
+
+    static func contentChangeDecision(
+        hasUnresolvedSendAttempt: Bool,
+        existingDraftAttachmentCount: Int = 0
+    ) -> MailComposerContentChangeDecision {
+        hasUnresolvedSendAttempt
+            ? .forkDraftForNewSendAttempt(
+                discardExistingDraftAttachments: existingDraftAttachmentCount > 0
+            )
+            : .keepCurrentSendAttempt
+    }
+
     static func shouldClearUnchangedResponseRecovery(
         force: Bool,
         hasUnresolvedSendAttempt: Bool,
@@ -1440,6 +1468,22 @@ enum MailComposerPolicy {
     }
 }
 
+struct MailComposerDraftChangeTracker: Equatable {
+    private(set) var synchronizedFingerprint: String?
+
+    mutating func synchronize(fingerprint: String) {
+        synchronizedFingerprint = fingerprint
+    }
+
+    mutating func shouldHandleChange(fingerprint: String) -> Bool {
+        guard fingerprint != synchronizedFingerprint else {
+            return false
+        }
+        synchronizedFingerprint = fingerprint
+        return true
+    }
+}
+
 struct MailComposerRecoveryLoadGate<Presentation> {
     private(set) var isComplete = false
     private var pendingPresentation: Presentation?
@@ -1465,6 +1509,16 @@ enum MailComposerExitDecision: Equatable {
     case block
     case finishAndClearRecovery
     case finishPreservingRecovery
+}
+
+enum MailComposerDraftSendPreparation: Equatable {
+    case saveDraft
+    case retryExistingDraft(gmailDraftID: String, clientSendID: String)
+}
+
+enum MailComposerContentChangeDecision: Equatable {
+    case keepCurrentSendAttempt
+    case forkDraftForNewSendAttempt(discardExistingDraftAttachments: Bool)
 }
 
 struct MailReplyPrefillRecipients: Equatable {

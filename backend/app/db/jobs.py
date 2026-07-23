@@ -193,6 +193,98 @@ def count_active_jobs(database_url: str, *, user_id: str, kinds: list[str] | Non
     return int(value)
 
 
+def has_active_google_token_revocation(database_url: str, *, subject_hash: str) -> bool:
+    """Return whether provider cleanup is still pending for one Google subject."""
+    normalized_subject_hash = subject_hash.strip()
+    if not normalized_subject_hash:
+        raise ValueError("Google subject hash is required")
+    with get_engine(database_url).connect() as connection:
+        value = connection.execute(
+            text(
+                """
+                SELECT EXISTS (
+                  SELECT 1
+                  FROM background_jobs
+                  WHERE kind = 'google_token_revoke'
+                    AND status IN ('queued', 'running')
+                    AND payload_json::jsonb ->> 'subject_hash' = :subject_hash
+                )
+                """
+            ),
+            {"subject_hash": normalized_subject_hash},
+        ).scalar_one()
+    return bool(value)
+
+
+def complete_google_token_revocations_for_subject(database_url: str, *, subject_hash: str) -> int:
+    """Resolve every pending grant cleanup after Google confirms subject-wide revocation."""
+    normalized_subject_hash = subject_hash.strip()
+    if not normalized_subject_hash:
+        raise ValueError("Google subject hash is required")
+    with get_engine(database_url).begin() as connection:
+        completed_ids = connection.execute(
+            text(
+                """
+                UPDATE background_jobs
+                SET status = 'succeeded',
+                    completed_at = now(),
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = now()
+                WHERE kind = 'google_token_revoke'
+                  AND status IN ('queued', 'running')
+                  AND payload_json::jsonb ->> 'subject_hash' = :subject_hash
+                RETURNING id
+                """
+            ),
+            {"subject_hash": normalized_subject_hash},
+        ).scalars().all()
+        for job_id in completed_ids:
+            _insert_event(
+                connection,
+                str(job_id),
+                "succeeded",
+                None,
+                {"reason": "google_subject_revoked"},
+            )
+    return len(completed_ids)
+
+
+def complete_google_token_revocation_job(database_url: str, *, job_id: str) -> bool:
+    """Resolve one unusable credential without claiming sibling grants were revoked."""
+    normalized_job_id = job_id.strip()
+    if not normalized_job_id:
+        raise ValueError("Google token revocation job ID is required")
+    with get_engine(database_url).begin() as connection:
+        completed_job_id = connection.execute(
+            text(
+                """
+                UPDATE background_jobs
+                SET status = 'succeeded',
+                    completed_at = now(),
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = now()
+                WHERE id = :job_id
+                  AND kind = 'google_token_revoke'
+                  AND status IN ('queued', 'running')
+                RETURNING id
+                """
+            ),
+            {"job_id": normalized_job_id},
+        ).scalar_one_or_none()
+        if completed_job_id is None:
+            return False
+        _insert_event(
+            connection,
+            str(completed_job_id),
+            "succeeded",
+            None,
+            {"reason": "google_credential_already_invalid"},
+        )
+    return True
+
+
 def claim_job(database_url: str, *, worker_id: str, queues: list[str], lease_seconds: int = 300) -> BackgroundJob | None:
     if not queues:
         return None

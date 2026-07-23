@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
@@ -82,9 +83,23 @@ class GmailThreadActionRouteTests(unittest.TestCase):
         self.client = TestClient(
             create_app(replace(settings, app_env="local", rate_limit_enabled=False))
         )
-        self.settings_patch = patch.object(gmail_routes, "settings", SimpleNamespace(google_configured=True))
+        self.settings_patch = patch.object(
+            gmail_routes,
+            "settings",
+            SimpleNamespace(
+                google_configured=True,
+                database_path="postgresql://example/db",
+            ),
+        )
+        self.provider_lock_patch = patch.object(
+            gmail_routes,
+            "shared_user_mail_lock",
+            return_value=nullcontext(),
+        )
         self.settings_patch.start()
+        self.provider_lock_patch.start()
         self.addCleanup(self.settings_patch.stop)
+        self.addCleanup(self.provider_lock_patch.stop)
 
     @patch("app.api.routes.gmail.archive_gmail_thread_service")
     @patch("app.api.routes.gmail.require_current_user")

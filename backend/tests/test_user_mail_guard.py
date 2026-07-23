@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from time import monotonic
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -11,20 +13,25 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, IntegrityError, TimeoutError as SQLAlchemyTimeoutError
 
 from app.db import mail_groups, repository
 from app.db.jobs import cancel_user_jobs, complete_job, enqueue_job, fail_job, get_job
 from app.db.user_mail_guard import (
+    AdvisoryLockUnavailable,
     UserMailWorkBlocked,
     exclusive_google_subject_lock,
     exclusive_user_mail_lock,
+    gmail_draft_lock_key,
     google_subject_lock_key,
     google_subject_tombstone_hash,
     guard_user_mail_write,
+    shared_user_mail_lock,
     user_mail_lock_key,
+    user_mail_provider_lock_key,
     user_mail_write_transaction,
 )
+from app.services.integrations import google as google_service
 from app.services.integrations.google import persist_token_payload
 from app.workers import gmail_poller
 
@@ -35,11 +42,16 @@ class UserMailGuardUnitTests(unittest.TestCase):
 
         guard_user_mail_write(connection, user_id="user-1")
 
-        self.assertEqual(len(connection.calls), 3)
-        self.assertIn("pg_advisory_xact_lock_shared", connection.calls[0][0])
-        self.assertIn("google_data_delete_requested_at IS NULL", connection.calls[1][0])
-        self.assertIn("electronic_mail.user_mail_write_user_id", connection.calls[2][0])
-        self.assertEqual(connection.calls[0][1]["lock_key"], user_mail_lock_key("user-1"))
+        self.assertEqual(len(connection.calls), 4)
+        self.assertIn("lock_timeout", connection.calls[0][0])
+        self.assertEqual(
+            connection.calls[0][1]["lock_timeout"],
+            f"{repository.ADVISORY_LOCK_WAIT_TIMEOUT_SECONDS}s",
+        )
+        self.assertIn("pg_advisory_xact_lock_shared", connection.calls[1][0])
+        self.assertIn("google_data_delete_requested_at IS NULL", connection.calls[2][0])
+        self.assertIn("electronic_mail.user_mail_write_user_id", connection.calls[3][0])
+        self.assertEqual(connection.calls[1][1]["lock_key"], user_mail_lock_key("user-1"))
 
     def test_write_guard_rejects_disconnected_or_deleted_user(self) -> None:
         connection = _GuardConnection(allowed=False)
@@ -47,13 +59,266 @@ class UserMailGuardUnitTests(unittest.TestCase):
         with self.assertRaises(UserMailWorkBlocked):
             guard_user_mail_write(connection, user_id="user-1")
 
+    def test_transaction_lock_timeout_raises_safe_error_before_guard_check(self) -> None:
+        connection = _FailingTransactionGuardConnection(allowed=True)
+
+        with self.assertRaisesRegex(
+            AdvisoryLockUnavailable,
+            r"^Mail operation is temporarily busy\. Please retry shortly\.$",
+        ) as raised:
+            guard_user_mail_write(connection, user_id="user-1")
+
+        self.assertNotIn("driver-sensitive-detail", str(raised.exception))
+        self.assertEqual(len(connection.calls), 2)
+        self.assertIn("lock_timeout", connection.calls[0][0])
+        self.assertIn("pg_advisory_xact_lock_shared", connection.calls[1][0])
+        self.assertFalse(any("SELECT EXISTS" in statement for statement, _params in connection.calls))
+
+    def test_provider_lock_is_session_scoped_checks_after_lock_and_unlocks(self) -> None:
+        connection = _SessionGuardConnection(allowed=True)
+        engine = SimpleNamespace(connect=lambda: connection)
+
+        with patch(
+            "app.db.user_mail_guard.get_advisory_lock_engine",
+            return_value=engine,
+        ), patch("app.db.user_mail_guard.get_engine") as main_pool_engine:
+            with shared_user_mail_lock("postgresql://example/db", user_id="user-1"):
+                main_pool_engine.assert_not_called()
+                self.assertEqual(len(connection.calls), 3)
+                self.assertIn("lock_timeout", connection.calls[0][0])
+                self.assertIn("pg_advisory_lock_shared", connection.calls[1][0])
+                self.assertEqual(
+                    connection.calls[1][1]["lock_key"],
+                    user_mail_provider_lock_key("user-1"),
+                )
+                self.assertIn("SELECT EXISTS", connection.calls[2][0])
+
+        self.assertEqual(len(connection.calls), 4)
+        self.assertIn("pg_advisory_unlock_shared", connection.calls[3][0])
+        self.assertEqual(connection.commits, 3)
+        self.assertEqual(connection.rollbacks, 1)
+
+    def test_provider_lock_fails_closed_and_unlocks_when_durable_guard_is_closed(self) -> None:
+        connection = _SessionGuardConnection(allowed=False)
+        engine = SimpleNamespace(connect=lambda: connection)
+        provider_called = False
+
+        with patch(
+            "app.db.user_mail_guard.get_advisory_lock_engine",
+            return_value=engine,
+        ):
+            with self.assertRaises(UserMailWorkBlocked):
+                with shared_user_mail_lock("postgresql://example/db", user_id="user-1"):
+                    provider_called = True
+
+        self.assertFalse(provider_called)
+        self.assertIn("pg_advisory_unlock_shared", connection.calls[-1][0])
+        self.assertEqual(connection.commits, 2)
+        self.assertEqual(connection.rollbacks, 1)
+
+    def test_session_lock_timeout_releases_prior_lock_and_raises_safe_error(self) -> None:
+        connection = _FailingSessionGuardConnection(allowed=True, fail_lock_number=2)
+        engine = SimpleNamespace(connect=lambda: connection)
+
+        with patch("app.db.user_mail_guard.get_advisory_lock_engine", return_value=engine):
+            with self.assertRaisesRegex(
+                AdvisoryLockUnavailable,
+                r"^Mail operation is temporarily busy\. Please retry shortly\.$",
+            ) as raised:
+                with exclusive_user_mail_lock("postgresql://example/db", user_id="user-1"):
+                    self.fail("lock timeout must fail before entering the protected scope")
+
+        self.assertNotIn("driver-sensitive-detail", str(raised.exception))
+        self.assertEqual(connection.rollbacks, 1)
+        self.assertEqual(connection.commits, 1)
+        self.assertEqual(connection.invalidations, 0)
+        unlocked_keys = [
+            int(params["lock_key"])
+            for statement, params in connection.calls
+            if "pg_advisory_unlock" in statement
+        ]
+        self.assertEqual(unlocked_keys, [user_mail_provider_lock_key("user-1")])
+
+    def test_pool_checkout_timeout_raises_safe_error(self) -> None:
+        engine = SimpleNamespace(
+            connect=lambda: (_ for _ in ()).throw(
+                SQLAlchemyTimeoutError("pool-sensitive-detail")
+            )
+        )
+
+        with patch("app.db.user_mail_guard.get_advisory_lock_engine", return_value=engine):
+            with self.assertRaisesRegex(
+                AdvisoryLockUnavailable,
+                r"^Mail operation is temporarily busy\. Please retry shortly\.$",
+            ) as raised:
+                with shared_user_mail_lock("postgresql://example/db", user_id="user-1"):
+                    self.fail("pool timeout must fail before entering the protected scope")
+
+        self.assertNotIn("pool-sensitive-detail", str(raised.exception))
+
+    def test_unlock_failure_invalidates_and_closes_session_instead_of_pooling_it(self) -> None:
+        connection = _FailingSessionGuardConnection(allowed=True, fail_unlock=True)
+        engine = SimpleNamespace(connect=lambda: connection)
+
+        with patch("app.db.user_mail_guard.get_advisory_lock_engine", return_value=engine):
+            with self.assertRaisesRegex(
+                AdvisoryLockUnavailable,
+                r"^Mail operation is temporarily busy\. Please retry shortly\.$",
+            ) as raised:
+                with exclusive_google_subject_lock(
+                    "postgresql://example/db",
+                    subject_hash=google_subject_tombstone_hash("google-principal-123"),
+                ):
+                    pass
+
+        self.assertNotIn("cleanup-sensitive-detail", str(raised.exception))
+        self.assertEqual(connection.invalidations, 1)
+        self.assertEqual(connection.closes, 1)
+        self.assertTrue(connection.closed)
+
     def test_lock_key_is_stable_signed_bigint(self) -> None:
         lock_key = user_mail_lock_key("user-1")
+        provider_lock_key = user_mail_provider_lock_key("user-1")
 
         self.assertEqual(lock_key, user_mail_lock_key("user-1"))
         self.assertNotEqual(lock_key, user_mail_lock_key("user-2"))
+        self.assertEqual(provider_lock_key, user_mail_provider_lock_key("user-1"))
+        self.assertNotEqual(provider_lock_key, user_mail_provider_lock_key("user-2"))
+        self.assertNotEqual(provider_lock_key, lock_key)
         self.assertGreaterEqual(lock_key, -(2**63))
         self.assertLess(lock_key, 2**63)
+
+    def test_destructive_lock_uses_provider_then_transaction_namespace(self) -> None:
+        events: list[tuple[str, int]] = []
+
+        @contextmanager
+        def recording_scope(_database_url: str, *, locks: list[tuple[str, int]]):
+            for _mode, lock_key in locks:
+                events.append(("enter", lock_key))
+            try:
+                yield SimpleNamespace()
+            finally:
+                for _mode, lock_key in reversed(locks):
+                    events.append(("exit", lock_key))
+
+        with patch(
+            "app.db.user_mail_guard._advisory_lock_scope",
+            side_effect=recording_scope,
+        ):
+            with exclusive_user_mail_lock("postgresql://example/db", user_id="user-1"):
+                events.append(("body", 0))
+
+        self.assertEqual(
+            events,
+            [
+                ("enter", user_mail_provider_lock_key("user-1")),
+                ("enter", user_mail_lock_key("user-1")),
+                ("body", 0),
+                ("exit", user_mail_lock_key("user-1")),
+                ("exit", user_mail_provider_lock_key("user-1")),
+            ],
+        )
+
+    def test_nested_subject_and_user_locks_share_one_bounded_pool_session(self) -> None:
+        connection = _SessionGuardConnection(allowed=True)
+        connect_calls = 0
+
+        def connect():
+            nonlocal connect_calls
+            connect_calls += 1
+            return connection
+
+        engine = SimpleNamespace(connect=connect)
+        subject_hash = google_subject_tombstone_hash("google-principal-123")
+        with patch("app.db.user_mail_guard.get_advisory_lock_engine", return_value=engine):
+            with exclusive_google_subject_lock("postgresql://example/db", subject_hash=subject_hash):
+                with exclusive_user_mail_lock("postgresql://example/db", user_id="user-1"):
+                    pass
+
+        acquired_keys = [
+            int(params["lock_key"])
+            for statement, params in connection.calls
+            if "pg_advisory_lock(" in statement and "unlock" not in statement
+        ]
+        self.assertEqual(connect_calls, 1)
+        self.assertEqual(
+            acquired_keys,
+            [
+                google_subject_lock_key(subject_hash),
+                user_mail_provider_lock_key("user-1"),
+                user_mail_lock_key("user-1"),
+            ],
+        )
+
+    def test_nested_provider_and_draft_locks_share_one_bounded_pool_session(self) -> None:
+        connection = _SessionGuardConnection(allowed=True)
+        connect_calls = 0
+
+        def connect():
+            nonlocal connect_calls
+            connect_calls += 1
+            return connection
+
+        engine = SimpleNamespace(connect=connect)
+        with patch("app.db.user_mail_guard.get_advisory_lock_engine", return_value=engine):
+            with shared_user_mail_lock("postgresql://example/db", user_id="user-1"):
+                with mail_groups.client_draft_lock(
+                    "postgresql://example/db",
+                    user_id="user-1",
+                    client_draft_id="draft-1",
+                    gmail_draft_id="gmail-draft-1",
+                ):
+                    pass
+
+        acquired_keys = [
+            int(params["lock_key"])
+            for statement, params in connection.calls
+            if "pg_advisory_lock" in statement and "unlock" not in statement
+        ]
+        self.assertEqual(connect_calls, 1)
+        self.assertEqual(
+            acquired_keys,
+            [
+                user_mail_provider_lock_key("user-1"),
+                gmail_draft_lock_key("user-1", "gmail-draft-1"),
+                mail_groups.client_draft_lock_key("user-1", "draft-1"),
+            ],
+        )
+
+    def test_new_draft_handoff_reacquires_provider_before_client_on_same_session(self) -> None:
+        connection = _SessionGuardConnection(allowed=True)
+        connect_calls = 0
+
+        def connect():
+            nonlocal connect_calls
+            connect_calls += 1
+            return connection
+
+        engine = SimpleNamespace(connect=connect)
+        with patch("app.db.user_mail_guard.get_advisory_lock_engine", return_value=engine):
+            with shared_user_mail_lock("postgresql://example/db", user_id="user-1"):
+                with mail_groups.client_draft_lock(
+                    "postgresql://example/db",
+                    user_id="user-1",
+                    client_draft_id="client-draft-1",
+                ) as draft_lock:
+                    draft_lock.adopt_gmail_draft_id("gmail-draft-1")
+
+        acquired_keys = [
+            int(params["lock_key"])
+            for statement, params in connection.calls
+            if "pg_advisory_lock" in statement and "unlock" not in statement
+        ]
+        self.assertEqual(connect_calls, 1)
+        self.assertEqual(
+            acquired_keys,
+            [
+                user_mail_provider_lock_key("user-1"),
+                mail_groups.client_draft_lock_key("user-1", "client-draft-1"),
+                gmail_draft_lock_key("user-1", "gmail-draft-1"),
+                mail_groups.client_draft_lock_key("user-1", "client-draft-1"),
+            ],
+        )
 
     def test_google_subject_tombstone_hash_is_stable_and_does_not_reveal_subject(self) -> None:
         google_sub = "google-principal-123"
@@ -187,6 +452,35 @@ def _postgres_integration_enabled() -> bool:
 )
 class UserMailGuardPostgresTests(unittest.TestCase):
     database_url = os.getenv("DATABASE_URL", "")
+
+    def test_oauth_reconnect_rolls_back_guard_clear_when_token_write_fails(self) -> None:
+        user_id = f"guard-test-{uuid4()}"
+        self._create_connected_user(user_id)
+        self.addCleanup(self._delete_test_user, user_id)
+        mail_groups.mark_google_disconnected(self.database_url, user_id=user_id)
+
+        with self.assertRaises(IntegrityError):
+            repository.reconnect_google_oauth_token(
+                self.database_url,
+                user_id=user_id,
+                token_json_encrypted=None,  # type: ignore[arg-type]
+                oauth_started_epoch=2**62,
+            )
+
+        with repository.get_engine(self.database_url).connect() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT users.google_disconnected_at, tokens.token_json_encrypted
+                    FROM users
+                    JOIN google_oauth_tokens AS tokens ON tokens.user_id = users.id
+                    WHERE users.id = :user_id
+                    """
+                ),
+                {"user_id": user_id},
+            ).mappings().one()
+        self.assertIsNotNone(row["google_disconnected_at"])
+        self.assertEqual(row["token_json_encrypted"], "test-token")
 
     def test_fetched_attachment_only_message_replaces_metadata_payload(self) -> None:
         user_id = f"guard-test-{uuid4()}"
@@ -565,6 +859,120 @@ class UserMailGuardPostgresTests(unittest.TestCase):
                 {"lock_key": lock_key},
             )
 
+    def test_provider_shared_lock_drains_before_deletion_and_rejects_late_work(self) -> None:
+        user_id = f"guard-test-{uuid4()}"
+        lock_key = user_mail_provider_lock_key(user_id)
+        provider_entered = threading.Event()
+        deletion_attempted = threading.Event()
+        release_provider = threading.Event()
+        errors: list[BaseException] = []
+        order: list[str] = []
+
+        self._create_connected_user(user_id)
+        self.addCleanup(self._delete_test_user, user_id)
+
+        def provider_mutation() -> None:
+            try:
+                with shared_user_mail_lock(self.database_url, user_id=user_id):
+                    order.append("provider_entered")
+                    provider_entered.set()
+                    if not deletion_attempted.wait(5):
+                        raise TimeoutError("deletion did not attempt the exclusive lock")
+                    if not release_provider.wait(5):
+                        raise TimeoutError("test did not release provider mutation")
+                    # A real repository write acquires the transaction-key
+                    # shared lock on another connection. It must finish even
+                    # while deletion is queued on the provider key.
+                    mail_groups.mark_gmail_watch_error(
+                        self.database_url,
+                        user_id=user_id,
+                        error="provider completion",
+                    )
+                    order.append("provider_local_completion")
+                    # This stands for the last externally visible provider
+                    # effect. Deletion must not enter, much less return, first.
+                    order.append("provider_effect_complete")
+            except BaseException as exc:
+                errors.append(exc)
+
+        def delete_account_data() -> None:
+            try:
+                deletion_attempted.set()
+                with exclusive_user_mail_lock(self.database_url, user_id=user_id):
+                    order.append("deletion_entered")
+                    mail_groups.mark_google_disconnected(self.database_url, user_id=user_id)
+                    repository.delete_google_oauth_token(self.database_url, user_id=user_id)
+                order.append("deletion_returned")
+            except BaseException as exc:
+                errors.append(exc)
+
+        provider = threading.Thread(target=provider_mutation, daemon=True)
+        deletion = threading.Thread(target=delete_account_data, daemon=True)
+        provider.start()
+        self.assertTrue(provider_entered.wait(5), "provider did not acquire its shared lock")
+        deletion.start()
+        self.assertTrue(deletion_attempted.wait(5), "deletion did not attempt its exclusive lock")
+
+        unsigned_lock_key = lock_key % (2**64)
+        class_id = unsigned_lock_key >> 32
+        object_id = unsigned_lock_key & 0xFFFFFFFF
+        deadline = monotonic() + 5
+        deletion_is_waiting = False
+        with repository.get_engine(self.database_url).connect() as probe:
+            while monotonic() < deadline:
+                deletion_is_waiting = bool(
+                    probe.execute(
+                        text(
+                            """
+                            SELECT EXISTS (
+                              SELECT 1
+                              FROM pg_locks
+                              WHERE locktype = 'advisory'
+                                AND mode = 'ExclusiveLock'
+                                AND granted = FALSE
+                                AND classid::bigint = :class_id
+                                AND objid::bigint = :object_id
+                                AND objsubid = 1
+                            )
+                            """
+                        ),
+                        {"class_id": class_id, "object_id": object_id},
+                    ).scalar_one()
+                )
+                if deletion_is_waiting:
+                    break
+                deletion_attempted.wait(0.01)
+        self.assertTrue(deletion_is_waiting, "deletion did not queue on the provider lock")
+
+        # A non-blocking independent database probe proves the shared lock is
+        # excluding destructive work without relying on scheduler sleeps.
+        with repository.get_engine(self.database_url).connect() as probe:
+            acquired = probe.execute(
+                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                {"lock_key": lock_key},
+            ).scalar_one()
+            self.assertFalse(acquired)
+
+        release_provider.set()
+        provider.join(5)
+        deletion.join(5)
+
+        self.assertFalse(provider.is_alive() or deletion.is_alive(), "provider/deletion race deadlocked")
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            order,
+            [
+                "provider_entered",
+                "provider_local_completion",
+                "provider_effect_complete",
+                "deletion_entered",
+                "deletion_returned",
+            ],
+        )
+        with self.assertRaises(UserMailWorkBlocked):
+            with shared_user_mail_lock(self.database_url, user_id=user_id):
+                self.fail("post-deletion provider work passed the durable guard")
+
     def test_database_subject_key_matches_runtime_and_rolling_guard_triggers_exist(self) -> None:
         google_sub = f"parity-sub-{uuid4()}"
         with repository.get_engine(self.database_url).connect() as connection:
@@ -665,51 +1073,128 @@ class UserMailGuardPostgresTests(unittest.TestCase):
                 )
                 self.assertGreater(fresh_session.started_epoch, int(tombstone["deleted_epoch"]))
 
-    def test_refresh_completion_after_disconnect_cannot_recreate_token(self) -> None:
+    def test_deletion_waits_for_inflight_credential_refresh_and_then_removes_token(self) -> None:
         user_id = f"guard-test-{uuid4()}"
         settings = SimpleNamespace(
             database_path=self.database_url,
             app_encryption_key="refresh-race-encryption-key",
+            google_configured=True,
+            google_client_id="client-id",
+            google_client_secret="client-secret",
         )
         refresh_started = threading.Event()
-        disconnect_done = threading.Event()
-        stale_refresh_rejected = threading.Event()
+        release_refresh = threading.Event()
+        deletion_attempted = threading.Event()
+        deletion_done = threading.Event()
         errors: list[BaseException] = []
+        order: list[str] = []
 
         self._create_connected_user(user_id)
         self.addCleanup(self._delete_test_user, user_id)
 
+        credentials = SimpleNamespace(
+            expired=True,
+            token="expired-access-token",
+            refresh_token="refresh-token",
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id="client-id",
+            client_secret="client-secret",
+            scopes=[google_service.GMAIL_FULL_SCOPE],
+            expiry=None,
+        )
+
+        def block_refresh(_request) -> None:
+            refresh_started.set()
+            if not release_refresh.wait(5):
+                raise TimeoutError("test did not release credential refresh")
+            credentials.expired = False
+            credentials.token = "refreshed-access-token"
+
+        credentials.refresh = block_refresh
+
         def finish_external_refresh() -> None:
             try:
-                observed = repository.get_google_oauth_token(self.database_url, user_id=user_id)
-                if observed is None:
-                    raise AssertionError("refresh did not observe the connected token")
-                refresh_started.set()
-                if not disconnect_done.wait(5):
-                    raise TimeoutError("disconnect did not complete")
-                try:
-                    persist_token_payload(
-                        settings,
-                        {"token": "stale-refreshed-token", "refresh_token": "stale-refresh-token"},
-                        user_id=user_id,
-                    )
-                except UserMailWorkBlocked:
-                    stale_refresh_rejected.set()
+                loaded = google_service.create_authorized_credentials(settings, user_id=user_id)
+                if loaded is not credentials:
+                    raise AssertionError("credential refresh did not return the refreshed credentials")
+                order.append("refresh_returned")
             except BaseException as exc:
                 errors.append(exc)
 
-        refresh = threading.Thread(target=finish_external_refresh, daemon=True)
-        refresh.start()
-        self.assertTrue(refresh_started.wait(5), "refresh did not complete its external-read phase")
-        with exclusive_user_mail_lock(self.database_url, user_id=user_id):
-            mail_groups.mark_google_disconnected(self.database_url, user_id=user_id)
-            repository.delete_google_oauth_token(self.database_url, user_id=user_id)
-        disconnect_done.set()
-        refresh.join(5)
+        def disconnect() -> None:
+            try:
+                deletion_attempted.set()
+                with exclusive_user_mail_lock(self.database_url, user_id=user_id):
+                    order.append("deletion_entered")
+                    mail_groups.mark_google_disconnected(self.database_url, user_id=user_id)
+                    repository.delete_google_oauth_token(self.database_url, user_id=user_id)
+                order.append("deletion_returned")
+                deletion_done.set()
+            except BaseException as exc:
+                errors.append(exc)
 
-        self.assertFalse(refresh.is_alive(), "stale refresh race deadlocked")
+        with (
+            patch.object(
+                google_service,
+                "decrypt_json",
+                return_value={
+                    "token": "expired-access-token",
+                    "refresh_token": "refresh-token",
+                    "scopes": [google_service.GMAIL_FULL_SCOPE],
+                },
+            ),
+            patch.object(
+                google_service.Credentials,
+                "from_authorized_user_info",
+                return_value=credentials,
+            ),
+        ):
+            refresh = threading.Thread(target=finish_external_refresh, daemon=True)
+            deletion = threading.Thread(target=disconnect, daemon=True)
+            refresh.start()
+            self.assertTrue(refresh_started.wait(5), "credential refresh did not start")
+            deletion.start()
+            self.assertTrue(deletion_attempted.wait(5), "deletion did not attempt its lock")
+
+            lock_key = user_mail_provider_lock_key(user_id)
+            unsigned_lock_key = lock_key % (2**64)
+            deadline = monotonic() + 5
+            deletion_is_waiting = False
+            with repository.get_engine(self.database_url).connect() as probe:
+                while monotonic() < deadline:
+                    deletion_is_waiting = bool(
+                        probe.execute(
+                            text(
+                                """
+                                SELECT EXISTS (
+                                  SELECT 1 FROM pg_locks
+                                  WHERE locktype = 'advisory'
+                                    AND mode = 'ExclusiveLock'
+                                    AND granted = FALSE
+                                    AND classid::bigint = :class_id
+                                    AND objid::bigint = :object_id
+                                    AND objsubid = 1
+                                )
+                                """
+                            ),
+                            {
+                                "class_id": unsigned_lock_key >> 32,
+                                "object_id": unsigned_lock_key & 0xFFFFFFFF,
+                            },
+                        ).scalar_one()
+                    )
+                    if deletion_is_waiting:
+                        break
+                    deletion_attempted.wait(0.01)
+            self.assertTrue(deletion_is_waiting, "deletion did not wait for credential refresh")
+            self.assertFalse(deletion_done.is_set())
+            release_refresh.set()
+            refresh.join(5)
+            deletion.join(5)
+
+        self.assertFalse(refresh.is_alive() or deletion.is_alive(), "credential refresh race deadlocked")
         self.assertEqual(errors, [])
-        self.assertTrue(stale_refresh_rejected.is_set())
+        self.assertEqual(order, ["refresh_returned", "deletion_entered", "deletion_returned"])
         self.assertEqual(self._token_count(user_id), 0)
 
     def test_deletion_tombstone_rejects_started_callback_and_allows_new_oauth_start(self) -> None:
@@ -1153,7 +1638,88 @@ class _GuardConnection:
     def execute(self, statement, params=None):
         sql = str(statement)
         self.calls.append((sql, dict(params or {})))
+        if "pg_advisory_unlock" in sql:
+            return _GuardResult(True)
         return _GuardResult(self.allowed if "SELECT EXISTS" in sql else None)
+
+
+class _SessionGuardConnection(_GuardConnection):
+    def __init__(self, *, allowed: bool) -> None:
+        super().__init__(allowed=allowed)
+        self.commits = 0
+        self.rollbacks = 0
+        self.invalidations = 0
+        self.closes = 0
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        return None
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+    def invalidate(self) -> None:
+        self.invalidations += 1
+
+    def close(self) -> None:
+        self.closes += 1
+        self.closed = True
+
+
+class _PostgresLockTimeout(RuntimeError):
+    sqlstate = "55P03"
+
+
+class _FailingTransactionGuardConnection(_GuardConnection):
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        if "pg_advisory_xact_lock_shared" in sql:
+            self.calls.append((sql, dict(params or {})))
+            raise DBAPIError(
+                sql,
+                params,
+                _PostgresLockTimeout("driver-sensitive-detail"),
+                connection_invalidated=False,
+            )
+        return super().execute(statement, params)
+
+
+class _FailingSessionGuardConnection(_SessionGuardConnection):
+    def __init__(
+        self,
+        *,
+        allowed: bool,
+        fail_lock_number: int | None = None,
+        fail_unlock: bool = False,
+    ) -> None:
+        super().__init__(allowed=allowed)
+        self.fail_lock_number = fail_lock_number
+        self.fail_unlock = fail_unlock
+        self.lock_calls = 0
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        is_lock = "pg_advisory_lock" in sql and "pg_advisory_unlock" not in sql
+        if is_lock:
+            self.lock_calls += 1
+            if self.lock_calls == self.fail_lock_number:
+                self.calls.append((sql, dict(params or {})))
+                raise DBAPIError(
+                    sql,
+                    params,
+                    _PostgresLockTimeout("driver-sensitive-detail"),
+                    connection_invalidated=False,
+                )
+        if self.fail_unlock and "pg_advisory_unlock" in sql:
+            self.calls.append((sql, dict(params or {})))
+            raise RuntimeError("cleanup-sensitive-detail")
+        return super().execute(statement, params)
 
 
 if __name__ == "__main__":

@@ -2,16 +2,19 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import logging
 
 from googleapiclient.errors import HttpError
 
 from app.core.config import Settings
 from app.core.error_safety import safe_google_error
 from app.db.jobs import enqueue_job
+from app.db.user_mail_guard import UserMailWorkBlocked, shared_user_mail_lock
 from app.db.mail_groups import (
     GmailMessageRecord,
     PendingThreadActionRecord,
     delete_gmail_messages,
+    force_update_gmail_message_labels,
     get_mail_group_detail,
     get_pending_thread_action,
     list_messages_by_ids,
@@ -20,7 +23,6 @@ from app.db.mail_groups import (
     mark_pending_thread_action_applying,
     mark_pending_thread_action_failed,
     prune_empty_mail_groups,
-    upsert_gmail_messages,
     upsert_pending_thread_action,
 )
 from app.schemas.domain import QueuedThreadActionRequest, QueuedThreadActionResponse
@@ -48,6 +50,23 @@ from app.services.integrations.google import (
 )
 from app.services.mailbox_events import MAILBOX_CHANGED, emit_mailbox_event
 from app.services.mail_groups import enqueue_projection_refresh, rebuild_touched_mail_groups
+
+
+logger = logging.getLogger(__name__)
+
+_THREAD_ORDER_MEMBERSHIP_ACTIONS = frozenset(
+    {
+        "archive",
+        "unarchive",
+        "move_trash",
+        "restore_trash",
+        "mark_spam",
+        "not_spam",
+        "star",
+        "unstar",
+        "delete_forever",
+    }
+)
 
 
 class ThreadActionIdempotencyConflict(ValueError):
@@ -145,48 +164,57 @@ def run_pending_thread_action(settings: Settings, *, user_id: str, server_action
         return None
     if record.state == "applied":
         return _response_from_record(record)
-    mark_pending_thread_action_applying(database_url, user_id=user_id, server_action_id=server_action_id)
     try:
-        messages, thread_ids = _resolve_action_messages(
-            database_url,
-            user_id=user_id,
-            mailbox_thread_id=record.mailbox_thread_id,
-            target_message_id=record.target_message_id,
-        )
-        if not record.target_message_id and not thread_ids and not messages:
-            raise RuntimeError("Mail group not found")
-        if record.target_message_id and not messages:
-            raise RuntimeError("Gmail message not found")
-        if record.target_message_id and record.action in {
-            "mark_read",
-            "mark_unread",
-            "move_trash",
-            "restore_trash",
-            "mark_spam",
-            "not_spam",
-            "star",
-            "unstar",
-            "delete_forever",
-        }:
-            _apply_remote_message_action(settings, user_id=user_id, gmail_message_id=record.target_message_id, action=record.action)
-        else:
-            if not thread_ids:
-                raise RuntimeError("No Gmail thread IDs found for mailbox thread")
-            for thread_id in thread_ids:
-                _apply_remote_action(settings, user_id=user_id, gmail_thread_id=thread_id, action=record.action)
-        if record.action == "delete_forever":
-            affected_group_ids = delete_gmail_messages(database_url, user_id=user_id, message_ids=[message.message_id for message in messages])
-            prune_empty_mail_groups(database_url, user_id=user_id, group_ids=affected_group_ids)
-        applied = mark_pending_thread_action_applied(database_url, user_id=user_id, server_action_id=server_action_id)
-        enqueue_projection_refresh(settings, user_id=user_id, priority=10)
-        emit_mailbox_event(
-            settings,
-            user_id=user_id,
-            event_type=MAILBOX_CHANGED,
-            mailbox_label="all",
-            payload={"source": "thread_action_applied", "action": record.action, "mailbox_thread_id": record.mailbox_thread_id},
-        )
-        return _response_from_record(applied or record)
+        with shared_user_mail_lock(database_url, user_id=user_id):
+            # The session lock spans the Gmail mutation and its durable local
+            # completion. Account/data deletion cannot return in between them.
+            mark_pending_thread_action_applying(database_url, user_id=user_id, server_action_id=server_action_id)
+            messages, thread_ids = _resolve_action_messages(
+                database_url,
+                user_id=user_id,
+                mailbox_thread_id=record.mailbox_thread_id,
+                target_message_id=record.target_message_id,
+            )
+            if not record.target_message_id and not thread_ids and not messages:
+                raise RuntimeError("Mail group not found")
+            if record.target_message_id and not messages:
+                raise RuntimeError("Gmail message not found")
+            if record.target_message_id and record.action in {
+                "mark_read",
+                "mark_unread",
+                "move_trash",
+                "restore_trash",
+                "mark_spam",
+                "not_spam",
+                "star",
+                "unstar",
+                "delete_forever",
+            }:
+                _apply_remote_message_action(settings, user_id=user_id, gmail_message_id=record.target_message_id, action=record.action)
+            else:
+                if not thread_ids:
+                    raise RuntimeError("No Gmail thread IDs found for mailbox thread")
+                for thread_id in thread_ids:
+                    _apply_remote_action(settings, user_id=user_id, gmail_thread_id=thread_id, action=record.action)
+            if record.action == "delete_forever":
+                affected_group_ids = delete_gmail_messages(database_url, user_id=user_id, message_ids=[message.message_id for message in messages])
+                prune_empty_mail_groups(database_url, user_id=user_id, group_ids=affected_group_ids)
+            applied = mark_pending_thread_action_applied(database_url, user_id=user_id, server_action_id=server_action_id)
+            if applied is not None and record.action in _THREAD_ORDER_MEMBERSHIP_ACTIONS:
+                _enqueue_immediate_thread_order_refresh(settings, user_id=user_id)
+            enqueue_projection_refresh(settings, user_id=user_id, priority=10)
+            emit_mailbox_event(
+                settings,
+                user_id=user_id,
+                event_type=MAILBOX_CHANGED,
+                mailbox_label="all",
+                payload={"source": "thread_action_applied", "action": record.action, "mailbox_thread_id": record.mailbox_thread_id},
+            )
+            return _response_from_record(applied or record)
+    except UserMailWorkBlocked:
+        # Destructive work won the lock race. Do not write a new failure state
+        # into data that is being disconnected or purged.
+        raise
     except Exception as exc:
         mark_pending_thread_action_failed(
             database_url,
@@ -228,7 +256,11 @@ def rollback_failed_thread_action(settings: Settings, *, user_id: str, server_ac
     ]
     if not restored:
         return False
-    upsert_gmail_messages(database_url, restored)
+    force_update_gmail_message_labels(
+        database_url,
+        user_id=user_id,
+        labels_by_message_id={message.message_id: message.label_ids for message in restored},
+    )
     rebuild_touched_mail_groups(
         settings,
         user_id=user_id,
@@ -277,8 +309,35 @@ def _apply_local_action(
             changed.append(replace(message, label_ids=next_labels))
     if not changed:
         return
-    upsert_gmail_messages(database_url, changed)
+    force_update_gmail_message_labels(
+        database_url,
+        user_id=user_id,
+        labels_by_message_id={message.message_id: message.label_ids for message in changed},
+    )
     rebuild_touched_mail_groups(settings, user_id=user_id, message_ids=[message.message_id for message in changed], use_ai=False)
+
+
+def _enqueue_immediate_thread_order_refresh(settings: Settings, *, user_id: str) -> bool:
+    """Wake one authoritative Gmail ordering scan after a durable action succeeds."""
+    try:
+        enqueue_job(
+            str(settings.database_path),
+            kind="gmail_thread_order_refresh",
+            queue="slow",
+            user_id=user_id,
+            dedupe_key=f"gmail-thread-order-refresh:{user_id}:membership-action",
+            priority=70,
+            payload={"user_id": user_id, "target_history_id": None},
+            run_after_seconds=0,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Post-action Gmail thread-order refresh could not be queued user_id=%s error=%s",
+            user_id,
+            type(exc).__name__,
+        )
+        return False
+    return True
 
 
 def _resolve_action_messages(

@@ -14,7 +14,12 @@ from uuid import uuid4
 from sqlalchemy import text
 
 from app.db.repository import get_engine
-from app.db.user_mail_guard import user_mail_write_transaction
+from app.db.user_mail_guard import (
+    advisory_session_locks,
+    client_draft_lock_key,
+    gmail_draft_lock_key,
+    user_mail_write_transaction,
+)
 
 
 # Child tables precede their parents. Authentication/account tables are deliberately
@@ -174,21 +179,74 @@ class _MailboxCursorState:
     position: int | None = None
 
 
+class _ClientDraftLockHandle:
+    """Rebind a client-only create lock once Gmail returns provider identity."""
+
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        user_id: str,
+        client_draft_id: str,
+        gmail_draft_id: str | None,
+    ) -> None:
+        self.database_url = database_url
+        self.user_id = user_id
+        self.client_draft_id = client_draft_id
+        self.gmail_draft_id = gmail_draft_id
+        self._scope = None
+
+    def acquire(self) -> None:
+        lock_keys = []
+        if self.gmail_draft_id:
+            lock_keys.append(gmail_draft_lock_key(self.user_id, self.gmail_draft_id))
+        lock_keys.append(client_draft_lock_key(self.user_id, self.client_draft_id))
+        scope = advisory_session_locks(self.database_url, lock_keys=lock_keys)
+        scope.__enter__()
+        self._scope = scope
+
+    def adopt_gmail_draft_id(self, gmail_draft_id: str) -> None:
+        """Release client-only, then reacquire provider -> client deterministically."""
+        if not gmail_draft_id or gmail_draft_id == self.gmail_draft_id:
+            return
+        self.release()
+        self.gmail_draft_id = gmail_draft_id
+        self.acquire()
+
+    def release(self) -> None:
+        scope = self._scope
+        self._scope = None
+        if scope is not None:
+            scope.__exit__(None, None, None)
+
+
 @contextmanager
-def client_draft_lock(database_url: str, *, user_id: str, client_draft_id: str):
-    """Serialize one draft identity across API replicas while Gmail is updated."""
-    with get_engine(database_url).connect() as connection:
-        transaction = connection.begin()
-        try:
-            connection.execute(
-                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-                {"lock_key": f"gmail-draft:{user_id}:{client_draft_id}"},
-            )
-            yield
-            transaction.commit()
-        except Exception:
-            transaction.rollback()
-            raise
+def client_draft_lock(
+    database_url: str,
+    *,
+    user_id: str,
+    client_draft_id: str,
+    gmail_draft_id: str | None = None,
+):
+    """Serialize app and provider draft identities across API replicas.
+
+    Provider identity is always acquired before client identity. That fixed
+    order lets adoption, update, send, and delete converge on one Gmail lock
+    without a lock cycle, even when they use different client-side IDs.
+    """
+    # The helper reuses the provider-barrier session when nested, so one draft
+    # operation consumes at most one slot from the bounded advisory pool.
+    handle = _ClientDraftLockHandle(
+        database_url,
+        user_id=user_id,
+        client_draft_id=client_draft_id,
+        gmail_draft_id=gmail_draft_id,
+    )
+    handle.acquire()
+    try:
+        yield handle
+    finally:
+        handle.release()
 
 
 @dataclass(frozen=True)
@@ -1156,8 +1214,28 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                     )
                     ON CONFLICT (user_id, message_id) DO UPDATE SET
                       gmail_thread_id = excluded.gmail_thread_id,
-                      history_id = excluded.history_id,
-                      label_ids_json = excluded.label_ids_json,
+                      history_id = CASE
+                        WHEN excluded.history_id IS NULL
+                          OR excluded.history_id !~ '^[0-9]+$'
+                          THEN gmail_messages.history_id
+                        WHEN gmail_messages.history_id IS NULL
+                          OR gmail_messages.history_id !~ '^[0-9]+$'
+                          THEN excluded.history_id
+                        WHEN excluded.history_id::NUMERIC > gmail_messages.history_id::NUMERIC
+                          THEN excluded.history_id
+                        ELSE gmail_messages.history_id
+                      END,
+                      label_ids_json = CASE
+                        WHEN excluded.history_id IS NULL
+                          OR excluded.history_id !~ '^[0-9]+$'
+                          THEN gmail_messages.label_ids_json
+                        WHEN gmail_messages.history_id IS NULL
+                          OR gmail_messages.history_id !~ '^[0-9]+$'
+                          THEN excluded.label_ids_json
+                        WHEN excluded.history_id::NUMERIC > gmail_messages.history_id::NUMERIC
+                          THEN excluded.label_ids_json
+                        ELSE gmail_messages.label_ids_json
+                      END,
                       internal_date = excluded.internal_date,
                       subject = excluded.subject,
                       sender = excluded.sender,
@@ -1198,6 +1276,41 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                     """
                 ),
                 _message_params(message),
+            )
+    return len(rows)
+
+
+def force_update_gmail_message_labels(
+    database_url: str,
+    *,
+    user_id: str,
+    labels_by_message_id: dict[str, list[str]],
+) -> int:
+    """Apply local optimistic or rollback labels without changing provider history."""
+    rows = [
+        {
+            "user_id": user_id,
+            "message_id": message_id,
+            "label_ids_json": json.dumps(list(dict.fromkeys(labels)), ensure_ascii=True),
+        }
+        for message_id, labels in labels_by_message_id.items()
+        if message_id
+    ]
+    if not rows:
+        return 0
+    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        for row in rows:
+            connection.execute(
+                text(
+                    """
+                    UPDATE gmail_messages
+                    SET label_ids_json = :label_ids_json,
+                        updated_at = now()
+                    WHERE user_id = :user_id
+                      AND message_id = :message_id
+                    """
+                ),
+                row,
             )
     return len(rows)
 
@@ -1724,6 +1837,68 @@ def mark_client_draft_sent(
     return _client_draft_from_row(row) if row is not None else None
 
 
+def mark_client_draft_sending(
+    database_url: str,
+    *,
+    user_id: str,
+    client_draft_id: str,
+    client_send_id: str,
+) -> ClientDraftRecord | None:
+    """Durably claim one saved draft send before Gmail is called."""
+    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        row = connection.execute(
+            text(
+                """
+                UPDATE gmail_client_drafts
+                SET state = 'sending', last_client_send_id = :client_send_id,
+                    error = NULL, updated_at = now()
+                WHERE user_id = :user_id
+                  AND client_draft_id = :client_draft_id
+                  AND state = 'saved'
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": user_id,
+                "client_draft_id": client_draft_id,
+                "client_send_id": client_send_id,
+            },
+        ).mappings().first()
+    return _client_draft_from_row(row) if row is not None else None
+
+
+def restore_client_draft_after_definite_send_failure(
+    database_url: str,
+    *,
+    user_id: str,
+    client_draft_id: str,
+    client_send_id: str,
+    error: str,
+) -> ClientDraftRecord | None:
+    """Make a definitely rejected send retryable without clearing its identity."""
+    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        row = connection.execute(
+            text(
+                """
+                UPDATE gmail_client_drafts
+                SET state = 'saved', error = :error, updated_at = now()
+                WHERE user_id = :user_id
+                  AND client_draft_id = :client_draft_id
+                  AND state = 'sending'
+                  AND last_client_send_id = :client_send_id
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": user_id,
+                "client_draft_id": client_draft_id,
+                "client_send_id": client_send_id,
+                "error": error,
+            },
+        ).mappings().first()
+    return _client_draft_from_row(row) if row is not None else None
+
+
 def mark_client_draft_deleted(
     database_url: str,
     *,
@@ -1736,7 +1911,9 @@ def mark_client_draft_deleted(
                 """
                 UPDATE gmail_client_drafts
                 SET state = 'deleted', error = NULL, updated_at = now()
-                WHERE user_id = :user_id AND client_draft_id = :client_draft_id
+                WHERE user_id = :user_id
+                  AND client_draft_id = :client_draft_id
+                  AND state NOT IN ('sending', 'sent')
                 RETURNING *
                 """
             ),
@@ -1785,7 +1962,7 @@ def mark_pending_send_sending(database_url: str, *, user_id: str, server_send_id
 
 
 def claim_pending_send(database_url: str, *, user_id: str, server_send_id: str) -> PendingSendRecord | None:
-    """Atomically claim one queued/failed or stale delivery across workers."""
+    """Atomically claim one queued or conclusively failed delivery."""
     with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
         row = connection.execute(
             text(
@@ -1794,10 +1971,7 @@ def claim_pending_send(database_url: str, *, user_id: str, server_send_id: str) 
                 SET state = 'sending', error = NULL, updated_at = now()
                 WHERE user_id = :user_id
                   AND server_send_id = :server_send_id
-                  AND (
-                    state IN ('queued', 'failed')
-                    OR (state = 'sending' AND updated_at < now() - interval '2 minutes')
-                  )
+                  AND state IN ('queued', 'failed')
                 RETURNING *
                 """
             ),
