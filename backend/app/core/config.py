@@ -3,6 +3,7 @@ from __future__ import annotations
 """Runtime configuration loading for the Python backend."""
 
 from dataclasses import dataclass
+import ipaddress
 from pathlib import Path
 import re
 from typing import Literal
@@ -32,6 +33,10 @@ RESERVED_SERVICE_HOST_SUFFIXES = (
     ".local",
     ".localhost",
     ".test",
+)
+RELEASE_SHA_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+CANONICAL_DNS_HOSTNAME = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*"
 )
 
 
@@ -164,19 +169,38 @@ class Settings:
                 errors.append("GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL is required")
             if self.ai_grouping_enabled or self.openai_required or self.openai_configured or self.openai_debug_logs:
                 errors.append("AI/OpenAI configuration must remain disabled for the no-AI production release")
-            if not _is_https_url(self.google_redirect_uri) or urlparse(self.google_redirect_uri).path != "/auth/google/callback":
+            try:
+                google_redirect = urlparse(self.google_redirect_uri)
+            except ValueError:
+                google_redirect = None
+            if (
+                google_redirect is None
+                or not _is_https_url(self.google_redirect_uri)
+                or google_redirect.path != "/auth/google/callback"
+                or google_redirect.params
+                or google_redirect.query
+                or google_redirect.fragment
+            ):
                 errors.append("GOOGLE_REDIRECT_URI must be an HTTPS /auth/google/callback URL outside local development")
+            elif not _uses_public_dns_hostname(self.google_redirect_uri):
+                errors.append("GOOGLE_REDIRECT_URI must use a fully qualified public DNS hostname")
             elif _uses_reserved_service_hostname(self.google_redirect_uri):
                 errors.append("GOOGLE_REDIRECT_URI must use a concrete non-reserved hostname")
-            if not _is_https_origin(self.cors_origin):
+            cors_origin_is_valid = _is_https_origin(self.cors_origin)
+            if not cors_origin_is_valid:
                 errors.append("CORS_ORIGIN must be one HTTPS origin outside local development")
+            elif not _uses_public_dns_hostname(self.cors_origin):
+                errors.append("CORS_ORIGIN must use a fully qualified public DNS hostname")
             elif _uses_reserved_service_hostname(self.cors_origin):
                 errors.append("CORS_ORIGIN must use a concrete non-reserved hostname")
-            if not _is_https_origin(self.web_app_url):
+            web_origin_is_valid = _is_https_origin(self.web_app_url)
+            if not web_origin_is_valid:
                 errors.append("WEB_APP_URL must be one HTTPS origin outside local development")
+            elif not _uses_public_dns_hostname(self.web_app_url):
+                errors.append("WEB_APP_URL must use a fully qualified public DNS hostname")
             elif _uses_reserved_service_hostname(self.web_app_url):
                 errors.append("WEB_APP_URL must use a concrete non-reserved hostname")
-            if _url_origin(self.cors_origin) != _url_origin(self.web_app_url):
+            if cors_origin_is_valid and web_origin_is_valid and self.cors_origin != self.web_app_url:
                 errors.append("CORS_ORIGIN and WEB_APP_URL must identify the same web origin")
             if self.mobile_redirect_uri != "electronicmail://auth/callback":
                 errors.append("MOBILE_REDIRECT_URI must be electronicmail://auth/callback")
@@ -215,8 +239,8 @@ class Settings:
                 errors.append("CORS_ORIGIN cannot be '*' when credentialed authentication is enabled")
             if not self.rate_limit_enabled:
                 errors.append("RATE_LIMIT_ENABLED=true is required outside local development")
-            if self.release_sha == "local" or len(self.release_sha) < 7 or _looks_like_placeholder(self.release_sha):
-                errors.append("RELEASE_SHA must identify the deployed immutable revision")
+            if RELEASE_SHA_PATTERN.fullmatch(self.release_sha) is None:
+                errors.append("RELEASE_SHA must be a full lowercase 40- or 64-hex immutable revision")
 
         return errors
 
@@ -235,6 +259,11 @@ def load_settings() -> Settings:
     """Load environment variables once and expose a typed settings object."""
     database_url = os.getenv("DATABASE_URL", "").strip().strip("\"'")
     app_env = os.getenv("APP_ENV", "local").strip().lower() or "local"
+    web_app_url = os.getenv("WEB_APP_URL", os.getenv("CORS_ORIGIN", "http://localhost:5173"))
+    release_sha = os.getenv("RELEASE_SHA", "local") or "local"
+    if app_env == "local":
+        web_app_url = web_app_url.strip().rstrip("/")
+        release_sha = release_sha.strip()[:64] or "local"
 
     return Settings(
         app_env=app_env,  # type: ignore[arg-type]
@@ -242,7 +271,7 @@ def load_settings() -> Settings:
         database_url=database_url,
         database_path=_resolve_database_path(database_url),
         cors_origin=os.getenv("CORS_ORIGIN", "http://localhost:5173"),
-        web_app_url=os.getenv("WEB_APP_URL", os.getenv("CORS_ORIGIN", "http://localhost:5173")).strip().rstrip("/"),
+        web_app_url=web_app_url,
         app_session_secret=os.getenv("APP_SESSION_SECRET", "local-dev-session-secret").strip().strip("\"'"),
         session_cookie_domain=os.getenv("SESSION_COOKIE_DOMAIN", "").strip().strip("\"'"),
         session_cookie_samesite=_resolve_session_cookie_samesite(),
@@ -270,7 +299,7 @@ def load_settings() -> Settings:
         openai_debug_logs=os.getenv("OPENAI_DEBUG_LOGS", "").strip().lower() in {"1", "true", "yes", "on"},
         ai_grouping_enabled=os.getenv("AI_GROUPING_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"},
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
-        release_sha=os.getenv("RELEASE_SHA", "local").strip()[:64] or "local",
+        release_sha=release_sha,
         rate_limit_enabled=_resolve_boolean("RATE_LIMIT_ENABLED", default=app_env in {"staging", "production"}),
     )
 
@@ -335,23 +364,84 @@ def _looks_like_placeholder(value: str) -> bool:
 
 
 def _is_https_url(value: str) -> bool:
-    parsed = urlparse(value.strip())
-    return parsed.scheme == "https" and bool(parsed.hostname) and not parsed.username and not parsed.password
+    if _contains_control_character(value) or value != value.strip():
+        return False
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return False
+    return parsed.netloc == _canonical_https_netloc(parsed)
 
 
 def _is_https_origin(value: str) -> bool:
-    parsed = urlparse(value.strip())
-    return _is_https_url(value) and parsed.path in {"", "/"} and not parsed.params and not parsed.query and not parsed.fragment
+    if not _is_https_url(value):
+        return False
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    return (
+        parsed.path == ""
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+        and value == f"https://{_canonical_https_netloc(parsed)}"
+    )
+
+
+def _contains_control_character(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _canonical_https_netloc(parsed: object) -> str:
+    try:
+        hostname = getattr(parsed, "hostname", None)
+    except ValueError:
+        return ""
+    if not isinstance(hostname, str) or not hostname:
+        return ""
+    hostname = hostname.lower()
+    if hostname.endswith("."):
+        return ""
+    try:
+        canonical_ip = ipaddress.ip_address(hostname).compressed
+    except ValueError:
+        if CANONICAL_DNS_HOSTNAME.fullmatch(hostname) is None:
+            return ""
+    else:
+        if hostname != canonical_ip:
+            return ""
+    try:
+        port = getattr(parsed, "port", None)
+    except ValueError:
+        return ""
+    if port == 443:
+        return ""
+    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{rendered_host}:{port}" if port is not None else rendered_host
 
 
 def _uses_reserved_service_hostname(value: str) -> bool:
-    host = (urlparse(value.strip()).hostname or "").lower().rstrip(".")
+    try:
+        host = (urlparse(value).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return True
     return host in RESERVED_SERVICE_HOSTS or host.endswith(RESERVED_SERVICE_HOST_SUFFIXES)
 
 
-def _url_origin(value: str) -> tuple[str, str, int | None]:
-    parsed = urlparse(value.strip())
-    return parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port
+def _uses_public_dns_hostname(value: str) -> bool:
+    """Return whether a service URL names a canonical, dotted DNS host."""
+    try:
+        host = (urlparse(value).hostname or "").lower()
+    except ValueError:
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return "." in host and CANONICAL_DNS_HOSTNAME.fullmatch(host) is not None
+    return False
 
 
 def _cookie_domain_matches(cookie_domain: str, *urls: str) -> bool:
@@ -359,7 +449,10 @@ def _cookie_domain_matches(cookie_domain: str, *urls: str) -> bool:
     if not domain or "/" in domain or ":" in domain:
         return False
     for value in urls:
-        host = (urlparse(value.strip()).hostname or "").lower()
+        try:
+            host = (urlparse(value).hostname or "").lower()
+        except ValueError:
+            return False
         if host != domain and not host.endswith(f".{domain}"):
             return False
     return True

@@ -177,7 +177,4 @@ def _request_log_path(scope: dict[str, Any]) -> str:
     route_path = getattr(scope.get("route"), "path", None)
     if isinstance(route_path, str) and route_path:
         return route_path
-    path = str(scope.get("path") or "")
-    if path.startswith("/v1/auth/mobile/handoff/"):
-        return "/v1/auth/mobile/handoff/{handoff_id}"
-    return path
+    return "<unmatched>"

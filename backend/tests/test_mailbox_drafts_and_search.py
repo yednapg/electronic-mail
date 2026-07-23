@@ -15,8 +15,19 @@ from app.db.mail_groups import ClientDraftRecord
 from app.main import app
 from app.schemas.domain import MailDraftResponse, MailDraftSaveRequest, MailboxResponse
 from app.services.mailbox_drafts import _preserved_attachment_inputs, get_draft, save_draft, send_saved_draft
-from app.services.gmail_importer import hydrate_gmail_search_results
-from app.services.mailbox_search import enqueue_mailbox_search_hydration, mailbox_search_key, run_mailbox_search_hydration
+from app.services.gmail_importer import (
+    GMAIL_BACKFILL_JOB_PRIORITY,
+    GMAIL_SEARCH_MAX_PAGES,
+    GMAIL_SEARCH_PAGE_SIZE,
+    hydrate_gmail_search_results,
+)
+from app.services.mailbox_search import (
+    GMAIL_SEARCH_JOB_PRIORITY,
+    GMAIL_SEARCH_MAX_CONTINUATION_JOBS,
+    enqueue_mailbox_search_hydration,
+    mailbox_search_key,
+    run_mailbox_search_hydration,
+)
 from app.workers.main import _run_job
 from backend.tests.test_mailbox_sends import sample_message
 
@@ -952,6 +963,159 @@ class GmailSearchHydrationTests(unittest.TestCase):
         self.assertEqual(count, 0)
         mock_hydrate.assert_not_called()
 
+    @patch("app.services.gmail_importer.rebuild_touched_mail_groups", return_value=1)
+    @patch("app.services.gmail_importer.upsert_gmail_messages")
+    @patch("app.services.gmail_importer._hydrate_message_ids")
+    @patch("app.services.gmail_importer._has_body_for_reader", return_value=True)
+    @patch("app.services.gmail_importer.list_messages_by_ids")
+    @patch("app.services.gmail_importer.build_google_service")
+    @patch("app.services.gmail_importer.create_authorized_credentials", return_value=object())
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_search_hydration_follows_next_page_for_older_body_only_match(
+        self,
+        _mock_can_write: Mock,
+        _mock_credentials: Mock,
+        mock_build: Mock,
+        mock_existing: Mock,
+        _mock_has_body: Mock,
+        mock_hydrate: Mock,
+        mock_upsert: Mock,
+        mock_rebuild: Mock,
+    ) -> None:
+        recent_ids = [f"recent-{index}" for index in range(100)]
+        older_id = "older-body-only-match"
+        execute = Mock(
+            side_effect=[
+                {"messages": [{"id": message_id} for message_id in recent_ids], "nextPageToken": "older-page"},
+                {"messages": [{"id": older_id}]},
+            ]
+        )
+        messages_api = SimpleNamespace(list=Mock(return_value=SimpleNamespace(execute=execute)))
+        mock_build.return_value = SimpleNamespace(users=Mock(return_value=SimpleNamespace(messages=Mock(return_value=messages_api))))
+
+        def existing_messages(*_args, **kwargs):
+            message_ids = kwargs["message_ids"]
+            if message_ids == recent_ids:
+                return [replace(sample_message(), message_id=message_id) for message_id in recent_ids]
+            return []
+
+        older_message = replace(sample_message(), message_id=older_id, gmail_thread_id="older-thread")
+        mock_existing.side_effect = existing_messages
+        mock_hydrate.return_value = ([older_message], "20")
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+
+        count = hydrate_gmail_search_results(
+            settings,
+            user_id="user-1",
+            query="older body phrase",
+            label="all",
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(messages_api.list.call_count, 2)
+        self.assertNotIn("pageToken", messages_api.list.call_args_list[0].kwargs)
+        self.assertEqual(messages_api.list.call_args_list[1].kwargs["pageToken"], "older-page")
+        mock_hydrate.assert_called_once_with(
+            settings,
+            user_id="user-1",
+            message_ids=[older_id],
+            format="full",
+        )
+        mock_upsert.assert_called_once_with(settings.database_path, [older_message])
+        mock_rebuild.assert_called_once_with(
+            settings,
+            user_id="user-1",
+            message_ids=[older_id],
+            use_ai=False,
+        )
+
+    @patch("app.services.gmail_importer._hydrate_message_ids")
+    @patch("app.services.gmail_importer._has_body_for_reader", return_value=True)
+    @patch("app.services.gmail_importer.list_messages_by_ids")
+    @patch("app.services.gmail_importer.build_google_service")
+    @patch("app.services.gmail_importer.create_authorized_credentials", return_value=object())
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_search_hydration_stops_at_production_page_cap(
+        self,
+        _mock_can_write: Mock,
+        _mock_credentials: Mock,
+        mock_build: Mock,
+        mock_existing: Mock,
+        _mock_has_body: Mock,
+        mock_hydrate: Mock,
+    ) -> None:
+        responses = [
+            {"messages": [{"id": f"message-{index}"}], "nextPageToken": f"page-{index + 1}"}
+            for index in range(GMAIL_SEARCH_MAX_PAGES)
+        ]
+        execute = Mock(side_effect=responses)
+        messages_api = SimpleNamespace(list=Mock(return_value=SimpleNamespace(execute=execute)))
+        mock_build.return_value = SimpleNamespace(users=Mock(return_value=SimpleNamespace(messages=Mock(return_value=messages_api))))
+        mock_existing.side_effect = lambda *_args, **kwargs: [
+            replace(sample_message(), message_id=message_id)
+            for message_id in kwargs["message_ids"]
+        ]
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+
+        count = hydrate_gmail_search_results(
+            settings,
+            user_id="user-1",
+            query="many matches",
+            label="all",
+            max_pages=999,
+        )
+
+        self.assertEqual(count, 0)
+        self.assertEqual(messages_api.list.call_count, GMAIL_SEARCH_MAX_PAGES)
+        self.assertEqual(messages_api.list.call_args_list[-1].kwargs["pageToken"], f"page-{GMAIL_SEARCH_MAX_PAGES - 1}")
+        mock_hydrate.assert_not_called()
+
+    @patch("app.services.gmail_importer.rebuild_touched_mail_groups", return_value=1)
+    @patch("app.services.gmail_importer.upsert_gmail_messages")
+    @patch("app.services.gmail_importer._hydrate_message_ids")
+    @patch("app.services.gmail_importer.list_messages_by_ids", return_value=[])
+    @patch("app.services.gmail_importer.build_google_service")
+    @patch("app.services.gmail_importer.create_authorized_credentials", return_value=object())
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_search_hydration_persists_completed_page_before_later_page_failure(
+        self,
+        _mock_can_write: Mock,
+        _mock_credentials: Mock,
+        mock_build: Mock,
+        _mock_existing: Mock,
+        mock_hydrate: Mock,
+        mock_upsert: Mock,
+        mock_rebuild: Mock,
+    ) -> None:
+        first_message = replace(sample_message(), message_id="first-page-message")
+        execute = Mock(
+            side_effect=[
+                {"messages": [{"id": first_message.message_id}], "nextPageToken": "failing-page"},
+                RuntimeError("temporary Gmail failure"),
+            ]
+        )
+        messages_api = SimpleNamespace(list=Mock(return_value=SimpleNamespace(execute=execute)))
+        mock_build.return_value = SimpleNamespace(users=Mock(return_value=SimpleNamespace(messages=Mock(return_value=messages_api))))
+        mock_hydrate.return_value = ([first_message], "20")
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+
+        with self.assertRaisesRegex(RuntimeError, "temporary Gmail failure"):
+            hydrate_gmail_search_results(
+                settings,
+                user_id="user-1",
+                query="retry safely",
+                label="all",
+            )
+
+        self.assertEqual(messages_api.list.call_count, 2)
+        mock_upsert.assert_called_once_with(settings.database_path, [first_message])
+        mock_rebuild.assert_called_once_with(
+            settings,
+            user_id="user-1",
+            message_ids=[first_message.message_id],
+            use_ai=False,
+        )
+
 
 class MailboxSearchBackgroundTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -969,9 +1133,13 @@ class MailboxSearchBackgroundTests(unittest.TestCase):
 
         self.assertEqual(key, mailbox_search_key(query="invoice", label="all"))
         self.assertEqual(mock_enqueue.call_args.kwargs["kind"], "gmail_search_hydrate")
-        self.assertEqual(mock_enqueue.call_args.kwargs["queue"], "reader")
+        self.assertEqual(mock_enqueue.call_args.kwargs["queue"], "slow")
+        self.assertEqual(mock_enqueue.call_args.kwargs["priority"], GMAIL_SEARCH_JOB_PRIORITY)
+        self.assertGreater(GMAIL_SEARCH_JOB_PRIORITY, GMAIL_BACKFILL_JOB_PRIORITY)
         self.assertEqual(mock_enqueue.call_args.kwargs["dedupe_key"], f"gmail-search:user-1:{key}")
-        self.assertEqual(mock_enqueue.call_args.kwargs["payload"]["limit"], 200)
+        self.assertEqual(mock_enqueue.call_args.kwargs["payload"]["limit"], GMAIL_SEARCH_PAGE_SIZE)
+        self.assertEqual(mock_enqueue.call_args.kwargs["payload"]["max_pages"], GMAIL_SEARCH_MAX_PAGES)
+        self.assertEqual(mock_enqueue.call_args.kwargs["payload"]["response_limit"], 200)
         self.assertEqual(mock_enqueue.call_args.kwargs["payload"]["query"], "invoice")
 
     @patch("app.services.mailbox_search.emit_mailbox_event")
@@ -996,7 +1164,7 @@ class MailboxSearchBackgroundTests(unittest.TestCase):
 
     @patch("app.services.mailbox_search.emit_mailbox_event")
     @patch("app.services.mailbox_search.hydrate_gmail_search_results", return_value=0)
-    def test_no_event_when_authoritative_matches_are_already_local(self, _mock_hydrate: Mock, mock_emit: Mock) -> None:
+    def test_completed_hydration_refreshes_even_when_matches_are_already_local(self, _mock_hydrate: Mock, mock_emit: Mock) -> None:
         key = mailbox_search_key(query="invoice", label="all")
 
         count = run_mailbox_search_hydration(
@@ -1006,10 +1174,255 @@ class MailboxSearchBackgroundTests(unittest.TestCase):
             label="all",
             limit=100,
             search_key=key,
+            max_pages=GMAIL_SEARCH_MAX_PAGES,
         )
 
         self.assertEqual(count, 0)
-        mock_emit.assert_not_called()
+        mock_emit.assert_called_once()
+        self.assertEqual(mock_emit.call_args.kwargs["payload"]["hydrated_message_count"], 0)
+
+    @patch("app.services.mailbox_search.emit_mailbox_event")
+    @patch("app.services.mailbox_search.hydrate_gmail_search_results")
+    def test_committed_page_is_announced_before_later_page_failure(self, mock_hydrate: Mock, mock_emit: Mock) -> None:
+        key = mailbox_search_key(query="older receipt", label="all")
+
+        def hydrate_with_later_failure(*_args, **kwargs):
+            kwargs["on_page_hydrated"](3)
+            raise RuntimeError("later Gmail page failed")
+
+        mock_hydrate.side_effect = hydrate_with_later_failure
+
+        with self.assertRaisesRegex(RuntimeError, "later Gmail page failed"):
+            run_mailbox_search_hydration(
+                self.settings,
+                user_id="user-1",
+                query="older receipt",
+                label="all",
+                limit=100,
+                search_key=key,
+            )
+
+        mock_emit.assert_called_once()
+        self.assertEqual(mock_emit.call_args.kwargs["payload"]["search_key"], key)
+        self.assertEqual(mock_emit.call_args.kwargs["payload"]["hydrated_message_count"], 3)
+
+    @patch("app.services.mailbox_search.enqueue_job")
+    @patch("app.services.mailbox_search.emit_mailbox_event")
+    @patch("app.services.gmail_importer._has_body_for_reader", return_value=True)
+    @patch("app.services.gmail_importer.list_messages_by_ids")
+    @patch("app.services.gmail_importer.build_google_service")
+    @patch("app.services.gmail_importer.create_authorized_credentials", return_value=object())
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_bounded_continuation_eventually_reaches_sixth_gmail_page(
+        self,
+        _mock_can_write: Mock,
+        _mock_credentials: Mock,
+        mock_build: Mock,
+        mock_existing: Mock,
+        _mock_has_body: Mock,
+        mock_emit: Mock,
+        mock_enqueue: Mock,
+    ) -> None:
+        responses = [
+            {
+                "messages": [{"id": f"message-{page}"}],
+                "nextPageToken": f"page-token-{page}",
+            }
+            for page in range(1, GMAIL_SEARCH_MAX_PAGES + 1)
+        ]
+        responses.append({"messages": [{"id": "message-6"}]})
+        execute = Mock(side_effect=responses)
+        messages_api = SimpleNamespace(list=Mock(return_value=SimpleNamespace(execute=execute)))
+        mock_build.return_value = SimpleNamespace(users=Mock(return_value=SimpleNamespace(messages=Mock(return_value=messages_api))))
+        mock_existing.side_effect = lambda *_args, **kwargs: [
+            replace(sample_message(), message_id=message_id)
+            for message_id in kwargs["message_ids"]
+        ]
+        key = mailbox_search_key(query="older body match", label="all")
+
+        first_count = run_mailbox_search_hydration(
+            self.settings,
+            user_id="user-1",
+            query="older body match",
+            label="all",
+            limit=GMAIL_SEARCH_PAGE_SIZE,
+            search_key=key,
+        )
+
+        self.assertEqual(first_count, 0)
+        self.assertEqual(messages_api.list.call_count, GMAIL_SEARCH_MAX_PAGES)
+        mock_enqueue.assert_called_once()
+        continuation_job = mock_enqueue.call_args.kwargs
+        continuation_payload = continuation_job["payload"]
+        self.assertEqual(continuation_job["queue"], "slow")
+        self.assertEqual(continuation_job["priority"], GMAIL_SEARCH_JOB_PRIORITY)
+        self.assertIn(":continuation:", continuation_job["dedupe_key"])
+        self.assertEqual(continuation_payload["page_token"], f"page-token-{GMAIL_SEARCH_MAX_PAGES}")
+        self.assertEqual(continuation_payload["continuation_index"], 1)
+        self.assertEqual(len(continuation_payload["continuation_token_hashes"]), 1)
+
+        _run_job(
+            self.settings,
+            SimpleNamespace(
+                payload_version=1,
+                kind="gmail_search_hydrate",
+                user_id="user-1",
+                payload=continuation_payload,
+            ),
+        )
+
+        self.assertEqual(messages_api.list.call_count, GMAIL_SEARCH_MAX_PAGES + 1)
+        self.assertEqual(
+            messages_api.list.call_args_list[-1].kwargs["pageToken"],
+            f"page-token-{GMAIL_SEARCH_MAX_PAGES}",
+        )
+        self.assertEqual(mock_enqueue.call_count, 1)
+        self.assertEqual(mock_emit.call_count, GMAIL_SEARCH_MAX_PAGES + 1)
+
+    @patch("app.services.mailbox_search.emit_mailbox_event")
+    @patch("app.services.mailbox_search.enqueue_job")
+    @patch("app.services.mailbox_search.hydrate_gmail_search_results")
+    def test_continuation_rejects_tampering_and_cross_job_token_loop(
+        self,
+        mock_hydrate: Mock,
+        mock_enqueue: Mock,
+        _mock_emit: Mock,
+    ) -> None:
+        key = mailbox_search_key(query="loop safely", label="all")
+
+        def produce_continuation(*_args, **kwargs):
+            kwargs["on_continuation"]("next-page-token")
+            return 0
+
+        mock_hydrate.side_effect = produce_continuation
+        run_mailbox_search_hydration(
+            self.settings,
+            user_id="user-1",
+            query="loop safely",
+            label="all",
+            limit=100,
+            search_key=key,
+        )
+        payload = mock_enqueue.call_args.kwargs["payload"]
+
+        mock_hydrate.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, "invalid continuation key"):
+            run_mailbox_search_hydration(
+                self.settings,
+                user_id="user-1",
+                query=payload["query"],
+                label=payload["label"],
+                limit=payload["limit"],
+                search_key=payload["search_key"],
+                page_token=payload["page_token"],
+                continuation_index=payload["continuation_index"],
+                continuation_key="0" * 64,
+                continuation_token_hashes=payload["continuation_token_hashes"],
+            )
+        mock_hydrate.assert_not_called()
+
+        with self.assertRaisesRegex(RuntimeError, "invalid continuation token history"):
+            run_mailbox_search_hydration(
+                self.settings,
+                user_id="user-1",
+                query=payload["query"],
+                label=payload["label"],
+                limit=payload["limit"],
+                search_key=payload["search_key"],
+                page_token=payload["page_token"],
+                continuation_index=payload["continuation_index"],
+                continuation_key=payload["continuation_key"],
+                continuation_token_hashes=[[]],
+            )
+        mock_hydrate.assert_not_called()
+
+        mock_enqueue.reset_mock()
+
+        def repeat_continuation(*_args, **kwargs):
+            kwargs["on_continuation"](payload["page_token"])
+            return 0
+
+        mock_hydrate.side_effect = repeat_continuation
+        with self.assertRaisesRegex(RuntimeError, "repeated a continuation page token"):
+            run_mailbox_search_hydration(
+                self.settings,
+                user_id="user-1",
+                query=payload["query"],
+                label=payload["label"],
+                limit=payload["limit"],
+                search_key=payload["search_key"],
+                page_token=payload["page_token"],
+                continuation_index=payload["continuation_index"],
+                continuation_key=payload["continuation_key"],
+                continuation_token_hashes=payload["continuation_token_hashes"],
+            )
+        mock_enqueue.assert_not_called()
+
+    @patch("app.services.mailbox_search.emit_mailbox_event")
+    @patch("app.services.mailbox_search.enqueue_job")
+    @patch("app.services.mailbox_search.hydrate_gmail_search_results")
+    def test_continuation_chain_stops_at_safety_cap(
+        self,
+        mock_hydrate: Mock,
+        mock_enqueue: Mock,
+        _mock_emit: Mock,
+    ) -> None:
+        key = mailbox_search_key(query="bounded chain", label="all")
+        continuation_payload: dict | None = None
+
+        for continuation_index in range(1, GMAIL_SEARCH_MAX_CONTINUATION_JOBS + 1):
+            next_token = f"page-token-{continuation_index}"
+
+            def produce_continuation(*_args, _next_token=next_token, **kwargs):
+                kwargs["on_continuation"](_next_token)
+                return 0
+
+            mock_hydrate.side_effect = produce_continuation
+            call_kwargs = {
+                "user_id": "user-1",
+                "query": "bounded chain",
+                "label": "all",
+                "limit": GMAIL_SEARCH_PAGE_SIZE,
+                "search_key": key,
+            }
+            if continuation_payload is not None:
+                call_kwargs.update(
+                    {
+                        "response_limit": continuation_payload["response_limit"],
+                        "page_token": continuation_payload["page_token"],
+                        "continuation_index": continuation_payload["continuation_index"],
+                        "continuation_key": continuation_payload["continuation_key"],
+                        "continuation_token_hashes": continuation_payload["continuation_token_hashes"],
+                    }
+                )
+            run_mailbox_search_hydration(self.settings, **call_kwargs)
+            continuation_payload = mock_enqueue.call_args.kwargs["payload"]
+            self.assertEqual(continuation_payload["continuation_index"], continuation_index)
+            mock_enqueue.reset_mock()
+
+        if continuation_payload is None:
+            self.fail("continuation chain did not produce a capped payload")
+
+        def overflow_continuation(*_args, **kwargs):
+            kwargs["on_continuation"]("page-token-overflow")
+            return 0
+
+        mock_hydrate.side_effect = overflow_continuation
+        with self.assertRaisesRegex(RuntimeError, "exceeded its continuation safety limit"):
+            run_mailbox_search_hydration(
+                self.settings,
+                user_id="user-1",
+                query="bounded chain",
+                label="all",
+                limit=GMAIL_SEARCH_PAGE_SIZE,
+                search_key=key,
+                response_limit=continuation_payload["response_limit"],
+                page_token=continuation_payload["page_token"],
+                continuation_index=continuation_payload["continuation_index"],
+                continuation_key=continuation_payload["continuation_key"],
+                continuation_token_hashes=continuation_payload["continuation_token_hashes"],
+            )
+        mock_enqueue.assert_not_called()
 
     @patch("app.workers.main.run_mailbox_search_hydration")
     def test_worker_dispatches_persisted_search_hydration(self, mock_run: Mock) -> None:
@@ -1036,6 +1449,12 @@ class MailboxSearchBackgroundTests(unittest.TestCase):
             label="all",
             limit=100,
             search_key=key,
+            max_pages=GMAIL_SEARCH_MAX_PAGES,
+            response_limit=200,
+            page_token=None,
+            continuation_index=0,
+            continuation_key=None,
+            continuation_token_hashes=None,
         )
 
 

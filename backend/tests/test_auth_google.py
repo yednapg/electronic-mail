@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 import json
+import logging
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, Mock, patch
@@ -937,10 +938,19 @@ class MobileLoginCodeRepositoryTests(unittest.TestCase):
 
 
 class SensitiveRequestLoggingTests(unittest.TestCase):
-    def test_handoff_identifier_is_redacted_from_structured_request_log(self) -> None:
+    def test_unmatched_path_uses_fixed_safe_structured_log_value(self) -> None:
         scope = {"path": f"/v1/auth/mobile/handoff/{HANDOFF_ID}"}
 
-        self.assertEqual(_request_log_path(scope), "/v1/auth/mobile/handoff/{handoff_id}")
+        self.assertEqual(_request_log_path(scope), "<unmatched>")
+
+    def test_secret_bearing_404_path_never_appears_in_captured_logs(self) -> None:
+        secret = "oauth-code-do-not-log"
+        with self.assertLogs("electronic_mail.http", level=logging.INFO) as captured:
+            response = TestClient(app).get(f"/missing/{secret}?token={secret}")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(captured.records[-1].event_fields["path"], "<unmatched>")
+        self.assertNotIn(secret, "\n".join(captured.output))
 
 
 if __name__ == "__main__":
