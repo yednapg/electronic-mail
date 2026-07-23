@@ -106,6 +106,442 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(client.mailboxCallCount, 1)
     }
 
+    func testRapidMailboxSwitchKeepsNewestRefreshOwnedWhenCancelledRequestFails() async {
+        let inbox = makeSingleRowMailbox(threadID: "inbox-thread", title: "Inbox")
+        let archive = makeEmptyMailbox(label: .archive, totalThreads: 3, unreadThreads: 1)
+        let sentGate = ReaderActionRequestGate()
+        let archiveGate = ReaderActionRequestGate()
+        let client = RealtimeEventAppClient(
+            sessionMailbox: inbox,
+            mailboxResponses: [inbox, archive],
+            mailboxRequestGates: [.sent: sentGate, .archive: archiveGate],
+            mailboxFailureLabels: [.sent]
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        let sentSwitch = Task {
+            await store.setMailboxLabel(.sent)
+        }
+        await sentGate.waitUntilRequestStarts()
+
+        let archiveSwitch = Task {
+            await store.setMailboxLabel(.archive)
+        }
+        await archiveGate.waitUntilRequestStarts()
+
+        await sentGate.releaseRequest()
+        await sentSwitch.value
+
+        XCTAssertEqual(store.activeMailboxLabel, .archive)
+        XCTAssertFalse(store.refreshFailed)
+
+        let overlappingRefresh = Task {
+            await store.refresh()
+        }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertEqual(client.mailboxLabels.filter { $0 == .archive }.count, 1)
+        XCTAssertFalse(store.refreshFailed)
+
+        await archiveGate.releaseRequest()
+        await archiveSwitch.value
+        await overlappingRefresh.value
+
+        XCTAssertEqual(store.activeMailboxLabel, .archive)
+        XCTAssertEqual(store.activeMailboxCount, MailboxFolderCount(total: 3, unread: 1))
+        XCTAssertFalse(store.refreshFailed)
+    }
+
+    func testForcedMailboxRefreshSupersedesSlowOrdinaryRefresh() async {
+        let initial = makeSingleRowMailbox(threadID: "initial-thread", title: "Initial mailbox")
+        let stale = makeSingleRowMailbox(threadID: "stale-thread", title: "Stale mailbox")
+        let fresh = makeSingleRowMailbox(threadID: "fresh-thread", title: "Fresh mailbox")
+        let ordinaryRefreshGate = ReaderActionRequestGate()
+        let client = RealtimeEventAppClient(
+            sessionMailbox: initial,
+            mailboxResponses: [],
+            mailboxRequestGates: [.inbox: ordinaryRefreshGate],
+            mailboxRequestGateCalls: [.inbox: 2],
+            mailboxResponsesByCall: [1: initial, 2: stale, 3: fresh]
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        let ordinaryRefresh = Task {
+            await store.performTargetedThreadAction(
+                .star,
+                threadID: "initial-thread",
+                messageID: "initial-thread-message"
+            )
+        }
+        await ordinaryRefreshGate.waitUntilRequestStarts()
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: "force-over-ordinary",
+                event: "mailbox-changed",
+                data: #"{"mailbox_label":"inbox","payload":{"mailbox_revision":"forced-revision","mailbox_labels":["inbox"]}}"#
+            )
+        )
+        for _ in 0..<400 where client.mailboxCallCount < 3 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        XCTAssertEqual(client.mailboxCallCount, 3)
+        XCTAssertEqual(store.flatRows.map(\.title), ["Fresh mailbox"])
+
+        await ordinaryRefreshGate.releaseRequest()
+        await ordinaryRefresh.value
+
+        XCTAssertEqual(store.flatRows.map(\.title), ["Fresh mailbox"])
+        XCTAssertNotNil(store.lastForcedMailboxRefreshAt)
+        XCTAssertNil(store.lastForcedMailboxRefreshError)
+    }
+
+    func testHiddenSidebarLoadAvoidsFolderCountAndPriorityThreadPrefetch() async {
+        let mailbox = makeSingleRowMailbox(threadID: "visible-thread", title: "Visible row")
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [mailbox],
+            supportsFolderCountPrefetch: true
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+
+        await store.load()
+        try? await Task.sleep(nanoseconds: 850_000_000)
+
+        XCTAssertEqual(client.appSessionCallCount, 1)
+        XCTAssertEqual(client.mailboxLabels, [.inbox])
+        XCTAssertEqual(client.mailboxLimits, [100])
+        XCTAssertEqual(client.threadCallCount, 0)
+    }
+
+    func testVisibleSidebarFetchesSmallFolderCountsOnlyWhileEnabled() async {
+        let mailbox = makeSingleRowMailbox(threadID: "visible-thread", title: "Visible row")
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [mailbox],
+            supportsFolderCountPrefetch: true
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+
+        await store.load()
+        await store.setFolderCountPrefetchEnabled(true)
+
+        XCTAssertEqual(
+            client.mailboxLabels,
+            [.inbox, .starred, .drafts, .sent, .spam, .trash, .archive, .all]
+        )
+        XCTAssertEqual(client.mailboxLimits, [100] + Array(repeating: 1, count: 7))
+        XCTAssertTrue(client.mailboxCursors.allSatisfy { $0 == nil })
+
+        await store.setFolderCountPrefetchEnabled(false)
+        await store.refreshFolderCounts()
+
+        XCTAssertEqual(client.mailboxLabels.count, 8)
+    }
+
+    func testHidingSidebarCancelsInFlightFolderCountSweep() async {
+        let mailbox = makeSingleRowMailbox(threadID: "visible-thread", title: "Visible row")
+        let countGate = ReaderActionRequestGate()
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [mailbox],
+            supportsFolderCountPrefetch: true,
+            mailboxCountGate: countGate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+
+        await store.load()
+        let countTask = Task {
+            await store.setFolderCountPrefetchEnabled(true)
+        }
+        await countGate.waitUntilRequestStarts()
+
+        await store.setFolderCountPrefetchEnabled(false)
+        await countGate.releaseRequest()
+        await countTask.value
+
+        XCTAssertEqual(client.mailboxLabels, [.inbox, .starred])
+        XCTAssertEqual(client.mailboxLimits, [100, 1])
+        XCTAssertNil(store.mailboxCounts[.starred])
+
+        await store.setFolderCountPrefetchEnabled(true)
+
+        XCTAssertEqual(
+            client.mailboxLabels,
+            [.inbox, .starred, .starred, .drafts, .sent, .spam, .trash, .archive, .all]
+        )
+        XCTAssertEqual(client.mailboxLimits, [100] + Array(repeating: 1, count: 8))
+        XCTAssertNotNil(store.mailboxCounts[.all])
+    }
+
+    func testFolderNavigationRestartsCancelledVisibleSidebarCountSweep() async {
+        let inbox = makeSingleRowMailbox(threadID: "inbox-thread", title: "Inbox row")
+        let sent = MailboxResponse(
+            label: .sent,
+            totalThreads: 0,
+            loadedThreads: 0,
+            sections: [],
+            fullImportRunning: false,
+            fullImportCompleted: true
+        )
+        let countGate = ReaderActionRequestGate()
+        let client = RealtimeEventAppClient(
+            sessionMailbox: inbox,
+            mailboxResponses: [inbox, sent],
+            supportsFolderCountPrefetch: true,
+            mailboxCountGate: countGate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+
+        await store.load()
+        let initialCountTask = Task {
+            await store.setFolderCountPrefetchEnabled(true)
+        }
+        await countGate.waitUntilRequestStarts()
+
+        await store.setMailboxLabel(.sent)
+
+        XCTAssertEqual(
+            client.mailboxLabels,
+            [.inbox, .starred, .sent, .starred, .drafts, .spam, .trash, .archive, .all]
+        )
+        XCTAssertEqual(client.mailboxLimits, [100, 1, 100] + Array(repeating: 1, count: 6))
+        XCTAssertNotNil(store.mailboxCounts[.all])
+
+        await countGate.releaseRequest()
+        await initialCountTask.value
+    }
+
+    func testRepeatedSidebarEnableDoesNotRestartAnActiveCountSweep() async {
+        let mailbox = makeSingleRowMailbox(threadID: "visible-thread", title: "Visible row")
+        let countGate = ReaderActionRequestGate()
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [],
+            supportsFolderCountPrefetch: true,
+            mailboxCountGate: countGate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+
+        await store.load()
+        let initialCountTask = Task {
+            await store.setFolderCountPrefetchEnabled(true)
+        }
+        await countGate.waitUntilRequestStarts()
+
+        await store.setFolderCountPrefetchEnabled(true)
+
+        XCTAssertEqual(client.mailboxLabels, [.inbox, .starred])
+        XCTAssertNil(store.mailboxCounts[.all])
+
+        await countGate.releaseRequest()
+        await initialCountTask.value
+
+        XCTAssertEqual(
+            client.mailboxLabels,
+            [.inbox, .starred, .drafts, .sent, .spam, .trash, .archive, .all]
+        )
+        XCTAssertNotNil(store.mailboxCounts[.all])
+    }
+
+    func testFolderNavigationDoesNotRestartCompletedFreshCountSweep() async {
+        let inbox = makeSingleRowMailbox(threadID: "inbox-thread", title: "Inbox row")
+        let sent = makeEmptyMailbox(label: .sent, totalThreads: 4, unreadThreads: 1)
+        let countResponses = [
+            makeEmptyMailbox(label: .starred),
+            makeEmptyMailbox(label: .drafts),
+            makeEmptyMailbox(label: .sent),
+            makeEmptyMailbox(label: .spam),
+            makeEmptyMailbox(label: .trash),
+            makeEmptyMailbox(label: .archive),
+            makeEmptyMailbox(label: .all),
+        ]
+        let client = RealtimeEventAppClient(
+            sessionMailbox: inbox,
+            mailboxResponses: [inbox] + countResponses + [sent],
+            supportsFolderCountPrefetch: true
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+
+        await store.load()
+        await store.setFolderCountPrefetchEnabled(true)
+        let callsAfterCompletedSweep = client.mailboxCallCount
+
+        await store.setMailboxLabel(.sent)
+
+        XCTAssertEqual(client.mailboxCallCount, callsAfterCompletedSweep + 1)
+        XCTAssertEqual(Array(client.mailboxLabels.suffix(1)), [.sent])
+        XCTAssertEqual(Array(client.mailboxLimits.suffix(1)), [100])
+        XCTAssertEqual(store.mailboxCounts[.sent], MailboxFolderCount(total: 4, unread: 1))
+    }
+
+    func testFolderNavigationFetchesOnlyChangedFolderWithoutPriorityThreadPrefetch() async {
+        let inbox = makeSingleRowMailbox(threadID: "inbox-thread", title: "Inbox row")
+        let sent = MailboxResponse(
+            label: .sent,
+            totalThreads: 0,
+            loadedThreads: 0,
+            sections: [],
+            fullImportRunning: false,
+            fullImportCompleted: true
+        )
+        let client = RealtimeEventAppClient(
+            sessionMailbox: inbox,
+            mailboxResponses: [inbox, sent],
+            supportsFolderCountPrefetch: true
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+
+        await store.load()
+        await store.setMailboxLabel(.sent)
+        await store.setMailboxLabel(.sent)
+        try? await Task.sleep(nanoseconds: 850_000_000)
+
+        XCTAssertEqual(client.mailboxLabels, [.inbox, .sent])
+        XCTAssertEqual(client.mailboxLimits, [100, 100])
+        XCTAssertEqual(client.threadCallCount, 0)
+    }
+
+    func testFolderCountFetchDoesNotReplaceOfflineFullMailboxCache() async throws {
+        let fullMailbox = DemoAppFixtures.mailbox
+        let countResponse = makeSingleRowMailbox(threadID: "count-row", title: "Count row")
+        let backend = RealtimeEventAppClient(
+            sessionMailbox: fullMailbox,
+            mailboxResponses: [countResponse]
+        )
+        let localStore = MemoryLocalMailStore()
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+
+        _ = try await client.appSession()
+        localStore.writeMailbox(fullMailbox, userID: DemoAppFixtures.userID, label: .inbox)
+
+        _ = try await client.mailboxFolderCount(label: .inbox)
+
+        XCTAssertEqual(
+            localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox),
+            fullMailbox
+        )
+        XCTAssertEqual(backend.mailboxLimits, [1])
+    }
+
+    func testSyncPollingPolicyDefersToFreshRealtimeEvents() {
+        let now = Date(timeIntervalSince1970: 10_000)
+
+        XCTAssertFalse(
+            MailboxBackgroundRefreshPolicy.shouldPollSyncState(
+                supportsRealtimeUpdates: true,
+                realtimeConnected: true,
+                lastRealtimeEventAt: now.addingTimeInterval(-24),
+                now: now
+            )
+        )
+    }
+
+    func testSyncPollingPolicyPollsWhenConnectedStreamIsStaleOrMissingEvents() {
+        let now = Date(timeIntervalSince1970: 10_000)
+
+        XCTAssertTrue(
+            MailboxBackgroundRefreshPolicy.shouldPollSyncState(
+                supportsRealtimeUpdates: true,
+                realtimeConnected: true,
+                lastRealtimeEventAt: now.addingTimeInterval(-26),
+                now: now
+            )
+        )
+        XCTAssertTrue(
+            MailboxBackgroundRefreshPolicy.shouldPollSyncState(
+                supportsRealtimeUpdates: true,
+                realtimeConnected: true,
+                lastRealtimeEventAt: nil,
+                now: now
+            )
+        )
+    }
+
+    func testSyncPollingPolicyPollsWithoutRealtimeConnectionOrSupport() {
+        let now = Date(timeIntervalSince1970: 10_000)
+
+        XCTAssertTrue(
+            MailboxBackgroundRefreshPolicy.shouldPollSyncState(
+                supportsRealtimeUpdates: true,
+                realtimeConnected: false,
+                lastRealtimeEventAt: now,
+                now: now
+            )
+        )
+        XCTAssertTrue(
+            MailboxBackgroundRefreshPolicy.shouldPollSyncState(
+                supportsRealtimeUpdates: false,
+                realtimeConnected: true,
+                lastRealtimeEventAt: now,
+                now: now
+            )
+        )
+    }
+
+    func testThreadTaskOwnerRegistryIgnoresLateReleaseFromCancelledOwner() {
+        var owners = ThreadTaskOwnerRegistry()
+        let oldOwner = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+        let newOwner = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+
+        _ = owners.claim(threadID: "thread-1", ownerID: oldOwner)
+        owners.cancel(threadID: "thread-1")
+        _ = owners.claim(threadID: "thread-1", ownerID: newOwner)
+
+        XCTAssertFalse(owners.release(threadID: "thread-1", ownerID: oldOwner))
+        XCTAssertEqual(owners.ownerID(for: "thread-1"), newOwner)
+        XCTAssertTrue(owners.release(threadID: "thread-1", ownerID: newOwner))
+        XCTAssertNil(owners.ownerID(for: "thread-1"))
+    }
+
+    func testDefaultReaderBodyRefreshScheduleOutlivesFirstBackendRetryWindow() {
+        let delays = ReaderBodyRefreshPolicy.defaultDelaysNanoseconds
+
+        XCTAssertGreaterThanOrEqual(delays.last ?? 0, 30_000_000_000)
+        XCTAssertGreaterThanOrEqual(delays.reduce(0, +), 60_000_000_000)
+    }
+
     func testCompletedEmptyMailboxCanEnterMainInterface() async {
         let emptyMailbox = MailboxResponse(
             label: .inbox,
@@ -365,6 +801,268 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertFalse(store.readerThread?.messages.first?.labelIDs.contains("STARRED") == true)
 
         await actionGate.releaseRequest()
+        await actionTask.value
+
+        XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("STARRED") == true)
+    }
+
+    func testStaleReaderFetchCannotOverwriteLabelsMutatedWhileRequestWasInFlight() async {
+        let threadID = "reader-label-race-thread"
+        let messageID = "reader-label-race-message"
+        let mailbox = makeSingleRowMailbox(threadID: threadID, title: "Reader label race")
+        let cachedThread = makeReaderActionThread(
+            threadID: threadID,
+            messageID: messageID,
+            labelIDs: ["INBOX"]
+        )
+        let staleFetchedThread = makeReaderActionThread(
+            threadID: threadID,
+            messageID: messageID,
+            labelIDs: ["INBOX"]
+        )
+        let requestGate = ReaderActionRequestGate()
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [mailbox, mailbox],
+            threadResponses: [staleFetchedThread],
+            threadRequestGate: requestGate
+        )
+        let threadCache = ThreadCache(defaults: .ephemeral())
+        threadCache.write(cachedThread, userID: DemoAppFixtures.userID, threadID: threadID)
+        let localStore = MemoryLocalMailStore()
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: threadCache,
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        let openTask = store.openReader(threadID: threadID, focusedMessageID: messageID)
+        await requestGate.waitUntilRequestStarts()
+
+        await store.performReaderThreadAction(.star, threadID: threadID, messageID: messageID)
+        await store.performReaderThreadAction(.markUnread, threadID: threadID, messageID: messageID)
+        XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("STARRED") == true)
+        XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("UNREAD") == true)
+
+        await requestGate.releaseRequest()
+        await openTask.value
+
+        XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("STARRED") == true)
+        XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("UNREAD") == true)
+        XCTAssertTrue(
+            threadCache
+                .read(userID: DemoAppFixtures.userID, threadID: threadID)?
+                .messages.first?
+                .labelIDs.contains("STARRED") == true
+        )
+        XCTAssertTrue(
+            threadCache
+                .read(userID: DemoAppFixtures.userID, threadID: threadID)?
+                .messages.first?
+                .labelIDs.contains("UNREAD") == true
+        )
+        XCTAssertTrue(
+            localStore
+                .readThread(userID: DemoAppFixtures.userID, threadID: threadID)?
+                .messages.first?
+                .labelIDs.contains("STARRED") == true
+        )
+        XCTAssertTrue(
+            localStore
+                .readThread(userID: DemoAppFixtures.userID, threadID: threadID)?
+                .messages.first?
+                .labelIDs.contains("UNREAD") == true
+        )
+    }
+
+    func testReaderFetchStartedDuringLabelMutationPreservesSettledLabel() async {
+        let threadID = "reader-label-settlement-race"
+        let messageID = "reader-label-settlement-message"
+        let mailbox = makeSingleRowMailbox(threadID: threadID, title: "Reader label settlement")
+        let initialThread = makeReaderActionThread(
+            threadID: threadID,
+            messageID: messageID,
+            labelIDs: ["INBOX"]
+        )
+        let staleFetchedThread = makeReaderActionThread(
+            threadID: threadID,
+            messageID: messageID,
+            labelIDs: ["INBOX"]
+        )
+        let actionGate = ReaderActionRequestGate()
+        let readerGate = ReaderActionRequestGate()
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [mailbox, mailbox],
+            threadResponses: [initialThread, staleFetchedThread],
+            threadRequestGate: readerGate,
+            threadRequestGateCall: 2,
+            actionRequestGate: actionGate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        await store.openReader(threadID: threadID, focusedMessageID: messageID).value
+
+        let actionTask = Task {
+            await store.performReaderThreadAction(.star, threadID: threadID, messageID: messageID)
+        }
+        await actionGate.waitUntilRequestStarts()
+        XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("STARRED") == true)
+
+        let readerTask = Task {
+            await store.prefetchThread(threadID: threadID, force: true, silent: false)
+        }
+        await readerGate.waitUntilRequestStarts()
+
+        await actionGate.releaseRequest()
+        await actionTask.value
+        await readerGate.releaseRequest()
+        await readerTask.value
+
+        XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("STARRED") == true)
+    }
+
+    func testLabelActionCompletedBeforeColdReaderFetchCannotBeOverwrittenByStaleResponse() async {
+        let threadID = "cold-reader-label-race"
+        let messageID = "cold-reader-label-message"
+        let mailbox = makeSingleRowMailbox(threadID: threadID, title: "Cold reader label race")
+        let staleFetchedThread = makeReaderActionThread(
+            threadID: threadID,
+            messageID: messageID,
+            labelIDs: ["INBOX", "UNREAD"]
+        )
+        let actionGate = ReaderActionRequestGate()
+        let readerGate = ReaderActionRequestGate()
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [mailbox, mailbox],
+            threadResponses: [staleFetchedThread],
+            threadRequestGate: readerGate,
+            actionRequestGate: actionGate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        let readerTask = store.openReader(threadID: threadID, focusedMessageID: messageID)
+        await readerGate.waitUntilRequestStarts()
+        XCTAssertNil(store.readerThread)
+
+        let actionTask = Task {
+            await store.performReaderThreadAction(.markRead, threadID: threadID, messageID: messageID)
+        }
+        await actionGate.waitUntilRequestStarts()
+        await actionGate.releaseRequest()
+        await actionTask.value
+
+        await readerGate.releaseRequest()
+        await readerTask.value
+
+        XCTAssertFalse(store.readerThread?.messages.first?.labelIDs.contains("UNREAD") == true)
+    }
+
+    func testLoadedOppositeLabelActionSupersedesSettledColdReaderIntent() async {
+        let threadID = "cold-reader-opposite-action"
+        let messageID = "cold-reader-opposite-message"
+        let mailbox = makeSingleRowMailbox(threadID: threadID, title: "Cold reader opposite action")
+        let unreadThread = makeReaderActionThread(
+            threadID: threadID,
+            messageID: messageID,
+            labelIDs: ["INBOX", "UNREAD"]
+        )
+        let readerGate = ReaderActionRequestGate()
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [mailbox, mailbox, mailbox],
+            threadResponses: [unreadThread, unreadThread],
+            threadRequestGate: readerGate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        let readerTask = store.openReader(threadID: threadID, focusedMessageID: messageID)
+        await readerGate.waitUntilRequestStarts()
+        await store.performReaderThreadAction(.markRead, threadID: threadID, messageID: messageID)
+        await readerGate.releaseRequest()
+        await readerTask.value
+        XCTAssertFalse(store.readerThread?.messages.first?.labelIDs.contains("UNREAD") == true)
+
+        await store.performReaderThreadAction(.markUnread, threadID: threadID, messageID: messageID)
+        XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("UNREAD") == true)
+
+        await store.prefetchThread(threadID: threadID, force: true, silent: false)
+
+        XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("UNREAD") == true)
+    }
+
+    func testDiskPersistenceDelayCannotOverwriteNewerOptimisticReaderLabel() async {
+        let threadID = "reader-persistence-race"
+        let messageID = "reader-persistence-message"
+        let mailbox = makeSingleRowMailbox(threadID: threadID, title: "Reader persistence race")
+        let initialThread = makeReaderActionThread(
+            threadID: threadID,
+            messageID: messageID,
+            labelIDs: ["INBOX"]
+        )
+        let staleFetchedThread = makeReaderActionThread(
+            threadID: threadID,
+            messageID: messageID,
+            labelIDs: ["INBOX"]
+        )
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [mailbox, mailbox],
+            threadResponses: [initialThread, staleFetchedThread]
+        )
+        let localStore = BlockingThreadWriteLocalMailStore(blockOnThreadWriteCall: 2)
+        defer { localStore.releaseBlockedThreadWrite() }
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        await store.openReader(threadID: threadID, focusedMessageID: messageID).value
+
+        let refreshTask = Task {
+            await store.prefetchThread(threadID: threadID, force: true, silent: false)
+        }
+        for _ in 0..<100 where !localStore.hasBlockedThreadWrite {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertTrue(localStore.hasBlockedThreadWrite)
+
+        let actionTask = Task {
+            await store.performReaderThreadAction(.star, threadID: threadID, messageID: messageID)
+        }
+        for _ in 0..<100 where store.readerThread?.messages.first?.labelIDs.contains("STARRED") != true {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("STARRED") == true)
+
+        localStore.releaseBlockedThreadWrite()
+        await refreshTask.value
         await actionTask.value
 
         XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("STARRED") == true)
@@ -1622,6 +2320,193 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(store.lastForcedMailboxRefreshAt, initialForcedRefreshAt)
     }
 
+    func testThreadContentHydratedSSEImmediatelyReplacesSnippetWithFullBodyAndAttachments() async {
+        let mailbox = makeSingleRowMailbox(threadID: "hydrating-thread", title: "Hydrating")
+        let incomplete = makeHydrationThread(body: "Metadata snippet", bodyComplete: false)
+        let hydrated = makeHydrationThread(
+            body: "Complete Gmail message body",
+            bodyComplete: true,
+            attachments: [
+                ThreadAttachment(
+                    id: "message-1:attachment-1",
+                    filename: "statement.pdf",
+                    mimeType: "application/pdf",
+                    size: 1_024,
+                    attachmentID: "attachment-1",
+                    partID: "1",
+                    downloadURL: "/v1/mailbox/messages/message-1/attachments/attachment-1"
+                )
+            ]
+        )
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [mailbox],
+            threadResponses: [incomplete, hydrated]
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false,
+            bodyRefreshDelaysNanoseconds: [60_000_000_000]
+        )
+
+        await store.load()
+        await store.openReader(threadID: "hydrating-thread").value
+        XCTAssertEqual(store.readerThread?.messages.first?.body, "Metadata snippet")
+        XCTAssertEqual(client.threadCallCount, 1)
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: "hydrate-1",
+                event: "thread-content-hydrated",
+                data: #"{"payload":{"thread_ids":["hydrating-thread"],"hydrated_message_count":1}}"#
+            )
+        )
+        for _ in 0..<20 where client.threadCallCount < 2 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        XCTAssertEqual(client.threadCallCount, 2)
+        XCTAssertEqual(store.readerThread?.messages.first?.body, "Complete Gmail message body")
+        XCTAssertEqual(store.readerThread?.messages.first?.attachments.map(\.filename), ["statement.pdf"])
+        XCTAssertEqual(store.readerThread?.messages.first?.bodyComplete, true)
+    }
+
+    func testHydrationEventDuringInFlightStaleReaderFetchStartsOneImmediateFollowUp() async {
+        let mailbox = makeSingleRowMailbox(threadID: "racing-thread", title: "Racing hydration")
+        let requestGate = ReaderActionRequestGate()
+        let incomplete = makeHydrationThread(
+            body: "Metadata snippet",
+            bodyComplete: false,
+            threadID: "racing-thread"
+        )
+        let hydrated = makeHydrationThread(
+            body: "Hydrated after the in-flight response",
+            bodyComplete: true,
+            threadID: "racing-thread"
+        )
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [mailbox],
+            threadResponses: [incomplete, hydrated],
+            threadRequestGate: requestGate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false,
+            bodyRefreshDelaysNanoseconds: [60_000_000_000]
+        )
+
+        await store.load()
+        let openTask = store.openReader(threadID: "racing-thread")
+        await requestGate.waitUntilRequestStarts()
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: "hydrate-race-1",
+                event: "thread-content-hydrated",
+                data: #"{"payload":{"thread_ids":["racing-thread"],"hydrated_message_count":1}}"#
+            )
+        )
+        XCTAssertEqual(client.threadCallCount, 1)
+
+        await requestGate.releaseRequest()
+        await openTask.value
+        for _ in 0..<40 where client.threadCallCount < 2 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        XCTAssertEqual(client.threadCallCount, 2)
+        XCTAssertEqual(
+            store.readerThread?.messages.first?.body,
+            "Hydrated after the in-flight response"
+        )
+        XCTAssertTrue(store.readerThread?.messages.first?.bodyComplete == true)
+
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(client.threadCallCount, 2)
+    }
+
+    func testIncompleteReaderUsesBoundedRefreshFallbackWhenSSEIsUnavailable() async {
+        let mailbox = makeSingleRowMailbox(threadID: "fallback-thread", title: "Fallback")
+        let incomplete = makeHydrationThread(body: "Metadata snippet", bodyComplete: false, threadID: "fallback-thread")
+        let hydrated = makeHydrationThread(body: "Hydrated by fallback", bodyComplete: true, threadID: "fallback-thread")
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailbox,
+            mailboxResponses: [mailbox],
+            threadResponses: [incomplete, hydrated]
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false,
+            bodyRefreshDelaysNanoseconds: [1_000_000]
+        )
+
+        await store.load()
+        await store.openReader(threadID: "fallback-thread").value
+        for _ in 0..<20 where client.threadCallCount < 2 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        XCTAssertEqual(client.threadCallCount, 2)
+        XCTAssertEqual(store.readerThread?.messages.first?.body, "Hydrated by fallback")
+        XCTAssertEqual(store.readerThread?.messages.first?.bodyComplete, true)
+    }
+
+    func testSyncStateSSEUpdatesFullStateAndMarksRealtimeRecovered() async throws {
+        let mailbox = makeSingleRowMailbox(threadID: "inbox-thread", title: "Inbox row")
+        let client = RealtimeEventAppClient(sessionMailbox: mailbox, mailboxResponses: [mailbox])
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+        await store.load()
+        var state = makeMailboxSyncStateResponse(connected: true, mailboxRevision: "sse-revision-1")
+        state.watchStatus = "active"
+        state.pollerOnline = true
+        state.pendingActionCount = 2
+        let data = String(decoding: try JSONEncoder.backend.encode(state), as: UTF8.self)
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(id: nil, event: "sync-state", data: data)
+        )
+
+        XCTAssertEqual(store.syncState, state)
+        XCTAssertTrue(store.realtimeConnected)
+        XCTAssertNotNil(store.lastSSEConnectedAt)
+        XCTAssertNotNil(store.lastSSEEventAt)
+        store.stopLiveRefreshLoop()
+    }
+
+    func testDisconnectedSyncStateSSETransitionsToReauthentication() async throws {
+        let mailbox = makeSingleRowMailbox(threadID: "inbox-thread", title: "Inbox row")
+        let client = RealtimeEventAppClient(sessionMailbox: mailbox, mailboxResponses: [mailbox])
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+        store.setSessionToken("revoked-google-token-session")
+        await store.load()
+        let state = makeMailboxSyncStateResponse(connected: false, mailboxRevision: "sse-revision-2")
+        let data = String(decoding: try JSONEncoder.backend.encode(state), as: UTF8.self)
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(id: nil, event: "sync-state", data: data)
+        )
+
+        XCTAssertFalse(store.hasSessionToken)
+        XCTAssertNil(store.session)
+        XCTAssertFalse(store.realtimeConnected)
+        XCTAssertEqual(store.phase, .failed("Sign in with Google to load your mailbox."))
+    }
+
     func testDashboardChangedSSERefreshesSessionEvenForDuplicateRevision() async {
         let mailbox = makeSingleRowMailbox(threadID: "inbox-thread", title: "Inbox row")
         let client = RealtimeEventAppClient(sessionMailbox: mailbox, mailboxResponses: [mailbox, mailbox, mailbox])
@@ -1634,7 +2519,12 @@ final class InboxStoreTests: XCTestCase {
             MailboxServerEvent(
                 id: nil,
                 event: "sync-state",
-                data: #"{"mailbox_revision":"rev-1"}"#
+                data: String(
+                    decoding: try! JSONEncoder.backend.encode(
+                        makeMailboxSyncStateResponse(connected: true, mailboxRevision: "rev-1")
+                    ),
+                    as: UTF8.self
+                )
             )
         )
         try? await Task.sleep(nanoseconds: 1_200_000_000)
@@ -2293,6 +3183,76 @@ private func makeSingleRowMailbox(threadID: String, title: String, receivedAt: S
     )
 }
 
+private func makeEmptyMailbox(
+    label: MailboxLabel,
+    totalThreads: Int = 0,
+    unreadThreads: Int = 0
+) -> MailboxResponse {
+    MailboxResponse(
+        label: label,
+        totalThreads: totalThreads,
+        unreadThreads: unreadThreads,
+        loadedThreads: 0,
+        sections: [],
+        fullImportRunning: false,
+        fullImportCompleted: true
+    )
+}
+
+private func makeMailboxSyncStateResponse(
+    connected: Bool,
+    mailboxRevision: String?
+) -> MailboxSyncStateResponse {
+    var state = MailboxSyncStateResponse(
+        connected: connected,
+        lastHistoryID: connected ? "history-sse" : nil,
+        lastFullSyncAt: connected ? "2026-07-23T12:00:00Z" : nil,
+        watchExpirationAt: connected ? "2026-07-23T13:00:00Z" : nil,
+        lastSyncStartedAt: "2026-07-23T11:59:59Z",
+        lastSyncCompletedAt: connected ? "2026-07-23T12:00:00Z" : nil,
+        lastSyncError: connected ? nil : "Google is not connected.",
+        totalThreads: 1
+    )
+    state.mailboxRevision = mailboxRevision
+    return state
+}
+
+private func makeHydrationThread(
+    body: String,
+    bodyComplete: Bool,
+    threadID: String = "hydrating-thread",
+    attachments: [ThreadAttachment] = []
+) -> ThreadReaderResponse {
+    ThreadReaderResponse(
+        entityID: threadID,
+        userID: DemoAppFixtures.userID,
+        source: .gmail,
+        gmailThreadID: threadID,
+        subject: "Hydration test",
+        totalMessages: 1,
+        messages: [
+            ThreadMessage(
+                id: "message-1",
+                source: .gmail,
+                threadID: threadID,
+                fromAddress: "sender@example.com",
+                to: "gaurav@example.com",
+                cc: nil,
+                bcc: nil,
+                subject: "Hydration test",
+                body: body,
+                bodyComplete: bodyComplete,
+                htmlBody: nil,
+                htmlRenderDocument: nil,
+                snippet: "Metadata snippet",
+                attachments: attachments,
+                labelIDs: ["INBOX"],
+                receivedAt: "2026-05-29T09:30:00+05:30"
+            )
+        ]
+    )
+}
+
 private func makeReaderActionThread(threadID: String, messageID: String, labelIDs: [String]) -> ThreadReaderResponse {
     ThreadReaderResponse(
         entityID: threadID,
@@ -2348,6 +3308,84 @@ private actor ReaderActionRequestGate {
     func releaseRequest() {
         releaseContinuation?.resume()
         releaseContinuation = nil
+    }
+}
+
+private final class BlockingThreadWriteLocalMailStore: LocalMailStore {
+    private let base = MemoryLocalMailStore()
+    private let lock = NSLock()
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
+    private let blockOnThreadWriteCall: Int
+    private var threadWriteCallCount = 0
+    private var blockedThreadWrite = false
+
+    init(blockOnThreadWriteCall: Int) {
+        self.blockOnThreadWriteCall = blockOnThreadWriteCall
+    }
+
+    var hasBlockedThreadWrite: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return blockedThreadWrite
+    }
+
+    func releaseBlockedThreadWrite() {
+        releaseSemaphore.signal()
+    }
+
+    func readSession() -> AppSessionResponse? {
+        base.readSession()
+    }
+
+    func writeSession(_ session: AppSessionResponse) {
+        base.writeSession(session)
+    }
+
+    func readMailbox(userID: String, label: MailboxLabel) -> MailboxResponse? {
+        base.readMailbox(userID: userID, label: label)
+    }
+
+    func writeMailbox(_ mailbox: MailboxResponse, userID: String, label: MailboxLabel) {
+        base.writeMailbox(mailbox, userID: userID, label: label)
+    }
+
+    func readThread(userID: String, threadID: String) -> ThreadReaderResponse? {
+        base.readThread(userID: userID, threadID: threadID)
+    }
+
+    func writeThread(_ thread: ThreadReaderResponse, userID: String, threadID: String) {
+        lock.lock()
+        threadWriteCallCount += 1
+        let shouldBlock = threadWriteCallCount == blockOnThreadWriteCall
+        if shouldBlock {
+            blockedThreadWrite = true
+        }
+        lock.unlock()
+
+        if shouldBlock {
+            releaseSemaphore.wait()
+        }
+        base.writeThread(thread, userID: userID, threadID: threadID)
+    }
+
+    func writePendingThreadAction(_ action: LocalPendingThreadAction) {
+        base.writePendingThreadAction(action)
+    }
+
+    func pendingThreadActions() -> [LocalPendingThreadAction] {
+        base.pendingThreadActions()
+    }
+
+    func removePendingThreadAction(clientActionID: String) {
+        base.removePendingThreadAction(clientActionID: clientActionID)
+    }
+
+    func markPendingThreadActionFailed(clientActionID: String, error: String) {
+        base.markPendingThreadActionFailed(clientActionID: clientActionID, error: error)
+    }
+
+    func clearAll() {
+        base.clearAll()
     }
 }
 
@@ -2634,14 +3672,54 @@ private final class RealtimeEventAppClient: AppClient {
     var baseURL = AppConfiguration.defaultBackendURL
     var sessionToken: String?
     let mode: AppRunMode = .demo
+    let supportsFolderCountPrefetch: Bool
     private let sessionMailbox: MailboxResponse
     private var mailboxResponses: [MailboxResponse]
+    private var threadResponses: [ThreadReaderResponse]
+    private let mailboxCountGate: ReaderActionRequestGate?
+    private let mailboxRequestGates: [MailboxLabel: ReaderActionRequestGate]
+    private let mailboxRequestGateCalls: [MailboxLabel: Int]
+    private let mailboxResponsesByCall: [Int: MailboxResponse]
+    private let mailboxFailureLabels: Set<MailboxLabel>
+    private let threadRequestGate: ReaderActionRequestGate?
+    private let threadRequestGateCall: Int
+    private let actionRequestGate: ReaderActionRequestGate?
+    private var didSuspendCountRequest = false
+    private var mailboxCallsByLabel: [MailboxLabel: Int] = [:]
+    private var didSuspendThreadRequest = false
     private(set) var appSessionCallCount = 0
     private(set) var mailboxCallCount = 0
+    private(set) var mailboxLabels: [MailboxLabel] = []
+    private(set) var mailboxLimits: [Int] = []
+    private(set) var mailboxCursors: [String?] = []
+    private(set) var threadCallCount = 0
 
-    init(sessionMailbox: MailboxResponse, mailboxResponses: [MailboxResponse]) {
+    init(
+        sessionMailbox: MailboxResponse,
+        mailboxResponses: [MailboxResponse],
+        threadResponses: [ThreadReaderResponse] = [],
+        supportsFolderCountPrefetch: Bool = false,
+        mailboxCountGate: ReaderActionRequestGate? = nil,
+        mailboxRequestGates: [MailboxLabel: ReaderActionRequestGate] = [:],
+        mailboxRequestGateCalls: [MailboxLabel: Int] = [:],
+        mailboxResponsesByCall: [Int: MailboxResponse] = [:],
+        mailboxFailureLabels: Set<MailboxLabel> = [],
+        threadRequestGate: ReaderActionRequestGate? = nil,
+        threadRequestGateCall: Int = 1,
+        actionRequestGate: ReaderActionRequestGate? = nil
+    ) {
         self.sessionMailbox = sessionMailbox
         self.mailboxResponses = mailboxResponses
+        self.threadResponses = threadResponses
+        self.supportsFolderCountPrefetch = supportsFolderCountPrefetch
+        self.mailboxCountGate = mailboxCountGate
+        self.mailboxRequestGates = mailboxRequestGates
+        self.mailboxRequestGateCalls = mailboxRequestGateCalls
+        self.mailboxResponsesByCall = mailboxResponsesByCall
+        self.mailboxFailureLabels = mailboxFailureLabels
+        self.threadRequestGate = threadRequestGate
+        self.threadRequestGateCall = threadRequestGateCall
+        self.actionRequestGate = actionRequestGate
     }
 
     func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
@@ -2662,6 +3740,27 @@ private final class RealtimeEventAppClient: AppClient {
 
     func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
         mailboxCallCount += 1
+        mailboxLabels.append(label)
+        mailboxLimits.append(limit)
+        mailboxCursors.append(cursor)
+        mailboxCallsByLabel[label, default: 0] += 1
+        let labelCall = mailboxCallsByLabel[label, default: 0]
+        let responseForCall = mailboxResponsesByCall[mailboxCallCount]
+        if limit == 1, !didSuspendCountRequest, let mailboxCountGate {
+            didSuspendCountRequest = true
+            await mailboxCountGate.suspendRequest()
+        }
+        if limit > 1,
+           labelCall == mailboxRequestGateCalls[label, default: 1],
+           let gate = mailboxRequestGates[label] {
+            await gate.suspendRequest()
+        }
+        if mailboxFailureLabels.contains(label) {
+            throw APIError.httpStatus(503)
+        }
+        if let responseForCall {
+            return responseForCall
+        }
         if mailboxResponses.isEmpty {
             return sessionMailbox
         }
@@ -2669,7 +3768,17 @@ private final class RealtimeEventAppClient: AppClient {
     }
 
     func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
-        DemoAppFixtures.threads[threadID] ?? DemoAppFixtures.threads["demo-google-today"]!
+        threadCallCount += 1
+        if !didSuspendThreadRequest,
+           threadCallCount == threadRequestGateCall,
+           let threadRequestGate {
+            didSuspendThreadRequest = true
+            await threadRequestGate.suspendRequest()
+        }
+        if !threadResponses.isEmpty {
+            return threadResponses.removeFirst()
+        }
+        return DemoAppFixtures.threads[threadID] ?? DemoAppFixtures.threads["demo-google-today"]!
     }
 
     func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
@@ -2693,7 +3802,10 @@ private final class RealtimeEventAppClient: AppClient {
     }
 
     func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
-        try await DemoAppClient().enqueueThreadAction(request)
+        if let actionRequestGate {
+            await actionRequestGate.suspendRequest()
+        }
+        return try await DemoAppClient().enqueueThreadAction(request)
     }
 
     func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {

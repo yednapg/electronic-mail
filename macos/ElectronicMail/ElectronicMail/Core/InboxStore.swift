@@ -243,10 +243,76 @@ public struct MailboxFolderCount: Equatable {
     let unread: Int
 }
 
+enum MailboxBackgroundRefreshPolicy {
+    static let maximumRealtimeEventAge: TimeInterval = 25
+
+    static func shouldPollSyncState(
+        supportsRealtimeUpdates: Bool,
+        realtimeConnected: Bool,
+        lastRealtimeEventAt: Date?,
+        now: Date = Date(),
+        maximumEventAge: TimeInterval = MailboxBackgroundRefreshPolicy.maximumRealtimeEventAge
+    ) -> Bool {
+        guard supportsRealtimeUpdates,
+              realtimeConnected,
+              let lastRealtimeEventAt else {
+            return true
+        }
+        return now.timeIntervalSince(lastRealtimeEventAt) > maximumEventAge
+    }
+}
+
+@usableFromInline
+enum ReaderBodyRefreshPolicy {
+    // The final fallback runs after the backend's first 30-second retry backoff,
+    // even when the initial Gmail request itself took time to fail. Healthy SSE
+    // hydration normally cancels this schedule much earlier.
+    @usableFromInline
+    static let defaultDelaysNanoseconds: [UInt64] = [
+        1_000_000_000,
+        2_000_000_000,
+        4_000_000_000,
+        8_000_000_000,
+        16_000_000_000,
+        45_000_000_000,
+    ]
+}
+
+struct ThreadTaskOwnerRegistry {
+    private var ownerIDs: [String: UUID] = [:]
+
+    mutating func claim(threadID: String, ownerID: UUID = UUID()) -> UUID {
+        ownerIDs[threadID] = ownerID
+        return ownerID
+    }
+
+    func ownerID(for threadID: String) -> UUID? {
+        ownerIDs[threadID]
+    }
+
+    @discardableResult
+    mutating func release(threadID: String, ownerID: UUID) -> Bool {
+        guard ownerIDs[threadID] == ownerID else {
+            return false
+        }
+        ownerIDs[threadID] = nil
+        return true
+    }
+
+    mutating func cancel(threadID: String) {
+        ownerIDs[threadID] = nil
+    }
+
+    mutating func cancelAll() {
+        ownerIDs = [:]
+    }
+}
+
 private struct MailboxEventEnvelope {
     var mailboxRevision: String?
     var mailboxLabels: [String] = []
     var searchKey: String?
+    var threadIDs: [String] = []
 }
 
 private struct MailboxPageContext: Equatable {
@@ -254,6 +320,16 @@ private struct MailboxPageContext: Equatable {
     let label: MailboxLabel
     let searchQuery: String?
     let userID: String
+}
+
+private struct MailboxRefreshContext: Equatable {
+    let requestID: UUID
+    let accountGeneration: UInt
+    let userID: String
+    let label: MailboxLabel
+    let allowCachedFallback: Bool
+    let force: Bool
+    let startedAt: Date
 }
 
 private struct InboxTimestampLabelCacheKey: Hashable {
@@ -277,7 +353,21 @@ private struct ReaderLabelMutation {
     let threadID: String
     let labelID: String
     let isPresent: Bool
+    let targetMessageID: String?
+    let beganWithoutLoadedThread: Bool
     let previousPresenceByMessageID: [String: Bool]
+}
+
+private struct ReaderLabelIntentKey: Hashable {
+    let threadID: String
+    let labelID: String
+    let targetMessageID: String?
+}
+
+private struct ReaderLabelIntentOverride {
+    let ownerID: UUID
+    let isPresent: Bool
+    var settled: Bool
 }
 
 private actor LocalMailStoreWorker {
@@ -374,10 +464,13 @@ public final class InboxStore: ObservableObject {
     private let localMailStore: LocalMailStore
     private let localMailStoreWorker: LocalMailStoreWorker
     private let automaticallyPrefetchThreads: Bool
+    private let bodyRefreshDelaysNanoseconds: [UInt64]
     private var inFlightSessionRefresh: Task<AppSessionResponse, Error>?
     private var inFlightMailboxRefresh: Task<MailboxResponse, Error>?
+    private var inFlightMailboxRefreshContext: MailboxRefreshContext?
     private var inFlightMailboxPage: Task<MailboxResponse, Error>?
     private var inFlightThreads: [String: Task<ThreadReaderResponse, Error>] = [:]
+    private var inFlightThreadLabelMutationGenerations: [String: UInt] = [:]
     private var selectionPrefetchTask: Task<Void, Never>?
     private var priorityPrefetchTask: Task<Void, Never>?
     private var syncLoopTask: Task<Void, Never>?
@@ -392,6 +485,10 @@ public final class InboxStore: ObservableObject {
     private var searchRequestID: UUID?
     private var searchHydrationRefreshTask: Task<Void, Never>?
     private var bodyRefreshAttempts: [String: Int] = [:]
+    private var bodyRefreshTasks: [String: Task<Void, Never>] = [:]
+    private var bodyRefreshTaskOwners = ThreadTaskOwnerRegistry()
+    private var pendingHydrationRefreshThreadIDs: Set<String> = []
+    private var hydrationRefreshTaskOwners = ThreadTaskOwnerRegistry()
     private var readActionQueuedKeys: Set<String> = []
     private var lastMailboxEventID: String?
     private var lastSeenMailboxRevision: String?
@@ -400,24 +497,44 @@ public final class InboxStore: ObservableObject {
     private var timestampLabelCache: [InboxTimestampLabelCacheKey: String] = [:]
     private var inboxSectionsRevision: UInt = 0
     private var inboxSectionsCache: InboxSectionsCache?
+    private var folderCountPrefetchEnabled = false
     private var folderCountsRefreshRevision: UInt = 0
+    private var folderCountsRefreshOwnerID: UUID?
+    private var lastCompletedFolderCountsRefreshAt: Date?
+    private var inFlightFolderCountRequest: Task<MailboxResponse, Error>?
+    private var inFlightFolderCountRequestID: UUID?
     private var accountOperationGeneration: UInt = 0
     private var readerLabelMutationOwners: [ReaderLabelMutationKey: UUID] = [:]
+    private var readerLabelMutationGenerations: [String: UInt] = [:]
+    private var readerLabelMutationLabelGenerations: [String: [String: UInt]] = [:]
+    private var readerLabelIntentOverrides: [ReaderLabelIntentKey: ReaderLabelIntentOverride] = [:]
 
     private let activeSyncInterval: TimeInterval = 10
     private let minimumSyncGap: TimeInterval = 8
     private let minimumMailboxRefreshGap: TimeInterval = 20
+    private let folderCountsFreshnessInterval: TimeInterval = 60
     private let eventRefreshDebounce: TimeInterval = 1
     private let threadFetchLimit = 50
     private let mailboxPageLimit = 100
     private let timestampLabelCacheLimit = 2_048
+    private static let folderCountLabels: [MailboxLabel] = [
+        .inbox,
+        .starred,
+        .drafts,
+        .sent,
+        .spam,
+        .trash,
+        .archive,
+        .all,
+    ]
 
     public init(
         client: AppClient = LiveBackendAppClient(baseURL: AppConfiguration.defaultBackendURL),
         sessionCache: AppSessionCache = AppSessionCache(),
         threadCache: ThreadCache = ThreadCache(),
         localMailStore: LocalMailStore = NoopLocalMailStore(),
-        automaticallyPrefetchThreads: Bool = true
+        automaticallyPrefetchThreads: Bool = false,
+        bodyRefreshDelaysNanoseconds: [UInt64] = ReaderBodyRefreshPolicy.defaultDelaysNanoseconds
     ) {
         self.client = client
         self.sessionCache = sessionCache
@@ -425,6 +542,7 @@ public final class InboxStore: ObservableObject {
         self.localMailStore = localMailStore
         self.localMailStoreWorker = LocalMailStoreWorker(store: localMailStore)
         self.automaticallyPrefetchThreads = automaticallyPrefetchThreads
+        self.bodyRefreshDelaysNanoseconds = bodyRefreshDelaysNanoseconds
     }
 
     public var runMode: AppRunMode {
@@ -489,8 +607,7 @@ public final class InboxStore: ObservableObject {
             bodyRefreshAttempts = [:]
             readActionQueuedKeys = []
             lastMailboxRefreshAt = [:]
-            inFlightMailboxRefresh?.cancel()
-            inFlightMailboxRefresh = nil
+            cancelActiveMailboxRefresh()
             selectionPrefetchTask?.cancel()
             selectionPrefetchTask = nil
             priorityPrefetchTask?.cancel()
@@ -505,6 +622,9 @@ public final class InboxStore: ObservableObject {
             realtimeConnected = false
             syncState = nil
             mailboxCounts = [:]
+            lastCompletedFolderCountsRefreshAt = nil
+            folderCountPrefetchEnabled = false
+            cancelFolderCountRefresh()
             pendingLocalActionCount = 0
             searchQuery = ""
             searchResults = nil
@@ -579,6 +699,7 @@ public final class InboxStore: ObservableObject {
         openedThreads = [:]
         timestampLabelCache.removeAll(keepingCapacity: false)
         mailboxCounts = [:]
+        lastCompletedFolderCountsRefreshAt = nil
         selectedThreadID = nil
         readerThreadID = nil
         readerThread = nil
@@ -1170,7 +1291,6 @@ public final class InboxStore: ObservableObject {
         guard let userID = session?.user.id else {
             return
         }
-        let operationGeneration = accountOperationGeneration
         let label = activeMailboxLabel
         let now = Date()
         if !force,
@@ -1180,28 +1300,52 @@ public final class InboxStore: ObservableObject {
             return
         }
 
-        do {
-            let task = inFlightMailboxRefresh ?? Task { [client, mailboxPageLimit] in
-                try await client.mailbox(label: label, limit: mailboxPageLimit, cursor: nil)
+        let context: MailboxRefreshContext
+        let task: Task<MailboxResponse, Error>
+        if let existingTask = inFlightMailboxRefresh,
+           let existingContext = inFlightMailboxRefreshContext,
+           existingContext.accountGeneration == accountOperationGeneration,
+           existingContext.userID == userID,
+           existingContext.label == label,
+           !force || existingContext.force {
+            context = existingContext
+            task = existingTask
+        } else {
+            cancelActiveMailboxRefresh()
+            context = MailboxRefreshContext(
+                requestID: UUID(),
+                accountGeneration: accountOperationGeneration,
+                userID: userID,
+                label: label,
+                allowCachedFallback: allowCachedFallback,
+                force: force,
+                startedAt: now
+            )
+            task = Task { [client, mailboxPageLimit] in
+                try Task.checkCancellation()
+                return try await client.mailbox(label: label, limit: mailboxPageLimit, cursor: nil)
             }
+            inFlightMailboxRefreshContext = context
             inFlightMailboxRefresh = task
-            let mailbox = try await task.value
-            guard operationGeneration == accountOperationGeneration,
-                  session?.user.id == userID else {
-                return
-            }
-            inFlightMailboxRefresh = nil
-            guard label == activeMailboxLabel else {
-                return
-            }
-            lastMailboxRefreshAt[label] = now
+        }
 
-            let shouldResetPagination = force
+        do {
+            let mailbox = try await task.value
+            guard ownsActiveMailboxRefresh(context),
+                  context.accountGeneration == accountOperationGeneration,
+                  session?.user.id == context.userID,
+                  activeMailboxLabel == context.label else {
+                return
+            }
+            clearActiveMailboxRefresh(context)
+            lastMailboxRefreshAt[context.label] = context.startedAt
+
+            let shouldResetPagination = context.force
                 || discardLoadedMailboxPagesOnNextRefresh
                 || Self.mailboxRevisionChanged(from: activeMailbox, to: mailbox)
             let merged = activeMailbox?.preservingLoadedPages(
                 afterRefreshingFirstPage: mailbox,
-                discardStalePages: force || discardLoadedMailboxPagesOnNextRefresh
+                discardStalePages: context.force || discardLoadedMailboxPagesOnNextRefresh
             ) ?? mailbox
             if shouldResetPagination {
                 resetMailboxPagination()
@@ -1212,8 +1356,7 @@ public final class InboxStore: ObservableObject {
             if let revision = merged.mailboxRevision, !revision.isEmpty {
                 lastSeenMailboxRevision = revision
             }
-            await localMailStoreWorker.writeMailbox(merged, userID: userID, label: label)
-            if force {
+            if context.force {
                 lastForcedMailboxRefreshAt = Date()
                 lastForcedMailboxRefreshError = nil
             }
@@ -1224,22 +1367,41 @@ public final class InboxStore: ObservableObject {
             if automaticallyPrefetchThreads {
                 prefetchPriorityThreads()
             }
+            await localMailStoreWorker.writeMailbox(
+                merged,
+                userID: context.userID,
+                label: context.label
+            )
+        } catch is CancellationError {
+            clearActiveMailboxRefresh(context)
         } catch {
-            guard operationGeneration == accountOperationGeneration,
-                  session?.user.id == userID else {
+            guard ownsActiveMailboxRefresh(context),
+                  context.accountGeneration == accountOperationGeneration,
+                  session?.user.id == context.userID,
+                  activeMailboxLabel == context.label else {
                 return
             }
             inFlightMailboxRefresh = nil
-            if force {
+            let cached = context.allowCachedFallback
+                ? await localMailStoreWorker.readMailbox(userID: context.userID, label: context.label)
+                : nil
+            guard ownsActiveMailboxRefresh(context),
+                  context.accountGeneration == accountOperationGeneration,
+                  session?.user.id == context.userID,
+                  activeMailboxLabel == context.label else {
+                return
+            }
+            clearActiveMailboxRefresh(context)
+            if context.force {
                 lastForcedMailboxRefreshError = error.localizedDescription
             }
             refreshFailed = true
-            if allowCachedFallback, let cached = await localMailStoreWorker.readMailbox(userID: userID, label: activeMailboxLabel) {
+            if let cached {
                 activeMailbox = cached
                 phase = .loaded
                 seedActiveSelectionIfNeeded()
-            } else if allowCachedFallback,
-                      activeMailboxLabel == .inbox,
+            } else if context.allowCachedFallback,
+                      context.label == .inbox,
                       let sessionInbox = session?.mailbox {
                 activeMailbox = sessionInbox
                 phase = .loaded
@@ -1248,6 +1410,24 @@ public final class InboxStore: ObservableObject {
                 phase = .failed(error.localizedDescription)
             }
         }
+    }
+
+    private func ownsActiveMailboxRefresh(_ context: MailboxRefreshContext) -> Bool {
+        inFlightMailboxRefreshContext == context
+    }
+
+    private func clearActiveMailboxRefresh(_ context: MailboxRefreshContext) {
+        guard ownsActiveMailboxRefresh(context) else {
+            return
+        }
+        inFlightMailboxRefresh = nil
+        inFlightMailboxRefreshContext = nil
+    }
+
+    private func cancelActiveMailboxRefresh() {
+        inFlightMailboxRefresh?.cancel()
+        inFlightMailboxRefresh = nil
+        inFlightMailboxRefreshContext = nil
     }
 
     public func loadMoreMailbox(automatic _: Bool = false) async {
@@ -1372,6 +1552,10 @@ public final class InboxStore: ObservableObject {
 
     @discardableResult
     public func openReader(threadID: String, focusedMessageID: String? = nil) -> Task<Void, Never> {
+        if let previousThreadID = readerThreadID, previousThreadID != threadID {
+            cancelBodyRefresh(for: previousThreadID)
+            pendingHydrationRefreshThreadIDs.remove(previousThreadID)
+        }
         selectionPrefetchTask?.cancel()
         selectionPrefetchTask = nil
         selectedThreadID = threadID
@@ -1392,6 +1576,10 @@ public final class InboxStore: ObservableObject {
     }
 
     public func closeReader() {
+        if let readerThreadID {
+            cancelBodyRefresh(for: readerThreadID)
+            pendingHydrationRefreshThreadIDs.remove(readerThreadID)
+        }
         readerThreadID = nil
         readerFocusedMessageID = nil
     }
@@ -1412,6 +1600,13 @@ public final class InboxStore: ObservableObject {
         guard activeMailboxLabel != label else {
             return
         }
+        let operationGeneration = accountOperationGeneration
+        let userID = session?.user.id
+        cancelFolderCountRefresh()
+        if let readerThreadID {
+            cancelBodyRefresh(for: readerThreadID)
+            pendingHydrationRefreshThreadIDs.remove(readerThreadID)
+        }
         activeMailboxLabel = label
         clearSearch()
         selectedThreadID = nil
@@ -1424,22 +1619,33 @@ public final class InboxStore: ObservableObject {
         readerRow = nil
         readerError = nil
         expandedThreadIDs = []
-        inFlightMailboxRefresh?.cancel()
-        inFlightMailboxRefresh = nil
+        cancelActiveMailboxRefresh()
         lastMailboxRefreshAt[label] = nil
-        if let userID = session?.user.id,
+        if let userID,
            let cached = await localMailStoreWorker.readMailbox(userID: userID, label: label) {
+            guard operationGeneration == accountOperationGeneration,
+                  session?.user.id == userID,
+                  activeMailboxLabel == label else {
+                return
+            }
             activeMailbox = cached
             phase = .loaded
             seedActiveSelectionIfNeeded()
         } else {
+            guard operationGeneration == accountOperationGeneration,
+                  session?.user.id == userID,
+                  activeMailboxLabel == label else {
+                return
+            }
             activeMailbox = nil
         }
-        if label == .inbox {
-            await refreshActiveMailbox(allowCachedFallback: true, force: true)
+        await refreshActiveMailbox(allowCachedFallback: true, force: true)
+        guard operationGeneration == accountOperationGeneration,
+              session?.user.id == userID,
+              activeMailboxLabel == label else {
             return
         }
-        await refreshActiveMailbox(allowCachedFallback: true, force: true)
+        await refreshFolderCountsIfNeeded()
     }
 
     public func syncNow() async {
@@ -1618,20 +1824,43 @@ public final class InboxStore: ObservableObject {
         guard let labelChange = readerLabelChange(for: action) else {
             return nil
         }
+        recordReaderLabelMutationGeneration(threadID: threadID, labelID: labelChange.labelID)
+        supersedeReaderLabelIntentOverrides(
+            threadID: threadID,
+            labelID: labelChange.labelID,
+            targetMessageID: targetMessageID
+        )
+
         let currentThread = readerThreadID == threadID
             ? (readerThread ?? openedThreads[threadID])
             : openedThreads[threadID]
-        guard let currentThread else {
-            return nil
-        }
-        let targetMessages = currentThread.messages.filter { message in
+        let targetMessages = currentThread?.messages.filter { message in
             targetMessageID == nil || message.id == targetMessageID
-        }
-        guard !targetMessages.isEmpty else {
-            return nil
-        }
+        } ?? []
 
         let mutationID = UUID()
+        guard let currentThread, !targetMessages.isEmpty else {
+            let intentKey = ReaderLabelIntentKey(
+                threadID: threadID,
+                labelID: labelChange.labelID,
+                targetMessageID: targetMessageID
+            )
+            readerLabelIntentOverrides[intentKey] = ReaderLabelIntentOverride(
+                ownerID: mutationID,
+                isPresent: labelChange.isPresent,
+                settled: false
+            )
+            return ReaderLabelMutation(
+                id: mutationID,
+                threadID: threadID,
+                labelID: labelChange.labelID,
+                isPresent: labelChange.isPresent,
+                targetMessageID: targetMessageID,
+                beganWithoutLoadedThread: true,
+                previousPresenceByMessageID: [:]
+            )
+        }
+
         var previousPresence: [String: Bool] = [:]
         for message in targetMessages {
             previousPresence[message.id] = message.hasLabel(labelChange.labelID)
@@ -1654,6 +1883,8 @@ public final class InboxStore: ObservableObject {
             threadID: threadID,
             labelID: labelChange.labelID,
             isPresent: labelChange.isPresent,
+            targetMessageID: targetMessageID,
+            beganWithoutLoadedThread: false,
             previousPresenceByMessageID: previousPresence
         )
     }
@@ -1670,6 +1901,23 @@ public final class InboxStore: ObservableObject {
             return ("STARRED", false)
         case .archive, .unarchive, .moveTrash, .restoreTrash, .markSpam, .notSpam, .deleteForever:
             return nil
+        }
+    }
+
+    private func supersedeReaderLabelIntentOverrides(
+        threadID: String,
+        labelID: String,
+        targetMessageID: String?
+    ) {
+        let overlappingKeys = readerLabelIntentOverrides.keys.filter { key in
+            key.threadID == threadID
+                && key.labelID == labelID
+                && (key.targetMessageID == nil
+                    || targetMessageID == nil
+                    || key.targetMessageID == targetMessageID)
+        }
+        for key in overlappingKeys {
+            readerLabelIntentOverrides[key] = nil
         }
     }
 
@@ -1709,7 +1957,54 @@ public final class InboxStore: ObservableObject {
             return
         }
 
+        if mutation.beganWithoutLoadedThread {
+            let intentKey = ReaderLabelIntentKey(
+                threadID: mutation.threadID,
+                labelID: mutation.labelID,
+                targetMessageID: mutation.targetMessageID
+            )
+            guard var intent = readerLabelIntentOverrides[intentKey],
+                  intent.ownerID == mutation.id else {
+                return
+            }
+
+            if succeeded {
+                intent.settled = true
+                readerLabelIntentOverrides[intentKey] = intent
+                let currentThread = readerThreadID == mutation.threadID
+                    ? (readerThread ?? openedThreads[mutation.threadID])
+                    : openedThreads[mutation.threadID]
+                if let currentThread {
+                    let confirmedPresence: [String: Bool] = Dictionary(
+                        uniqueKeysWithValues: currentThread.messages.compactMap { message -> (String, Bool)? in
+                            guard mutation.targetMessageID == nil || message.id == mutation.targetMessageID else {
+                                return nil
+                            }
+                            return (message.id, mutation.isPresent)
+                        }
+                    )
+                    if !confirmedPresence.isEmpty {
+                        updateCachedReaderThread(
+                            currentThread.settingMessageLabel(
+                                mutation.labelID,
+                                presenceByMessageID: confirmedPresence
+                            ),
+                            threadID: mutation.threadID
+                        )
+                    }
+                }
+            } else {
+                readerLabelIntentOverrides[intentKey] = nil
+            }
+            recordReaderLabelMutationGeneration(
+                threadID: mutation.threadID,
+                labelID: mutation.labelID
+            )
+            return
+        }
+
         var settledPresence: [String: Bool] = [:]
+        var didSettleOwnedMutation = false
         let currentThread = readerThreadID == mutation.threadID
             ? (readerThread ?? openedThreads[mutation.threadID])
             : openedThreads[mutation.threadID]
@@ -1722,6 +2017,7 @@ public final class InboxStore: ObservableObject {
             guard readerLabelMutationOwners[key] == mutation.id else {
                 continue
             }
+            didSettleOwnedMutation = true
             readerLabelMutationOwners[key] = nil
             if succeeded {
                 settledPresence[messageID] = mutation.isPresent
@@ -1733,6 +2029,17 @@ public final class InboxStore: ObservableObject {
             settledPresence[messageID] = previousPresence
         }
 
+        // A reader request can start after the optimistic update but while the
+        // action request is suspended. Advancing the generation again on both
+        // confirmation and rollback makes that in-flight reader response merge
+        // the settled label state instead of restoring its stale snapshot.
+        if didSettleOwnedMutation {
+            recordReaderLabelMutationGeneration(
+                threadID: mutation.threadID,
+                labelID: mutation.labelID
+            )
+        }
+
         guard !settledPresence.isEmpty, let currentThread else {
             return
         }
@@ -1740,6 +2047,12 @@ public final class InboxStore: ObservableObject {
             currentThread.settingMessageLabel(mutation.labelID, presenceByMessageID: settledPresence),
             threadID: mutation.threadID
         )
+    }
+
+    private func recordReaderLabelMutationGeneration(threadID: String, labelID: String) {
+        let generation = (readerLabelMutationGenerations[threadID] ?? 0) &+ 1
+        readerLabelMutationGenerations[threadID] = generation
+        readerLabelMutationLabelGenerations[threadID, default: [:]][labelID] = generation
     }
 
     private func updateCachedReaderThread(_ thread: ThreadReaderResponse, threadID: String) {
@@ -1762,6 +2075,58 @@ public final class InboxStore: ObservableObject {
         await localMailStoreWorker.writeThread(thread, userID: userID, threadID: threadID)
     }
 
+    private func preservingReaderLabelMutations(
+        in fetchedThread: ThreadReaderResponse,
+        threadID: String,
+        since mutationGenerationAtStart: UInt
+    ) -> ThreadReaderResponse {
+        var reconciledThread = fetchedThread
+        if (readerLabelMutationGenerations[threadID] ?? 0) != mutationGenerationAtStart,
+           let currentThread = readerThreadID == threadID
+            ? (readerThread ?? openedThreads[threadID])
+            : openedThreads[threadID] {
+            let changedLabelIDs = readerLabelMutationLabelGenerations[threadID, default: [:]]
+                .filter { $0.value > mutationGenerationAtStart }
+                .map(\.key)
+            for labelID in changedLabelIDs {
+                let presenceByMessageID = Dictionary(
+                    uniqueKeysWithValues: currentThread.messages.map { ($0.id, $0.hasLabel(labelID)) }
+                )
+                reconciledThread = reconciledThread.settingMessageLabel(
+                    labelID,
+                    presenceByMessageID: presenceByMessageID
+                )
+            }
+        }
+
+        let intentOverrides = readerLabelIntentOverrides.filter { $0.key.threadID == threadID }
+        for (intentKey, intent) in intentOverrides {
+            guard intent.settled else {
+                continue
+            }
+            let targetMessages = reconciledThread.messages.filter { message in
+                intentKey.targetMessageID == nil || message.id == intentKey.targetMessageID
+            }
+            guard !targetMessages.isEmpty else {
+                continue
+            }
+            if targetMessages.allSatisfy({ $0.hasLabel(intentKey.labelID) == intent.isPresent }) {
+                if intent.settled,
+                   readerLabelIntentOverrides[intentKey]?.ownerID == intent.ownerID {
+                    readerLabelIntentOverrides[intentKey] = nil
+                }
+                continue
+            }
+            reconciledThread = reconciledThread.settingMessageLabel(
+                intentKey.labelID,
+                presenceByMessageID: Dictionary(
+                    uniqueKeysWithValues: targetMessages.map { ($0.id, intent.isPresent) }
+                )
+            )
+        }
+        return reconciledThread
+    }
+
     public func prefetchThread(threadID: String, force: Bool = false, silent: Bool = true) async {
         guard let userID = session?.user.id else {
             if !silent {
@@ -1774,6 +2139,7 @@ public final class InboxStore: ObservableObject {
             return
         }
         let operationGeneration = accountOperationGeneration
+        let labelMutationGenerationAtReadStart = readerLabelMutationGenerations[threadID] ?? 0
         let memoryCachedThread = force
             ? nil
             : threadCache.read(userID: userID, threadID: threadID).flatMap { $0.userID == userID ? $0 : nil }
@@ -1785,7 +2151,12 @@ public final class InboxStore: ObservableObject {
             return
         }
         let cachedThread = (memoryCachedThread ?? diskCachedThread).flatMap { $0.userID == userID ? $0 : nil }
-        if let cached = cachedThread {
+        if let fetchedCachedThread = cachedThread {
+            let cached = preservingReaderLabelMutations(
+                in: fetchedCachedThread,
+                threadID: threadID,
+                since: labelMutationGenerationAtReadStart
+            )
             if memoryCachedThread == nil {
                 threadCache.write(cached, userID: userID, threadID: threadID)
             }
@@ -1797,13 +2168,20 @@ public final class InboxStore: ObservableObject {
             }
         }
         if let inFlight = inFlightThreads[threadID] {
+            let inFlightLabelMutationGeneration =
+                inFlightThreadLabelMutationGenerations[threadID] ?? labelMutationGenerationAtReadStart
             do {
-                let thread = try await inFlight.value
+                let fetchedThread = try await inFlight.value
                 guard operationGeneration == accountOperationGeneration,
                       session?.user.id == userID,
-                      thread.userID == userID else {
+                      fetchedThread.userID == userID else {
                     return
                 }
+                let thread = preservingReaderLabelMutations(
+                    in: fetchedThread,
+                    threadID: threadID,
+                    since: inFlightLabelMutationGeneration
+                )
                 openedThreads[threadID] = thread
                 updateReader(threadID: threadID, thread: thread, error: nil)
             } catch {
@@ -1813,10 +2191,14 @@ public final class InboxStore: ObservableObject {
                 if !silent {
                     recordThreadError(error.localizedDescription, threadID: threadID)
                 }
+                if let cached = openedThreads[threadID] {
+                    scheduleBodyRefreshIfNeeded(threadID: threadID, thread: cached)
+                }
             }
             return
         }
 
+        let inFlightLabelMutationGeneration = readerLabelMutationGenerations[threadID] ?? 0
         let task = Task { [client, threadFetchLimit, userID] in
             var combined = try await client.thread(threadID: threadID, limit: threadFetchLimit, offset: 0)
             guard combined.userID == userID else {
@@ -1838,26 +2220,49 @@ public final class InboxStore: ObservableObject {
             return combined
         }
         inFlightThreads[threadID] = task
+        inFlightThreadLabelMutationGenerations[threadID] = inFlightLabelMutationGeneration
         do {
-            let thread = try await task.value
+            let fetchedThread = try await task.value
             guard operationGeneration == accountOperationGeneration,
                   session?.user.id == userID else {
                 return
             }
             inFlightThreads[threadID] = nil
+            inFlightThreadLabelMutationGenerations[threadID] = nil
+            let thread = preservingReaderLabelMutations(
+                in: fetchedThread,
+                threadID: threadID,
+                since: inFlightLabelMutationGeneration
+            )
             openedThreads[threadID] = thread
             threadCache.write(thread, userID: userID, threadID: threadID)
-            await localMailStoreWorker.writeThread(thread, userID: userID, threadID: threadID)
             threadErrors[threadID] = nil
             updateReader(threadID: threadID, thread: thread, error: nil)
+            await localMailStoreWorker.writeThread(thread, userID: userID, threadID: threadID)
+            if startPendingHydrationRefreshAfterCurrentRequest(
+                threadID: threadID,
+                threadNeedsRefresh: thread.needsReaderBodyRefresh
+            ) {
+                return
+            }
             scheduleBodyRefreshIfNeeded(threadID: threadID, thread: thread)
         } catch {
             guard operationGeneration == accountOperationGeneration else {
                 return
             }
             inFlightThreads[threadID] = nil
+            inFlightThreadLabelMutationGenerations[threadID] = nil
             if cachedThread == nil, !silent {
                 recordThreadError(error.localizedDescription, threadID: threadID)
+            }
+            if startPendingHydrationRefreshAfterCurrentRequest(
+                threadID: threadID,
+                threadNeedsRefresh: openedThreads[threadID]?.needsReaderBodyRefresh ?? true
+            ) {
+                return
+            }
+            if let cached = openedThreads[threadID] {
+                scheduleBodyRefreshIfNeeded(threadID: threadID, thread: cached)
             }
         }
     }
@@ -1866,10 +2271,24 @@ public final class InboxStore: ObservableObject {
         guard client.mode == .localBackend else {
             return
         }
-        if let lastSyncTriggerAt, Date().timeIntervalSince(lastSyncTriggerAt) < minimumSyncGap {
+        let now = Date()
+        let shouldPollSyncState = MailboxBackgroundRefreshPolicy.shouldPollSyncState(
+            supportsRealtimeUpdates: client.supportsRealtimeMailboxUpdates,
+            realtimeConnected: realtimeConnected,
+            lastRealtimeEventAt: lastSSEEventAt,
+            now: now
+        )
+        guard shouldPollSyncState else {
             return
         }
-        lastSyncTriggerAt = Date()
+        if client.supportsRealtimeMailboxUpdates, realtimeConnected {
+            realtimeConnected = false
+            lastSSEDisconnectedAt = now
+        }
+        if let lastSyncTriggerAt, now.timeIntervalSince(lastSyncTriggerAt) < minimumSyncGap {
+            return
+        }
+        lastSyncTriggerAt = now
         do {
             let state = try await client.mailboxSyncState()
             syncState = state
@@ -1903,9 +2322,12 @@ public final class InboxStore: ObservableObject {
         }
         syncLoopTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.triggerMailboxSyncIfNeeded()
                 let interval = self?.activeSyncInterval ?? 8
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                guard !Task.isCancelled else {
+                    return
+                }
+                await self?.triggerMailboxSyncIfNeeded()
             }
         }
     }
@@ -1991,12 +2413,17 @@ public final class InboxStore: ObservableObject {
     }
 
     func handleMailboxServerEvent(_ event: MailboxServerEvent) {
+        let eventDate = Date()
+        if !realtimeConnected {
+            lastSSEConnectedAt = eventDate
+        }
+        realtimeConnected = true
         if let id = event.id, !id.isEmpty {
             lastMailboxEventID = id
             lastSSEEventID = id
         }
         lastSSEEventType = event.event
-        lastSSEEventAt = Date()
+        lastSSEEventAt = eventDate
         switch event.event {
         case "mailbox-search-hydrated":
             let envelope = decodedEventEnvelope(event.data)
@@ -2004,6 +2431,15 @@ public final class InboxStore: ObservableObject {
                 return
             }
             scheduleHydratedSearchRefresh(matchingSearchKey: searchKey)
+        case "thread-content-hydrated":
+            let envelope = decodedEventEnvelope(event.data)
+            guard let readerThreadID,
+                  envelope.threadIDs.contains(readerThreadID) else {
+                return
+            }
+            cancelBodyRefresh(for: readerThreadID)
+            pendingHydrationRefreshThreadIDs.insert(readerThreadID)
+            startPendingHydrationRefreshIfPossible(threadID: readerThreadID)
         case "mailbox-changed":
             let envelope = decodedEventEnvelope(event.data)
             guard eventAffectsActiveMailbox(envelope) else {
@@ -2017,8 +2453,15 @@ public final class InboxStore: ObservableObject {
             _ = shouldRefreshForRevision(envelope.mailboxRevision)
             scheduleEventRefresh(needsSession: true)
         case "sync-state":
-            let revision = decodedSyncStateRevision(event.data)
-            if shouldRefreshForRevision(revision) {
+            guard let state = decodedSyncState(event.data) else {
+                return
+            }
+            syncState = state
+            guard state.connected else {
+                transitionToReauthentication()
+                return
+            }
+            if shouldRefreshForRevision(state.mailboxRevision) {
                 scheduleEventRefresh(needsSession: false)
             }
         default:
@@ -2148,10 +2591,12 @@ public final class InboxStore: ObservableObject {
         let revision = payload["mailbox_revision"] as? String
         let labels = payload["mailbox_labels"] as? [String]
         let searchKey = payload["search_key"] as? String
+        let threadIDs = payload["thread_ids"] as? [String]
         return MailboxEventEnvelope(
             mailboxRevision: revision,
             mailboxLabels: labels ?? (mailboxLabel.map { [$0] } ?? []),
-            searchKey: searchKey
+            searchKey: searchKey,
+            threadIDs: threadIDs ?? []
         )
     }
 
@@ -2161,12 +2606,11 @@ public final class InboxStore: ObservableObject {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    private func decodedSyncStateRevision(_ data: String) -> String? {
-        guard let raw = data.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
+    private func decodedSyncState(_ data: String) -> MailboxSyncStateResponse? {
+        guard let raw = data.data(using: .utf8) else {
             return nil
         }
-        return json["mailbox_revision"] as? String
+        return try? JSONDecoder.backend.decode(MailboxSyncStateResponse.self, from: raw)
     }
 
     private func scheduleSelectionPrefetch(threadID: String) {
@@ -2262,20 +2706,113 @@ public final class InboxStore: ObservableObject {
         readerRow = rowViewModel(threadID: threadID)
     }
 
+    private func startPendingHydrationRefreshAfterCurrentRequest(
+        threadID: String,
+        threadNeedsRefresh: Bool
+    ) -> Bool {
+        guard pendingHydrationRefreshThreadIDs.contains(threadID) else {
+            return false
+        }
+        guard readerThreadID == threadID else {
+            pendingHydrationRefreshThreadIDs.remove(threadID)
+            return false
+        }
+        guard threadNeedsRefresh else {
+            pendingHydrationRefreshThreadIDs.remove(threadID)
+            return false
+        }
+        return startPendingHydrationRefreshIfPossible(threadID: threadID)
+    }
+
+    @discardableResult
+    private func startPendingHydrationRefreshIfPossible(threadID: String) -> Bool {
+        guard pendingHydrationRefreshThreadIDs.contains(threadID),
+              readerThreadID == threadID,
+              inFlightThreads[threadID] == nil,
+              hydrationRefreshTaskOwners.ownerID(for: threadID) == nil else {
+            return false
+        }
+        let ownerID = hydrationRefreshTaskOwners.claim(threadID: threadID)
+        Task { [weak self] in
+            await self?.performPendingHydrationRefresh(threadID: threadID, ownerID: ownerID)
+        }
+        return true
+    }
+
+    private func performPendingHydrationRefresh(threadID: String, ownerID: UUID) async {
+        guard hydrationRefreshTaskOwners.ownerID(for: threadID) == ownerID else {
+            return
+        }
+        guard readerThreadID == threadID else {
+            pendingHydrationRefreshThreadIDs.remove(threadID)
+            _ = hydrationRefreshTaskOwners.release(threadID: threadID, ownerID: ownerID)
+            return
+        }
+        guard inFlightThreads[threadID] == nil else {
+            _ = hydrationRefreshTaskOwners.release(threadID: threadID, ownerID: ownerID)
+            return
+        }
+
+        pendingHydrationRefreshThreadIDs.remove(threadID)
+        await prefetchThread(threadID: threadID, force: true, silent: true)
+
+        guard hydrationRefreshTaskOwners.release(threadID: threadID, ownerID: ownerID) else {
+            return
+        }
+        guard pendingHydrationRefreshThreadIDs.contains(threadID) else {
+            return
+        }
+        guard readerThreadID == threadID else {
+            pendingHydrationRefreshThreadIDs.remove(threadID)
+            return
+        }
+        if openedThreads[threadID]?.needsReaderBodyRefresh == true {
+            startPendingHydrationRefreshIfPossible(threadID: threadID)
+        } else {
+            pendingHydrationRefreshThreadIDs.remove(threadID)
+        }
+    }
+
     private func scheduleBodyRefreshIfNeeded(threadID: String, thread: ThreadReaderResponse) {
         guard thread.needsReaderBodyRefresh, readerThreadID == threadID else {
-            bodyRefreshAttempts[threadID] = nil
+            cancelBodyRefresh(for: threadID)
+            return
+        }
+        guard bodyRefreshTasks[threadID] == nil else {
             return
         }
         let attempts = bodyRefreshAttempts[threadID, default: 0]
-        guard attempts < 3 else {
+        guard attempts < bodyRefreshDelaysNanoseconds.count else {
             return
         }
         bodyRefreshAttempts[threadID] = attempts + 1
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            await self?.prefetchThread(threadID: threadID, force: true, silent: true)
+        let delay = bodyRefreshDelaysNanoseconds[attempts]
+        let ownerID = bodyRefreshTaskOwners.claim(threadID: threadID)
+        bodyRefreshTasks[threadID] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            guard let self else {
+                return
+            }
+            guard !Task.isCancelled, self.readerThreadID == threadID else {
+                self.finishBodyRefreshTask(threadID: threadID, ownerID: ownerID)
+                return
+            }
+            self.finishBodyRefreshTask(threadID: threadID, ownerID: ownerID)
+            await self.prefetchThread(threadID: threadID, force: true, silent: true)
         }
+    }
+
+    private func finishBodyRefreshTask(threadID: String, ownerID: UUID) {
+        guard bodyRefreshTaskOwners.release(threadID: threadID, ownerID: ownerID) else {
+            return
+        }
+        bodyRefreshTasks[threadID] = nil
+    }
+
+    private func cancelBodyRefresh(for threadID: String) {
+        bodyRefreshTaskOwners.cancel(threadID: threadID)
+        bodyRefreshTasks.removeValue(forKey: threadID)?.cancel()
+        bodyRefreshAttempts[threadID] = nil
     }
 
     private func prefetchPriorityThreads() {
@@ -2415,38 +2952,139 @@ public final class InboxStore: ObservableObject {
         }
     }
 
+    public func setFolderCountPrefetchEnabled(_ enabled: Bool) async {
+        guard folderCountPrefetchEnabled != enabled else {
+            if enabled {
+                await refreshFolderCountsIfNeeded()
+            }
+            return
+        }
+        folderCountPrefetchEnabled = enabled
+        guard enabled else {
+            cancelFolderCountRefresh()
+            return
+        }
+        await refreshFolderCountsIfNeeded()
+    }
+
     public func refreshFolderCounts() async {
-        guard client.supportsFolderCountPrefetch,
+        await performFolderCountRefresh(labels: Self.folderCountLabels)
+    }
+
+    private func refreshFolderCountsIfNeeded(now: Date = Date()) async {
+        guard folderCountPrefetchEnabled,
+              client.supportsFolderCountPrefetch,
               client.mode != .localBackend || client.sessionToken?.isEmpty == false else {
             return
         }
-        folderCountsRefreshRevision &+= 1
+        guard folderCountsRefreshOwnerID == nil else {
+            return
+        }
+
+        let missingLabels = Self.folderCountLabels.filter { mailboxCounts[$0] == nil }
+        if !missingLabels.isEmpty {
+            await performFolderCountRefresh(labels: missingLabels)
+            return
+        }
+
+        if let lastCompletedFolderCountsRefreshAt,
+           now.timeIntervalSince(lastCompletedFolderCountsRefreshAt) < folderCountsFreshnessInterval {
+            return
+        }
+        await performFolderCountRefresh(labels: Self.folderCountLabels)
+    }
+
+    private func performFolderCountRefresh(labels: [MailboxLabel]) async {
+        guard folderCountPrefetchEnabled,
+              client.supportsFolderCountPrefetch,
+              client.mode != .localBackend || client.sessionToken?.isEmpty == false,
+              !labels.isEmpty else {
+            return
+        }
+        cancelFolderCountRefresh()
         let refreshRevision = folderCountsRefreshRevision
+        let refreshOwnerID = UUID()
+        folderCountsRefreshOwnerID = refreshOwnerID
+        defer {
+            clearFolderCountRefreshOwner(id: refreshOwnerID)
+        }
         let countsAtStart = mailboxCounts
-        let labels: [MailboxLabel] = [.inbox, .starred, .drafts, .sent, .spam, .trash, .archive, .all]
-        var refreshedCounts: [MailboxLabel: MailboxFolderCount] = [:]
+        var completedEveryRequest = true
         for label in labels {
-            guard refreshRevision == folderCountsRefreshRevision else { return }
-            if label == activeMailboxLabel, let activeMailbox {
-                refreshedCounts[label] = Self.folderCount(from: activeMailbox)
+            guard !Task.isCancelled,
+                  refreshRevision == folderCountsRefreshRevision,
+                  folderCountsRefreshOwnerID == refreshOwnerID else {
+                return
+            }
+            if label == activeMailboxLabel,
+               let activeMailbox,
+               activeMailbox.label == label {
+                updateFolderCount(from: activeMailbox)
                 continue
             }
+
+            let requestID = UUID()
+            let request = Task { [client] in
+                try await client.mailboxFolderCount(label: label)
+            }
+            inFlightFolderCountRequestID = requestID
+            inFlightFolderCountRequest = request
             do {
-                let mailbox = try await client.mailbox(label: label, limit: mailboxPageLimit, cursor: nil)
-                guard refreshRevision == folderCountsRefreshRevision else { return }
-                refreshedCounts[label] = Self.folderCount(from: mailbox)
+                let mailbox = try await request.value
+                clearInFlightFolderCountRequest(id: requestID)
+                guard !Task.isCancelled,
+                      refreshRevision == folderCountsRefreshRevision,
+                      folderCountsRefreshOwnerID == refreshOwnerID else {
+                    return
+                }
+                if mailboxCounts[label] == countsAtStart[label] {
+                    mailboxCounts[label] = Self.folderCount(from: mailbox)
+                }
+            } catch is CancellationError {
+                clearInFlightFolderCountRequest(id: requestID)
+                return
             } catch {
+                clearInFlightFolderCountRequest(id: requestID)
+                guard refreshRevision == folderCountsRefreshRevision,
+                      folderCountsRefreshOwnerID == refreshOwnerID else {
+                    return
+                }
+                completedEveryRequest = false
                 continue
             }
         }
-        guard refreshRevision == folderCountsRefreshRevision else { return }
-        var nextCounts = mailboxCounts
-        for (label, count) in refreshedCounts where mailboxCounts[label] == countsAtStart[label] {
-            nextCounts[label] = count
+        guard !Task.isCancelled,
+              refreshRevision == folderCountsRefreshRevision,
+              folderCountsRefreshOwnerID == refreshOwnerID else {
+            return
         }
-        if mailboxCounts != nextCounts {
-            mailboxCounts = nextCounts
+        if completedEveryRequest,
+           Self.folderCountLabels.allSatisfy({ mailboxCounts[$0] != nil }) {
+            lastCompletedFolderCountsRefreshAt = Date()
         }
+    }
+
+    private func cancelFolderCountRefresh() {
+        folderCountsRefreshRevision &+= 1
+        folderCountsRefreshOwnerID = nil
+        inFlightFolderCountRequest?.cancel()
+        inFlightFolderCountRequest = nil
+        inFlightFolderCountRequestID = nil
+    }
+
+    private func clearInFlightFolderCountRequest(id: UUID) {
+        guard inFlightFolderCountRequestID == id else {
+            return
+        }
+        inFlightFolderCountRequest = nil
+        inFlightFolderCountRequestID = nil
+    }
+
+    private func clearFolderCountRefreshOwner(id: UUID) {
+        guard folderCountsRefreshOwnerID == id else {
+            return
+        }
+        folderCountsRefreshOwnerID = nil
     }
 
     private func updateFolderCount(from mailbox: MailboxResponse) {
@@ -2471,14 +3109,17 @@ public final class InboxStore: ObservableObject {
     private func invalidateAccountScopedOperations() {
         accountOperationGeneration &+= 1
         readerLabelMutationOwners = [:]
+        readerLabelMutationGenerations = [:]
+        readerLabelMutationLabelGenerations = [:]
+        readerLabelIntentOverrides = [:]
         inFlightSessionRefresh?.cancel()
         inFlightSessionRefresh = nil
-        inFlightMailboxRefresh?.cancel()
-        inFlightMailboxRefresh = nil
+        cancelActiveMailboxRefresh()
         for task in inFlightThreads.values {
             task.cancel()
         }
         inFlightThreads = [:]
+        inFlightThreadLabelMutationGenerations = [:]
         selectionPrefetchTask?.cancel()
         selectionPrefetchTask = nil
         priorityPrefetchTask?.cancel()
@@ -2487,10 +3128,19 @@ public final class InboxStore: ObservableObject {
         eventRefreshTask = nil
         postSendRefreshTask?.cancel()
         postSendRefreshTask = nil
+        for task in bodyRefreshTasks.values {
+            task.cancel()
+        }
+        bodyRefreshTasks = [:]
+        bodyRefreshTaskOwners.cancelAll()
+        bodyRefreshAttempts = [:]
+        pendingHydrationRefreshThreadIDs = []
+        hydrationRefreshTaskOwners.cancelAll()
         searchHydrationRefreshTask?.cancel()
         searchHydrationRefreshTask = nil
         searchRequestID = nil
-        folderCountsRefreshRevision &+= 1
+        cancelFolderCountRefresh()
+        lastCompletedFolderCountsRefreshAt = nil
         resetMailboxPagination()
     }
 
@@ -2695,6 +3345,7 @@ private extension ThreadMessage {
             bcc: bcc,
             subject: subject,
             body: body,
+            bodyComplete: bodyComplete,
             htmlBody: htmlBody,
             htmlRenderDocument: htmlRenderDocument,
             reader: reader,
@@ -2718,9 +3369,7 @@ private extension ThreadMessage {
     }
 
     var needsReaderBodyRefresh: Bool {
-        let bodyMissing = body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let readerMissing = reader?.originalHTMLAvailable == false && htmlBody == nil && htmlRenderDocument == nil
-        return bodyMissing || readerMissing
+        !bodyComplete
     }
 }
 

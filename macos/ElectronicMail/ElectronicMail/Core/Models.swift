@@ -1621,6 +1621,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
     let bcc: String?
     let subject: String?
     let body: String
+    let bodyComplete: Bool
     let htmlBody: String?
     let htmlRenderDocument: String?
     let reader: ThreadMessageReader?
@@ -1640,6 +1641,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         case bcc
         case subject
         case body
+        case bodyComplete = "body_complete"
         case htmlBody = "html_body"
         case htmlRenderDocument = "html_render_document"
         case reader
@@ -1656,6 +1658,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         let decodedHTMLBody = try container.decodeIfPresent(String.self, forKey: .htmlBody)
         let decodedHTMLRenderDocument = try container.decodeIfPresent(String.self, forKey: .htmlRenderDocument)
         let decodedReader = try container.decodeIfPresent(ThreadMessageReader.self, forKey: .reader)
+        let decodedSnippet = try container.decodeIfPresent(String.self, forKey: .snippet)
 
         id = decodedID
         source = try container.decode(SourceType.self, forKey: .source)
@@ -1667,10 +1670,18 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         bcc = try container.decodeIfPresent(String.self, forKey: .bcc)
         subject = try container.decodeIfPresent(String.self, forKey: .subject)
         body = decodedBody
+        bodyComplete = try container.decodeIfPresent(Bool.self, forKey: .bodyComplete)
+            ?? Self.inferredBodyCompleteness(
+                body: decodedBody,
+                snippet: decodedSnippet,
+                htmlBody: decodedHTMLBody,
+                htmlRenderDocument: decodedHTMLRenderDocument,
+                reader: decodedReader
+            )
         htmlBody = decodedHTMLBody
         htmlRenderDocument = decodedHTMLRenderDocument
         reader = decodedReader
-        snippet = try container.decodeIfPresent(String.self, forKey: .snippet)
+        snippet = decodedSnippet
         attachments = try container.decodeIfPresent([ThreadAttachment].self, forKey: .attachments) ?? []
         labelIDs = try container.decodeIfPresent([String].self, forKey: .labelIDs) ?? []
         receivedAt = try container.decode(String.self, forKey: .receivedAt)
@@ -1693,6 +1704,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         bcc: String?,
         subject: String?,
         body: String,
+        bodyComplete: Bool = true,
         htmlBody: String?,
         htmlRenderDocument: String?,
         reader: ThreadMessageReader? = nil,
@@ -1711,6 +1723,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         self.bcc = bcc
         self.subject = subject
         self.body = body
+        self.bodyComplete = bodyComplete
         self.htmlBody = htmlBody
         self.htmlRenderDocument = htmlRenderDocument
         self.reader = reader
@@ -1724,6 +1737,26 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
             html: htmlRenderDocument ?? htmlBody,
             reader: reader
         )
+    }
+
+    private static func inferredBodyCompleteness(
+        body: String,
+        snippet: String?,
+        htmlBody: String?,
+        htmlRenderDocument: String?,
+        reader: ThreadMessageReader?
+    ) -> Bool {
+        let normalizedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedBody.isEmpty else {
+            return false
+        }
+        let hasHTML = htmlBody?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            || htmlRenderDocument?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        if hasHTML || reader?.originalHTMLAvailable == true {
+            return true
+        }
+        let normalizedSnippet = snippet?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return normalizedSnippet.isEmpty || normalizedBody != normalizedSnippet
     }
 
     private static func makeRenderRevision(

@@ -286,6 +286,51 @@ final class ModelDecodingTests: XCTestCase {
 
         XCTAssertEqual(thread.gmailThreadID, "thread-1")
         XCTAssertEqual(thread.messages.first?.id, "source-1")
+        XCTAssertEqual(thread.messages.first?.bodyComplete, true)
+    }
+
+    func testLegacyPlainTextMessageInfersCompleteWhenBodyDiffersFromSnippet() throws {
+        let data = """
+        {
+          "id": "legacy-full-text",
+          "source": "gmail",
+          "body": "This is the complete plain-text message with additional detail.",
+          "snippet": "This is the preview.",
+          "reader": {
+            "primary_text": "This is the complete plain-text message with additional detail.",
+            "markers": [],
+            "original_html_available": false
+          },
+          "label_ids": ["INBOX"],
+          "received_at": "2026-07-23T10:00:00Z"
+        }
+        """.data(using: .utf8)!
+
+        let message = try JSONDecoder.backend.decode(ThreadMessage.self, from: data)
+
+        XCTAssertTrue(message.bodyComplete)
+    }
+
+    func testLegacySnippetOnlyMessageInfersIncompleteWithoutHTML() throws {
+        let data = """
+        {
+          "id": "legacy-snippet-only",
+          "source": "gmail",
+          "body": "This is the metadata preview.",
+          "snippet": "This is the metadata preview.",
+          "reader": {
+            "primary_text": "This is the metadata preview.",
+            "markers": [],
+            "original_html_available": false
+          },
+          "label_ids": ["INBOX"],
+          "received_at": "2026-07-23T10:00:00Z"
+        }
+        """.data(using: .utf8)!
+
+        let message = try JSONDecoder.backend.decode(ThreadMessage.self, from: data)
+
+        XCTAssertFalse(message.bodyComplete)
     }
 
     func testThreadReaderResponseDecodesCleanReaderPayload() throws {
@@ -308,6 +353,7 @@ final class ModelDecodingTests: XCTestCase {
               "from_address": "HDFCFXclearretail <hdfcfxclearretail@hdfc.bank.in>",
               "subject": "Re: FX Retail",
               "body": "Noisy fallback",
+              "body_complete": false,
               "html_body": "<html><body>Raw</body></html>",
               "html_render_document": "<html><body>Raw</body></html>",
               "reader": {
@@ -336,6 +382,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(thread.messages[0].reader?.quotedText, "On Tue, Gaurav wrote:")
         XCTAssertEqual(thread.messages[0].reader?.footerText, "Disclaimer: confidential")
         XCTAssertEqual(thread.messages[0].reader?.originalHTMLAvailable, true)
+        XCTAssertFalse(thread.messages[0].bodyComplete)
     }
 
     func testGmailMutationResponseDecodesSharedContractFixture() throws {

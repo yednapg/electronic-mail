@@ -88,6 +88,22 @@ public final class OfflineFirstAppClient: AppClient {
         }
     }
 
+    public func mailboxFolderCount(label: MailboxLabel) async throws -> MailboxResponse {
+        let expectedSessionToken = backend.sessionToken
+        let userID = await resolvedBackendUserID()
+        do {
+            let response = try await backend.mailboxFolderCount(label: label)
+            try validateSessionToken(expectedSessionToken)
+            return response
+        } catch {
+            try validateSessionToken(expectedSessionToken)
+            if let userID, let cached = localMailStore.readMailbox(userID: userID, label: label) {
+                return cached
+            }
+            throw error
+        }
+    }
+
     public func searchMailbox(
         query: String,
         label: MailboxLabel?,
