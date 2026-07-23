@@ -65,6 +65,7 @@ public struct SignedInShellView: View {
     @State private var commandPaletteOpen = false
     @State private var composer: MailComposerPresentation?
     @State private var recoveredComposerSnapshot: ComposerRecoverySnapshot?
+    @State private var composerRecoveryLoadGate = MailComposerRecoveryLoadGate<MailComposerPresentation>()
     @State private var pendingCommandThreadID: String?
     @State private var mailboxSearchText = ""
 
@@ -145,7 +146,7 @@ public struct SignedInShellView: View {
                     store: store,
                     colorScheme: colorScheme,
                     onReauthorizeGoogle: onReauthorizeGoogle,
-                    onClose: closeComposer
+                    onClose: closeComposer(preserving:)
                 )
                 .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .center)))
                 .zIndex(12)
@@ -262,11 +263,12 @@ public struct SignedInShellView: View {
         guard composer == nil else {
             return
         }
-        recoveredComposerSnapshot = nil
         withAnimation(.easeInOut(duration: 0.12)) {
             commandPaletteOpen = false
         }
-        composer = MailComposerPresentation(mode: .compose, threadID: nil, sourceMessageID: nil, title: "New Message")
+        presentComposer(
+            MailComposerPresentation(mode: .compose, threadID: nil, sourceMessageID: nil, title: "New Message")
+        )
     }
 
     private func syncNow() {
@@ -303,42 +305,77 @@ public struct SignedInShellView: View {
     }
 
     private func openResponseComposer(threadID: String, mode: MailComposerMode, sourceMessageID: String) {
-        recoveredComposerSnapshot = nil
-        composer = MailComposerPresentation(
-            mode: mode,
-            threadID: threadID,
-            sourceMessageID: sourceMessageID,
-            title: store.readerRow?.title ?? mode.title
+        presentComposer(
+            MailComposerPresentation(
+                mode: mode,
+                threadID: threadID,
+                sourceMessageID: sourceMessageID,
+                title: store.readerRow?.title ?? mode.title
+            )
         )
     }
 
     private func openDraftComposer(threadID: String) {
-        recoveredComposerSnapshot = nil
-        composer = MailComposerPresentation(mode: .draft, threadID: threadID, sourceMessageID: nil, title: "Edit Draft")
+        presentComposer(
+            MailComposerPresentation(mode: .draft, threadID: threadID, sourceMessageID: nil, title: "Edit Draft")
+        )
     }
 
-    private func closeComposer() {
+    private func presentComposer(_ requestedPresentation: MailComposerPresentation) {
+        guard let requestedPresentation = composerRecoveryLoadGate.request(requestedPresentation) else {
+            return
+        }
+        presentComposerAfterRecoveryLoad(requestedPresentation)
+    }
+
+    private func presentComposerAfterRecoveryLoad(_ requestedPresentation: MailComposerPresentation) {
+        if let recovery = recoveredComposerSnapshot,
+           MailComposerPolicy.shouldRestorePendingRecovery(
+               recoveryAccountUserID: recovery.accountUserID,
+               currentAccountUserID: store.session?.user.id
+           ) {
+            composer = MailComposerPresentation(
+                mode: recovery.mode,
+                threadID: recovery.threadID,
+                sourceMessageID: recovery.sourceMessageID,
+                title: recovery.title
+            )
+            return
+        }
+        recoveredComposerSnapshot = nil
+        composer = requestedPresentation
+    }
+
+    private func closeComposer(preserving recovery: ComposerRecoverySnapshot?) {
+        recoveredComposerSnapshot = recovery
         withAnimation(.easeInOut(duration: 0.12)) {
             composer = nil
         }
-        recoveredComposerSnapshot = nil
     }
 
     @MainActor
     private func restoreRecoveredComposerIfNeeded() async {
-        guard composer == nil else { return }
-        guard let recovery = await ComposerRecoveryWriter.shared.load(),
-              composer == nil,
-              recovery.belongs(to: store.session?.user.id) else {
-            return
+        let recovery = await ComposerRecoveryWriter.shared.load()
+        guard !Task.isCancelled else { return }
+
+        let recoveredPresentation: MailComposerPresentation?
+        if let recovery, recovery.belongs(to: store.session?.user.id) {
+            recoveredComposerSnapshot = recovery
+            recoveredPresentation = MailComposerPresentation(
+                mode: recovery.mode,
+                threadID: recovery.threadID,
+                sourceMessageID: recovery.sourceMessageID,
+                title: recovery.title
+            )
+        } else {
+            recoveredPresentation = nil
         }
-        recoveredComposerSnapshot = recovery
-        composer = MailComposerPresentation(
-            mode: recovery.mode,
-            threadID: recovery.threadID,
-            sourceMessageID: recovery.sourceMessageID,
-            title: recovery.title
+
+        let presentation = composerRecoveryLoadGate.complete(
+            recoveredPresentation: recoveredPresentation
         )
+        guard composer == nil, let presentation else { return }
+        presentComposerAfterRecoveryLoad(presentation)
     }
 }
 
@@ -1311,7 +1348,7 @@ private struct MailComposerOverlay: View {
     @ObservedObject var store: InboxStore
     let colorScheme: ColorScheme
     let onReauthorizeGoogle: () async throws -> Void
-    let onClose: () -> Void
+    let onClose: (ComposerRecoverySnapshot?) -> Void
 
     var body: some View {
         GeometryReader { proxy in
@@ -1372,7 +1409,7 @@ private struct MailComposerSheet: View {
     @ObservedObject var store: InboxStore
     let colorScheme: ColorScheme
     let onReauthorizeGoogle: () async throws -> Void
-    let onClose: () -> Void
+    let onClose: (ComposerRecoverySnapshot?) -> Void
 
     @State private var toText = ""
     @State private var ccText = ""
@@ -1838,13 +1875,12 @@ private struct MailComposerSheet: View {
         gmailThreadID = message.threadID ?? store.readerThread?.gmailThreadID
         sourceAttachmentCount = message.attachments.count
         let currentUser = store.session?.user.email
-        let sender = normalizedAddress(message.replyTo) ?? normalizedAddress(message.fromAddress)
         let recipients = MailReplyPrefillPolicy.recipients(
             mode: presentation.mode,
             currentUser: currentUser,
-            sender: sender,
-            originalTo: parsedAddresses(message.to ?? ""),
-            originalCC: parsedAddresses(message.cc ?? "")
+            senderHeader: message.replyTo ?? message.fromAddress,
+            originalToHeader: message.to,
+            originalCCHeader: message.cc
         )
         switch presentation.mode {
         case .reply:
@@ -1885,7 +1921,7 @@ private struct MailComposerSheet: View {
     @MainActor
     @discardableResult
     private func persistRecoverySnapshotIfNeeded(force: Bool = false) async -> Bool {
-        guard didLoadInitialValues, let accountUserID = store.session?.user.id else {
+        guard didLoadInitialValues else {
             return presentation.mode == .draft && !didLoadInitialValues
         }
         guard hasDraftContent || gmailDraftID?.isEmpty == false || unresolvedSendAttempt else {
@@ -1902,30 +1938,39 @@ private struct MailComposerSheet: View {
             await ComposerRecoveryWriter.shared.clear()
             return true
         }
-        return await ComposerRecoveryWriter.shared.save(
-            ComposerRecoverySnapshot(
-                accountUserID: accountUserID,
-                mode: presentation.mode,
-                threadID: presentation.threadID,
-                sourceMessageID: presentation.sourceMessageID,
-                title: presentation.title,
-                toText: toText,
-                ccText: ccText,
-                bccText: bccText,
-                subject: subject,
-                bodyText: bodyText,
-                clientSendID: clientSendID,
-                serverSendID: serverSendID,
-                unresolvedSendAttempt: unresolvedSendAttempt,
-                clientDraftID: clientDraftID,
-                gmailDraftID: gmailDraftID,
-                gmailThreadID: gmailThreadID,
-                attachments: attachments,
-                existingDraftAttachments: existingDraftAttachments,
-                preserveExistingDraftAttachments: preserveExistingDraftAttachments,
-                sourceAttachmentCount: sourceAttachmentCount,
-                includeOriginalAttachments: includeOriginalAttachments
-            )
+        guard let snapshot = currentRecoverySnapshot() else {
+            return false
+        }
+        return await ComposerRecoveryWriter.shared.save(snapshot)
+    }
+
+    @MainActor
+    private func currentRecoverySnapshot() -> ComposerRecoverySnapshot? {
+        guard let accountUserID = store.session?.user.id else {
+            return nil
+        }
+        return ComposerRecoverySnapshot(
+            accountUserID: accountUserID,
+            mode: presentation.mode,
+            threadID: presentation.threadID,
+            sourceMessageID: presentation.sourceMessageID,
+            title: presentation.title,
+            toText: toText,
+            ccText: ccText,
+            bccText: bccText,
+            subject: subject,
+            bodyText: bodyText,
+            clientSendID: clientSendID,
+            serverSendID: serverSendID,
+            unresolvedSendAttempt: unresolvedSendAttempt,
+            clientDraftID: clientDraftID,
+            gmailDraftID: gmailDraftID,
+            gmailThreadID: gmailThreadID,
+            attachments: attachments,
+            existingDraftAttachments: existingDraftAttachments,
+            preserveExistingDraftAttachments: preserveExistingDraftAttachments,
+            sourceAttachmentCount: sourceAttachmentCount,
+            includeOriginalAttachments: includeOriginalAttachments
         )
     }
 
@@ -2148,28 +2193,50 @@ private struct MailComposerSheet: View {
             statusText = "Waiting for delivery confirmation..."
             return
         }
+
+        let recoveryPersisted = await persistRecoverySnapshotIfNeeded(force: unresolvedSendAttempt)
+        guard recoveryPersisted else {
+            statusText = "Your message could not be preserved. Keep this window open and try again."
+            return
+        }
         if unresolvedSendAttempt {
-            guard await persistRecoverySnapshotIfNeeded(force: true) else {
+            guard let recovery = currentRecoverySnapshot() else {
                 statusText = "Your message could not be preserved. Keep this window open and try again."
                 return
             }
             composerResolved = true
-            onClose()
+            onClose(recovery)
             return
         }
-        if shouldPersistGmailDraft {
-            guard let response = await saveDraftIfNeeded(force: true), response.state == .saved else {
-                statusText = statusText ?? "Draft could not be saved. Try again before closing."
+
+        let requiresGmailDraftSave = shouldPersistGmailDraft
+        let gmailDraftSaveState = requiresGmailDraftSave
+            ? await saveDraftIfNeeded(force: true)?.state
+            : nil
+        switch MailComposerPolicy.closeDecision(
+            recoveryPersisted: recoveryPersisted,
+            requiresGmailDraftSave: requiresGmailDraftSave,
+            gmailDraftSaveState: gmailDraftSaveState
+        ) {
+        case .block:
+            statusText = "Your message could not be preserved. Keep this window open and try again."
+        case .finishAndClearRecovery:
+            finishComposer()
+        case .finishPreservingRecovery:
+            guard let recovery = currentRecoverySnapshot() else {
+                statusText = "Your message could not be preserved. Keep this window open and try again."
                 return
             }
+            composerResolved = true
+            onClose(recovery)
         }
-        finishComposer()
     }
 
     @MainActor
     private func prepareForShutdown() async -> Bool {
         autosaveTask?.cancel()
-        guard await persistRecoverySnapshotIfNeeded(force: unresolvedSendAttempt) else {
+        let recoveryPersisted = await persistRecoverySnapshotIfNeeded(force: unresolvedSendAttempt)
+        guard recoveryPersisted else {
             statusText = "Your unsent message could not be preserved. Keep the app open and try again."
             return false
         }
@@ -2181,14 +2248,23 @@ private struct MailComposerSheet: View {
             composerResolved = true
             return true
         }
-        guard shouldPersistGmailDraft else {
-            ComposerRecoveryStore.clear()
-            composerResolved = true
-            return true
-        }
-        guard let response = await saveDraftIfNeeded(force: true), response.state == .saved else {
-            statusText = statusText ?? "Draft could not be saved. Try quitting again after your connection recovers."
+
+        let requiresGmailDraftSave = shouldPersistGmailDraft
+        let gmailDraftSaveState = requiresGmailDraftSave
+            ? await saveDraftIfNeeded(force: true)?.state
+            : nil
+        switch MailComposerPolicy.shutdownDecision(
+            recoveryPersisted: recoveryPersisted,
+            requiresGmailDraftSave: requiresGmailDraftSave,
+            gmailDraftSaveState: gmailDraftSaveState
+        ) {
+        case .block:
+            statusText = "Your unsent message could not be preserved. Keep the app open and try again."
             return false
+        case .finishAndClearRecovery:
+            ComposerRecoveryStore.clear()
+        case .finishPreservingRecovery:
+            break
         }
         composerResolved = true
         return true
@@ -2200,7 +2276,7 @@ private struct MailComposerSheet: View {
         serverSendID = nil
         composerResolved = true
         ComposerRecoveryStore.clear()
-        onClose()
+        onClose(nil)
     }
 
     @MainActor
@@ -2328,9 +2404,7 @@ private struct MailComposerSheet: View {
     }
 
     private func parsedAddresses(_ value: String) -> [String] {
-        value
-            .split(whereSeparator: { ",;\n".contains($0) })
-            .compactMap { normalizedAddress(String($0)) }
+        MailAddressParser.addresses(in: value)
     }
 
     private var draftAttachmentPayload: [MailAttachmentUpload]? {
@@ -2348,13 +2422,7 @@ private struct MailComposerSheet: View {
     }
 
     private func normalizedAddress(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let start = trimmed.lastIndex(of: "<"), let end = trimmed.lastIndex(of: ">"), start < end {
-            let email = trimmed[trimmed.index(after: start)..<end].trimmingCharacters(in: .whitespacesAndNewlines)
-            return email.isEmpty ? nil : email
-        }
-        return trimmed.isEmpty ? nil : trimmed
+        MailAddressParser.firstAddress(in: value)
     }
 
     private func isValidEmail(_ value: String) -> Bool {
