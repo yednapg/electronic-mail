@@ -1227,7 +1227,7 @@ private enum ComposerRecoveryStore {
         if status == errSecDuplicateItem {
             return loadKey()
         }
-        #if os(macOS) && DEBUG
+        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
         if status == errSecMissingEntitlement {
             let classicStatus = writeKeyData(
                 data,
@@ -1249,7 +1249,7 @@ private enum ComposerRecoveryStore {
         if let data = readKeyData(query: dataProtectionKeychainQuery()), data.count == 32 {
             return SymmetricKey(data: data)
         }
-        #if os(macOS) && DEBUG
+        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
         if let classicData = readKeyData(query: classicMacKeychainQuery()), classicData.count == 32 {
             if writeKeyData(
                 classicData,
@@ -1258,8 +1258,9 @@ private enum ComposerRecoveryStore {
             ) == errSecSuccess {
                 _ = SecItemDelete(classicMacKeychainQuery() as CFDictionary)
             }
-            // The classic macOS Keychain fallback is only for local DEBUG builds;
-            // Release builds require the device-only Data Protection Keychain.
+            // This classic Keychain fallback is compiled only for local Debug or
+            // explicitly marked local-beta builds. Production Release builds
+            // require the device-only Data Protection Keychain.
             return SymmetricKey(data: classicData)
         }
         #endif

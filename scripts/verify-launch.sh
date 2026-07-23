@@ -510,6 +510,8 @@ verify_app_bundle() {
   EXPECTED_SOURCE_COMMIT="$EXPECTED_RELEASE_SHA" \
   EXPECTED_TEAM_ID="$APPLE_DEVELOPMENT_TEAM" \
   SIGNING_MODE=developer-id \
+  INFO_POLICY=production \
+  REQUIRE_ADHOC_SIGNATURE=0 \
   REQUIRE_NOTARIZATION=1 \
   bash "$ROOT_DIR/scripts/verify-macos-release.sh"
 }
