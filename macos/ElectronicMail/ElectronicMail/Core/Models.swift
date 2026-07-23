@@ -1388,6 +1388,83 @@ enum MailComposerPolicy {
             return responseChanged
         }
     }
+
+    static func shouldRestorePendingRecovery(
+        recoveryAccountUserID: String,
+        currentAccountUserID: String?
+    ) -> Bool {
+        guard let currentAccountUserID else {
+            return false
+        }
+        return recoveryAccountUserID == currentAccountUserID
+    }
+
+    static func closeDecision(
+        recoveryPersisted: Bool,
+        requiresGmailDraftSave: Bool,
+        gmailDraftSaveState: MailDraftState?
+    ) -> MailComposerExitDecision {
+        exitDecision(
+            recoveryPersisted: recoveryPersisted,
+            requiresGmailDraftSave: requiresGmailDraftSave,
+            gmailDraftSaveState: gmailDraftSaveState
+        )
+    }
+
+    static func shutdownDecision(
+        recoveryPersisted: Bool,
+        requiresGmailDraftSave: Bool,
+        gmailDraftSaveState: MailDraftState?
+    ) -> MailComposerExitDecision {
+        exitDecision(
+            recoveryPersisted: recoveryPersisted,
+            requiresGmailDraftSave: requiresGmailDraftSave,
+            gmailDraftSaveState: gmailDraftSaveState
+        )
+    }
+
+    private static func exitDecision(
+        recoveryPersisted: Bool,
+        requiresGmailDraftSave: Bool,
+        gmailDraftSaveState: MailDraftState?
+    ) -> MailComposerExitDecision {
+        guard recoveryPersisted else {
+            return .block
+        }
+        guard requiresGmailDraftSave else {
+            return .finishAndClearRecovery
+        }
+        return gmailDraftSaveState == .saved
+            ? .finishAndClearRecovery
+            : .finishPreservingRecovery
+    }
+}
+
+struct MailComposerRecoveryLoadGate<Presentation> {
+    private(set) var isComplete = false
+    private var pendingPresentation: Presentation?
+
+    mutating func request(_ presentation: Presentation) -> Presentation? {
+        guard isComplete else {
+            if pendingPresentation == nil {
+                pendingPresentation = presentation
+            }
+            return nil
+        }
+        return presentation
+    }
+
+    mutating func complete(recoveredPresentation: Presentation?) -> Presentation? {
+        isComplete = true
+        defer { pendingPresentation = nil }
+        return recoveredPresentation ?? pendingPresentation
+    }
+}
+
+enum MailComposerExitDecision: Equatable {
+    case block
+    case finishAndClearRecovery
+    case finishPreservingRecovery
 }
 
 struct MailReplyPrefillRecipients: Equatable {
@@ -1395,7 +1472,114 @@ struct MailReplyPrefillRecipients: Equatable {
     let cc: [String]
 }
 
+enum MailAddressParser {
+    static func addresses(in value: String?) -> [String] {
+        guard let value, !value.isEmpty else {
+            return []
+        }
+
+        var mailboxes: [String] = []
+        var mailboxStart = value.startIndex
+        var index = value.startIndex
+        var insideQuotes = false
+        var escapingQuotedCharacter = false
+        var angleDepth = 0
+
+        func appendMailbox(endingAt end: String.Index) {
+            let mailbox = String(value[mailboxStart..<end])
+            if let address = address(from: mailbox) {
+                mailboxes.append(address)
+            }
+        }
+
+        while index < value.endIndex {
+            let character = value[index]
+            if insideQuotes {
+                if escapingQuotedCharacter {
+                    escapingQuotedCharacter = false
+                } else if character == "\\" {
+                    escapingQuotedCharacter = true
+                } else if character == "\"" {
+                    insideQuotes = false
+                }
+            } else {
+                switch character {
+                case "\"":
+                    insideQuotes = true
+                case "<":
+                    angleDepth += 1
+                case ">":
+                    angleDepth = max(0, angleDepth - 1)
+                case ",", ";", "\n", "\r":
+                    if angleDepth == 0 {
+                        appendMailbox(endingAt: index)
+                        mailboxStart = value.index(after: index)
+                    }
+                default:
+                    break
+                }
+            }
+            index = value.index(after: index)
+        }
+        appendMailbox(endingAt: value.endIndex)
+        return mailboxes
+    }
+
+    static func firstAddress(in value: String?) -> String? {
+        addresses(in: value).first
+    }
+
+    private static func address(from mailbox: String) -> String? {
+        let trimmed = mailbox.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        var insideQuotes = false
+        var escapingQuotedCharacter = false
+        var angleStart: String.Index?
+        var index = trimmed.startIndex
+        while index < trimmed.endIndex {
+            let character = trimmed[index]
+            if insideQuotes {
+                if escapingQuotedCharacter {
+                    escapingQuotedCharacter = false
+                } else if character == "\\" {
+                    escapingQuotedCharacter = true
+                } else if character == "\"" {
+                    insideQuotes = false
+                }
+            } else if character == "\"" {
+                insideQuotes = true
+            } else if character == "<" {
+                angleStart = trimmed.index(after: index)
+            } else if character == ">", let angleStart, angleStart <= index {
+                let address = trimmed[angleStart..<index].trimmingCharacters(in: .whitespacesAndNewlines)
+                return address.isEmpty ? nil : address
+            }
+            index = trimmed.index(after: index)
+        }
+        return trimmed
+    }
+}
+
 enum MailReplyPrefillPolicy {
+    static func recipients(
+        mode: MailComposerMode,
+        currentUser: String?,
+        senderHeader: String?,
+        originalToHeader: String?,
+        originalCCHeader: String?
+    ) -> MailReplyPrefillRecipients {
+        recipients(
+            mode: mode,
+            currentUser: currentUser,
+            sender: MailAddressParser.firstAddress(in: senderHeader),
+            originalTo: MailAddressParser.addresses(in: originalToHeader),
+            originalCC: MailAddressParser.addresses(in: originalCCHeader)
+        )
+    }
+
     static func recipients(
         mode: MailComposerMode,
         currentUser: String?,
@@ -1737,6 +1921,28 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
             html: htmlRenderDocument ?? htmlBody,
             reader: reader
         )
+    }
+
+    init(copying message: ThreadMessage, labelIDs: [String]) {
+        id = message.id
+        renderRevision = message.renderRevision
+        source = message.source
+        threadID = message.threadID
+        fromAddress = message.fromAddress
+        replyTo = message.replyTo
+        to = message.to
+        cc = message.cc
+        bcc = message.bcc
+        subject = message.subject
+        body = message.body
+        bodyComplete = message.bodyComplete
+        htmlBody = message.htmlBody
+        htmlRenderDocument = message.htmlRenderDocument
+        reader = message.reader
+        snippet = message.snippet
+        attachments = message.attachments
+        self.labelIDs = labelIDs
+        receivedAt = message.receivedAt
     }
 
     private static func inferredBodyCompleteness(

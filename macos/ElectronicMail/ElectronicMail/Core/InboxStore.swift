@@ -207,7 +207,6 @@ public struct InboxRowViewModel: Identifiable, Equatable {
     let section: String
     let isUnread: Bool
     let isGrouped: Bool
-    let isSelected: Bool
     let threadID: String
     let focusedMessageID: String?
     let messageCount: Int
@@ -218,7 +217,7 @@ public struct InboxRowViewModel: Identifiable, Equatable {
     let isExpandable: Bool
     let isExpanded: Bool
 
-    var visualTone: InboxRowVisualTone {
+    func visualTone(isSelected: Bool = false) -> InboxRowVisualTone {
         if isSelected {
             return .selected
         }
@@ -418,14 +417,10 @@ public final class InboxStore: ObservableObject {
     }
     @Published private(set) var refreshFailed = false
     @Published private(set) var manualSyncInProgress = false
-    @Published private(set) var selectedThreadID: String? {
-        didSet { invalidateInboxSections() }
-    }
-    @Published private(set) var selectedMessageID: String? {
-        didSet { invalidateInboxSections() }
-    }
-    @Published private(set) var activeThreadID: String?
-    @Published private(set) var activeMessageID: String?
+    @Published private(set) var selectedThreadID: String?
+    @Published private(set) var selectedMessageID: String?
+    private(set) var activeThreadID: String?
+    private(set) var activeMessageID: String?
     @Published private(set) var readerThreadID: String?
     @Published private(set) var readerFocusedMessageID: String?
     @Published private(set) var readerThread: ThreadReaderResponse?
@@ -728,7 +723,6 @@ public final class InboxStore: ObservableObject {
                     section: section.title,
                     isUnread: row.isUnread,
                     isGrouped: row.isGrouped,
-                    isSelected: selectedThreadID == row.threadID && selectedMessageID == nil,
                     threadID: row.threadID,
                     focusedMessageID: nil,
                     messageCount: row.messageCount,
@@ -752,7 +746,6 @@ public final class InboxStore: ObservableObject {
                         section: section.title,
                         isUnread: child.isUnread,
                         isGrouped: false,
-                        isSelected: selectedThreadID == row.threadID && selectedMessageID == child.messageID,
                         threadID: row.threadID,
                         focusedMessageID: child.messageID,
                         messageCount: 1,
@@ -1513,8 +1506,12 @@ public final class InboxStore: ObservableObject {
     }
 
     public func select(threadID: String, focusedMessageID: String?, prefetch: Bool = true) {
-        selectedThreadID = threadID
-        selectedMessageID = focusedMessageID
+        if selectedThreadID != threadID {
+            selectedThreadID = threadID
+        }
+        if selectedMessageID != focusedMessageID {
+            selectedMessageID = focusedMessageID
+        }
         activeThreadID = threadID
         activeMessageID = focusedMessageID
         threadErrors[threadID] = nil
@@ -3009,6 +3006,7 @@ public final class InboxStore: ObservableObject {
             clearFolderCountRefreshOwner(id: refreshOwnerID)
         }
         let countsAtStart = mailboxCounts
+        var refreshedCounts: [MailboxLabel: MailboxFolderCount] = [:]
         var completedEveryRequest = true
         for label in labels {
             guard !Task.isCancelled,
@@ -3019,7 +3017,7 @@ public final class InboxStore: ObservableObject {
             if label == activeMailboxLabel,
                let activeMailbox,
                activeMailbox.label == label {
-                updateFolderCount(from: activeMailbox)
+                refreshedCounts[label] = Self.folderCount(from: activeMailbox)
                 continue
             }
 
@@ -3037,9 +3035,7 @@ public final class InboxStore: ObservableObject {
                       folderCountsRefreshOwnerID == refreshOwnerID else {
                     return
                 }
-                if mailboxCounts[label] == countsAtStart[label] {
-                    mailboxCounts[label] = Self.folderCount(from: mailbox)
-                }
+                refreshedCounts[label] = Self.folderCount(from: mailbox)
             } catch is CancellationError {
                 clearInFlightFolderCountRequest(id: requestID)
                 return
@@ -3057,6 +3053,13 @@ public final class InboxStore: ObservableObject {
               refreshRevision == folderCountsRefreshRevision,
               folderCountsRefreshOwnerID == refreshOwnerID else {
             return
+        }
+        var mergedCounts = mailboxCounts
+        for (label, count) in refreshedCounts where mailboxCounts[label] == countsAtStart[label] {
+            mergedCounts[label] = count
+        }
+        if mergedCounts != mailboxCounts {
+            mailboxCounts = mergedCounts
         }
         if completedEveryRequest,
            Self.folderCountLabels.allSatisfy({ mailboxCounts[$0] != nil }) {
@@ -3334,26 +3337,7 @@ private extension ThreadMessage {
         if isPresent {
             nextLabelIDs.append(labelID)
         }
-        return ThreadMessage(
-            id: id,
-            source: source,
-            threadID: threadID,
-            fromAddress: fromAddress,
-            replyTo: replyTo,
-            to: to,
-            cc: cc,
-            bcc: bcc,
-            subject: subject,
-            body: body,
-            bodyComplete: bodyComplete,
-            htmlBody: htmlBody,
-            htmlRenderDocument: htmlRenderDocument,
-            reader: reader,
-            snippet: snippet,
-            attachments: attachments,
-            labelIDs: nextLabelIDs,
-            receivedAt: receivedAt
-        )
+        return ThreadMessage(copying: self, labelIDs: nextLabelIDs)
     }
 
     var needsHTMLRenderDocumentRefresh: Bool {
