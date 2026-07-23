@@ -4,6 +4,7 @@ import SwiftUI
 
 @main
 struct ElectronicMailApp: App {
+    @NSApplicationDelegateAdaptor(ElectronicMailApplicationDelegate.self) private var appDelegate
     @StateObject private var store: InboxStore
 
     init() {
@@ -20,62 +21,53 @@ struct ElectronicMailApp: App {
         WindowGroup {
             ElectronicMailRootView(store: store)
                 .frame(minWidth: 1100, minHeight: 680)
-                .background(WindowTrafficLightOffset())
+                .tint(ElectronicMailDesign.appleBlue)
         }
-        .windowStyle(.hiddenTitleBar)
+        .windowToolbarStyle(.unifiedCompact(showsTitle: true))
         .defaultSize(width: 1440, height: 900)
         .commands {
-            CommandGroup(after: .appInfo) {
-                Button("Open Command Palette") {
-                    NotificationCenter.default.post(name: .electronicMailOpenCommandPalette, object: nil)
-                }
-                .keyboardShortcut("k", modifiers: [.command])
+            SidebarCommands()
 
+            CommandGroup(after: .newItem) {
                 Button("New Message") {
                     NotificationCenter.default.post(name: .electronicMailOpenComposer, object: nil)
                 }
                 .keyboardShortcut("n", modifiers: [.command])
             }
-        }
-    }
-}
 
-private struct WindowTrafficLightOffset: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
-        DispatchQueue.main.async {
-            Self.apply(to: view.window)
-        }
-        return view
-    }
+            CommandMenu("Mailbox") {
+                Button("Get New Mail") {
+                    NotificationCenter.default.post(name: .electronicMailSyncMailbox, object: nil)
+                }
+                .keyboardShortcut("r", modifiers: [.command])
 
-    func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async {
-            Self.apply(to: nsView.window)
-        }
-    }
+                Divider()
 
-    private static func apply(to window: NSWindow?) {
-        guard let window, !WindowTrafficLightOffsetState.configured.contains(ObjectIdentifier(window)) else {
-            return
-        }
-
-        for buttonType in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-            guard let button = window.standardWindowButton(buttonType) else {
-                continue
+                Button("Open Command Palette") {
+                    NotificationCenter.default.post(name: .electronicMailOpenCommandPalette, object: nil)
+                }
+                .keyboardShortcut("k", modifiers: [.command])
             }
-            button.setFrameOrigin(NSPoint(x: button.frame.origin.x + 7, y: button.frame.origin.y - 7))
         }
-
-        WindowTrafficLightOffsetState.configured.insert(ObjectIdentifier(window))
     }
 }
 
-private enum WindowTrafficLightOffsetState {
-    static var configured: Set<ObjectIdentifier> = []
+@MainActor
+private final class ElectronicMailApplicationDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard ElectronicMailComposerShutdownCoordinator.shared.hasActiveComposer else {
+            return .terminateNow
+        }
+        Task { @MainActor in
+            let canTerminate = await ElectronicMailComposerShutdownCoordinator.shared.prepareForShutdown()
+            sender.reply(toApplicationShouldTerminate: canTerminate)
+        }
+        return .terminateLater
+    }
 }
 
 private enum AppLaunchStage {
+    case resolvingSession
     case signIn
     case setup
     case app
@@ -83,9 +75,10 @@ private enum AppLaunchStage {
 
 private struct ElectronicMailRootView: View {
     @ObservedObject var store: InboxStore
-    @State private var stage: AppLaunchStage = .signIn
+    @State private var stage: AppLaunchStage = .resolvingSession
     @State private var setupStartedAt = Date()
     @State private var setupError: String?
+    @State private var resolvingError: String?
     @State private var signInInProgress = false
     @State private var signInError: String?
 
@@ -94,6 +87,10 @@ private struct ElectronicMailRootView: View {
     var body: some View {
         ZStack {
             switch stage {
+            case .resolvingSession:
+                SessionResolvingView(errorMessage: resolvingError) {
+                    Task { await restoreExistingSessionIfAvailable() }
+                }
             case .signIn:
                 GoogleSignInView(
                     isSigningIn: signInInProgress,
@@ -112,9 +109,13 @@ private struct ElectronicMailRootView: View {
                 }
                 .transition(.opacity)
             case .app:
-                SignedInShellView(store: store) {
-                    try await performGoogleReauthorization()
-                }
+                SignedInShellView(
+                    store: store,
+                    onReauthorizeGoogle: { try await performGoogleReauthorization() },
+                    onSignOut: { try await performSignOut() },
+                    onDisconnectGoogle: { try await performGoogleDisconnect() },
+                    onDeleteAccount: { try await performAccountDeletion() }
+                )
                     .onAppear {
                         store.startLiveRefreshLoop()
                     }
@@ -124,14 +125,41 @@ private struct ElectronicMailRootView: View {
         .task {
             await restoreExistingSessionIfAvailable()
         }
+        .onChange(of: store.hasSessionToken) { hadSession, hasSession in
+            guard hadSession, !hasSession else {
+                return
+            }
+            handleUnexpectedSessionLoss()
+        }
         .onOpenURL { url in
             GoogleOAuthService.handleCallbackURL(url)
         }
     }
 
     @MainActor
+    private func handleUnexpectedSessionLoss() {
+        guard stage != .signIn else {
+            return
+        }
+
+        tokenStore.clear()
+        signInInProgress = false
+        setupError = nil
+        resolvingError = nil
+        signInError = "Sign in with Google to load your mailbox."
+        withAnimation(.easeInOut(duration: 0.25)) {
+            stage = .signIn
+        }
+    }
+
+    @MainActor
     private func restoreExistingSessionIfAvailable() async {
-        guard stage == .signIn, let token = tokenStore.load(), !token.isEmpty else {
+        guard stage == .resolvingSession else {
+            return
+        }
+        resolvingError = nil
+        guard let token = tokenStore.load(), !token.isEmpty else {
+            stage = .signIn
             return
         }
 
@@ -139,9 +167,13 @@ private struct ElectronicMailRootView: View {
         await store.load()
 
         if case .failed(let message) = store.phase {
-            tokenStore.clear()
-            store.setSessionToken(nil)
-            signInError = message
+            if store.hasSessionToken {
+                resolvingError = message
+            } else {
+                tokenStore.clear()
+                signInError = message
+                stage = .signIn
+            }
             return
         }
 
@@ -165,11 +197,10 @@ private struct ElectronicMailRootView: View {
         signInError = nil
 
         do {
-            let loginCode = try await GoogleOAuthService().startGoogleAuthentication(
-                baseURL: store.backendURL,
-                authRedirectURI: AppConfiguration.authRedirectURI
+            let grant = try await GoogleOAuthService().startGoogleAuthenticationWithBrowserHandoff(
+                baseURL: store.backendURL
             )
-            let session = try await store.exchangeMobileSession(loginCode: loginCode)
+            let session = try await store.exchangeMobileSession(grant: grant)
             try tokenStore.save(session.sessionToken)
             await store.load()
 
@@ -189,13 +220,48 @@ private struct ElectronicMailRootView: View {
 
     @MainActor
     private func performGoogleReauthorization() async throws {
-        let loginCode = try await GoogleOAuthService().startGoogleAuthentication(
-            baseURL: store.backendURL,
-            authRedirectURI: AppConfiguration.authRedirectURI
+        let grant = try await GoogleOAuthService().startGoogleAuthenticationWithBrowserHandoff(
+            baseURL: store.backendURL
         )
-        let session = try await store.exchangeMobileSession(loginCode: loginCode)
+        let session = try await store.exchangeMobileSession(grant: grant)
         try tokenStore.save(session.sessionToken)
         await store.load()
+    }
+
+    @MainActor
+    private func performSignOut() async throws {
+        try await store.logoutRemoteSession()
+        ElectronicMailComposerShutdownCoordinator.shared.clearRecoveryData()
+        tokenStore.clear()
+        store.setSessionToken(nil)
+        signInError = nil
+        withAnimation(.easeInOut(duration: 0.25)) {
+            stage = .signIn
+        }
+    }
+
+    @MainActor
+    private func performGoogleDisconnect() async throws {
+        try await store.disconnectGoogleAndDeleteData()
+        ElectronicMailComposerShutdownCoordinator.shared.clearRecoveryData()
+        tokenStore.clear()
+        store.setSessionToken(nil)
+        signInError = "Google was disconnected."
+        withAnimation(.easeInOut(duration: 0.25)) {
+            stage = .signIn
+        }
+    }
+
+    @MainActor
+    private func performAccountDeletion() async throws {
+        try await store.deleteAccountPermanently()
+        ElectronicMailComposerShutdownCoordinator.shared.clearRecoveryData()
+        tokenStore.clear()
+        store.setSessionToken(nil)
+        signInError = "Your Electronic Mail account was deleted."
+        withAnimation(.easeInOut(duration: 0.25)) {
+            stage = .signIn
+        }
     }
 
     @MainActor
@@ -249,11 +315,12 @@ private struct PostLoginCoordinator {
 }
 
 private final class MacSessionTokenStore: SessionTokenStoring {
-    #if DEBUG
-    private let store = UserDefaultsSessionTokenStore()
-    #else
+    private static let legacyPlaintextTokenKey = "ElectronicMail.debug.email_session"
     private let store = KeychainSessionTokenStore()
-    #endif
+
+    init(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: Self.legacyPlaintextTokenKey)
+    }
 
     func load() -> String? {
         store.load()
@@ -265,6 +332,52 @@ private final class MacSessionTokenStore: SessionTokenStoring {
 
     func clear() {
         store.clear()
+    }
+}
+
+private struct SessionResolvingView: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let errorMessage: String?
+    let onRetry: () -> Void
+
+    var body: some View {
+        ZStack {
+            ElectronicMailDesign.background(for: colorScheme)
+                .ignoresSafeArea()
+
+            VStack(spacing: 18) {
+                Image(systemName: "envelope.fill")
+                    .font(.system(size: 34, weight: .semibold, design: .rounded))
+                    .symbolRenderingMode(.monochrome)
+                    .foregroundStyle(ElectronicMailDesign.appleBlue)
+
+                Text("Electronic Mail")
+                    .font(ElectronicMailType.title())
+                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+
+                if let errorMessage {
+                    Text(errorMessage)
+                        .font(ElectronicMailType.small())
+                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 520)
+
+                    Button("Try Again", action: onRetry)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                } else {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(ElectronicMailDesign.appleBlue)
+                        .accessibilityLabel("Opening your mailbox")
+
+                    Text("Opening your mailbox…")
+                        .font(ElectronicMailType.small())
+                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                }
+            }
+            .padding(40)
+        }
     }
 }
 
@@ -294,27 +407,21 @@ private struct GoogleSignInView: View {
                 }
                 .font(ElectronicMailType.sectionTitle())
 
-                Text("Turn your emails into to-do's!")
+                Text("A focused home for your email.")
                     .font(ElectronicMailType.sectionTitle())
                     .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                    .tracking(ElectronicMailType.bodyTracking)
 
                 Button(action: onSignIn) {
-                    Text(isSigningIn ? "Signing in ..." : "Sign in with Google")
-                        .font(ElectronicMailType.body())
-                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                        .padding(.horizontal, 20)
-                        .frame(height: 50)
-                    .background(
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(ElectronicMailDesign.controlFill(for: colorScheme))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .stroke(ElectronicMailDesign.panelBorder(for: colorScheme), lineWidth: 1)
-                    )
+                    if isSigningIn {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text("Sign in with Google")
+                            .font(ElectronicMailType.body())
+                    }
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
                 .disabled(isSigningIn)
                 .help("Sign in with Google")
 
@@ -328,12 +435,12 @@ private struct GoogleSignInView: View {
             }
             .padding(.top, 18)
         }
-        .environment(\.font, .system(.body, design: .rounded))
     }
 }
 
 private struct SetupAnimationView: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let startedAt: Date
     let readiness: PostLoginReadinessResponse?
@@ -342,9 +449,9 @@ private struct SetupAnimationView: View {
 
     private let steps = [
         "Importing emails ...",
-        "Grouping related emails ...",
-        "Finding to-do items ...",
-        "Building dashboard ...",
+        "Indexing conversations ...",
+        "Syncing mailbox folders ...",
+        "Preparing your mailbox ...",
         "Almost ready!"
     ]
 
@@ -360,8 +467,8 @@ private struct SetupAnimationView: View {
                 VStack(spacing: 18) {
                     WavyStatusText(text: statusText(fallbackStep: step))
                         .id(statusText(fallbackStep: step))
-                        .transition(.opacity.combined(with: .scale(scale: 0.985)))
-                        .animation(.easeInOut(duration: 0.35), value: statusText(fallbackStep: step))
+                        .transition(reduceMotion ? .identity : .opacity.combined(with: .scale(scale: 0.985)))
+                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: statusText(fallbackStep: step))
 
                     if let errorMessage {
                         VStack(spacing: 12) {
@@ -372,6 +479,7 @@ private struct SetupAnimationView: View {
                                 onRetry()
                             }
                             .buttonStyle(.plain)
+                            .font(ElectronicMailType.small(weight: .semibold))
                             .foregroundStyle(ElectronicMailDesign.appleBlue)
                         }
                     }
@@ -404,24 +512,34 @@ private struct SetupAnimationView: View {
 
 private struct WavyStatusText: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let text: String
 
+    @ViewBuilder
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timeline in
-            let elapsed = timeline.date.timeIntervalSinceReferenceDate
+        if reduceMotion {
+            Text(text)
+                .font(ElectronicMailType.sectionTitle())
+                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .accessibilityLabel(text)
+        } else {
+            TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timeline in
+                let elapsed = timeline.date.timeIntervalSinceReferenceDate
 
-            HStack(spacing: 0) {
-                ForEach(Array(text.enumerated()), id: \.offset) { index, character in
-                    let phase = elapsed * 4.0 - Double(index) * 0.52
-                    let crest = (sin(phase) + 1.0) / 2.0
-                    let opacity = 0.34 + (crest * crest * 0.66)
+                HStack(spacing: 0) {
+                    ForEach(Array(text.enumerated()), id: \.offset) { index, character in
+                        let phase = elapsed * 4.0 - Double(index) * 0.52
+                        let crest = (sin(phase) + 1.0) / 2.0
+                        let opacity = 0.34 + (crest * crest * 0.66)
 
-                    Text(String(character))
-                        .font(ElectronicMailType.sectionTitle())
-                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme).opacity(opacity))
+                        Text(String(character))
+                            .font(ElectronicMailType.sectionTitle())
+                            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme).opacity(opacity))
+                    }
                 }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(text)
             }
-            .accessibilityLabel(text)
         }
     }
 }

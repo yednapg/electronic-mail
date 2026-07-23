@@ -1,58 +1,64 @@
+import AppKit
 import SwiftUI
 
 public enum ElectronicMailDesign {
-    public static let appleBlue = Color(red: 0.0, green: 90.0 / 255.0, blue: 205.0 / 255.0)
-    public static let green = Color(red: 0.0, green: 190.0 / 255.0, blue: 36.0 / 255.0)
+    /// Electronic Mail's original brand accent. Keep this independent from the
+    /// user's system accent so the product identity remains black and blue.
+    public static let appleBlue = Color(red: 0, green: 90.0 / 255.0, blue: 205.0 / 255.0)
+    public static let green = Color(red: 0, green: 190.0 / 255.0, blue: 36.0 / 255.0)
+    public static let sidebarBackground = Color.black
+    public static let sidebarText = Color.white.opacity(0.90)
+    public static let sidebarSecondaryText = Color.white.opacity(0.58)
 
     public static func background(for colorScheme: ColorScheme) -> Color {
         colorScheme == .dark ? .black : .white
     }
 
-    public static func selectedText(for colorScheme: ColorScheme) -> Color {
+    public static func selectedText(for _: ColorScheme) -> Color {
         .white
     }
 
-    public static func panelFill(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.075) : Color.black.opacity(0.045)
+    public static func panelFill(for _: ColorScheme) -> Color {
+        Color(nsColor: .controlBackgroundColor)
     }
 
-    public static func panelBorder(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.08)
+    public static func panelBorder(for _: ColorScheme) -> Color {
+        Color(nsColor: .separatorColor)
     }
 
-    public static func primaryText(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.90) : Color.black.opacity(0.90)
+    public static func primaryText(for _: ColorScheme) -> Color {
+        Color(nsColor: .labelColor)
     }
 
-    public static func secondaryText(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.75) : Color.black.opacity(0.75)
+    public static func secondaryText(for _: ColorScheme) -> Color {
+        Color(nsColor: .secondaryLabelColor)
     }
 
     public static func unreadText(for colorScheme: ColorScheme) -> Color {
-        primaryText(for: colorScheme)
+        colorScheme == .dark ? .white : .black
     }
 
-    public static func readText(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.50) : Color.black.opacity(0.50)
+    public static func readText(for _: ColorScheme) -> Color {
+        Color(nsColor: .secondaryLabelColor)
     }
 
-    public static func tertiaryText(for colorScheme: ColorScheme) -> Color {
-        readText(for: colorScheme)
+    public static func tertiaryText(for _: ColorScheme) -> Color {
+        Color(nsColor: .tertiaryLabelColor)
     }
 
-    public static func sectionText(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.25) : Color.black.opacity(0.25)
+    public static func sectionText(for _: ColorScheme) -> Color {
+        Color(nsColor: .secondaryLabelColor)
     }
 
-    public static func divider(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.10) : Color.black.opacity(0.10)
+    public static func divider(for _: ColorScheme) -> Color {
+        Color(nsColor: .separatorColor)
     }
 
     public static func controlFill(for colorScheme: ColorScheme, selected: Bool = false) -> Color {
         if selected {
             return appleBlue.opacity(colorScheme == .dark ? 0.24 : 0.13)
         }
-        return colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.035)
+        return Color(nsColor: .controlBackgroundColor)
     }
 }
 
@@ -98,6 +104,47 @@ public enum ElectronicMailType {
 
     public static func icon(weight: Font.Weight = .regular) -> Font {
         .system(size: iconSize, weight: weight, design: .rounded)
+    }
+}
+
+/// Mailbox-specific type roles. The reader and composer keep the product's
+/// original, larger rounded scale; the dense mailbox uses a macOS hierarchy.
+public enum ElectronicMailMailboxType {
+    public static let rowHeight: CGFloat = 32
+    public static let sidebarHeaderSize: CGFloat = 12
+    public static let sidebarItemSize: CGFloat = 14
+    public static let sidebarAccountSize: CGFloat = 13
+    public static let sectionSize: CGFloat = 12
+    public static let senderSize: CGFloat = 15
+    public static let subjectSize: CGFloat = 14
+    public static let metadataSize: CGFloat = 12
+
+    public static func sidebarHeader() -> Font {
+        .system(size: sidebarHeaderSize, weight: .semibold, design: .rounded)
+    }
+
+    public static func sidebarItem(selected: Bool = false) -> Font {
+        .system(size: sidebarItemSize, weight: selected ? .semibold : .regular, design: .rounded)
+    }
+
+    public static func sidebarAccount() -> Font {
+        .system(size: sidebarAccountSize, weight: .medium, design: .rounded)
+    }
+
+    public static func section() -> Font {
+        .system(size: sectionSize, weight: .semibold, design: .rounded)
+    }
+
+    public static func sender(unread: Bool) -> Font {
+        .system(size: senderSize, weight: unread ? .semibold : .medium, design: .rounded)
+    }
+
+    public static func subject(unread: Bool) -> Font {
+        .system(size: subjectSize, weight: unread ? .medium : .regular, design: .rounded)
+    }
+
+    public static func metadata(unread: Bool = false) -> Font {
+        .system(size: metadataSize, weight: unread ? .medium : .regular, design: .rounded)
     }
 }
 

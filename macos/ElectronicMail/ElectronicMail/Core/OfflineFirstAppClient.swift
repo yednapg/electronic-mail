@@ -29,25 +29,58 @@ public final class OfflineFirstAppClient: AppClient {
         backend.mode
     }
 
+    public var supportsRealtimeMailboxUpdates: Bool {
+        backend.supportsRealtimeMailboxUpdates
+    }
+
+    public var supportsFolderCountPrefetch: Bool {
+        backend.supportsFolderCountPrefetch
+    }
+
     public func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
         try await backend.exchangeMobileSession(loginCode: loginCode)
     }
 
+    public func exchangeMobileSession(grant: MobileAuthenticationGrant) async throws -> MobileSessionExchangeResponse {
+        try await backend.exchangeMobileSession(grant: grant)
+    }
+
+    public func logout() async throws {
+        try await backend.logout()
+    }
+
+    public func disconnectGoogle(deleteData: Bool, revokeSessions: Bool) async throws {
+        try await backend.disconnectGoogle(deleteData: deleteData, revokeSessions: revokeSessions)
+    }
+
+    public func deleteGoogleData() async throws {
+        try await backend.deleteGoogleData()
+    }
+
+    public func deleteAccount() async throws {
+        try await backend.deleteAccount()
+    }
+
     public func appSession() async throws -> AppSessionResponse {
-        let response = try await refreshLocalSession()
-        await replayPendingThreadActions(for: response.user.id)
+        let expectedSessionToken = backend.sessionToken
+        let response = try await refreshLocalSession(expectedSessionToken: expectedSessionToken)
+        await replayPendingThreadActions(for: response.user.id, expectedSessionToken: expectedSessionToken)
+        try validateSessionToken(expectedSessionToken)
         return response
     }
 
     public func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
+        let expectedSessionToken = backend.sessionToken
         let userID = await resolvedBackendUserID()
         do {
             let response = try await backend.mailbox(label: label, limit: limit, cursor: cursor)
+            try validateSessionToken(expectedSessionToken)
             if let userID {
                 localMailStore.writeMailbox(response, userID: userID, label: label)
             }
             return response
         } catch {
+            try validateSessionToken(expectedSessionToken)
             if let userID, let cached = localMailStore.readMailbox(userID: userID, label: label) {
                 return cached
             }
@@ -55,8 +88,30 @@ public final class OfflineFirstAppClient: AppClient {
         }
     }
 
+    public func searchMailbox(
+        query: String,
+        label: MailboxLabel?,
+        limit: Int,
+        cursor: String?,
+        hydrateInBackground: Bool = true
+    ) async throws -> MailboxResponse {
+        try await backend.searchMailbox(
+            query: query,
+            label: label,
+            limit: limit,
+            cursor: cursor,
+            hydrateInBackground: hydrateInBackground
+        )
+    }
+
     public func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
+        let expectedSessionToken = backend.sessionToken
+        let expectedUserID = currentBackendUserID ?? localMailStore.readSession()?.user.id
         let response = try await backend.thread(threadID: threadID, limit: limit, offset: offset)
+        try validateSessionToken(expectedSessionToken)
+        if let expectedUserID, response.userID != expectedUserID {
+            throw APIError.emptyResponse
+        }
         localMailStore.writeThread(response, userID: response.userID, threadID: threadID)
         return response
     }
@@ -93,6 +148,9 @@ public final class OfflineFirstAppClient: AppClient {
             localMailStore.removePendingThreadAction(clientActionID: request.clientActionID)
             return response
         } catch {
+            guard Self.isRetryableOfflineActionError(error) else {
+                throw error
+            }
             if let userID = localMailStore.readSession()?.user.id {
                 localMailStore.writePendingThreadAction(
                     LocalPendingThreadAction(
@@ -129,6 +187,38 @@ public final class OfflineFirstAppClient: AppClient {
         try await backend.sendReply(threadID: threadID, request: request)
     }
 
+    public func outbox(limit: Int) async throws -> MailOutboxResponse {
+        try await backend.outbox(limit: limit)
+    }
+
+    public func sendStatus(serverSendID: String) async throws -> MailSendResponse {
+        try await backend.sendStatus(serverSendID: serverSendID)
+    }
+
+    public func retrySend(serverSendID: String) async throws -> MailSendResponse {
+        try await backend.retrySend(serverSendID: serverSendID)
+    }
+
+    public func createDraft(_ request: MailDraftSaveRequest) async throws -> MailDraftResponse {
+        try await backend.createDraft(request)
+    }
+
+    public func draft(mailboxThreadID: String) async throws -> MailDraftResponse {
+        try await backend.draft(mailboxThreadID: mailboxThreadID)
+    }
+
+    public func updateDraft(gmailDraftID: String, request: MailDraftSaveRequest) async throws -> MailDraftResponse {
+        try await backend.updateDraft(gmailDraftID: gmailDraftID, request: request)
+    }
+
+    public func deleteDraft(gmailDraftID: String) async throws {
+        try await backend.deleteDraft(gmailDraftID: gmailDraftID)
+    }
+
+    public func sendDraft(gmailDraftID: String, request: MailDraftSendRequest) async throws -> MailSendResponse {
+        try await backend.sendDraft(gmailDraftID: gmailDraftID, request: request)
+    }
+
     public func downloadAttachment(messageID: String, attachment: ThreadAttachment) async throws -> DownloadedAttachment {
         try await backend.downloadAttachment(messageID: messageID, attachment: attachment)
     }
@@ -157,8 +247,9 @@ public final class OfflineFirstAppClient: AppClient {
         return GmailThreadMutationResponse(threadID: threadID, action: action)
     }
 
-    private func refreshLocalSession() async throws -> AppSessionResponse {
+    private func refreshLocalSession(expectedSessionToken: String?) async throws -> AppSessionResponse {
         let response = try await backend.appSession()
+        try validateSessionToken(expectedSessionToken)
         currentBackendUserID = response.user.id
         localMailStore.writeSession(response)
         return response
@@ -168,29 +259,86 @@ public final class OfflineFirstAppClient: AppClient {
         if let currentBackendUserID {
             return currentBackendUserID
         }
-        return try? await refreshLocalSession().user.id
+        let expectedSessionToken = backend.sessionToken
+        return try? await refreshLocalSession(expectedSessionToken: expectedSessionToken).user.id
     }
 
     private func replayPendingThreadActionsForCurrentUser() async {
+        let expectedSessionToken = backend.sessionToken
         guard let userID = await resolvedBackendUserID() else {
             return
         }
-        await replayPendingThreadActions(for: userID)
+        guard backend.sessionToken == expectedSessionToken else {
+            return
+        }
+        await replayPendingThreadActions(for: userID, expectedSessionToken: expectedSessionToken)
     }
 
-    private func replayPendingThreadActions(for userID: String) async {
+    private func replayPendingThreadActions(for userID: String, expectedSessionToken: String?) async {
         for action in localMailStore.pendingThreadActions() {
+            guard backend.sessionToken == expectedSessionToken else {
+                return
+            }
             guard action.userID == userID else {
                 continue
             }
             do {
                 _ = try await backend.enqueueThreadAction(action.request)
+                guard backend.sessionToken == expectedSessionToken else {
+                    return
+                }
                 localMailStore.removePendingThreadAction(clientActionID: action.clientActionID)
             } catch {
+                guard backend.sessionToken == expectedSessionToken else {
+                    return
+                }
+                if Self.shouldDiscardReplayedOfflineAction(error) {
+                    localMailStore.removePendingThreadAction(clientActionID: action.clientActionID)
+                    continue
+                }
                 localMailStore.markPendingThreadActionFailed(clientActionID: action.clientActionID, error: error.localizedDescription)
                 return
             }
         }
+    }
+
+    private func validateSessionToken(_ expectedSessionToken: String?) throws {
+        guard backend.sessionToken == expectedSessionToken else {
+            throw CancellationError()
+        }
+    }
+
+    private static func isRetryableOfflineActionError(_ error: Error) -> Bool {
+        if case APIError.httpStatus(let status) = error {
+            return status == 408 || status == 429 || status >= 500
+        }
+        guard let urlError = error as? URLError else {
+            return false
+        }
+        switch urlError.code {
+        case .timedOut,
+             .cannotFindHost,
+             .cannotConnectToHost,
+             .networkConnectionLost,
+             .dnsLookupFailed,
+             .notConnectedToInternet,
+             .internationalRoamingOff,
+             .callIsActive,
+             .dataNotAllowed,
+             .secureConnectionFailed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func shouldDiscardReplayedOfflineAction(_ error: Error) -> Bool {
+        guard case APIError.httpStatus(let status) = error else {
+            // A durable user action should survive failures whose permanence is
+            // unknown. This keeps it available for a later app or network fix.
+            return false
+        }
+        return [400, 404, 409, 410, 413, 422].contains(status)
     }
 }
 

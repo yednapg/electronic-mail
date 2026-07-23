@@ -23,7 +23,13 @@ public enum GmailThreadAction: String, Codable, Equatable {
     case archive
     case unarchive
     case markRead = "mark_read"
+    case markUnread = "mark_unread"
     case moveTrash = "move_trash"
+    case restoreTrash = "restore_trash"
+    case markSpam = "mark_spam"
+    case notSpam = "not_spam"
+    case star
+    case unstar
     case deleteForever = "delete_forever"
 }
 
@@ -33,6 +39,14 @@ public enum MailSendState: String, Codable, Equatable {
     case sent
     case failed
     case reauthRequired = "reauth_required"
+}
+
+public enum MailComposerMode: String, Codable, Equatable {
+    case compose
+    case reply
+    case replyAll = "reply_all"
+    case forward
+    case draft
 }
 
 public enum NeedType: String, Codable, Equatable {
@@ -172,9 +186,31 @@ public struct AuthUserResponse: Codable, Equatable {
 
 public struct MobileSessionExchangeRequest: Codable, Equatable {
     let loginCode: String
+    let handoffID: String
+    let codeVerifier: String
+
+    init(loginCode: String, handoffID: String, codeVerifier: String) {
+        self.loginCode = loginCode
+        self.handoffID = handoffID
+        self.codeVerifier = codeVerifier
+    }
 
     enum CodingKeys: String, CodingKey {
         case loginCode = "login_code"
+        case handoffID = "handoff_id"
+        case codeVerifier = "code_verifier"
+    }
+}
+
+public struct MobileAuthenticationGrant: Equatable {
+    public let loginCode: String
+    public let handoffID: String
+    public let codeVerifier: String
+
+    public init(loginCode: String, handoffID: String, codeVerifier: String) {
+        self.loginCode = loginCode
+        self.handoffID = handoffID
+        self.codeVerifier = codeVerifier
     }
 }
 
@@ -352,7 +388,7 @@ public struct AttentionItem: Codable, Equatable, Identifiable, Hashable {
     }
 }
 
-public enum MailboxLabel: String, Codable, Equatable, Hashable {
+public enum MailboxLabel: String, Codable, Equatable, Hashable, CaseIterable {
     case inbox
     case sent
     case drafts
@@ -360,6 +396,7 @@ public enum MailboxLabel: String, Codable, Equatable, Hashable {
     case trash
     case archive
     case all
+    case starred
 }
 
 public struct GmailThreadUpdate: Codable, Equatable, Identifiable, Hashable {
@@ -399,7 +436,7 @@ public struct GmailThreadChildRow: Codable, Equatable, Identifiable, Hashable {
     }
 
     var displayTitle: String {
-        aiTitle ?? subject ?? snippet ?? "Untitled"
+        subject ?? snippet ?? "Untitled"
     }
 
     var isUnread: Bool {
@@ -468,14 +505,11 @@ public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
     }
 
     var displayTitle: String {
-        if presentationStatus == "ai_pending", aiTitle == nil {
-            return "Building title... \(title ?? latestSubject ?? summary ?? snippet ?? "Email")"
-        }
-        return aiTitle ?? title ?? latestSubject ?? summary ?? snippet ?? "Untitled"
+        title ?? latestSubject ?? snippet ?? "Untitled"
     }
 
     var displaySummary: String? {
-        aiSummary ?? summary ?? snippet
+        snippet
     }
 
     var isGrouped: Bool {
@@ -649,6 +683,7 @@ public struct GmailThreadSection: Codable, Equatable, Identifiable {
 public struct MailboxResponse: Codable, Equatable {
     let label: MailboxLabel
     let totalThreads: Int
+    var unreadThreads: Int? = nil
     let nextCursor: String?
     let loadedThreads: Int?
     let windowDays: Int?
@@ -668,6 +703,7 @@ public struct MailboxResponse: Codable, Equatable {
     init(
         label: MailboxLabel,
         totalThreads: Int,
+        unreadThreads: Int? = nil,
         nextCursor: String? = nil,
         loadedThreads: Int? = nil,
         windowDays: Int? = nil,
@@ -682,6 +718,7 @@ public struct MailboxResponse: Codable, Equatable {
     ) {
         self.label = label
         self.totalThreads = totalThreads
+        self.unreadThreads = unreadThreads
         self.nextCursor = nextCursor
         self.loadedThreads = loadedThreads
         self.windowDays = windowDays
@@ -698,6 +735,7 @@ public struct MailboxResponse: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case label
         case totalThreads = "total_threads"
+        case unreadThreads = "unread_threads"
         case nextCursor = "next_cursor"
         case loadedThreads = "loaded_threads"
         case windowDays = "window_days"
@@ -837,7 +875,30 @@ public struct MailComposeRequest: Codable, Equatable {
     let subject: String
     let bodyText: String
     let bodyHTML: String?
+    let attachments: [MailAttachmentUpload]
     let createdAt: String
+
+    init(
+        clientSendID: String,
+        to: [String],
+        cc: [String],
+        bcc: [String],
+        subject: String,
+        bodyText: String,
+        bodyHTML: String?,
+        attachments: [MailAttachmentUpload] = [],
+        createdAt: String
+    ) {
+        self.clientSendID = clientSendID
+        self.to = to
+        self.cc = cc
+        self.bcc = bcc
+        self.subject = subject
+        self.bodyText = bodyText
+        self.bodyHTML = bodyHTML
+        self.attachments = attachments
+        self.createdAt = createdAt
+    }
 
     enum CodingKeys: String, CodingKey {
         case clientSendID = "client_send_id"
@@ -847,24 +908,87 @@ public struct MailComposeRequest: Codable, Equatable {
         case subject
         case bodyText = "body_text"
         case bodyHTML = "body_html"
+        case attachments
         case createdAt = "created_at"
     }
 }
 
+public struct MailAttachmentUpload: Codable, Equatable {
+    let filename: String
+    let mimeType: String
+    let dataBase64: String
+
+    enum CodingKeys: String, CodingKey {
+        case filename
+        case mimeType = "mime_type"
+        case dataBase64 = "data_base64"
+    }
+}
+
+public enum MailReplyMode: String, Codable, Equatable {
+    case reply
+    case replyAll = "reply_all"
+    case forward
+}
+
 public struct MailReplyRequest: Codable, Equatable {
     let clientSendID: String
+    let sourceMessageID: String?
+    let mode: MailReplyMode
+    let to: [String]
     let cc: [String]
     let bcc: [String]
+    let subject: String?
     let bodyText: String
     let bodyHTML: String?
+    let attachments: [MailAttachmentUpload]
+    let includeQuotedOriginal: Bool
+    let includeOriginalAttachments: Bool
     let createdAt: String
+
+    init(
+        clientSendID: String,
+        sourceMessageID: String? = nil,
+        mode: MailReplyMode = .reply,
+        to: [String] = [],
+        cc: [String],
+        bcc: [String],
+        subject: String? = nil,
+        bodyText: String,
+        bodyHTML: String?,
+        attachments: [MailAttachmentUpload] = [],
+        includeQuotedOriginal: Bool = true,
+        includeOriginalAttachments: Bool = false,
+        createdAt: String
+    ) {
+        self.clientSendID = clientSendID
+        self.sourceMessageID = sourceMessageID
+        self.mode = mode
+        self.to = to
+        self.cc = cc
+        self.bcc = bcc
+        self.subject = subject
+        self.bodyText = bodyText
+        self.bodyHTML = bodyHTML
+        self.attachments = attachments
+        self.includeQuotedOriginal = includeQuotedOriginal
+        self.includeOriginalAttachments = includeOriginalAttachments
+        self.createdAt = createdAt
+    }
 
     enum CodingKeys: String, CodingKey {
         case clientSendID = "client_send_id"
+        case sourceMessageID = "source_message_id"
+        case mode
+        case to
         case cc
         case bcc
+        case subject
         case bodyText = "body_text"
         case bodyHTML = "body_html"
+        case attachments
+        case includeQuotedOriginal = "include_quoted_original"
+        case includeOriginalAttachments = "include_original_attachments"
         case createdAt = "created_at"
     }
 }
@@ -892,6 +1016,66 @@ public struct MailSendResponse: Codable, Equatable {
         case sentAt = "sent_at"
         case error
         case reauthURL = "reauth_url"
+    }
+}
+
+public typealias MailOutboxResponse = [MailSendResponse]
+
+enum DurableSendConfirmationDecision: Equatable {
+    case confirmedSent
+    case poll(serverSendID: String)
+    case preserveForRetry(message: String)
+}
+
+enum DurableSendConfirmationPolicy {
+    // A short, bounded sequence keeps confirmation responsive without turning a
+    // delayed worker into an unbounded task owned by the composer view.
+    static let pollDelayNanoseconds: [UInt64] = [
+        250_000_000,
+        500_000_000,
+        1_000_000_000,
+        2_000_000_000,
+        3_000_000_000,
+    ]
+
+    static func decision(for response: MailSendResponse) -> DurableSendConfirmationDecision {
+        switch response.state {
+        case .sent:
+            return .confirmedSent
+        case .queued, .sending:
+            guard let serverSendID = normalized(response.serverSendID) else {
+                return .preserveForRetry(
+                    message: "Delivery has not been confirmed. Your message is preserved; retry safely."
+                )
+            }
+            return .poll(serverSendID: serverSendID)
+        case .failed:
+            return .preserveForRetry(message: response.error ?? "Send failed. You can retry safely.")
+        case .reauthRequired:
+            return .preserveForRetry(
+                message: response.error ?? "Google needs permission to send mail."
+            )
+        }
+    }
+
+    static func matches(
+        _ response: MailSendResponse,
+        expectedClientSendID: String,
+        expectedServerSendID: String? = nil
+    ) -> Bool {
+        guard response.clientSendID == expectedClientSendID else {
+            return false
+        }
+        guard let expectedServerSendID else {
+            return true
+        }
+        return normalized(response.serverSendID) == expectedServerSendID
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
     }
 }
 
@@ -1039,6 +1223,314 @@ public struct GmailDraftResponse: Codable, Equatable {
     }
 }
 
+public struct MailDraftSaveRequest: Codable, Equatable {
+    let clientDraftID: String
+    let gmailDraftID: String?
+    let gmailThreadID: String?
+    let to: [String]
+    let cc: [String]
+    let bcc: [String]
+    let subject: String
+    let bodyText: String
+    let bodyHTML: String?
+    let attachments: [MailAttachmentUpload]?
+    let retainedAttachmentIDs: [String]?
+    let responseMode: MailReplyMode?
+    let mailboxThreadID: String?
+    let sourceMessageID: String?
+    let includeQuotedOriginal: Bool
+    let includeOriginalAttachments: Bool
+    let createdAt: String
+
+    init(
+        clientDraftID: String,
+        gmailDraftID: String?,
+        gmailThreadID: String?,
+        to: [String],
+        cc: [String],
+        bcc: [String],
+        subject: String,
+        bodyText: String,
+        bodyHTML: String?,
+        attachments: [MailAttachmentUpload]?,
+        retainedAttachmentIDs: [String]?,
+        responseMode: MailReplyMode? = nil,
+        mailboxThreadID: String? = nil,
+        sourceMessageID: String? = nil,
+        includeQuotedOriginal: Bool = true,
+        includeOriginalAttachments: Bool = true,
+        createdAt: String
+    ) {
+        self.clientDraftID = clientDraftID
+        self.gmailDraftID = gmailDraftID
+        self.gmailThreadID = gmailThreadID
+        self.to = to
+        self.cc = cc
+        self.bcc = bcc
+        self.subject = subject
+        self.bodyText = bodyText
+        self.bodyHTML = bodyHTML
+        self.attachments = attachments
+        self.retainedAttachmentIDs = retainedAttachmentIDs
+        self.responseMode = responseMode
+        self.mailboxThreadID = mailboxThreadID
+        self.sourceMessageID = sourceMessageID
+        self.includeQuotedOriginal = includeQuotedOriginal
+        self.includeOriginalAttachments = includeOriginalAttachments
+        self.createdAt = createdAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case clientDraftID = "client_draft_id"
+        case gmailDraftID = "gmail_draft_id"
+        case gmailThreadID = "gmail_thread_id"
+        case to
+        case cc
+        case bcc
+        case subject
+        case bodyText = "body_text"
+        case bodyHTML = "body_html"
+        case attachments
+        case retainedAttachmentIDs = "retained_attachment_ids"
+        case responseMode = "response_mode"
+        case mailboxThreadID = "mailbox_thread_id"
+        case sourceMessageID = "source_message_id"
+        case includeQuotedOriginal = "include_quoted_original"
+        case includeOriginalAttachments = "include_original_attachments"
+        case createdAt = "created_at"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        clientDraftID = try container.decode(String.self, forKey: .clientDraftID)
+        gmailDraftID = try container.decodeIfPresent(String.self, forKey: .gmailDraftID)
+        gmailThreadID = try container.decodeIfPresent(String.self, forKey: .gmailThreadID)
+        to = try container.decodeIfPresent([String].self, forKey: .to) ?? []
+        cc = try container.decodeIfPresent([String].self, forKey: .cc) ?? []
+        bcc = try container.decodeIfPresent([String].self, forKey: .bcc) ?? []
+        subject = try container.decodeIfPresent(String.self, forKey: .subject) ?? ""
+        bodyText = try container.decodeIfPresent(String.self, forKey: .bodyText) ?? ""
+        bodyHTML = try container.decodeIfPresent(String.self, forKey: .bodyHTML)
+        attachments = try container.decodeIfPresent([MailAttachmentUpload].self, forKey: .attachments)
+        retainedAttachmentIDs = try container.decodeIfPresent([String].self, forKey: .retainedAttachmentIDs)
+        responseMode = try container.decodeIfPresent(MailReplyMode.self, forKey: .responseMode)
+        mailboxThreadID = try container.decodeIfPresent(String.self, forKey: .mailboxThreadID)
+        sourceMessageID = try container.decodeIfPresent(String.self, forKey: .sourceMessageID)
+        includeQuotedOriginal = try container.decodeIfPresent(Bool.self, forKey: .includeQuotedOriginal) ?? true
+        includeOriginalAttachments = try container.decodeIfPresent(Bool.self, forKey: .includeOriginalAttachments) ?? true
+        createdAt = try container.decode(String.self, forKey: .createdAt)
+    }
+}
+
+enum MailComposerPolicy {
+    static let maximumAttachmentBytes = 10 * 1_024 * 1_024
+    static let maximumTotalAttachmentBytes = 18 * 1_024 * 1_024
+
+    static func hasDraftContent(textFields: [String], attachmentCount: Int) -> Bool {
+        attachmentCount > 0 || textFields.contains {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    static func requiresEmptySubjectConfirmation(_ subject: String) -> Bool {
+        subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    static func acceptsAttachment(byteCount: Int, currentTotalBytes: Int) -> Bool {
+        byteCount <= maximumAttachmentBytes
+            && currentTotalBytes + byteCount <= maximumTotalAttachmentBytes
+    }
+
+    static func shouldApplyDraftSaveResponse(state: MailDraftState) -> Bool {
+        state == .saved
+    }
+
+    static func shouldClearUnchangedResponseRecovery(
+        force: Bool,
+        hasUnresolvedSendAttempt: Bool,
+        mode: MailComposerMode,
+        restoredFromRecovery: Bool,
+        responseIsUnchanged: Bool
+    ) -> Bool {
+        !force
+            && !hasUnresolvedSendAttempt
+            && responseMode(for: mode) != nil
+            && !restoredFromRecovery
+            && responseIsUnchanged
+    }
+
+    static func responseMode(for mode: MailComposerMode) -> MailReplyMode? {
+        switch mode {
+        case .reply:
+            return .reply
+        case .replyAll:
+            return .replyAll
+        case .forward:
+            return .forward
+        case .compose, .draft:
+            return nil
+        }
+    }
+
+    static func shouldPersistDraft(
+        mode: MailComposerMode,
+        hasContent: Bool,
+        responseChanged: Bool,
+        hasGmailDraft: Bool
+    ) -> Bool {
+        if hasGmailDraft {
+            return true
+        }
+        switch mode {
+        case .compose, .draft:
+            return hasContent
+        case .reply, .replyAll, .forward:
+            return responseChanged
+        }
+    }
+}
+
+struct MailReplyPrefillRecipients: Equatable {
+    let to: [String]
+    let cc: [String]
+}
+
+enum MailReplyPrefillPolicy {
+    static func recipients(
+        mode: MailComposerMode,
+        currentUser: String?,
+        sender: String?,
+        originalTo: [String],
+        originalCC: [String]
+    ) -> MailReplyPrefillRecipients {
+        let current = currentUser?.lowercased()
+        let normalizedSender = sender?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let senderIsCurrentUser = normalizedSender?.lowercased() == current
+        let toRecipients = unique(originalTo)
+        let ccRecipients = unique(originalCC)
+
+        if senderIsCurrentUser {
+            let nonSelfTo = toRecipients.filter { $0.lowercased() != current }
+            switch mode {
+            case .reply:
+                return MailReplyPrefillRecipients(
+                    to: nonSelfTo.isEmpty ? selfFallback(currentUser: currentUser, originalTo: toRecipients, originalCC: ccRecipients) : nonSelfTo,
+                    cc: []
+                )
+            case .replyAll:
+                let nonSelfCC = ccRecipients.filter {
+                    $0.lowercased() != current && !nonSelfTo.map({ $0.lowercased() }).contains($0.lowercased())
+                }
+                let fallback = selfFallback(currentUser: currentUser, originalTo: toRecipients, originalCC: ccRecipients)
+                return MailReplyPrefillRecipients(to: nonSelfTo.isEmpty ? fallback : nonSelfTo, cc: nonSelfCC)
+            case .compose, .forward, .draft:
+                return MailReplyPrefillRecipients(to: [], cc: [])
+            }
+        }
+
+        let primary = normalizedSender.map { [$0] } ?? []
+        switch mode {
+        case .reply:
+            return MailReplyPrefillRecipients(to: primary, cc: [])
+        case .replyAll:
+            let excluded = Set(([currentUser, normalizedSender].compactMap { $0 }).map { $0.lowercased() })
+            let copied = unique(toRecipients + ccRecipients).filter { !excluded.contains($0.lowercased()) }
+            return MailReplyPrefillRecipients(to: primary, cc: copied)
+        case .compose, .forward, .draft:
+            return MailReplyPrefillRecipients(to: [], cc: [])
+        }
+    }
+
+    private static func selfFallback(currentUser: String?, originalTo: [String], originalCC: [String]) -> [String] {
+        guard unique(originalTo + originalCC).allSatisfy({ $0.lowercased() == currentUser?.lowercased() }),
+              let currentUser,
+              !currentUser.isEmpty else {
+            return []
+        }
+        return [currentUser]
+    }
+
+    private static func unique(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return values.filter {
+            let value = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !value.isEmpty && seen.insert(value.lowercased()).inserted
+        }
+    }
+}
+
+public enum MailDraftState: String, Codable, Equatable {
+    case saved
+    case deleted
+    case sent
+    case failed
+    case reauthRequired = "reauth_required"
+}
+
+public struct MailDraftResponse: Codable, Equatable {
+    let clientDraftID: String
+    let gmailDraftID: String?
+    let gmailMessageID: String?
+    let gmailThreadID: String?
+    let to: [String]
+    let cc: [String]
+    let bcc: [String]
+    let subject: String
+    let bodyText: String
+    let bodyHTML: String?
+    let attachments: [MailDraftAttachment]
+    let state: MailDraftState
+    let savedAt: String?
+    let error: String?
+    let reauthURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case clientDraftID = "client_draft_id"
+        case gmailDraftID = "gmail_draft_id"
+        case gmailMessageID = "gmail_message_id"
+        case gmailThreadID = "gmail_thread_id"
+        case to
+        case cc
+        case bcc
+        case subject
+        case bodyText = "body_text"
+        case bodyHTML = "body_html"
+        case attachments
+        case state
+        case savedAt = "saved_at"
+        case error
+        case reauthURL = "reauth_url"
+    }
+}
+
+public struct MailDraftAttachment: Codable, Equatable, Identifiable {
+    public var id: String { "\(messageID):\(attachmentID)" }
+
+    let filename: String
+    let mimeType: String
+    let messageID: String
+    let attachmentID: String
+    let downloadURL: String
+
+    enum CodingKeys: String, CodingKey {
+        case filename
+        case mimeType = "mime_type"
+        case messageID = "message_id"
+        case attachmentID = "attachment_id"
+        case downloadURL = "download_url"
+    }
+}
+
+public struct MailDraftSendRequest: Codable, Equatable {
+    let clientSendID: String
+    let clientDraftID: String
+
+    enum CodingKeys: String, CodingKey {
+        case clientSendID = "client_send_id"
+        case clientDraftID = "client_draft_id"
+    }
+}
+
 public struct ThreadReaderResponse: Codable, Equatable {
     let entityID: String
     let userID: String
@@ -1119,9 +1611,11 @@ public struct ThreadAttachment: Codable, Equatable, Identifiable {
 
 public struct ThreadMessage: Codable, Equatable, Identifiable {
     public let id: String
+    let renderRevision: UInt64
     let source: SourceType
     let threadID: String?
     let fromAddress: String?
+    let replyTo: String?
     let to: String?
     let cc: String?
     let bcc: String?
@@ -1140,6 +1634,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         case source
         case threadID = "thread_id"
         case fromAddress = "from_address"
+        case replyTo = "reply_to"
         case to
         case cc
         case bcc
@@ -1156,22 +1651,35 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(String.self, forKey: .id)
+        let decodedID = try container.decode(String.self, forKey: .id)
+        let decodedBody = try container.decode(String.self, forKey: .body)
+        let decodedHTMLBody = try container.decodeIfPresent(String.self, forKey: .htmlBody)
+        let decodedHTMLRenderDocument = try container.decodeIfPresent(String.self, forKey: .htmlRenderDocument)
+        let decodedReader = try container.decodeIfPresent(ThreadMessageReader.self, forKey: .reader)
+
+        id = decodedID
         source = try container.decode(SourceType.self, forKey: .source)
         threadID = try container.decodeIfPresent(String.self, forKey: .threadID)
         fromAddress = try container.decodeIfPresent(String.self, forKey: .fromAddress)
+        replyTo = try container.decodeIfPresent(String.self, forKey: .replyTo)
         to = try container.decodeIfPresent(String.self, forKey: .to)
         cc = try container.decodeIfPresent(String.self, forKey: .cc)
         bcc = try container.decodeIfPresent(String.self, forKey: .bcc)
         subject = try container.decodeIfPresent(String.self, forKey: .subject)
-        body = try container.decode(String.self, forKey: .body)
-        htmlBody = try container.decodeIfPresent(String.self, forKey: .htmlBody)
-        htmlRenderDocument = try container.decodeIfPresent(String.self, forKey: .htmlRenderDocument)
-        reader = try container.decodeIfPresent(ThreadMessageReader.self, forKey: .reader)
+        body = decodedBody
+        htmlBody = decodedHTMLBody
+        htmlRenderDocument = decodedHTMLRenderDocument
+        reader = decodedReader
         snippet = try container.decodeIfPresent(String.self, forKey: .snippet)
         attachments = try container.decodeIfPresent([ThreadAttachment].self, forKey: .attachments) ?? []
         labelIDs = try container.decodeIfPresent([String].self, forKey: .labelIDs) ?? []
         receivedAt = try container.decode(String.self, forKey: .receivedAt)
+        renderRevision = Self.makeRenderRevision(
+            id: decodedID,
+            body: decodedBody,
+            html: decodedHTMLRenderDocument ?? decodedHTMLBody,
+            reader: decodedReader
+        )
     }
 
     init(
@@ -1179,6 +1687,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         source: SourceType,
         threadID: String?,
         fromAddress: String?,
+        replyTo: String? = nil,
         to: String?,
         cc: String?,
         bcc: String?,
@@ -1196,6 +1705,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         self.source = source
         self.threadID = threadID
         self.fromAddress = fromAddress
+        self.replyTo = replyTo
         self.to = to
         self.cc = cc
         self.bcc = bcc
@@ -1208,6 +1718,53 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         self.attachments = attachments
         self.labelIDs = labelIDs
         self.receivedAt = receivedAt
+        self.renderRevision = Self.makeRenderRevision(
+            id: id,
+            body: body,
+            html: htmlRenderDocument ?? htmlBody,
+            reader: reader
+        )
+    }
+
+    private static func makeRenderRevision(
+        id: String,
+        body: String,
+        html: String?,
+        reader: ThreadMessageReader?
+    ) -> UInt64 {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+
+        func mix(_ value: String?) {
+            guard let value else {
+                hash ^= 0
+                hash &*= 1_099_511_628_211
+                return
+            }
+            for byte in value.utf8 {
+                hash ^= UInt64(byte)
+                hash &*= 1_099_511_628_211
+            }
+            hash ^= 255
+            hash &*= 1_099_511_628_211
+        }
+
+        mix(id)
+        mix(body)
+        mix(html)
+        mix(reader?.primaryText)
+        mix(reader?.renderMode)
+        mix(reader?.signatureText)
+        mix(reader?.quotedText)
+        mix(reader?.footerText)
+        mix(reader.map { $0.originalHTMLAvailable ? "html-available" : "html-unavailable" })
+        mix(reader?.htmlIsRich.map { $0 ? "html-rich" : "html-plain" })
+        mix(reader?.quoteDetected.map { $0 ? "quote-detected" : "quote-absent" })
+        for marker in reader?.markers ?? [] {
+            mix(marker.kind)
+            mix(marker.label)
+            mix(marker.text)
+        }
+        return hash
     }
 }
 
