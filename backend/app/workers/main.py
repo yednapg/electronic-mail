@@ -18,7 +18,14 @@ from app.core.observability import configure_observability
 from app.db.jobs import cancel_claimed_job, claim_job, cleanup_old_jobs, complete_job, fail_job, renew_heartbeat
 from app.db.repository import get_user_by_email
 from app.db.user_mail_guard import UserMailWorkBlocked
-from app.services.gmail_importer import refresh_gmail_thread_order, run_gmail_backfill, run_gmail_delta_sync, run_gmail_full_reconciliation, run_gmail_import_batch
+from app.services.gmail_importer import (
+    GMAIL_SEARCH_MAX_PAGES,
+    refresh_gmail_thread_order,
+    run_gmail_backfill,
+    run_gmail_delta_sync,
+    run_gmail_full_reconciliation,
+    run_gmail_import_batch,
+)
 from app.services.gmail_watch import ensure_gmail_watch
 from app.services.mailbox_events import DASHBOARD_CHANGED, MAILBOX_CHANGED, emit_mailbox_event
 from app.services.mailbox_actions import rollback_failed_thread_action, run_pending_thread_action
@@ -233,6 +240,12 @@ def _run_job(settings, job) -> None:
             label=str(payload.get("label") or "all"),
             limit=int(payload.get("limit") or 100),
             search_key=str(payload.get("search_key") or ""),
+            max_pages=int(payload.get("max_pages") or GMAIL_SEARCH_MAX_PAGES),
+            response_limit=int(payload.get("response_limit") or 200),
+            page_token=payload.get("page_token"),
+            continuation_index=payload.get("continuation_index", 0),
+            continuation_key=payload.get("continuation_key"),
+            continuation_token_hashes=payload.get("continuation_token_hashes"),
         )
         return
     if job.kind == "gmail_thread_action":

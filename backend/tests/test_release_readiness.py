@@ -53,7 +53,7 @@ def production_environment(**overrides: str) -> dict[str, str]:
         "OPENAI_REQUIRED": "false",
         "AI_GROUPING_ENABLED": "false",
         "RATE_LIMIT_ENABLED": "true",
-        "RELEASE_SHA": "abcdef1234567890",
+        "RELEASE_SHA": "0123456789abcdef0123456789abcdef01234567",
         "OPS_ADMIN_EMAILS": "launch@mail-launch.co",
     }
     values.update(overrides)
@@ -104,6 +104,51 @@ class ReleaseReadinessTests(unittest.TestCase):
 
         self.assertTrue(any("SESSION_COOKIE_SAMESITE=lax" in error for error in errors))
 
+    def test_production_rejects_noncanonical_origins(self) -> None:
+        cases = (
+            {"CORS_ORIGIN": "https://app.mail-launch.co/"},
+            {"CORS_ORIGIN": "https://app.mail-launch.co\t"},
+            {"CORS_ORIGIN": "https://user:secret@app.mail-launch.co"},
+            {"CORS_ORIGIN": "https://app.mail-launch.co/path"},
+            {"CORS_ORIGIN": "https://app.mail-launch.co?token=secret"},
+            {"CORS_ORIGIN": "https://app.mail-launch.co#fragment"},
+            {"CORS_ORIGIN": "HTTPS://app.mail-launch.co"},
+            {"CORS_ORIGIN": "https://APP.mail-launch.co"},
+            {"CORS_ORIGIN": "https://app.mail-launch.co:443"},
+            {"WEB_APP_URL": "https://app.mail-launch.co/"},
+        )
+
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                with patch.dict(os.environ, production_environment(**overrides), clear=True):
+                    errors = load_settings().readiness_errors()
+
+                field = next(iter(overrides))
+                self.assertTrue(any(error.startswith(field) for error in errors), errors)
+
+    def test_production_release_sha_requires_full_lowercase_hex(self) -> None:
+        invalid_values = (
+            "abcdefg",
+            "a" * 39,
+            "A" * 40,
+            "a" * 40 + " ",
+            "a" * 65,
+        )
+
+        for release_sha in invalid_values:
+            with self.subTest(release_sha=release_sha):
+                with patch.dict(
+                    os.environ,
+                    production_environment(RELEASE_SHA=release_sha),
+                    clear=True,
+                ):
+                    errors = load_settings().readiness_errors()
+
+                self.assertIn(
+                    "RELEASE_SHA must be a full lowercase 40- or 64-hex immutable revision",
+                    errors,
+                )
+
     def test_production_rejects_template_placeholders_and_reused_key_material(self) -> None:
         placeholder_environment = production_environment(
             DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/electronic_mail",
@@ -149,6 +194,61 @@ class ReleaseReadinessTests(unittest.TestCase):
                     errors = load_settings().readiness_errors()
 
                 self.assertIn(expected_error, errors)
+
+    def test_production_service_urls_require_public_dns_hostnames(self) -> None:
+        cases = (
+            (
+                {"GOOGLE_REDIRECT_URI": "https://prod/auth/google/callback"},
+                "GOOGLE_REDIRECT_URI must use a fully qualified public DNS hostname",
+            ),
+            (
+                {"GOOGLE_REDIRECT_URI": "https://10.0.0.8/auth/google/callback"},
+                "GOOGLE_REDIRECT_URI must use a fully qualified public DNS hostname",
+            ),
+            (
+                {"CORS_ORIGIN": "https://prod"},
+                "CORS_ORIGIN must use a fully qualified public DNS hostname",
+            ),
+            (
+                {"CORS_ORIGIN": "https://169.254.169.254"},
+                "CORS_ORIGIN must use a fully qualified public DNS hostname",
+            ),
+            (
+                {"WEB_APP_URL": "https://prod"},
+                "WEB_APP_URL must use a fully qualified public DNS hostname",
+            ),
+            (
+                {"WEB_APP_URL": "https://127.0.0.1"},
+                "WEB_APP_URL must use a fully qualified public DNS hostname",
+            ),
+            (
+                {"WEB_APP_URL": "https://[::1]"},
+                "WEB_APP_URL must use a fully qualified public DNS hostname",
+            ),
+        )
+
+        for overrides, expected_error in cases:
+            with self.subTest(overrides=overrides):
+                with patch.dict(os.environ, production_environment(**overrides), clear=True):
+                    errors = load_settings().readiness_errors()
+
+                self.assertIn(expected_error, errors)
+
+    def test_production_accepts_canonical_public_dotted_service_hostnames(self) -> None:
+        with patch.dict(
+            os.environ,
+            production_environment(
+                CORS_ORIGIN="https://mail.app.launch-domain.co",
+                WEB_APP_URL="https://mail.app.launch-domain.co",
+                SESSION_COOKIE_DOMAIN=".launch-domain.co",
+                GOOGLE_REDIRECT_URI="https://oauth.api.launch-domain.co/auth/google/callback",
+                GMAIL_PUBSUB_PUSH_AUDIENCE="https://oauth.api.launch-domain.co/v1/mailbox/pubsub",
+            ),
+            clear=True,
+        ):
+            errors = load_settings().readiness_errors()
+
+        self.assertEqual(errors, [])
 
     def test_deploy_guard_rejects_example_service_url_template(self) -> None:
         with patch.dict(
