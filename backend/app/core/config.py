@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Runtime configuration loading for the Python backend."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import ipaddress
 from pathlib import Path
@@ -88,6 +89,7 @@ class Settings:
     log_level: str
     release_sha: str
     rate_limit_enabled: bool
+    explicit_runtime_configuration_errors: tuple[str, ...]
 
     @property
     def google_configured(self) -> bool:
@@ -153,6 +155,7 @@ class Settings:
             errors.append("DATABASE_URL must be Postgres. SQLite is no longer supported.")
 
         if self.is_production_like:
+            errors.extend(self.explicit_runtime_configuration_errors)
             if self.gmail_sync_scope != "full":
                 errors.append("GMAIL_SYNC_SCOPE=full is required outside local development")
             if self.registration_mode not in {"allowlist", "open"}:
@@ -301,6 +304,10 @@ def load_settings() -> Settings:
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         release_sha=release_sha,
         rate_limit_enabled=_resolve_boolean("RATE_LIMIT_ENABLED", default=app_env in {"staging", "production"}),
+        explicit_runtime_configuration_errors=_explicit_runtime_configuration_errors(
+            app_env=app_env,
+            environment=os.environ,
+        ),
     )
 
 
@@ -343,6 +350,38 @@ def _resolve_boolean(name: str, *, default: bool) -> bool:
     if value is None or not value.strip():
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _explicit_runtime_configuration_errors(
+    *,
+    app_env: str,
+    environment: Mapping[str, str],
+) -> tuple[str, ...]:
+    """Reject ambiguous production values for launch-critical feature switches.
+
+    Boolean convenience parsing is useful during local development, but a
+    missing value or typo must not silently become the launch configuration.
+    In particular, the no-AI release requires an explicit reviewed assertion
+    that every AI switch is disabled and that no OpenAI key is present.
+    """
+    if app_env not in {"staging", "production"}:
+        return ()
+
+    errors: list[str] = []
+    for name in ("AI_GROUPING_ENABLED", "OPENAI_REQUIRED", "OPENAI_DEBUG_LOGS"):
+        raw_value = environment.get(name)
+        if raw_value != "false":
+            errors.append(f"{name} must be explicitly set to false outside local development")
+
+    if "OPENAI_API_KEY" not in environment:
+        errors.append("OPENAI_API_KEY must be explicitly set to an empty value outside local development")
+    elif environment["OPENAI_API_KEY"] != "":
+        errors.append("OPENAI_API_KEY must be empty outside local development")
+
+    if environment.get("RATE_LIMIT_ENABLED") != "true":
+        errors.append("RATE_LIMIT_ENABLED must be explicitly set to true outside local development")
+
+    return tuple(errors)
 
 
 def _looks_like_placeholder(value: str) -> bool:
