@@ -162,6 +162,9 @@ public struct SignedInShellView: View {
         .task(id: selection) {
             await applyMailboxSelection()
         }
+        .task(id: columnVisibility) {
+            await store.setFolderCountPrefetchEnabled(columnVisibility != .detailOnly)
+        }
         .onChange(of: store.activeMailboxLabel) { _, label in
             let destination = SignedInDestination(mailboxLabel: label)
             if selection != destination {

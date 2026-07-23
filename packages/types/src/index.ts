@@ -457,6 +457,7 @@ export interface ThreadMessage {
   readonly bcc?: string | null;
   readonly subject?: string | null;
   readonly body: string;
+  readonly body_complete: boolean;
   readonly html_body?: string | null;
   readonly html_render_document?: string | null;
   readonly reader?: ThreadMessageReader | null;

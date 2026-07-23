@@ -127,6 +127,7 @@ public protocol AppClient: AnyObject {
     func deleteAccount() async throws
     func appSession() async throws -> AppSessionResponse
     func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse
+    func mailboxFolderCount(label: MailboxLabel) async throws -> MailboxResponse
     func searchMailbox(
         query: String,
         label: MailboxLabel?,
@@ -161,6 +162,10 @@ public protocol AppClient: AnyObject {
 public extension AppClient {
     var supportsRealtimeMailboxUpdates: Bool { false }
     var supportsFolderCountPrefetch: Bool { false }
+
+    func mailboxFolderCount(label: MailboxLabel) async throws -> MailboxResponse {
+        try await mailbox(label: label, limit: 1, cursor: nil)
+    }
 
     func exchangeMobileSession(grant: MobileAuthenticationGrant) async throws -> MobileSessionExchangeResponse {
         try await exchangeMobileSession(loginCode: grant.loginCode)

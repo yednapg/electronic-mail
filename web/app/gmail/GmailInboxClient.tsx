@@ -551,6 +551,7 @@ function buildPreviewThread(row: GmailThreadRow): ThreadReaderResponse {
         bcc: null,
         subject: row.latest_subject,
         body,
+        body_complete: false,
         snippet: row.snippet ?? row.summary ?? null,
         label_ids: row.label_ids ?? [],
         received_at: row.latest_received_at,
