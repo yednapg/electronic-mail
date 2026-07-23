@@ -11,8 +11,7 @@ import type {
   ThreadReaderResponse,
 } from './types';
 import type { FirstRunImportJobResponse } from '@decision-pipeline/types';
-
-const DEFAULT_BACKEND_URL = 'http://localhost:3001';
+import { resolveBackendURL } from './backend-config';
 
 export type MailGroupDetailOptions = {
   limit?: number;
@@ -22,16 +21,18 @@ export type MailGroupDetailOptions = {
 export type BackendRequestOptions = {
   cookie?: string | null;
   headers?: HeadersInit;
+  signal?: AbortSignal;
 };
 
 export function getBackendURL(): string {
-  return (process.env.DECISION_PIPELINE_BACKEND_URL ?? DEFAULT_BACKEND_URL).replace(/\/+$/, '');
+  return resolveBackendURL();
 }
 
 export async function getAppSession(options: BackendRequestOptions = {}): Promise<AppSessionStateResponse> {
   const res = await fetch(`${getBackendURL()}/v1/app/session`, {
     cache: 'no-store',
     headers: backendHeaders(options),
+    signal: options.signal,
   });
   if (!res.ok) throw new Error('Failed to fetch app session');
   return res.json();
@@ -41,6 +42,7 @@ export async function getDashboard(options: BackendRequestOptions = {}): Promise
   const res = await fetch(`${getBackendURL()}/dashboard`, {
     cache: 'no-store',
     headers: backendHeaders(options),
+    signal: options.signal,
   });
   if (!res.ok) throw new Error('Failed to fetch dashboard');
   return res.json();
@@ -50,6 +52,7 @@ export async function getGoogleAuthState(options: BackendRequestOptions = {}): P
   const res = await fetch(`${getBackendURL()}/v1/auth/google/state`, {
     cache: 'no-store',
     headers: backendHeaders(options),
+    signal: options.signal,
   });
   if (!res.ok) throw new Error('Failed to fetch Google auth state');
   return res.json();
@@ -61,6 +64,7 @@ export async function getLatestFirstRunImportJob(
   const res = await fetch(`${getBackendURL()}/v1/first-run/import-jobs/latest`, {
     cache: 'no-store',
     headers: backendHeaders(options),
+    signal: options.signal,
   });
   if (res.status === 404) {
     return null;
@@ -73,6 +77,7 @@ export async function getGmailView(options: BackendRequestOptions = {}): Promise
   const res = await fetch(`${getBackendURL()}/v1/gmail-view`, {
     cache: 'no-store',
     headers: backendHeaders(options),
+    signal: options.signal,
   });
   if (!res.ok) throw new Error('Failed to fetch Gmail view');
   return res.json();
@@ -98,6 +103,7 @@ options: BackendRequestOptions = {}): Promise<MailboxResponse> {
   const res = await fetch(`${getBackendURL()}/v1/mailbox?${params.toString()}`, {
     cache: 'no-store',
     headers: backendHeaders(options),
+    signal: options.signal,
   });
   if (!res.ok) throw new Error('Failed to fetch mailbox');
   return res.json();
@@ -119,6 +125,7 @@ export async function getMailboxThread(
   const res = await fetch(`${getBackendURL()}/v1/mailbox/threads/${encodeURIComponent(threadId)}${query ? `?${query}` : ''}`, {
     cache: 'no-store',
     headers: backendHeaders(options),
+    signal: options.signal,
   });
   if (!res.ok) throw new Error('Failed to fetch mailbox thread');
   return res.json();
@@ -128,6 +135,7 @@ export async function getMailboxSyncState(options: BackendRequestOptions = {}): 
   const res = await fetch(`${getBackendURL()}/v1/mailbox/sync-state`, {
     cache: 'no-store',
     headers: backendHeaders(options),
+    signal: options.signal,
   });
   if (!res.ok) throw new Error('Failed to fetch mailbox sync state');
   return res.json();
@@ -153,6 +161,7 @@ async function postJSON<Response>(
       },
     }),
     body: JSON.stringify(body),
+    signal: options.signal,
   });
   if (!res.ok) throw new Error(`Backend request failed: ${path}`);
   return res.json();

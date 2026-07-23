@@ -1,39 +1,25 @@
 /** Root web layout that applies fonts and global dashboard styles. */
 import type { Metadata } from 'next';
 import type { ReactNode } from 'react';
-import localFont from 'next/font/local';
 
 import { CommandPaletteMount } from '../components/command-palette/CommandPaletteMount';
 import { LayoutInteractions } from '../components/LayoutInteractions';
+import { isWebProductUIEnabled } from '../lib/web-product-boundary';
 import './globals.css';
 
-const sfProRounded = localFont({
-  variable: '--font-sf-pro-rounded',
-  display: 'block',
-  src: [
-    { path: '../font/SF-Pro-Rounded-Thin.otf', weight: '100', style: 'normal' },
-    { path: '../font/SF-Pro-Rounded-Ultralight.otf', weight: '200', style: 'normal' },
-    { path: '../font/SF-Pro-Rounded-Light.otf', weight: '300', style: 'normal' },
-    { path: '../font/SF-Pro-Rounded-Regular.otf', weight: '400', style: 'normal' },
-    { path: '../font/SF-Pro-Rounded-Medium.otf', weight: '500', style: 'normal' },
-    { path: '../font/SF-Pro-Rounded-Semibold.otf', weight: '600', style: 'normal' },
-    { path: '../font/SF-Pro-Rounded-Bold.otf', weight: '700', style: 'normal' },
-    { path: '../font/SF-Pro-Rounded-Heavy.otf', weight: '800', style: 'normal' },
-    { path: '../font/SF-Pro-Rounded-Black.otf', weight: '900', style: 'normal' },
-  ],
-});
-
 export const metadata: Metadata = {
+  title: 'Electronic Mail',
+  description: 'A focused native email client for Gmail.',
   icons: [{ rel: 'icon', url: '/icon.svg', type: 'image/svg+xml' }],
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en" className={`${sfProRounded.variable} ${sfProRounded.className}`} suppressHydrationWarning>
-      <body className={`${sfProRounded.variable} ${sfProRounded.className}`}>
+    <html lang="en" suppressHydrationWarning>
+      <body>
         <LayoutInteractions />
         {children}
-        <CommandPaletteMount />
+        {isWebProductUIEnabled() ? <CommandPaletteMount /> : null}
         <ThemeToggleButton />
       </body>
     </html>

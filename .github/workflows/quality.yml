@@ -1,0 +1,436 @@
+name: Quality and release gates
+
+on:
+  pull_request:
+  push:
+    branches: [main, "codex/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reproducibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest scripts/tests/test_verify_reproducibility.py
+      - run: python3 scripts/verify-reproducibility.py
+
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17.10-bookworm@sha256:67870dc097790edf2bd6726658db995dcc830f799d41bb2b78ef07c9a2d5f010
+        env:
+          POSTGRES_USER: electronic_mail
+          POSTGRES_PASSWORD: test-password
+          POSTGRES_DB: electronic_mail
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U electronic_mail"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP_ENV: staging
+      DATABASE_URL: postgresql://electronic_mail:test-password@127.0.0.1:5432/electronic_mail
+      CORS_ORIGIN: https://app.ci.electronicmail.dev
+      WEB_APP_URL: https://app.ci.electronicmail.dev
+      APP_SESSION_SECRET: ci-session-secret-material-longer-than-thirty-two
+      APP_ENCRYPTION_KEY: ci-encryption-key-material-longer-than-thirty-two
+      SESSION_COOKIE_DOMAIN: .ci.electronicmail.dev
+      SESSION_COOKIE_SAMESITE: lax
+      REGISTRATION_MODE: allowlist
+      ALLOWED_EMAILS: ci@example.test
+      GOOGLE_CLIENT_ID: ci-client-id
+      GOOGLE_CLIENT_SECRET: ci-client-secret
+      GOOGLE_REDIRECT_URI: https://api.ci.electronicmail.dev/auth/google/callback
+      MOBILE_REDIRECT_URI: electronicmail://auth/callback
+      GMAIL_SYNC_SCOPE: full
+      GMAIL_RECENT_DAYS: 90
+      GMAIL_PUBSUB_TOPIC: projects/ci/topics/gmail
+      GMAIL_PUBSUB_SUBSCRIPTION: gmail-ci
+      GMAIL_PUBSUB_PUSH_AUDIENCE: https://api.ci.electronicmail.dev/v1/mailbox/pubsub
+      GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL: gmail-push@ci.iam.gserviceaccount.com
+      GMAIL_WATCH_RENEWAL_HOURS: 24
+      RATE_LIMIT_ENABLED: "true"
+      OPS_ADMIN_EMAILS: ci@example.test
+      RELEASE_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.lock
+      - run: bash scripts/tests/backup-postgres.test.sh && bash scripts/tests/restore-postgres.test.sh
+      - run: python -m venv .venv
+      - run: .venv/bin/pip install --upgrade pip==26.1.2 && .venv/bin/pip install --no-deps -r backend/requirements.lock
+      - run: test -x .venv/bin/python && ! grep -R "cd backend && \.venv/bin" package.json scripts
+      - name: Audit the production lock in an isolated tool environment
+        run: |
+          python -m venv .audit-venv
+          .audit-venv/bin/pip install --upgrade pip==26.1.2
+          .audit-venv/bin/pip install pip-audit==2.10.1
+          .audit-venv/bin/python -m pip_audit -r backend/requirements.lock
+      - run: cd backend && ../.venv/bin/alembic upgrade head
+      - run: PYTHONPATH=backend .venv/bin/python -m app.deploy_check
+      - run: PYTHONPATH=backend .venv/bin/python -m unittest discover -s backend/tests -t . -p 'test_*.py'
+      - run: .venv/bin/python -m compileall -q backend/app backend/tests
+
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      DECISION_PIPELINE_BACKEND_URL: https://api.ci.electronicmail.dev
+      MACOS_DOWNLOAD_ENABLED: "true"
+      MACOS_DOWNLOAD_URL: https://downloads.ci.electronicmail.dev/ElectronicMail.dmg
+      LEGAL_ENTITY_NAME: Electronic Mail CI Operator
+      LEGAL_SUPPORT_EMAIL: support@ci.electronicmail.dev
+      STATUS_PAGE_URL: https://status.ci.electronicmail.dev
+      LEGAL_EFFECTIVE_DATE: "2026-07-13"
+      LEGAL_JURISDICTION: Karnataka, India
+      LEGAL_HOSTING_PROVIDERS: Electronic Mail CI hosting providers
+      LEGAL_DATA_REGIONS: CI ephemeral test region
+      LEGAL_BACKUP_RETENTION_DAYS: "14"
+      LEGAL_REVIEW_STATUS: approved
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.22.0
+          cache: npm
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm run web:typecheck
+      - run: npm run web:test
+      - run: npm run web:build
+      - run: npm run web:verify:assets:test
+      - run: npm run web:verify:assets
+
+  backend-container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17.10-bookworm@sha256:67870dc097790edf2bd6726658db995dcc830f799d41bb2b78ef07c9a2d5f010
+        env:
+          POSTGRES_USER: electronic_mail
+          POSTGRES_PASSWORD: ci_${{ github.run_id }}_${{ github.run_attempt }}_ephemeral
+          POSTGRES_DB: electronic_mail
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U electronic_mail"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BACKEND_IMAGE: electronic-mail-backend:${{ github.sha }}
+      APP_ENV: staging
+      PORT: 3001
+      DATABASE_URL: postgresql://electronic_mail:ci_${{ github.run_id }}_${{ github.run_attempt }}_ephemeral@127.0.0.1:5432/electronic_mail
+      CORS_ORIGIN: https://app.ci.electronicmail.dev
+      WEB_APP_URL: https://app.ci.electronicmail.dev
+      SESSION_COOKIE_DOMAIN: .ci.electronicmail.dev
+      SESSION_COOKIE_SAMESITE: lax
+      REGISTRATION_MODE: allowlist
+      ALLOWED_EMAILS: ci-runner@electronicmail.dev
+      GOOGLE_CLIENT_ID: electronic-mail-ci-oauth-client
+      GOOGLE_REDIRECT_URI: https://api.ci.electronicmail.dev/auth/google/callback
+      MOBILE_REDIRECT_URI: electronicmail://auth/callback
+      GMAIL_SYNC_SCOPE: full
+      GMAIL_RECENT_DAYS: 90
+      GMAIL_PUBSUB_TOPIC: projects/electronic-mail-ci/topics/gmail
+      GMAIL_PUBSUB_SUBSCRIPTION: gmail-ci
+      GMAIL_PUBSUB_PUSH_AUDIENCE: https://api.ci.electronicmail.dev/v1/mailbox/pubsub
+      GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL: gmail-push@electronic-mail-ci.iam.gserviceaccount.com
+      GMAIL_WATCH_RENEWAL_HOURS: 24
+      OPENAI_API_KEY: ""
+      OPENAI_REQUIRED: "false"
+      OPENAI_DEBUG_LOGS: "false"
+      AI_GROUPING_ENABLED: "false"
+      RATE_LIMIT_ENABLED: "true"
+      OPS_ADMIN_EMAILS: ci-ops@electronicmail.dev
+      RELEASE_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: backend
+          load: true
+          push: false
+          tags: ${{ env.BACKEND_IMAGE }}
+      - name: Create isolated container runtime configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_env="$RUNNER_TEMP/backend-container.env"
+          session_secret="$(openssl rand -hex 32)"
+          encryption_key="$(openssl rand -hex 32)"
+          google_client_secret="$(openssl rand -hex 32)"
+          echo "::add-mask::$session_secret"
+          echo "::add-mask::$encryption_key"
+          echo "::add-mask::$google_client_secret"
+          umask 077
+          {
+            for name in \
+              APP_ENV PORT DATABASE_URL CORS_ORIGIN WEB_APP_URL \
+              SESSION_COOKIE_DOMAIN SESSION_COOKIE_SAMESITE REGISTRATION_MODE \
+              ALLOWED_EMAILS GOOGLE_CLIENT_ID GOOGLE_REDIRECT_URI MOBILE_REDIRECT_URI \
+              GMAIL_SYNC_SCOPE GMAIL_RECENT_DAYS GMAIL_PUBSUB_TOPIC \
+              GMAIL_PUBSUB_SUBSCRIPTION GMAIL_PUBSUB_PUSH_AUDIENCE \
+              GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL GMAIL_WATCH_RENEWAL_HOURS \
+              OPENAI_API_KEY OPENAI_REQUIRED OPENAI_DEBUG_LOGS AI_GROUPING_ENABLED \
+              RATE_LIMIT_ENABLED OPS_ADMIN_EMAILS RELEASE_SHA
+            do
+              printf '%s=%s\n' "$name" "${!name}"
+            done
+            printf 'APP_SESSION_SECRET=%s\n' "$session_secret"
+            printf 'APP_ENCRYPTION_KEY=%s\n' "$encryption_key"
+            printf 'GOOGLE_CLIENT_SECRET=%s\n' "$google_client_secret"
+          } > "$runtime_env"
+          echo "BACKEND_CONTAINER_ENV_FILE=$runtime_env" >> "$GITHUB_ENV"
+      - name: Migrate Postgres with the built image
+        shell: bash
+        run: >-
+          docker run --rm --network host
+          --env-file "$BACKEND_CONTAINER_ENV_FILE"
+          "$BACKEND_IMAGE" python -m alembic upgrade head
+      - name: Exercise the built image readiness path
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_name="electronic-mail-backend-ci"
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then
+              docker logs "$container_name" 2>&1 || true
+            fi
+            docker rm --force "$container_name" >/dev/null 2>&1 || true
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          docker run --detach --rm --network host \
+            --name "$container_name" \
+            --env-file "$BACKEND_CONTAINER_ENV_FILE" \
+            "$BACKEND_IMAGE" >/dev/null
+
+          ready_json=""
+          for _ in $(seq 1 30); do
+            if ready_json="$(curl --fail --silent --show-error http://127.0.0.1:3001/ready 2>/dev/null)"; then
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$ready_json" ]; then
+            echo "The built backend image did not become ready within 30 seconds." >&2
+            exit 1
+          fi
+
+          READY_JSON="$ready_json" python3 - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["READY_JSON"])
+          expected = {
+              "status": "ready",
+              "environment": "staging",
+              "database": "postgres",
+              "google_configured": True,
+              "ai_enabled": False,
+              "release": os.environ["GITHUB_SHA"],
+          }
+          mismatches = {
+              key: {"expected": value, "actual": payload.get(key)}
+              for key, value in expected.items()
+              if payload.get(key) != value
+          }
+          if payload.get("schema_revision") != payload.get("schema_head") or not payload.get("schema_head"):
+              mismatches["schema"] = {
+                  "revision": payload.get("schema_revision"),
+                  "head": payload.get("schema_head"),
+              }
+          if mismatches:
+              raise SystemExit(f"Unexpected /ready payload: {mismatches}")
+          PY
+
+  web-container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DECISION_PIPELINE_BACKEND_URL: https://api.ci.electronicmail.dev
+      MACOS_DOWNLOAD_ENABLED: "true"
+      MACOS_DOWNLOAD_URL: https://downloads.ci.electronicmail.dev/ElectronicMail.dmg
+      WEB_IMAGE: electronic-mail-web:${{ github.sha }}
+      LEGAL_ENTITY_NAME: Electronic Mail CI Operator
+      LEGAL_SUPPORT_EMAIL: support@ci.electronicmail.dev
+      STATUS_PAGE_URL: https://status.ci.electronicmail.dev
+      LEGAL_EFFECTIVE_DATE: "2026-07-13"
+      LEGAL_JURISDICTION: Karnataka, India
+      LEGAL_HOSTING_PROVIDERS: Electronic Mail CI hosting providers
+      LEGAL_DATA_REGIONS: CI ephemeral test region
+      LEGAL_BACKUP_RETENTION_DAYS: "14"
+      LEGAL_REVIEW_STATUS: approved
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile.web
+          load: true
+          push: false
+          tags: ${{ env.WEB_IMAGE }}
+      - name: Scan the exact built container filesystem
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_id="$(docker create "$WEB_IMAGE")"
+          deployed_root="$RUNNER_TEMP/web-container-app"
+          cleanup() {
+            docker rm --force "$container_id" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          mkdir -p "$deployed_root"
+          docker cp "$container_id:/app/." "$deployed_root/"
+          python3 scripts/verify_web_assets.py \
+            --root "$GITHUB_WORKSPACE" \
+            --deployed-root "$deployed_root"
+      - name: Exercise the built native-only web runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_name="electronic-mail-web-ci"
+          page_dir="$RUNNER_TEMP/web-container-pages"
+          mkdir -p "$page_dir"
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then
+              docker logs "$container_name" 2>&1 || true
+            fi
+            docker rm --force "$container_name" >/dev/null 2>&1 || true
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          docker run --detach --rm \
+            --name "$container_name" \
+            --publish 127.0.0.1:5173:5173 \
+            --env APP_ENV=production \
+            --env "DECISION_PIPELINE_BACKEND_URL=$DECISION_PIPELINE_BACKEND_URL" \
+            --env "MACOS_DOWNLOAD_ENABLED=$MACOS_DOWNLOAD_ENABLED" \
+            --env "MACOS_DOWNLOAD_URL=$MACOS_DOWNLOAD_URL" \
+            --env "LEGAL_ENTITY_NAME=$LEGAL_ENTITY_NAME" \
+            --env "LEGAL_SUPPORT_EMAIL=$LEGAL_SUPPORT_EMAIL" \
+            --env "STATUS_PAGE_URL=$STATUS_PAGE_URL" \
+            --env "LEGAL_EFFECTIVE_DATE=$LEGAL_EFFECTIVE_DATE" \
+            --env "LEGAL_JURISDICTION=$LEGAL_JURISDICTION" \
+            --env "LEGAL_HOSTING_PROVIDERS=$LEGAL_HOSTING_PROVIDERS" \
+            --env "LEGAL_DATA_REGIONS=$LEGAL_DATA_REGIONS" \
+            --env "LEGAL_BACKUP_RETENTION_DAYS=$LEGAL_BACKUP_RETENTION_DAYS" \
+            --env "LEGAL_REVIEW_STATUS=$LEGAL_REVIEW_STATUS" \
+            "$WEB_IMAGE" >/dev/null
+
+          for _ in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:5173/support > "$page_dir/support.html" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          [ -s "$page_dir/support.html" ] || {
+            echo "The built web image did not become ready within 30 seconds." >&2
+            exit 1
+          }
+
+          curl --fail --silent --show-error --dump-header "$page_dir/home.headers" \
+            http://127.0.0.1:5173/ > "$page_dir/home.html"
+          curl --fail --silent --show-error http://127.0.0.1:5173/privacy > "$page_dir/privacy.html"
+          curl --fail --silent --show-error http://127.0.0.1:5173/terms > "$page_dir/terms.html"
+
+          post_login_status="$(curl --silent --show-error --output "$page_dir/post-login.html" \
+            --write-out '%{http_code}' http://127.0.0.1:5173/post-login)"
+          if [ "$post_login_status" != "200" ]; then
+            echo "The OAuth completion fallback must remain available when the backend is unreachable (received $post_login_status)." >&2
+            exit 1
+          fi
+          grep -Fq 'Connection status unavailable' "$page_dir/post-login.html"
+          grep -Fq 'Try again' "$page_dir/post-login.html"
+
+          grep -Fqi 'native Gmail client for macOS' "$page_dir/home.html"
+          grep -Fq "href=\"$MACOS_DOWNLOAD_URL\"" "$page_dir/home.html"
+          grep -Fq 'Download for macOS' "$page_dir/home.html"
+          grep -qi '^content-security-policy:.*frame-ancestors.*none' "$page_dir/home.headers"
+          grep -qi "^content-security-policy:.*font-src[[:space:]]*'none'" "$page_dir/home.headers"
+          grep -qi '^x-content-type-options:[[:space:]]*nosniff' "$page_dir/home.headers"
+          grep -qi '^x-frame-options:[[:space:]]*DENY' "$page_dir/home.headers"
+          grep -qi '^referrer-policy:[[:space:]]*no-referrer' "$page_dir/home.headers"
+          grep -qi '^permissions-policy:.*camera=()' "$page_dir/home.headers"
+          ! grep -qi '^x-powered-by:' "$page_dir/home.headers"
+          grep -Fq 'support@ci.electronicmail.dev' "$page_dir/support.html"
+          grep -Fq 'href="https://status.ci.electronicmail.dev"' "$page_dir/support.html"
+          grep -Fq 'Report a security issue' "$page_dir/support.html"
+          grep -Fq '2026-07-13' "$page_dir/privacy.html"
+          grep -Fq 'Electronic Mail CI hosting providers' "$page_dir/privacy.html"
+          grep -Fq 'CI ephemeral test region' "$page_dir/privacy.html"
+          grep -Fq 'up to <!-- -->14<!-- --> days' "$page_dir/privacy.html"
+          if grep -Eqi 'OWNER REVIEW REQUIRED|not approved for public launch|support@example\.com' "$page_dir"/*.html; then
+            echo "The built web image rendered invalid legal configuration." >&2
+            exit 1
+          fi
+          if grep -Eqi 'Continue with Google|href="/gmail|href="/dashboard' "$page_dir/home.html"; then
+            echo "The production home page exposed the retired web product UI." >&2
+            exit 1
+          fi
+
+          for route in gmail dashboard api/dashboard; do
+            status="$(curl --silent --show-error --output "$page_dir/${route//\//-}.txt" \
+              --write-out '%{http_code}' "http://127.0.0.1:5173/$route")"
+            if [ "$status" != "404" ]; then
+              echo "$route must return 404 in the native-only web runtime (received $status)." >&2
+              exit 1
+            fi
+          done
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.22.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.lock
+      - run: python -m venv .venv
+      - run: .venv/bin/pip install --upgrade pip==26.1.2
+      - run: .venv/bin/pip install --no-deps -r backend/requirements.lock
+      - run: npm run verify:macos
+      - run: npm run release:macos:preflight
+      - run: npm run launch:verify:test

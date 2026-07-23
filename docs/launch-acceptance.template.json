@@ -1,0 +1,207 @@
+{
+  "schema_version": 2,
+  "product": "Electronic Mail",
+  "release": {
+    "source_commit": "REPLACE_WITH_FULL_GIT_COMMIT",
+    "dmg_sha256": "REPLACE_WITH_APPROVED_DMG_SHA256",
+    "version": "REPLACE_WITH_VERSION",
+    "build_number": "REPLACE_WITH_BUILD_NUMBER",
+    "backend_origin": "https://api.your-owned-domain.example",
+    "web_origin": "https://www.your-owned-domain.example"
+  },
+  "completed_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+  "manual_tests": [
+    {
+      "id": "install",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/install", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "auth",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/auth", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "full_sync",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/full_sync", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "compose",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/compose", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "draft",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/draft", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "conversation",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/conversation", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "actions",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/actions", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "search",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/search", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "attachments",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/attachments", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "sync",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/sync", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "scale",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/scale", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "failure",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/failure", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "security",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/security", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "accessibility",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/accessibility", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    },
+    {
+      "id": "update",
+      "status": "not_run",
+      "tester": "REPLACE_WITH_ACCOUNTABLE_TESTER_EMAIL",
+      "tested_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "test_account": "REPLACE_WITH_REDACTED_TEST_ACCOUNT_LABEL",
+      "environment": "REPLACE_WITH_DEVICE_OS_AND_ENVIRONMENT",
+      "evidence": [{"url": "https://evidence.your-owned-domain.example/manual/update", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"}],
+      "notes": ""
+    }
+  ],
+  "approvals": [
+    {
+      "id": "product_owner",
+      "status": "pending",
+      "approver": "REPLACE_WITH_ACCOUNTABLE_APPROVER_EMAIL",
+      "approved_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "evidence": {"url": "https://evidence.your-owned-domain.example/approvals/product_owner", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"},
+      "notes": ""
+    },
+    {
+      "id": "privacy_legal",
+      "status": "pending",
+      "approver": "REPLACE_WITH_ACCOUNTABLE_APPROVER_EMAIL",
+      "approved_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "evidence": {"url": "https://evidence.your-owned-domain.example/approvals/privacy_legal", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"},
+      "notes": ""
+    },
+    {
+      "id": "google_oauth_security",
+      "status": "pending",
+      "approver": "REPLACE_WITH_ACCOUNTABLE_APPROVER_EMAIL",
+      "approved_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "evidence": {"url": "https://evidence.your-owned-domain.example/approvals/google_oauth_security", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"},
+      "notes": ""
+    },
+    {
+      "id": "support_on_call",
+      "status": "pending",
+      "approver": "REPLACE_WITH_ACCOUNTABLE_APPROVER_EMAIL",
+      "approved_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "evidence": {"url": "https://evidence.your-owned-domain.example/approvals/support_on_call", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"},
+      "notes": ""
+    },
+    {
+      "id": "production_operations",
+      "status": "pending",
+      "approver": "REPLACE_WITH_ACCOUNTABLE_APPROVER_EMAIL",
+      "approved_at": "REPLACE_WITH_TIMEZONED_ISO_8601_TIMESTAMP",
+      "evidence": {"url": "https://evidence.your-owned-domain.example/approvals/production_operations", "sha256": "REPLACE_WITH_EVIDENCE_SHA256"},
+      "notes": ""
+    }
+  ]
+}
