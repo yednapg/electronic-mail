@@ -51,6 +51,7 @@ def production_environment(**overrides: str) -> dict[str, str]:
         "GMAIL_WATCH_RENEWAL_HOURS": "24",
         "OPENAI_API_KEY": "",
         "OPENAI_REQUIRED": "false",
+        "OPENAI_DEBUG_LOGS": "false",
         "AI_GROUPING_ENABLED": "false",
         "RATE_LIMIT_ENABLED": "true",
         "RELEASE_SHA": "0123456789abcdef0123456789abcdef01234567",
@@ -93,6 +94,53 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertTrue(any("APP_SESSION_SECRET" in error for error in errors))
         self.assertTrue(any("APP_ENCRYPTION_KEY" in error for error in errors))
         self.assertTrue(any("AI/OpenAI" in error for error in errors))
+
+    def test_production_requires_explicit_canonical_no_ai_configuration(self) -> None:
+        cases = (
+            (
+                {"AI_GROUPING_ENABLED": None},
+                "AI_GROUPING_ENABLED must be explicitly set to false outside local development",
+            ),
+            (
+                {"AI_GROUPING_ENABLED": "off"},
+                "AI_GROUPING_ENABLED must be explicitly set to false outside local development",
+            ),
+            (
+                {"OPENAI_REQUIRED": "FALSE"},
+                "OPENAI_REQUIRED must be explicitly set to false outside local development",
+            ),
+            (
+                {"OPENAI_DEBUG_LOGS": "0"},
+                "OPENAI_DEBUG_LOGS must be explicitly set to false outside local development",
+            ),
+            (
+                {"OPENAI_API_KEY": None},
+                "OPENAI_API_KEY must be explicitly set to an empty value outside local development",
+            ),
+            (
+                {"OPENAI_API_KEY": "configured-but-unused"},
+                "OPENAI_API_KEY must be empty outside local development",
+            ),
+            (
+                {"RATE_LIMIT_ENABLED": "yes"},
+                "RATE_LIMIT_ENABLED must be explicitly set to true outside local development",
+            ),
+        )
+
+        for changes, expected_error in cases:
+            with self.subTest(changes=changes):
+                environment = production_environment()
+                for name, value in changes.items():
+                    if value is None:
+                        environment.pop(name, None)
+                    else:
+                        environment[name] = value
+                with patch.dict(os.environ, environment, clear=True):
+                    settings = load_settings()
+                    deploy_result = deploy_check.main()
+
+                self.assertIn(expected_error, settings.readiness_errors())
+                self.assertEqual(deploy_result, 1)
 
     def test_production_rejects_cross_site_session_cookies(self) -> None:
         with patch.dict(
