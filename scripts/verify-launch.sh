@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=macos-release-toolchain.env
+source "$ROOT_DIR/scripts/macos-release-toolchain.env"
 LAUNCH_VERIFY_MODE="${LAUNCH_VERIFY_MODE:-production}"
 BACKEND_URL="${BACKEND_URL:-}"
 APP_PATH="${APP_PATH:-}"
@@ -433,12 +435,14 @@ verify_release_metadata() {
     "$EXPECTED_VERSION" \
     "$EXPECTED_BUILD_NUMBER" \
     "$BACKEND_URL" \
-    "$APPLE_DEVELOPMENT_TEAM" <<'PY'
+    "$APPLE_DEVELOPMENT_TEAM" \
+    "$APPROVED_XCODE_VERSION" \
+    "$APPROVED_XCODE_BUILD" <<'PY'
 from datetime import datetime, timedelta, timezone
 import json
 import sys
 
-path, release, version, build, backend, team = sys.argv[1:]
+path, release, version, build, backend, team, xcode_version, xcode_build = sys.argv[1:]
 
 def reject_duplicates(pairs):
     result = {}
@@ -464,6 +468,8 @@ expected = {
     "build_number": build,
     "backend_origin": backend,
     "developer_team": team,
+    "xcode_version": xcode_version,
+    "xcode_build": xcode_build,
 }
 for field, expected_value in expected.items():
     if metadata.get(field) != expected_value:

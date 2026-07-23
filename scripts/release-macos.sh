@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=macos-release-toolchain.env
+source "$ROOT_DIR/scripts/macos-release-toolchain.env"
 VALIDATE_INPUTS_ONLY=0
 
 if [ "${1:-}" = "--preflight" ]; then
@@ -103,19 +105,12 @@ for command in codesign ditto git hdiutil lipo plutil python3 security shasum sp
   command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
 
-if [ -n "${DEVELOPER_DIR:-}" ]; then
-  RELEASE_DEVELOPER_DIR="$DEVELOPER_DIR"
-elif [ -d /Applications/Xcode.app/Contents/Developer ]; then
-  RELEASE_DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-elif [ -d /Applications/Xcode-beta.app/Contents/Developer ]; then
-  fail "stable Xcode is required for a distributable build; only Xcode-beta is installed"
-else
-  fail "full stable Xcode is required"
-fi
-case "$RELEASE_DEVELOPER_DIR" in
-  *[Bb]eta*) fail "stable Xcode is required for a distributable build" ;;
-esac
-export DEVELOPER_DIR="$RELEASE_DEVELOPER_DIR"
+DEVELOPER_DIR="${DEVELOPER_DIR:-$APPROVED_DEVELOPER_DIR}"
+EXPECTED_XCODE_VERSION="${EXPECTED_XCODE_VERSION:-$APPROVED_XCODE_VERSION}"
+EXPECTED_XCODE_BUILD="${EXPECTED_XCODE_BUILD:-$APPROVED_XCODE_BUILD}"
+export DEVELOPER_DIR EXPECTED_XCODE_VERSION EXPECTED_XCODE_BUILD
+bash "$ROOT_DIR/scripts/verify-macos-toolchain.sh"
+RELEASE_DEVELOPER_DIR="$DEVELOPER_DIR"
 
 if [ "$SKIP_NOTARIZATION" != "1" ] && [ -n "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=all)" ]; then
   fail "the production source tree must be clean and committed before signing"
