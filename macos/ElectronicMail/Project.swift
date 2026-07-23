@@ -40,7 +40,10 @@ let project = Project(
             ],
             dependencies: [
                 .sdk(name: "sqlite3", type: .library)
-            ]
+            ],
+            settings: .settings(base: [
+                "ENABLE_HARDENED_RUNTIME": "YES"
+            ])
         ),
         .target(
             name: "ElectronicMail",
