@@ -1,5 +1,6 @@
 import ElectronicMailCore
 import AppKit
+import Darwin
 import SwiftUI
 
 @main
@@ -8,6 +9,12 @@ struct ElectronicMailApp: App {
     @StateObject private var store: InboxStore
 
     init() {
+#if ELECTRONIC_MAIL_LOCAL_BETA
+        if CommandLine.arguments.count == 2,
+           CommandLine.arguments[1] == "--electronic-mail-beta-launch-smoke" {
+            Darwin.exit(EXIT_SUCCESS)
+        }
+#endif
         let localMailStore = AppClientFactory.makeLocalMailStore()
         _store = StateObject(
             wrappedValue: InboxStore(

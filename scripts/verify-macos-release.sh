@@ -15,6 +15,7 @@ INFO_POLICY="${INFO_POLICY:-production}"
 REQUIRE_ADHOC_SIGNATURE="${REQUIRE_ADHOC_SIGNATURE:-0}"
 
 SOURCE_ENTITLEMENTS="$ROOT_DIR/macos/ElectronicMail/ElectronicMail/Mac/ElectronicMail.entitlements"
+SOURCE_BETA_ENTITLEMENTS="$ROOT_DIR/macos/ElectronicMail/Config/Entitlements/ElectronicMail-Beta.entitlements"
 SOURCE_PRIVACY_MANIFEST="$ROOT_DIR/macos/ElectronicMail/ElectronicMail/Mac/PrivacyInfo.xcprivacy"
 SOURCE_RELEASE_INFO="$ROOT_DIR/macos/ElectronicMail/Config/InfoPlists/ElectronicMail-Release-Info.plist"
 SOURCE_BETA_INFO="$ROOT_DIR/macos/ElectronicMail/Config/InfoPlists/ElectronicMail-Beta-Info.plist"
@@ -61,6 +62,9 @@ fi
 if [ "$REQUIRE_ADHOC_SIGNATURE" = "1" ] && [ "$SIGNING_MODE" != "identity-free" ]; then
   fail "an ad-hoc signature can be required only for an identity-free artifact"
 fi
+if [ "$REQUIRE_ADHOC_SIGNATURE" = "1" ] && [ "$INFO_POLICY" != "local-beta" ]; then
+  fail "an ad-hoc signature can be required only for the local-beta policy"
+fi
 
 for command in codesign grep lipo plutil python3 xcrun; do
   command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
@@ -91,6 +95,7 @@ for marker in demo-session-token demo@example.com demo-google-today DemoAppFixtu
 done
 
 plutil -lint "$SOURCE_ENTITLEMENTS" >/dev/null
+plutil -lint "$SOURCE_BETA_ENTITLEMENTS" >/dev/null
 plutil -lint "$SOURCE_PRIVACY_MANIFEST" >/dev/null
 plutil -lint "$SOURCE_RELEASE_INFO" >/dev/null
 plutil -lint "$SOURCE_BETA_INFO" >/dev/null
@@ -133,13 +138,14 @@ if [ -n "$DSYM_PATH" ]; then
   [ "$EXECUTABLE_UUIDS" = "$DSYM_UUIDS" ] || fail "dSYM UUIDs do not match the packaged executable"
 fi
 
-python3 - "$SOURCE_ENTITLEMENTS" "$SOURCE_PRIVACY_MANIFEST" "$SOURCE_RELEASE_INFO" "$SOURCE_BETA_INFO" "$SOURCE_PROJECT_MANIFEST" "$SOURCE_XCODE_PROJECT" "$SOURCE_DEMO_CLIENT" "$PRIVACY_MANIFEST" "$FRAMEWORK_PRIVACY_MANIFEST" "$INFO_PLIST" "$INFO_POLICY" <<'PY'
+python3 - "$SOURCE_ENTITLEMENTS" "$SOURCE_BETA_ENTITLEMENTS" "$SOURCE_PRIVACY_MANIFEST" "$SOURCE_RELEASE_INFO" "$SOURCE_BETA_INFO" "$SOURCE_PROJECT_MANIFEST" "$SOURCE_XCODE_PROJECT" "$SOURCE_DEMO_CLIENT" "$PRIVACY_MANIFEST" "$FRAMEWORK_PRIVACY_MANIFEST" "$INFO_PLIST" "$INFO_POLICY" <<'PY'
 import plistlib
 import re
 import sys
 
 (
     source_entitlements_path,
+    source_beta_entitlements_path,
     source_privacy_path,
     source_release_info_path,
     source_beta_info_path,
@@ -223,6 +229,14 @@ expected_entitlements = {
     "com.apple.security.files.user-selected.read-write": True,
 }
 require(entitlements == expected_entitlements, f"source entitlements differ from the approved minimal set: {entitlements}")
+beta_entitlements = load(source_beta_entitlements_path)
+expected_beta_entitlements = expected_entitlements | {
+    "com.apple.security.cs.disable-library-validation": True,
+}
+require(
+    beta_entitlements == expected_beta_entitlements,
+    f"beta entitlements differ from the approved local-testing set: {beta_entitlements}",
+)
 
 source_release_info = load(source_release_info_path)
 source_beta_info = load(source_beta_info_path)
@@ -344,7 +358,11 @@ if [ "$SIGNING_MODE" = "identity-free" ]; then
     trap 'rm -rf "$ADHOC_ENTITLEMENTS_DIR"' EXIT
     codesign -d --entitlements - --xml "$APP_PATH" > "$ADHOC_ENTITLEMENTS_DIR/embedded-entitlements.plist" 2> "$ADHOC_ENTITLEMENTS_DIR/codesign-entitlements.log"
     plutil -lint "$ADHOC_ENTITLEMENTS_DIR/embedded-entitlements.plist" >/dev/null
-    python3 - "$SOURCE_ENTITLEMENTS" "$ADHOC_ENTITLEMENTS_DIR/embedded-entitlements.plist" <<'PY'
+    ADHOC_SOURCE_ENTITLEMENTS="$SOURCE_ENTITLEMENTS"
+    if [ "$INFO_POLICY" = "local-beta" ]; then
+      ADHOC_SOURCE_ENTITLEMENTS="$SOURCE_BETA_ENTITLEMENTS"
+    fi
+    python3 - "$ADHOC_SOURCE_ENTITLEMENTS" "$ADHOC_ENTITLEMENTS_DIR/embedded-entitlements.plist" <<'PY'
 import plistlib
 import sys
 
@@ -353,7 +371,7 @@ with open(sys.argv[1], "rb") as handle:
 with open(sys.argv[2], "rb") as handle:
     actual = plistlib.load(handle)
 if actual != expected:
-    raise SystemExit(f"ad-hoc app entitlements differ from the approved source policy: {actual}")
+    raise SystemExit(f"ad-hoc app entitlements differ from the approved {sys.argv[1]} policy: {actual}")
 PY
   fi
 fi
