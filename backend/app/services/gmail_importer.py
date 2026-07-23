@@ -7,7 +7,7 @@ from hashlib import sha256
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from googleapiclient.errors import HttpError
@@ -58,6 +58,9 @@ GMAIL_BATCH_GET_SIZE = 50
 GMAIL_HISTORY_PAGE_SIZE = 500
 GMAIL_RECONCILE_BATCH_SIZE = 250
 GMAIL_RECONCILE_PAGES_PER_JOB = 4
+GMAIL_BACKFILL_JOB_PRIORITY = 80
+GMAIL_SEARCH_PAGE_SIZE = 100
+GMAIL_SEARCH_MAX_PAGES = 5
 GMAIL_HISTORY_TYPES = ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
 GMAIL_METADATA_HEADERS = ["Subject", "From", "To", "Cc", "Bcc", "Date", "Message-ID", "In-Reply-To", "References", "List-ID"]
 GMAIL_THREAD_ORDER_SPECS: tuple[tuple[str, dict[str, Any]], ...] = (
@@ -113,7 +116,7 @@ def run_gmail_import_batch(settings: Settings, *, user_id: str, batch_size: int,
             queue="slow",
             user_id=user_id,
             dedupe_key=f"gmail-backfill:{user_id}",
-            priority=80,
+            priority=GMAIL_BACKFILL_JOB_PRIORITY,
             payload={"user_id": user_id, "batch_size": BACKFILL_BATCH_SIZE},
         )
         if _ai_grouping_enabled(settings):
@@ -328,7 +331,7 @@ def run_gmail_backfill(settings: Settings, *, user_id: str, batch_size: int = BA
                 queue="slow",
                 user_id=user_id,
                 dedupe_key=f"gmail-backfill:{user_id}:{next_cursor}",
-                priority=80,
+                priority=GMAIL_BACKFILL_JOB_PRIORITY,
                 payload={"user_id": user_id, "batch_size": batch_size},
             )
         if messages:
@@ -910,13 +913,19 @@ def hydrate_gmail_search_results(
     user_id: str,
     query: str,
     label: str = "all",
-    limit: int = 200,
+    limit: int = GMAIL_SEARCH_PAGE_SIZE,
+    max_pages: int = GMAIL_SEARCH_MAX_PAGES,
+    page_token: str | None = None,
+    on_page_hydrated: Callable[[int], None] | None = None,
+    on_continuation: Callable[[str], None] | None = None,
 ) -> int:
     """Hydrate only Gmail search matches absent from the canonical local mailbox.
 
     Gmail's message-list search remains authoritative for discovering older and
-    body-only matches. Already downloaded full messages are deliberately reused:
-    fetching every result body again made an interactive search take seconds.
+    body-only matches. Each durable worker job follows continuation tokens within
+    a hard page budget and indexes one page before requesting the next. Already
+    downloaded full messages are deliberately reused, including when a failed
+    job restarts from page one.
     """
     if not user_can_write_gmail(str(settings.database_path), user_id=user_id):
         return 0
@@ -938,40 +947,76 @@ def hydrate_gmail_search_results(
     if credentials is None:
         raise GoogleCredentialsUnavailable("Google credentials are not connected")
     service = build_google_service("gmail", "v1", credentials)
-    remaining = max(1, min(limit, 200))
-    page_token: str | None = None
-    message_ids: list[str] = []
-    while remaining > 0:
+    page_size = max(1, min(int(limit), GMAIL_SEARCH_PAGE_SIZE))
+    page_budget = max(1, min(int(max_pages), GMAIL_SEARCH_MAX_PAGES))
+    page_token = page_token or None
+    seen_page_tokens = {page_token} if page_token else set()
+    hydrated_count = 0
+    continuation_pending = False
+    for _page_index in range(page_budget):
         kwargs: dict[str, Any] = {
             "userId": "me",
             "q": gmail_query,
-            "maxResults": min(remaining, 100),
+            "maxResults": page_size,
             "includeSpamTrash": True,
         }
         if page_token:
             kwargs["pageToken"] = page_token
         response = service.users().messages().list(**kwargs).execute()
         items = response.get("messages") if isinstance(response, dict) else None
+        message_ids: list[str] = []
         if isinstance(items, list):
             for item in items:
                 if isinstance(item, dict) and item.get("id"):
                     message_ids.append(str(item["id"]))
-                    remaining -= 1
-                    if remaining <= 0:
-                        break
-        page_token = str(response.get("nextPageToken") or "") if isinstance(response, dict) else ""
-        if not page_token or not items:
+        page_hydrated_count = _hydrate_gmail_search_message_ids(
+            settings,
+            user_id=user_id,
+            message_ids=list(dict.fromkeys(message_ids)),
+        )
+        hydrated_count += page_hydrated_count
+        # Publish after every committed page, including a retry that discovers
+        # the page is already local. If a later Gmail request fails, the client
+        # can still refresh the durable progress made by earlier attempts.
+        if on_page_hydrated is not None:
+            on_page_hydrated(page_hydrated_count)
+
+        next_page_token = str(response.get("nextPageToken") or "") if isinstance(response, dict) else ""
+        continuation_pending = bool(next_page_token)
+        if not next_page_token:
             break
-    unique_message_ids = list(dict.fromkeys(message_ids))
+        if next_page_token == page_token or next_page_token in seen_page_tokens:
+            raise RuntimeError("Gmail search pagination repeated a page token")
+        seen_page_tokens.add(next_page_token)
+        page_token = next_page_token
+    if continuation_pending:
+        logger.info(
+            "Gmail search hydration reached its page cap user_id=%s page_cap=%s",
+            user_id,
+            page_budget,
+        )
+        if on_continuation is not None and page_token:
+            on_continuation(page_token)
+    return hydrated_count
+
+
+def _hydrate_gmail_search_message_ids(
+    settings: Settings,
+    *,
+    user_id: str,
+    message_ids: list[str],
+) -> int:
+    if not message_ids:
+        return 0
     existing_messages = list_messages_by_ids(
         str(settings.database_path),
         user_id=user_id,
-        message_ids=unique_message_ids,
+        message_ids=message_ids,
     )
     existing_by_id = {message.message_id: message for message in existing_messages}
     message_ids_needing_full_body = [
         message_id
-        for message_id in unique_message_ids
+        for message_id in message_ids
         if message_id not in existing_by_id or not _has_body_for_reader(existing_by_id[message_id])
     ]
     if not message_ids_needing_full_body:
