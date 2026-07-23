@@ -41,6 +41,7 @@ class StoredOAuthLoginSession:
     redirect_to: str | None
     expires_at: str
     created_at: str
+    started_epoch: int
 
 
 @dataclass
@@ -49,6 +50,21 @@ class StoredMobileLoginCode:
 
     code_hash: str
     user_id: str
+    expires_at: str
+    consumed_at: str | None
+    created_at: str
+
+
+@dataclass
+class StoredMobileOAuthHandoff:
+    """Encrypted one-time browser-to-native OAuth handoff."""
+
+    handoff_id: str
+    login_code_encrypted: str | None
+    login_code_hash: str | None
+    exchange_code_challenge: str | None
+    status: str
+    error: str | None
     expires_at: str
     consumed_at: str | None
     created_at: str

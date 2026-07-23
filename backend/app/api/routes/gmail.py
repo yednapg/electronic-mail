@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from googleapiclient.errors import HttpError
 
 from app.core.config import load_settings
+from app.core.error_safety import safe_google_error
 from app.schemas.domain import GmailThreadMutationResponse
 from app.services.auth import require_current_user
 from app.services.integrations.google import (
@@ -26,9 +27,9 @@ def archive_thread(http_request: Request, thread_id: str) -> GmailThreadMutation
     try:
         archive_gmail_thread_service(settings, thread_id, user_id=user.id)
     except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=safe_google_error(exc, operation="archive")) from exc
     except HttpError as exc:
-        raise HTTPException(status_code=_http_status(exc), detail=f"Gmail archive failed: {exc}") from exc
+        raise HTTPException(status_code=_http_status(exc), detail=safe_google_error(exc, operation="archive")) from exc
     return GmailThreadMutationResponse(thread_id=thread_id, action="archive")
 
 
@@ -40,9 +41,9 @@ def unarchive_thread(http_request: Request, thread_id: str) -> GmailThreadMutati
     try:
         unarchive_gmail_thread_service(settings, thread_id, user_id=user.id)
     except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=safe_google_error(exc, operation="unarchive")) from exc
     except HttpError as exc:
-        raise HTTPException(status_code=_http_status(exc), detail=f"Gmail unarchive failed: {exc}") from exc
+        raise HTTPException(status_code=_http_status(exc), detail=safe_google_error(exc, operation="unarchive")) from exc
     return GmailThreadMutationResponse(thread_id=thread_id, action="unarchive")
 
 
@@ -54,9 +55,9 @@ def mark_thread_read(http_request: Request, thread_id: str) -> GmailThreadMutati
     try:
         mark_gmail_thread_read(settings, thread_id, user_id=user.id)
     except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=safe_google_error(exc, operation="mark-read")) from exc
     except HttpError as exc:
-        raise HTTPException(status_code=_http_status(exc), detail=f"Gmail mark-read failed: {exc}") from exc
+        raise HTTPException(status_code=_http_status(exc), detail=safe_google_error(exc, operation="mark-read")) from exc
     return GmailThreadMutationResponse(thread_id=thread_id, action="mark_read")
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -97,6 +98,31 @@ class SystemRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertIn(system_routes.ALEMBIC_HEAD_REVISION, response.json()["detail"]["errors"][0])
 
+    def test_ready_does_not_expose_database_exception_details(self) -> None:
+        secret_detail = "postgresql://admin:super-secret@database.internal/app"
+        settings = SimpleNamespace(
+            app_env="production",
+            database_path="postgresql://example/db",
+            database_backend="postgres",
+            google_configured=True,
+            readiness_errors=lambda: [],
+        )
+
+        with (
+            patch.object(system_routes, "settings", settings),
+            patch.object(system_routes, "get_engine", return_value=FailingEngine(secret_detail)),
+            self.assertLogs(system_routes.logger, level="ERROR") as captured_logs,
+        ):
+            response = self.client.get("/ready", headers={"X-Request-ID": "readiness-safe-1"})
+
+        response_text = json.dumps(response.json())
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"]["errors"], ["Postgres readiness check failed"])
+        self.assertNotIn(secret_detail, response_text)
+        self.assertEqual(response.headers["x-request-id"], "readiness-safe-1")
+        self.assertEqual(captured_logs.records[0].event_fields["exception_type"], "RuntimeError")
+        self.assertNotIn(secret_detail, captured_logs.output[0])
+
 
 class FakeResult:
     def __init__(self, value: str | None = None) -> None:
@@ -128,6 +154,14 @@ class FakeEngine:
 
     def connect(self) -> FakeConnection:
         return FakeConnection(self.revision)
+
+
+class FailingEngine:
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+
+    def connect(self) -> FakeConnection:
+        raise RuntimeError(self.detail)
 
 
 if __name__ == "__main__":

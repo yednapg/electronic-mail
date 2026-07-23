@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from googleapiclient.errors import HttpError
 from httplib2 import Response
 
+from app.core.error_safety import GoogleCredentialsUnavailable
 from app.db.jobs import renew_heartbeat
 from app.db.mail_groups import AppSessionSnapshotRecord, GmailMessageRecord, MailboxCursorError, MailboxThreadPage, MailGroupRecord, VisibleMailGroupRecord, decode_mailbox_cursor, encode_mailbox_cursor
 from app.services.auth import CurrentUser
@@ -21,6 +22,8 @@ from app.services.mail_groups import (
     _refresh_ai_lifecycle_groups,
     build_app_session_response,
     build_mailbox_response,
+    build_post_login_readiness_response,
+    enrich_group,
     enqueue_mailbox_sync,
     ensure_background_import_work,
     rebuild_touched_mail_groups,
@@ -121,10 +124,13 @@ class SpeedPipelineTests(unittest.TestCase):
             ai_grouping_enabled=False,
         )
         self.importer_event_patch = patch("app.services.gmail_importer.emit_mailbox_event")
+        self.importer_order_patch = patch("app.services.gmail_importer._refresh_gmail_thread_order_best_effort", return_value=True)
         self.worker_event_patch = patch("app.workers.main.emit_mailbox_event")
         self.mock_importer_event = self.importer_event_patch.start()
+        self.mock_importer_order = self.importer_order_patch.start()
         self.mock_worker_event = self.worker_event_patch.start()
         self.addCleanup(self.importer_event_patch.stop)
+        self.addCleanup(self.importer_order_patch.stop)
         self.addCleanup(self.worker_event_patch.stop)
 
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
@@ -168,6 +174,7 @@ class SpeedPipelineTests(unittest.TestCase):
             message_ids=["msg-1", "draft-1"],
             use_ai=False,
         )
+        self.mock_importer_order.assert_not_called()
         mock_projection.assert_not_called()
 
     @patch("app.services.gmail_importer._hydrate_thread_metadata_for_messages")
@@ -191,6 +198,8 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_enqueue: Mock,
         mock_thread_history: Mock,
     ) -> None:
+        self.settings.ai_grouping_enabled = True
+        self.settings.openai_configured = True
         inbox = sample_message("inbox-1")
         sent = replace(sample_message("sent-1"), gmail_thread_id="thread-2", label_ids=["SENT"])
         draft = replace(sample_message("draft-1"), gmail_thread_id="thread-3", label_ids=["DRAFT"])
@@ -219,6 +228,7 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertIsNotNone(mock_completed.call_args.kwargs["full_backfill_cursor"])
         self.assertFalse(mock_completed.call_args.kwargs["clear_full_backfill_cursor"])
         self.assertTrue(mock_completed.call_args.kwargs["full_backfill_started"])
+        self.mock_importer_order.assert_not_called()
         self.assertTrue(any(call.kwargs.get("kind") == "gmail_backfill" for call in mock_enqueue.call_args_list))
         self.assertFalse(any(call.kwargs.get("kind") == "first_run_ai_grouping" for call in mock_enqueue.call_args_list))
 
@@ -265,8 +275,36 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_rebuild.assert_not_called()
         mock_completed.assert_called_once()
         self.assertEqual(mock_completed.call_args.kwargs["last_history_id"], "11")
+        self.mock_importer_order.assert_not_called()
         mock_enqueue.assert_not_called()
         mock_projection.assert_not_called()
+
+    @patch("app.services.gmail_importer.mark_import_error")
+    @patch("app.services.gmail_importer._list_history_delta")
+    @patch("app.services.gmail_importer.mark_import_started")
+    @patch("app.services.gmail_importer.get_import_state")
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_delta_sync_persists_safe_reauthentication_error(
+        self,
+        _mock_can_write: Mock,
+        mock_state: Mock,
+        _mock_started: Mock,
+        mock_history: Mock,
+        mock_error: Mock,
+    ) -> None:
+        mock_state.return_value = SimpleNamespace(last_history_id="10")
+        mock_history.side_effect = GoogleCredentialsUnavailable(
+            "Google credentials are not connected"
+        )
+
+        with self.assertRaises(GoogleCredentialsUnavailable):
+            run_gmail_delta_sync(self.settings, user_id="user-1", batch_size=100)
+
+        mock_error.assert_called_once_with(
+            self.settings.database_path,
+            user_id="user-1",
+            error="Google authorization expired or was revoked. Please sign in again.",
+        )
 
     @patch("app.services.gmail_importer._list_messages")
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
@@ -310,9 +348,15 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_list_messages.assert_not_called()
         mock_hydrate_ids.assert_called_once_with(self.settings, user_id="user-1", message_ids=["msg-2"], format="metadata")
         mock_rebuild.assert_called_once_with(self.settings, user_id="user-1", message_ids=["msg-2"], use_ai=False)
+        self.mock_importer_order.assert_called_once_with(
+            self.settings,
+            user_id="user-1",
+            target_history_id="13",
+        )
         self.assertFalse(any(call.kwargs.get("kind") == "mail_group_enrich" for call in mock_enqueue.call_args_list))
         mock_projection.assert_not_called()
 
+    @patch("app.services.gmail_importer.enqueue_gmail_full_reconciliation", return_value="reconcile-job-1")
     @patch("app.services.gmail_importer._run_recent_metadata_sync", return_value=2)
     @patch("app.services.gmail_importer._list_history_delta")
     @patch("app.services.gmail_importer.mark_import_started")
@@ -325,6 +369,7 @@ class SpeedPipelineTests(unittest.TestCase):
         _mock_started: Mock,
         mock_history: Mock,
         mock_fallback: Mock,
+        mock_reconcile: Mock,
     ) -> None:
         mock_state.return_value = SimpleNamespace(last_history_id="10")
         mock_history.side_effect = HttpError(Response({"status": "404"}), b"History expired")
@@ -333,6 +378,7 @@ class SpeedPipelineTests(unittest.TestCase):
 
         self.assertEqual(touched, 2)
         mock_fallback.assert_called_once_with(self.settings, user_id="user-1", batch_size=100, can_write_checked=True)
+        mock_reconcile.assert_called_once_with(self.settings, user_id="user-1")
 
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
     @patch("app.services.gmail_importer.enqueue_job")
@@ -372,6 +418,11 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_delete.assert_called_once_with(self.settings.database_path, user_id="user-1", message_ids=["msg-1"])
         mock_prune.assert_called_once_with(self.settings.database_path, user_id="user-1", group_ids=["group-1"])
         mock_pending.assert_called_once_with(self.settings.database_path, user_id="user-1", group_ids=["group-1"])
+        self.mock_importer_order.assert_called_once_with(
+            self.settings,
+            user_id="user-1",
+            target_history_id="11",
+        )
         self.assertFalse(any(call.kwargs.get("kind") == "mail_group_enrich" for call in mock_enqueue.call_args_list))
         mock_projection.assert_not_called()
 
@@ -428,6 +479,29 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_delta.assert_called_once_with(self.settings, user_id="user-1", batch_size=100, target_history_id="123")
         mock_snapshot.assert_called_once_with(self.settings, user_id="user-1")
 
+    @patch("app.workers.main.get_import_state", return_value=SimpleNamespace(last_history_id="123"))
+    @patch("app.workers.main.refresh_gmail_thread_order")
+    @patch("app.workers.main.refresh_app_session_snapshot")
+    def test_thread_order_refresh_runs_only_in_slow_worker_job(
+        self,
+        mock_snapshot: Mock,
+        mock_refresh_order: Mock,
+        _mock_import_state: Mock,
+    ) -> None:
+        job = SimpleNamespace(
+            payload_version=1,
+            kind="gmail_thread_order_refresh",
+            payload={"user_id": "user-1", "target_history_id": "123"},
+            user_id="user-1",
+        )
+
+        _run_job(self.settings, job)
+
+        mock_refresh_order.assert_called_once_with(self.settings, user_id="user-1")
+        mock_snapshot.assert_called_once_with(self.settings, user_id="user-1")
+        self.assertEqual(self.mock_worker_event.call_args.kwargs["event_type"], "mailbox-changed")
+        self.assertEqual(self.mock_worker_event.call_args.kwargs["mailbox_label"], "all")
+
     @patch("app.services.gmail_watch.enqueue_job")
     @patch("app.services.gmail_watch.mark_gmail_watch_started")
     @patch("app.services.gmail_watch.start_gmail_watch")
@@ -473,7 +547,7 @@ class SpeedPipelineTests(unittest.TestCase):
     @patch("app.services.mail_groups.list_group_messages", return_value=[])
     @patch("app.services.mail_groups.list_messages_by_ids", return_value=[sample_message("msg-2")])
     @patch("app.services.mail_groups.user_can_write_gmail", return_value=True)
-    def test_changed_ready_group_becomes_pending_for_fresh_ai(
+    def test_raw_mail_change_skips_retired_group_projection_work(
         self,
         _mock_can_write: Mock,
         _mock_messages: Mock,
@@ -484,117 +558,56 @@ class SpeedPipelineTests(unittest.TestCase):
     ) -> None:
         touched = rebuild_touched_mail_groups(self.settings, user_id="user-1", message_ids=["msg-2"], use_ai=False)
 
-        self.assertEqual(touched, 1)
-        self.assertEqual(mock_upsert_group.call_args.kwargs["enrichment_status"], "pending")
-        self.assertFalse(mock_upsert_group.call_args.kwargs["dashboard_visible"])
+        self.assertEqual(touched, 0)
+        mock_upsert_group.assert_not_called()
 
-    @patch("app.services.mail_groups.enqueue_job")
-    @patch("app.services.mail_groups.refresh_app_session_snapshot")
-    @patch("app.services.mail_groups.refresh_visible_mail_projection")
-    @patch("app.services.mail_groups.mark_import_completed")
-    @patch("app.services.mail_groups.rebuild_touched_mail_groups", return_value=1)
-    @patch("app.services.mail_groups._store_ai_batch_groups", return_value=(3, 1, {"msg-1"}))
-    @patch("app.services.mail_groups._ai_batch_group_messages", return_value=[])
-    @patch("app.services.mail_groups._first_run_candidate_messages")
-    @patch("app.services.mail_groups.list_recent_messages_since")
-    @patch("app.services.mail_groups.user_can_write_gmail", return_value=True)
-    def test_first_run_creates_pending_groups_for_ai_omitted_recent_messages(
-        self,
-        _mock_can_write: Mock,
-        mock_recent: Mock,
-        mock_candidates: Mock,
-        _mock_ai: Mock,
-        _mock_store: Mock,
-        mock_rebuild_touched: Mock,
-        _mock_completed: Mock,
-        _mock_visible_projection: Mock,
-        _mock_snapshot: Mock,
-        mock_enqueue: Mock,
-    ) -> None:
-        selected = sample_message("msg-1")
-        omitted = replace(sample_message("msg-2"), gmail_thread_id="thread-2")
-        mock_recent.return_value = [selected, omitted]
-        mock_candidates.return_value = [selected]
+    def test_first_run_ai_entrypoint_is_hard_disabled_even_with_stale_settings(self) -> None:
+        self.settings.ai_grouping_enabled = True
+        self.settings.openai_configured = True
 
         created = run_first_run_ai_grouping(self.settings, user_id="user-1", limit=50)
 
-        self.assertEqual(created, 3)
-        self.assertGreaterEqual(mock_recent.call_args.kwargs["limit"], 270)
-        mock_rebuild_touched.assert_called_once_with(self.settings, user_id="user-1", message_ids=["msg-2"], use_ai=False)
-        self.assertTrue(any(call.kwargs.get("kind") == "mail_group_enrich" for call in mock_enqueue.call_args_list))
+        self.assertEqual(created, 0)
 
-    @patch("app.services.mail_groups.replace_group_members")
-    @patch("app.services.mail_groups.upsert_mail_group", return_value=SimpleNamespace(id="ai-lifecycle-group"))
-    @patch("app.services.mail_groups._ai_lifecycle_group_proposals")
-    @patch("app.services.mail_groups.list_recent_messages_since")
-    def test_projection_refresh_persists_ai_lifecycle_proposals(
-        self,
-        mock_recent: Mock,
-        mock_proposals: Mock,
-        mock_upsert_group: Mock,
-        mock_replace_members: Mock,
-    ) -> None:
+    def test_ai_lifecycle_projection_is_hard_disabled_with_stale_openai_key(self) -> None:
         settings = SimpleNamespace(**{**self.settings.__dict__, "openai_configured": True})
-        inbound = replace(
-            sample_message("msg-1"),
-            gmail_thread_id="thread-1",
-            sender="Northstar Bank <support@northstarbank.example>",
-            subject="Request for Status of International Wire Sent",
-            snippet="Northstar is checking the international wire status.",
-            extracted_signals={"sender_domain": "northstarbank.example"},
-        )
-        processed = replace(
-            sample_message("msg-2"),
-            gmail_thread_id="thread-2",
-            sender="Tradequalityunit <tradequalityunit@northstarbank.example>",
-            subject="Outward remittance processed",
-            snippet="The outward remittance was processed.",
-            extracted_signals={"sender_domain": "northstarbank.example"},
-        )
-        sent = replace(
-            sample_message("msg-3"),
-            gmail_thread_id="thread-3",
-            label_ids=["SENT"],
-            sender="TestUser <me@example.com>",
-            subject="Fwd: Request for Status of International Wire Sent",
-            extracted_signals={"sender_domain": "gmail.com"},
-        )
-        mock_recent.return_value = [inbound, processed, sent]
-        mock_proposals.return_value = [
-            {
-                "group_kind": "lifecycle",
-                "canonical_entity": "Northstar Bank",
-                "shared_object": "International wire remittance status",
-                "workflow_family": "financial_transfer",
-                "member_ids": ["msg-1", "msg-2"],
-                "context_sent_ids": ["msg-3"],
-                "excluded_ids": [],
-                "confidence": 0.96,
-                "risk_level": "low",
-                "per_message_evidence": {
-                    "msg-1": "Northstar support is responding on the wire status request.",
-                    "msg-2": "Northstar confirms the remittance was processed.",
-                },
-                "strong_evidence": ["same international wire/remittance lifecycle"],
-                "weak_evidence": ["same bank and close dates"],
-                "should_show_in_inbox": True,
-                "should_show_in_dashboard": True,
-                "workflow_state": "resolved",
-                "requires_user_action": False,
-                "terminal_state": True,
-                "urgency": "low",
-                "ai_title": "Northstar international wire remittance status",
-                "ai_summary": "Northstar support and remittance mail describe the same international wire status.",
-            }
-        ]
-
         created = _refresh_ai_lifecycle_groups(settings, user_id="user-1")
 
-        self.assertEqual(created, 1)
-        self.assertEqual(mock_upsert_group.call_args.kwargs["membership_source"], "ai_lifecycle")
-        self.assertEqual(mock_upsert_group.call_args.kwargs["group_type"], "financial_transfer")
-        members = mock_replace_members.call_args.kwargs["members"]
-        self.assertEqual({message.message_id for message, _source, _confidence in members}, {"msg-1", "msg-2", "msg-3"})
+        self.assertEqual(created, 0)
+
+    def test_no_ai_enrichment_and_legacy_jobs_never_import_openai(self) -> None:
+        self.settings.ai_grouping_enabled = True
+        self.settings.openai_configured = True
+        self.settings.openai_api_key = "stale-key-must-not-be-used"
+        real_import = __import__
+
+        def guarded_import(name: str, *args, **kwargs):
+            if name == "openai" or name.startswith("openai."):
+                raise AssertionError("No-AI runtime attempted to import OpenAI")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=guarded_import):
+            enrichment = enrich_group(
+                self.settings,
+                messages=[sample_message()],
+                group_key="gmail-thread:thread-1",
+                generated_from_hash="hash-1",
+                use_ai=True,
+            )
+            self.assertFalse(enrichment.get("_ai_ready", False))
+            self.assertEqual(run_first_run_ai_grouping(self.settings, user_id="user-1"), 0)
+            self.assertEqual(_refresh_ai_lifecycle_groups(self.settings, user_id="user-1"), 0)
+
+            for kind in ("mail_group_enrich", "first_run_ai_grouping", "first_run_ready_check"):
+                _run_job(
+                    self.settings,
+                    SimpleNamespace(
+                        payload_version=1,
+                        kind=kind,
+                        payload={"user_id": "user-1"},
+                        user_id="user-1",
+                    ),
+                )
 
     def test_candidate_groups_keep_same_sender_lifecycle_threads_separate_without_exact_evidence(self) -> None:
         first = replace(
@@ -786,6 +799,11 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_drafts.assert_called_once_with(self.settings, user_id="user-1", batch_size=100, page_token="draft-page-2")
         self.assertIsNone(mock_completed.call_args.kwargs["full_backfill_cursor"])
         self.assertTrue(mock_completed.call_args.kwargs["full_backfill_completed"])
+        self.mock_importer_order.assert_called_once_with(
+            self.settings,
+            user_id="user-1",
+            target_history_id="22",
+        )
 
     @patch("app.services.mail_groups.ensure_background_import_work")
     @patch("app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1")
@@ -823,12 +841,9 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual(mock_thread_page.call_args.kwargs["label"], "inbox")
         self.assertEqual(mock_thread_page.call_args.kwargs["limit"], 150)
         self.assertIsNone(mock_thread_page.call_args.kwargs["since_iso"])
-        mock_count_threads.assert_called_once_with(
-            self.settings.database_path,
-            user_id="user-1",
-            label="inbox",
-            since_iso=None,
-        )
+        self.assertEqual(mock_count_threads.call_count, 2)
+        self.assertFalse(mock_count_threads.call_args_list[0].kwargs.get("unread_only", False))
+        self.assertTrue(mock_count_threads.call_args_list[1].kwargs["unread_only"])
 
     def test_mailbox_cursor_round_trips_and_rejects_invalid_values(self) -> None:
         cursor = encode_mailbox_cursor("2026-05-15T12:00:00+00:00", "thread-1")
@@ -839,6 +854,118 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual(thread_key, "thread-1")
         with self.assertRaises(MailboxCursorError):
             decode_mailbox_cursor("not-a-valid-cursor")
+
+    def test_mailbox_response_does_not_resort_authoritative_gmail_order(self) -> None:
+        gmail_first = replace(
+            sample_message("gmail-first"),
+            gmail_thread_id="thread-gmail-first",
+            internal_date="2026-05-15T10:00:00+00:00",
+        )
+        gmail_second = replace(
+            sample_message("gmail-second"),
+            gmail_thread_id="thread-gmail-second",
+            internal_date="2026-05-15T12:00:00+00:00",
+        )
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_active_jobs", return_value=0), patch(
+            "app.services.mail_groups.count_mail_groups_by_enrichment_status",
+            return_value={"ready": 2, "pending": 0},
+        ), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            return_value=MailboxThreadPage(
+                threads=[
+                    ("thread-gmail-first", [gmail_first]),
+                    ("thread-gmail-second", [gmail_second]),
+                ],
+                next_cursor=None,
+                loaded_threads=2,
+                order_source="gmail",
+            ),
+        ), patch("app.services.mail_groups.count_mailbox_threads", return_value=2), patch(
+            "app.services.mail_groups.oldest_imported_message_at", return_value=None
+        ), patch("app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1"):
+            mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
+
+        rows = [row for section in mailbox.sections for row in section.rows]
+        self.assertEqual([row.thread_id for row in rows], ["thread-gmail-first", "thread-gmail-second"])
+
+    def test_gmail_order_survives_reappearing_date_sections_and_pagination(self) -> None:
+        first = replace(
+            sample_message("gmail-rank-1"),
+            gmail_thread_id="thread-gmail-rank-1",
+            internal_date="2026-05-15T10:00:00+00:00",
+        )
+        second = replace(
+            sample_message("gmail-rank-2"),
+            gmail_thread_id="thread-gmail-rank-2",
+            internal_date="2025-04-15T12:00:00+00:00",
+        )
+        third = replace(
+            sample_message("gmail-rank-3"),
+            gmail_thread_id="thread-gmail-rank-3",
+            internal_date="2026-05-14T09:00:00+00:00",
+        )
+        fourth = replace(
+            sample_message("gmail-rank-4"),
+            gmail_thread_id="thread-gmail-rank-4",
+            internal_date="2025-04-14T08:00:00+00:00",
+        )
+        pages = [
+            MailboxThreadPage(
+                threads=[
+                    ("thread-gmail-rank-1", [first]),
+                    ("thread-gmail-rank-2", [second]),
+                    ("thread-gmail-rank-3", [third]),
+                ],
+                next_cursor="ranked-page-2",
+                loaded_threads=3,
+                order_source="gmail",
+            ),
+            MailboxThreadPage(
+                threads=[("thread-gmail-rank-4", [fourth])],
+                next_cursor=None,
+                loaded_threads=1,
+                order_source="gmail",
+            ),
+        ]
+        with patch("app.services.mail_groups.ensure_background_import_work"), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
+        ), patch("app.services.mail_groups.count_active_jobs", return_value=0), patch(
+            "app.services.mail_groups.count_mail_groups_by_enrichment_status",
+            return_value={"ready": 4, "pending": 0},
+        ), patch(
+            "app.services.mail_groups.list_mailbox_thread_page",
+            side_effect=pages,
+        ), patch("app.services.mail_groups.count_mailbox_threads", return_value=4), patch(
+            "app.services.mail_groups.oldest_imported_message_at", return_value=None
+        ), patch("app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-order-1"):
+            first_page = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
+            second_page = build_mailbox_response(
+                self.settings,
+                user_id="user-1",
+                label="inbox",
+                cursor=first_page.next_cursor,
+            )
+
+        first_ids = [row.thread_id for section in first_page.sections for row in section.rows]
+        second_ids = [row.thread_id for section in second_page.sections for row in section.rows]
+        self.assertEqual(
+            first_ids,
+            ["thread-gmail-rank-1", "thread-gmail-rank-2", "thread-gmail-rank-3"],
+        )
+        self.assertEqual(second_ids, ["thread-gmail-rank-4"])
+        self.assertEqual(len(first_page.sections), 3)
+        section_ids = [section.id for section in [*first_page.sections, *second_page.sections]]
+        self.assertEqual(len(section_ids), len(set(section_ids)))
+        combined_ids = [
+            row.thread_id
+            for section in [*first_page.sections, *second_page.sections]
+            for row in section.rows
+        ]
+        self.assertEqual(combined_ids, [*first_ids, *second_ids])
 
     def test_candidate_groups_normalize_exact_reference_sender_variants(self) -> None:
         grievance = replace(
@@ -867,7 +994,7 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual(list(candidates), ["ticket_id:northstar-bank:900000003"])
         self.assertEqual([message.message_id for message in candidates["ticket_id:northstar-bank:900000003"]], ["northstar-grievance", "northstar-service"])
 
-    def test_mailbox_uses_compatible_ai_group_for_title_and_summary_without_replacing_thread_id(self) -> None:
+    def test_mailbox_ignores_ai_projection_even_when_stale_flag_is_true(self) -> None:
         self.settings.ai_grouping_enabled = True
         first = replace(
             sample_message("msg-1"),
@@ -930,14 +1057,13 @@ class SpeedPipelineTests(unittest.TestCase):
 
         rows = [row for section in mailbox.sections for row in section.rows]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].thread_id, "group-1")
-        self.assertEqual(rows[0].entity_id, "visible-1")
-        self.assertEqual(rows[0].title, "AI grouped title")
-        self.assertEqual(rows[0].summary, "AI grouped summary")
-        self.assertEqual(rows[0].ai_group_id, "group-1")
-        self.assertEqual(rows[0].ai_title, "AI grouped title")
-        self.assertEqual(rows[0].ai_summary, "AI grouped summary")
-        self.assertEqual(rows[0].sender, "Example Sender")
+        self.assertEqual(rows[0].thread_id, "thread-1")
+        self.assertEqual(rows[0].entity_id, "thread-1")
+        self.assertEqual(rows[0].title, "Raw second subject")
+        self.assertEqual(rows[0].summary, "Raw second snippet")
+        self.assertIsNone(rows[0].ai_group_id)
+        self.assertIsNone(rows[0].ai_title)
+        self.assertIsNone(rows[0].ai_summary)
         self.assertEqual(mailbox.mailbox_revision, "rev-1")
         self.assertIsNotNone(mailbox.generated_at)
         self.assertEqual(rows[0].latest_subject, "Raw second subject")
@@ -946,11 +1072,11 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual(rows[0].message_count, 2)
         self.assertEqual([child.message_id for child in rows[0].children], ["msg-1", "msg-2"])
         self.assertEqual(rows[0].children[0].subject, "Raw first subject")
-        self.assertEqual(rows[0].children[0].ai_title, "Clean first title")
+        self.assertIsNone(rows[0].children[0].ai_title)
         self.assertEqual(rows[0].children[1].subject, "Raw second subject")
-        self.assertEqual(rows[0].children[1].ai_title, "Clean second title")
+        self.assertIsNone(rows[0].children[1].ai_title)
 
-    def test_mailbox_uses_thread_ai_group_for_plain_gmail_thread_rows(self) -> None:
+    def test_mailbox_ignores_thread_ai_group_for_plain_gmail_thread_rows(self) -> None:
         self.settings.ai_grouping_enabled = True
         message = replace(
             sample_message("msg-plain"),
@@ -991,13 +1117,13 @@ class SpeedPipelineTests(unittest.TestCase):
 
         rows = [row for section in mailbox.sections for row in section.rows]
         self.assertEqual(rows[0].thread_id, "thread-plain")
-        self.assertEqual(rows[0].entity_id, "group-thread-plain")
-        self.assertEqual(rows[0].title, "Clean bank support title")
-        self.assertEqual(rows[0].summary, "Bank confirmed the support case and next steps.")
-        self.assertEqual(rows[0].ai_group_id, "group-thread-plain")
-        self.assertEqual(rows[0].presentation_status, "ai_ready")
+        self.assertEqual(rows[0].entity_id, "thread-plain")
+        self.assertEqual(rows[0].title, "Raw bank subject")
+        self.assertEqual(rows[0].summary, "Raw Gmail snippet")
+        self.assertIsNone(rows[0].ai_group_id)
+        self.assertEqual(rows[0].presentation_status, "fallback")
 
-    def test_mailbox_display_clusters_safe_newsletter_threads(self) -> None:
+    def test_no_ai_mailbox_keeps_newsletter_threads_separate(self) -> None:
         self.settings.ai_grouping_enabled = True
         first = replace(
             sample_message("claude-1"),
@@ -1054,13 +1180,10 @@ class SpeedPipelineTests(unittest.TestCase):
             mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
 
         rows = [row for section in mailbox.sections for row in section.rows]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].sender, "Claude")
-        self.assertEqual(rows[0].title, "Claude updates")
-        self.assertEqual(rows[0].message_count, 3)
-        self.assertEqual([child.message_id for child in rows[0].children], ["claude-3", "claude-1", "claude-2"])
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([row.thread_id for row in rows], ["thread-claude-2", "thread-claude-1", "thread-claude-3"])
 
-    def test_mailbox_display_clusters_safe_provider_stream_with_sender_variants(self) -> None:
+    def test_no_ai_mailbox_keeps_provider_threads_separate(self) -> None:
         self.settings.ai_grouping_enabled = True
         weekly = replace(
             sample_message("slashy-weekly"),
@@ -1107,13 +1230,10 @@ class SpeedPipelineTests(unittest.TestCase):
             mailbox = build_mailbox_response(self.settings, user_id="user-1", label="inbox")
 
         rows = [row for section in mailbox.sections for row in section.rows]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].sender, "Slashy")
-        self.assertEqual(rows[0].title, "Slashy updates")
-        self.assertEqual(rows[0].message_count, 2)
-        self.assertEqual([child.message_id for child in rows[0].children], ["slashy-welcome", "slashy-weekly"])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row.thread_id for row in rows], ["thread-slashy-weekly", "thread-slashy-welcome"])
 
-    def test_mailbox_row_uses_only_messages_matching_requested_label(self) -> None:
+    def test_mailbox_folder_eligibility_renders_canonical_whole_thread(self) -> None:
         inbox = replace(
             sample_message("inbox-1"),
             gmail_thread_id="thread-1",
@@ -1158,24 +1278,23 @@ class SpeedPipelineTests(unittest.TestCase):
 
         inbox_row = [row for section in inbox_mailbox.sections for row in section.rows][0]
         sent_row = [row for section in sent_mailbox.sections for row in section.rows][0]
-        self.assertEqual(inbox_row.message_count, 1)
-        self.assertEqual(inbox_row.latest_subject, "Inbox copy")
-        self.assertEqual(inbox_row.latest_sender, "Sender <sender@example.com>")
-        self.assertEqual(inbox_row.sender, "Sender <sender@example.com>")
-        self.assertEqual(inbox_row.label_ids, ["INBOX", "UNREAD"])
-        self.assertEqual(inbox_row.participants, ["Sender"])
-        self.assertEqual([child.message_id for child in inbox_row.children], ["inbox-1"])
+        self.assertEqual(inbox_row.message_count, 2)
+        self.assertEqual(inbox_row.latest_subject, "Sent reply")
+        self.assertEqual(inbox_row.latest_sender, "Me <me@example.com>")
+        self.assertEqual(inbox_row.sender, "Me <me@example.com>")
+        self.assertEqual(inbox_row.label_ids, ["INBOX", "SENT", "UNREAD"])
+        self.assertEqual(inbox_row.participants, ["Sender", "Me"])
+        self.assertEqual([child.message_id for child in inbox_row.children], ["inbox-1", "sent-1"])
         self.assertEqual(inbox_row.children[0].sender, "Sender <sender@example.com>")
         self.assertEqual(inbox_row.children[0].label_ids, ["INBOX", "UNREAD"])
-        self.assertEqual(sent_row.message_count, 1)
+        self.assertEqual(sent_row.message_count, 2)
         self.assertEqual(sent_row.latest_subject, "Sent reply")
         self.assertEqual(sent_row.latest_sender, "Me <me@example.com>")
         self.assertEqual(sent_row.sender, "Recipient Person")
-        self.assertEqual(sent_row.label_ids, ["SENT"])
-        self.assertEqual(sent_row.participants, ["Recipient Person", "Second Person"])
-        self.assertEqual([child.message_id for child in sent_row.children], ["sent-1"])
-        self.assertEqual(sent_row.children[0].sender, "Recipient Person")
-        self.assertEqual(sent_row.children[0].label_ids, ["SENT"])
+        self.assertEqual(sent_row.label_ids, ["INBOX", "SENT", "UNREAD"])
+        self.assertEqual([child.message_id for child in sent_row.children], ["inbox-1", "sent-1"])
+        self.assertEqual(sent_row.children[1].sender, "Recipient Person")
+        self.assertEqual(sent_row.children[1].label_ids, ["SENT"])
 
     def test_sent_mailbox_display_sender_falls_back_to_recipient_email(self) -> None:
         sent = replace(
@@ -1195,7 +1314,7 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual(row.participants, ["recipient@example.com"])
         self.assertEqual(row.children[0].sender, "recipient@example.com")
 
-    def test_mailbox_renders_northstar_workflow_ai_group_across_gmail_threads(self) -> None:
+    def test_no_ai_mailbox_does_not_merge_workflows_across_gmail_threads(self) -> None:
         self.settings.ai_grouping_enabled = True
         first = replace(
             sample_message("northstar-ack"),
@@ -1248,17 +1367,9 @@ class SpeedPipelineTests(unittest.TestCase):
             mailbox = build_mailbox_response(self.settings, user_id="user-1")
 
         rows = [row for section in mailbox.sections for row in section.rows]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].thread_id, "group-northstar")
-        self.assertEqual(rows[0].entity_id, "visible-northstar")
-        self.assertEqual(rows[0].ai_group_id, "group-northstar")
-        self.assertEqual(rows[0].sender, "Northstar Bank")
-        self.assertEqual(rows[0].title, "Northstar remittance support case")
-        self.assertEqual(rows[0].summary, "Northstar acknowledged and updated the wire transfer inquiry.")
-        self.assertEqual(rows[0].latest_subject, "Update on your Northstar wire transfer inquiry")
-        self.assertEqual(rows[0].message_count, 2)
-        self.assertEqual([child.message_id for child in rows[0].children], ["northstar-ack", "northstar-update"])
-        self.assertEqual([child.gmail_thread_id for child in rows[0].children], ["thread-northstar-ack", "thread-northstar-update"])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row.thread_id for row in rows], ["thread-northstar-update", "thread-northstar-ack"])
+        self.assertTrue(all(row.ai_group_id is None for row in rows))
 
     def test_visible_group_sender_falls_back_to_inbound_sender_when_projection_entity_is_user(self) -> None:
         self.settings.ai_grouping_enabled = True
@@ -1293,7 +1404,7 @@ class SpeedPipelineTests(unittest.TestCase):
             return_value=SimpleNamespace(first_batch_imported_at="ready", full_backfill_cursor=None),
         ), patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 1, "pending": 0}), patch(
             "app.services.mail_groups.list_mailbox_thread_page",
-            return_value=MailboxThreadPage(threads=[("thread-psu-reply", [reply]), ("thread-psu-sent", [sent])], next_cursor=None, loaded_threads=2),
+            return_value=MailboxThreadPage(threads=[("thread-psu-reply", [reply])], next_cursor=None, loaded_threads=1),
         ), patch(
             "app.services.mail_groups.list_visible_groups_for_gmail_threads",
             return_value={"thread-psu-reply": visible_group, "thread-psu-sent": visible_group},
@@ -1317,7 +1428,7 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].latest_sender, "State University <university-admissions@example.edu>")
         self.assertEqual(rows[0].sender, "State University <university-admissions@example.edu>")
-        self.assertEqual(rows[0].title, "State University reconsideration request")
+        self.assertEqual(rows[0].title, "RE: Question About Reconsideration Request")
         self.assertEqual(rows[0].message_count, 1)
         self.assertEqual([child.message_id for child in rows[0].children], ["psu-reply"])
 
@@ -1610,7 +1721,7 @@ class SpeedPipelineTests(unittest.TestCase):
     @patch("app.services.mail_groups.missing_google_scopes", return_value=[])
     @patch("app.services.mail_groups.user_can_write_gmail", return_value=True)
     @patch("app.services.mail_groups.build_dashboard_response")
-    def test_app_session_reads_snapshot_without_live_dashboard_rebuild(
+    def test_empty_snapshot_allows_entry_once_first_mail_import_completes(
         self,
         mock_live_dashboard: Mock,
         _mock_can_write: Mock,
@@ -1645,14 +1756,79 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual(session.user.email, "me@example.com")
         self.assertFalse(session.readiness.ready_to_enter)
         self.assertFalse(session.readiness.dashboard_ready)
+
+        _mock_state.return_value = SimpleNamespace(first_batch_imported_at="2026-05-15T12:00:00+00:00")
+        completed_session = build_app_session_response(self.settings, user=user)
+
+        self.assertTrue(completed_session.readiness.ready_to_enter)
+        self.assertTrue(completed_session.readiness.mailbox_ready)
+        self.assertTrue(completed_session.readiness.dashboard_ready)
         mock_live_dashboard.assert_not_called()
+
+    def test_post_login_readiness_allows_connected_empty_gmail_after_first_batch(self) -> None:
+        state = SimpleNamespace(
+            first_batch_imported_at="2026-05-15T12:00:00+00:00",
+            full_backfill_completed_at=None,
+            full_backfill_cursor=None,
+            last_sync_error=None,
+        )
+        user = CurrentUser(id="user-1", email="empty@example.com", display_name="Empty Mailbox")
+        with (
+            patch("app.services.mail_groups.get_import_state", return_value=state),
+            patch("app.services.mail_groups.count_mail_groups", return_value=0),
+            patch("app.services.mail_groups.count_mailbox_threads", return_value=0),
+            patch("app.services.mail_groups.count_dashboard_mail_groups", return_value=0),
+            patch("app.services.mail_groups.count_active_jobs", return_value=0),
+            patch(
+                "app.services.mail_groups._google_auth_state",
+                return_value=SimpleNamespace(connected=True, reauth_required=False),
+            ),
+        ):
+            readiness = build_post_login_readiness_response(self.settings, user=user)
+
+        self.assertTrue(readiness.ready_to_enter)
+        self.assertTrue(readiness.mailbox_ready)
+        self.assertTrue(readiness.dashboard_ready)
+
+    def test_post_login_readiness_keeps_disconnected_empty_account_blocked(self) -> None:
+        state = SimpleNamespace(
+            first_batch_imported_at="2026-05-15T12:00:00+00:00",
+            full_backfill_completed_at=None,
+            full_backfill_cursor=None,
+            last_sync_error=None,
+        )
+        user = CurrentUser(id="user-1", email="empty@example.com", display_name="Empty Mailbox")
+        with (
+            patch("app.services.mail_groups.get_import_state", return_value=state),
+            patch("app.services.mail_groups.count_mail_groups", return_value=0),
+            patch("app.services.mail_groups.count_mailbox_threads", return_value=0),
+            patch("app.services.mail_groups.count_dashboard_mail_groups", return_value=0),
+            patch("app.services.mail_groups.count_active_jobs", return_value=0),
+            patch(
+                "app.services.mail_groups._google_auth_state",
+                return_value=SimpleNamespace(connected=False, reauth_required=True),
+            ),
+        ):
+            readiness = build_post_login_readiness_response(self.settings, user=user)
+
+        self.assertFalse(readiness.ready_to_enter)
+        self.assertFalse(readiness.mailbox_ready)
 
     def test_heartbeat_renews_running_job_lease(self) -> None:
         connection = FakeConnection()
         with patch("app.db.jobs.get_engine", return_value=FakeEngine(connection)):
-            renew_heartbeat("postgresql://example/db", worker_id="worker-1", queues=["critical"], current_job_id="job-1")
+            renew_heartbeat(
+                "postgresql://example/db",
+                worker_id="worker-1",
+                queues=["critical"],
+                release_sha="release-abc123",
+                current_job_id="job-1",
+            )
 
         statements = [call[0] for call in connection.calls]
+        heartbeat_statement, heartbeat_params = connection.calls[0]
+        self.assertIn("release_sha", heartbeat_statement)
+        self.assertEqual(heartbeat_params["release_sha"], "release-abc123")
         self.assertTrue(any("UPDATE background_jobs" in statement and "lease_expires_at" in statement for statement in statements))
 
 

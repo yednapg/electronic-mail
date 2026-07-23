@@ -3,21 +3,26 @@ from __future__ import annotations
 """Durable Gmail raw import jobs for the mailbox product path."""
 
 import base64
+from hashlib import sha256
 import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 from googleapiclient.errors import HttpError
 
 from app.core.config import Settings
+from app.core.error_safety import GoogleCredentialsUnavailable, safe_google_error
 from app.db.jobs import enqueue_job
 from app.db.mail_groups import (
     GmailMessageRecord,
     delete_gmail_messages,
     existing_gmail_message_ids,
+    finalize_gmail_reconciliation,
     get_import_state,
     list_group_messages,
+    list_messages_by_ids,
     list_messages_for_gmail_thread,
     mark_gmail_messages_body_fetch_state,
     mark_import_completed,
@@ -25,6 +30,11 @@ from app.db.mail_groups import (
     mark_import_started,
     mark_mail_groups_pending,
     prune_empty_mail_groups,
+    record_gmail_reconciliation_page,
+    record_gmail_reconciliation_seen,
+    replace_gmail_thread_orders,
+    reset_gmail_reconciliation,
+    start_gmail_reconciliation,
     upsert_gmail_messages,
     user_can_write_gmail,
 )
@@ -41,13 +51,27 @@ FIRST_RUN_ALL_MAIL_SEED = "__ALL_MAIL__"
 FIRST_RUN_SEED_LABELS = ("INBOX", "SENT", "DRAFT", "SPAM", "TRASH", FIRST_RUN_ALL_MAIL_SEED)
 GMAIL_BATCH_GET_SIZE = 50
 GMAIL_HISTORY_PAGE_SIZE = 500
+GMAIL_RECONCILE_BATCH_SIZE = 250
+GMAIL_RECONCILE_PAGES_PER_JOB = 4
 GMAIL_HISTORY_TYPES = ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
 GMAIL_METADATA_HEADERS = ["Subject", "From", "To", "Cc", "Bcc", "Date", "Message-ID", "In-Reply-To", "References", "List-ID"]
+GMAIL_THREAD_ORDER_SPECS: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("inbox", {"labelIds": ["INBOX"]}),
+    ("sent", {"labelIds": ["SENT"]}),
+    ("drafts", {"labelIds": ["DRAFT"]}),
+    ("starred", {"labelIds": ["STARRED"]}),
+    ("spam", {"labelIds": ["SPAM"]}),
+    ("trash", {"labelIds": ["TRASH"]}),
+    ("all", {"q": "-label:spam -label:trash"}),
+    ("archive", {"q": "-label:inbox -label:sent -label:drafts -label:spam -label:trash"}),
+)
 logger = logging.getLogger(__name__)
 
 
 def _ai_grouping_enabled(settings: Settings) -> bool:
-    return bool(getattr(settings, "ai_grouping_enabled", False))
+    # This branch is the deliberate no-AI product. Stray local environment
+    # variables must never turn model-backed jobs back on.
+    return False
 
 
 def run_gmail_import_batch(settings: Settings, *, user_id: str, batch_size: int, first_run: bool = False) -> int:
@@ -107,7 +131,7 @@ def run_gmail_import_batch(settings: Settings, *, user_id: str, batch_size: int,
             )
         return len(messages)
     except Exception as exc:
-        mark_import_error(database_url, user_id=user_id, error=str(exc))
+        mark_import_error(database_url, user_id=user_id, error=safe_google_error(exc, operation="mail sync"))
         raise
 
 
@@ -158,6 +182,12 @@ def run_gmail_delta_sync(
                 message_ids=[message.message_id for message in messages],
                 use_ai=False,
             )
+        if messages or deleted_ids:
+            _refresh_gmail_thread_order_best_effort(
+                settings,
+                user_id=user_id,
+                target_history_id=latest_history_id,
+            )
         mark_import_completed(
             database_url,
             user_id=user_id,
@@ -202,11 +232,18 @@ def run_gmail_delta_sync(
         return touched + len(deleted_pending_group_ids)
     except HttpError as exc:
         if _is_history_cursor_expired(exc):
-            return _run_recent_metadata_sync(settings, user_id=user_id, batch_size=batch_size, can_write_checked=True)
-        mark_import_error(database_url, user_id=user_id, error=str(exc))
+            touched = _run_recent_metadata_sync(
+                settings,
+                user_id=user_id,
+                batch_size=batch_size,
+                can_write_checked=True,
+            )
+            enqueue_gmail_full_reconciliation(settings, user_id=user_id)
+            return touched
+        mark_import_error(database_url, user_id=user_id, error=safe_google_error(exc, operation="mail sync"))
         raise
     except Exception as exc:
-        mark_import_error(database_url, user_id=user_id, error=str(exc))
+        mark_import_error(database_url, user_id=user_id, error=safe_google_error(exc, operation="mail sync"))
         raise
 
 
@@ -261,6 +298,12 @@ def run_gmail_backfill(settings: Settings, *, user_id: str, batch_size: int = BA
             message_ids=[message.message_id for message in messages],
             use_ai=False,
         )
+        if full_backfill_completed:
+            _refresh_gmail_thread_order_best_effort(
+                settings,
+                user_id=user_id,
+                target_history_id=latest_history_id,
+            )
         mark_import_completed(
             database_url,
             user_id=user_id,
@@ -304,8 +347,284 @@ def run_gmail_backfill(settings: Settings, *, user_id: str, batch_size: int = BA
             )
         return touched
     except Exception as exc:
-        mark_import_error(database_url, user_id=user_id, error=str(exc))
+        mark_import_error(database_url, user_id=user_id, error=safe_google_error(exc, operation="mail sync"))
         raise
+
+
+def enqueue_gmail_full_reconciliation(settings: Settings, *, user_id: str) -> str:
+    """Ensure an authoritative, resumable scan exists after history expiration."""
+    state = get_import_state(str(settings.database_path), user_id=user_id)
+    generation_id = str(getattr(state, "reconcile_generation", None) or "")
+    cursor = str(getattr(state, "reconcile_cursor", None) or "finalize")
+    suffix = (
+        f"{generation_id}:{sha256(cursor.encode('utf-8')).hexdigest()[:16]}"
+        if generation_id
+        else "trigger"
+    )
+    job = enqueue_job(
+        str(settings.database_path),
+        kind="gmail_full_reconcile",
+        queue="slow",
+        user_id=user_id,
+        dedupe_key=f"gmail-full-reconcile:{user_id}:{suffix}",
+        priority=90,
+        payload={"user_id": user_id, "batch_size": GMAIL_RECONCILE_BATCH_SIZE},
+    )
+    return job.id
+
+
+def run_gmail_full_reconciliation(
+    settings: Settings,
+    *,
+    user_id: str,
+    batch_size: int = GMAIL_RECONCILE_BATCH_SIZE,
+    max_pages: int = GMAIL_RECONCILE_PAGES_PER_JOB,
+) -> int:
+    """Advance a durable full-mailbox reconciliation by a bounded page budget."""
+    database_url = str(settings.database_path)
+    if not user_can_write_gmail(database_url, user_id=user_id):
+        return 0
+    batch_size = max(1, min(int(batch_size), 500))
+    max_pages = max(1, min(int(max_pages), 20))
+    state = get_import_state(database_url, user_id=user_id)
+    if state is None or not getattr(state, "reconcile_generation", None):
+        baseline_history_id = _current_gmail_history_id(settings, user_id=user_id)
+        state = start_gmail_reconciliation(
+            database_url,
+            user_id=user_id,
+            generation_id=str(uuid4()),
+            baseline_history_id=baseline_history_id,
+            initial_cursor=_encode_full_mailbox_cursor(),
+        )
+    generation_id = str(state.reconcile_generation or "")
+    baseline_history_id = str(state.reconcile_baseline_history_id or "")
+    if not generation_id or not baseline_history_id.isdigit():
+        raise RuntimeError("Gmail reconciliation state is incomplete")
+
+    touched = 0
+    cursor = state.reconcile_cursor
+    for _ in range(max_pages):
+        if cursor is None:
+            return touched + _finalize_gmail_full_reconciliation(
+                settings,
+                user_id=user_id,
+                generation_id=generation_id,
+                baseline_history_id=baseline_history_id,
+            )
+        decoded_cursor = _decode_full_mailbox_cursor(cursor)
+        if decoded_cursor is None:
+            raise RuntimeError("Gmail reconciliation cursor is invalid")
+        messages, next_cursor = _hydrate_reconciliation_cursor_page(
+            settings,
+            user_id=user_id,
+            batch_size=batch_size,
+            cursor=decoded_cursor,
+        )
+        if next_cursor == cursor:
+            raise RuntimeError("Gmail reconciliation pagination repeated a cursor")
+        if messages:
+            upsert_gmail_messages(database_url, messages)
+        advanced = record_gmail_reconciliation_page(
+            database_url,
+            user_id=user_id,
+            generation_id=generation_id,
+            expected_cursor=cursor,
+            next_cursor=next_cursor,
+            message_ids=[message.message_id for message in messages],
+        )
+        if not advanced:
+            # Another worker checkpointed this generation. Its successor owns
+            # the next page; this duplicate can complete without mutating state.
+            return touched
+        touched += len(messages)
+        cursor = next_cursor
+
+    if cursor is None:
+        return touched + _finalize_gmail_full_reconciliation(
+            settings,
+            user_id=user_id,
+            generation_id=generation_id,
+            baseline_history_id=baseline_history_id,
+        )
+    enqueue_gmail_full_reconciliation(settings, user_id=user_id)
+    return touched
+
+
+def _hydrate_reconciliation_cursor_page(
+    settings: Settings,
+    *,
+    user_id: str,
+    batch_size: int,
+    cursor: dict[str, Any],
+) -> tuple[list[GmailMessageRecord], str | None]:
+    page_token = str(cursor.get("page_token") or "") or None
+    all_mail_completed = bool(cursor.get("all_mail_completed"))
+    draft_page_token = str(cursor.get("draft_page_token") or "") or None
+    drafts_completed = bool(cursor.get("drafts_completed"))
+    listed = (
+        {"messages": []}
+        if all_mail_completed
+        else _list_messages(settings, user_id=user_id, batch_size=batch_size, page_token=page_token)
+    )
+    draft_listed = {"messages": []}
+    if not drafts_completed:
+        draft_listed = _list_draft_messages(
+            settings,
+            user_id=user_id,
+            batch_size=batch_size,
+            page_token=draft_page_token,
+        )
+    merged = _merge_listed_messages(listed, draft_listed)
+    raw_items = merged.get("messages") if isinstance(merged.get("messages"), list) else []
+    listed_ids = [
+        str(item.get("id"))
+        for item in raw_items
+        if isinstance(item, dict) and item.get("id")
+    ]
+    messages, _latest_history_id = _hydrate_message_ids(
+        settings,
+        user_id=user_id,
+        message_ids=listed_ids,
+        format="metadata",
+        skip_not_found=True,
+    )
+    next_page_token = listed.get("nextPageToken") if isinstance(listed.get("nextPageToken"), str) else None
+    next_all_mail_completed = all_mail_completed or next_page_token is None
+    next_draft_page_token = (
+        draft_listed.get("nextPageToken")
+        if isinstance(draft_listed.get("nextPageToken"), str)
+        else None
+    )
+    next_drafts_completed = drafts_completed or next_draft_page_token is None
+    next_cursor = (
+        _encode_full_mailbox_cursor(
+            page_token=next_page_token,
+            all_mail_completed=next_all_mail_completed,
+            draft_page_token=next_draft_page_token,
+            drafts_completed=next_drafts_completed,
+        )
+        if not next_all_mail_completed or not next_drafts_completed
+        else None
+    )
+    return messages, next_cursor
+
+
+def _finalize_gmail_full_reconciliation(
+    settings: Settings,
+    *,
+    user_id: str,
+    generation_id: str,
+    baseline_history_id: str,
+) -> int:
+    database_url = str(settings.database_path)
+    try:
+        delta = _list_history_delta(
+            settings,
+            user_id=user_id,
+            start_history_id=baseline_history_id,
+            page_size=GMAIL_HISTORY_PAGE_SIZE,
+        )
+    except HttpError as exc:
+        if not _is_history_cursor_expired(exc):
+            raise
+        reset_gmail_reconciliation(
+            database_url,
+            user_id=user_id,
+            generation_id=generation_id,
+        )
+        enqueue_job(
+            database_url,
+            kind="gmail_full_reconcile",
+            queue="slow",
+            user_id=user_id,
+            dedupe_key=f"gmail-full-reconcile:{user_id}:restart:{uuid4()}",
+            priority=90,
+            payload={"user_id": user_id, "batch_size": GMAIL_RECONCILE_BATCH_SIZE},
+        )
+        return 0
+
+    deleted_ids = set(delta["deleted_message_ids"])
+    changed_ids = [message_id for message_id in delta["message_ids"] if message_id not in deleted_ids]
+    affected_group_ids = delete_gmail_messages(
+        database_url,
+        user_id=user_id,
+        message_ids=list(deleted_ids),
+    )
+    messages, hydrated_history_id = _hydrate_message_ids(
+        settings,
+        user_id=user_id,
+        message_ids=changed_ids,
+        format="metadata",
+        skip_not_found=True,
+    )
+    if messages:
+        upsert_gmail_messages(database_url, messages)
+    if not record_gmail_reconciliation_seen(
+        database_url,
+        user_id=user_id,
+        generation_id=generation_id,
+        message_ids=[message.message_id for message in messages],
+    ):
+        return 0
+    final_history_id = _max_history_id(
+        baseline_history_id,
+        _max_history_id(delta["latest_history_id"], hydrated_history_id),
+    )
+    if final_history_id is None:
+        raise RuntimeError("Gmail reconciliation did not produce a history cursor")
+    result = finalize_gmail_reconciliation(
+        database_url,
+        user_id=user_id,
+        generation_id=generation_id,
+        final_history_id=final_history_id,
+    )
+    if result is None:
+        return 0
+    all_affected_group_ids = list(dict.fromkeys([*affected_group_ids, *result.affected_group_ids]))
+    try:
+        prune_empty_mail_groups(database_url, user_id=user_id, group_ids=all_affected_group_ids)
+    except Exception as exc:
+        logger.warning(
+            "Post-reconciliation legacy-group cleanup failed user_id=%s error=%s",
+            user_id,
+            type(exc).__name__,
+        )
+    _refresh_gmail_thread_order_best_effort(
+        settings,
+        user_id=user_id,
+        target_history_id=final_history_id,
+    )
+    try:
+        emit_mailbox_event(
+            settings,
+            user_id=user_id,
+            event_type=MAILBOX_CHANGED,
+            mailbox_label="all",
+            payload={
+                "source": "gmail_full_reconcile",
+                "changed_count": len(messages),
+                "deleted_count": len(deleted_ids) + result.deleted_message_count,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "Post-reconciliation mailbox event failed user_id=%s error=%s",
+            user_id,
+            type(exc).__name__,
+        )
+    return len(messages) + len(deleted_ids) + result.deleted_message_count
+
+
+def _current_gmail_history_id(settings: Settings, *, user_id: str) -> str:
+    credentials = create_authorized_credentials(settings, user_id=user_id)
+    if credentials is None:
+        raise GoogleCredentialsUnavailable("Google credentials are not connected")
+    service = build_google_service("gmail", "v1", credentials)
+    profile = service.users().getProfile(userId="me").execute()
+    history_id = str(profile.get("historyId") or "") if isinstance(profile, dict) else ""
+    if not history_id.isdigit():
+        raise RuntimeError("Gmail profile did not return a valid history cursor")
+    return history_id
 
 
 def _list_messages(
@@ -318,7 +637,7 @@ def _list_messages(
 ) -> dict[str, Any]:
     credentials = create_authorized_credentials(settings, user_id=user_id)
     if credentials is None:
-        raise RuntimeError("Google credentials are not connected")
+        raise GoogleCredentialsUnavailable("Google credentials are not connected")
     service = build_google_service("gmail", "v1", credentials)
     list_args: dict[str, Any] = {
         "userId": "me",
@@ -331,6 +650,82 @@ def _list_messages(
         list_args["labelIds"] = label_ids
     request = service.users().messages().list(**list_args)
     return request.execute()
+
+
+def refresh_gmail_thread_order(settings: Settings, *, user_id: str) -> dict[str, str]:
+    """Snapshot Gmail's authoritative threads.list order for every app mailbox."""
+    credentials = create_authorized_credentials(settings, user_id=user_id)
+    if credentials is None:
+        raise GoogleCredentialsUnavailable("Google credentials are not connected")
+    service = build_google_service("gmail", "v1", credentials)
+    ordered_by_label: dict[str, list[str]] = {}
+    for label, query in GMAIL_THREAD_ORDER_SPECS:
+        page_token: str | None = None
+        seen_page_tokens: set[str] = set()
+        seen_thread_ids: set[str] = set()
+        ordered_thread_ids: list[str] = []
+        while True:
+            list_args: dict[str, Any] = {
+                "userId": "me",
+                "maxResults": 500,
+                "includeSpamTrash": True,
+                **query,
+            }
+            if page_token:
+                list_args["pageToken"] = page_token
+            response = service.users().threads().list(**list_args).execute()
+            raw_threads = response.get("threads") if isinstance(response, dict) else None
+            for raw_thread in raw_threads if isinstance(raw_threads, list) else []:
+                if not isinstance(raw_thread, dict) or not raw_thread.get("id"):
+                    continue
+                thread_id = str(raw_thread["id"])
+                if thread_id in seen_thread_ids:
+                    continue
+                seen_thread_ids.add(thread_id)
+                ordered_thread_ids.append(thread_id)
+            next_page_token = str(response.get("nextPageToken") or "") if isinstance(response, dict) else ""
+            if not next_page_token:
+                break
+            if next_page_token in seen_page_tokens:
+                raise RuntimeError("Gmail thread-order pagination repeated a page token")
+            seen_page_tokens.add(next_page_token)
+            page_token = next_page_token
+        ordered_by_label[label] = ordered_thread_ids
+    return replace_gmail_thread_orders(
+        str(settings.database_path),
+        user_id=user_id,
+        ordered_thread_ids_by_label=ordered_by_label,
+    )
+
+
+def _refresh_gmail_thread_order_best_effort(
+    settings: Settings,
+    *,
+    user_id: str,
+    target_history_id: str | None,
+) -> bool:
+    """Queue the expensive authoritative Gmail ordering scan off the sync path.
+
+    A complete ordering snapshot walks every page for each mailbox label. Doing
+    that inline made otherwise bounded imports and delta syncs wait on many
+    sequential Google API calls. The durable slow-queue job is deduplicated per
+    user, so bursts of Pub/Sub notifications collapse into one refresh.
+    """
+    try:
+        enqueue_job(
+            str(settings.database_path),
+            kind="gmail_thread_order_refresh",
+            queue="slow",
+            user_id=user_id,
+            dedupe_key=f"gmail-thread-order-refresh:{user_id}:{target_history_id or 'snapshot'}",
+            priority=20,
+            payload={"user_id": user_id, "target_history_id": target_history_id},
+            run_after_seconds=30,
+        )
+    except Exception as exc:
+        logger.warning("Gmail thread-order refresh could not be queued user_id=%s error=%s", user_id, type(exc).__name__)
+        return False
+    return True
 
 
 def _run_recent_metadata_sync(settings: Settings, *, user_id: str, batch_size: int, can_write_checked: bool = False) -> int:
@@ -372,7 +767,7 @@ def _run_recent_metadata_sync(settings: Settings, *, user_id: str, batch_size: i
             )
         return touched
     except Exception as exc:
-        mark_import_error(database_url, user_id=user_id, error=str(exc))
+        mark_import_error(database_url, user_id=user_id, error=safe_google_error(exc, operation="mail sync"))
         raise
 
 
@@ -395,7 +790,7 @@ def run_gmail_body_fetch(settings: Settings, *, user_id: str, group_id: str = ""
     try:
         credentials = create_authorized_credentials(settings, user_id=user_id)
         if credentials is None:
-            raise RuntimeError("Google credentials are not connected")
+            raise GoogleCredentialsUnavailable("Google credentials are not connected")
         service = build_google_service("gmail", "v1", credentials)
         payloads = _batch_get_message_payloads(service, missing, format="full")
         parsed_messages = [
@@ -411,13 +806,109 @@ def run_gmail_body_fetch(settings: Settings, *, user_id: str, group_id: str = ""
             for payload in payloads.values()
         ]
     except Exception as exc:
-        mark_gmail_messages_body_fetch_state(database_url, user_id=user_id, message_ids=missing, status="failed", error=f"{type(exc).__name__}: {exc}")
+        mark_gmail_messages_body_fetch_state(
+            database_url,
+            user_id=user_id,
+            message_ids=missing,
+            status="failed",
+            error=safe_google_error(exc, operation="message download"),
+        )
         raise
     upsert_gmail_messages(database_url, parsed_messages)
     rebuild_touched_mail_groups(settings, user_id=user_id, message_ids=[message.message_id for message in parsed_messages], use_ai=False)
     if _ai_grouping_enabled(settings):
         enqueue_projection_refresh(settings, user_id=user_id)
     return len(parsed_messages)
+
+
+def hydrate_gmail_search_results(
+    settings: Settings,
+    *,
+    user_id: str,
+    query: str,
+    label: str = "all",
+    limit: int = 200,
+) -> int:
+    """Hydrate only Gmail search matches absent from the canonical local mailbox.
+
+    Gmail's message-list search remains authoritative for discovering older and
+    body-only matches. Already downloaded full messages are deliberately reused:
+    fetching every result body again made an interactive search take seconds.
+    """
+    if not user_can_write_gmail(str(settings.database_path), user_id=user_id):
+        return 0
+    normalized_query = query.strip()[:200]
+    if not normalized_query:
+        return 0
+    label_terms = {
+        "inbox": "label:inbox",
+        "sent": "label:sent",
+        "drafts": "label:drafts",
+        "spam": "label:spam",
+        "trash": "label:trash",
+        "starred": "is:starred",
+        "archive": "-label:inbox -label:sent -label:drafts -label:spam -label:trash",
+        "all": "-label:spam -label:trash",
+    }
+    gmail_query = " ".join(part for part in [normalized_query, label_terms.get(label.strip().lower(), "")] if part)
+    credentials = create_authorized_credentials(settings, user_id=user_id)
+    if credentials is None:
+        raise GoogleCredentialsUnavailable("Google credentials are not connected")
+    service = build_google_service("gmail", "v1", credentials)
+    remaining = max(1, min(limit, 200))
+    page_token: str | None = None
+    message_ids: list[str] = []
+    while remaining > 0:
+        kwargs: dict[str, Any] = {
+            "userId": "me",
+            "q": gmail_query,
+            "maxResults": min(remaining, 100),
+            "includeSpamTrash": True,
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+        response = service.users().messages().list(**kwargs).execute()
+        items = response.get("messages") if isinstance(response, dict) else None
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and item.get("id"):
+                    message_ids.append(str(item["id"]))
+                    remaining -= 1
+                    if remaining <= 0:
+                        break
+        page_token = str(response.get("nextPageToken") or "") if isinstance(response, dict) else ""
+        if not page_token or not items:
+            break
+    unique_message_ids = list(dict.fromkeys(message_ids))
+    existing_messages = list_messages_by_ids(
+        str(settings.database_path),
+        user_id=user_id,
+        message_ids=unique_message_ids,
+    )
+    existing_by_id = {message.message_id: message for message in existing_messages}
+    message_ids_needing_full_body = [
+        message_id
+        for message_id in unique_message_ids
+        if message_id not in existing_by_id or not _has_body_for_reader(existing_by_id[message_id])
+    ]
+    if not message_ids_needing_full_body:
+        return 0
+    messages, _history_id = _hydrate_message_ids(
+        settings,
+        user_id=user_id,
+        message_ids=message_ids_needing_full_body,
+        format="full",
+    )
+    if not messages:
+        return 0
+    upsert_gmail_messages(str(settings.database_path), messages)
+    rebuild_touched_mail_groups(
+        settings,
+        user_id=user_id,
+        message_ids=[message.message_id for message in messages],
+        use_ai=False,
+    )
+    return len(messages)
 
 
 def _has_body_for_reader(message: GmailMessageRecord) -> bool:
@@ -594,7 +1085,7 @@ def _list_draft_messages(
 ) -> dict[str, Any]:
     credentials = create_authorized_credentials(settings, user_id=user_id)
     if credentials is None:
-        raise RuntimeError("Google credentials are not connected")
+        raise GoogleCredentialsUnavailable("Google credentials are not connected")
     service = build_google_service("gmail", "v1", credentials)
     list_args: dict[str, Any] = {
         "userId": "me",
@@ -716,7 +1207,7 @@ def _hydrate_thread_metadata_for_messages(
         return [], None
     credentials = create_authorized_credentials(settings, user_id=user_id)
     if credentials is None:
-        raise RuntimeError("Google credentials are not connected")
+        raise GoogleCredentialsUnavailable("Google credentials are not connected")
     service = build_google_service("gmail", "v1", credentials)
     hydrated: dict[str, GmailMessageRecord] = {}
     latest_history_id: str | None = None
@@ -746,14 +1237,20 @@ def _hydrate_messages(
     user_id: str,
     listed: dict[str, Any],
     format: str = "metadata",
+    skip_not_found: bool = False,
 ) -> tuple[list[GmailMessageRecord], str | None]:
     credentials = create_authorized_credentials(settings, user_id=user_id)
     if credentials is None:
-        raise RuntimeError("Google credentials are not connected")
+        raise GoogleCredentialsUnavailable("Google credentials are not connected")
     service = build_google_service("gmail", "v1", credentials)
     raw_items = listed.get("messages") if isinstance(listed.get("messages"), list) else []
     message_ids = [str(item.get("id")) for item in raw_items if isinstance(item, dict) and item.get("id")]
-    payloads = _batch_get_message_payloads(service, message_ids, format=format)
+    payloads = _batch_get_message_payloads(
+        service,
+        message_ids,
+        format=format,
+        skip_not_found=skip_not_found,
+    )
     messages: list[GmailMessageRecord] = []
     latest_history_id: str | None = None
     for message_id in message_ids:
@@ -798,9 +1295,16 @@ def _hydrate_message_ids(
     user_id: str,
     message_ids: list[str],
     format: str = "metadata",
+    skip_not_found: bool = False,
 ) -> tuple[list[GmailMessageRecord], str | None]:
     listed = {"messages": [{"id": message_id} for message_id in list(dict.fromkeys(message_ids))]}
-    return _hydrate_messages(settings, user_id=user_id, listed=listed, format=format)
+    return _hydrate_messages(
+        settings,
+        user_id=user_id,
+        listed=listed,
+        format=format,
+        skip_not_found=skip_not_found,
+    )
 
 
 def _list_history_delta(
@@ -812,7 +1316,7 @@ def _list_history_delta(
 ) -> dict[str, Any]:
     credentials = create_authorized_credentials(settings, user_id=user_id)
     if credentials is None:
-        raise RuntimeError("Google credentials are not connected")
+        raise GoogleCredentialsUnavailable("Google credentials are not connected")
     service = build_google_service("gmail", "v1", credentials)
     page_token: str | None = None
     message_ids: list[str] = []
@@ -864,7 +1368,13 @@ def _history_messages(history_item: dict[str, Any], *, keys: list[str]) -> list[
     return message_ids
 
 
-def _batch_get_message_payloads(service: Any, message_ids: list[str], *, format: str) -> dict[str, dict[str, Any]]:
+def _batch_get_message_payloads(
+    service: Any,
+    message_ids: list[str],
+    *,
+    format: str,
+    skip_not_found: bool = False,
+) -> dict[str, dict[str, Any]]:
     if not message_ids:
         return {}
     payloads: dict[str, dict[str, Any]] = {}
@@ -895,7 +1405,12 @@ def _batch_get_message_payloads(service: Any, message_ids: list[str], *, format:
         request_args = {"userId": "me", "id": message_id, "format": format}
         if format == "metadata":
             request_args["metadataHeaders"] = GMAIL_METADATA_HEADERS
-        payload = service.users().messages().get(**request_args).execute()
+        try:
+            payload = service.users().messages().get(**request_args).execute()
+        except HttpError as exc:
+            if skip_not_found and _is_history_cursor_expired(exc):
+                continue
+            raise
         if isinstance(payload, dict):
             payloads[message_id] = payload
     return payloads

@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from app.api.routes import entities as entity_routes
 from app.api.routes import tasks as task_routes
 from app.db.mail_groups import EntityOutcomeRecord, GmailMessageRecord, MailGroupRecord, ManualTaskRecord
-from app.main import app
+from app.main import create_app, settings
 from app.schemas.domain import DashboardProfile, GoogleAuthState
 from app.services.mail_groups import build_dashboard_response
 
@@ -361,7 +361,9 @@ class DashboardManualTaskTests(unittest.TestCase):
 
 class TaskOutcomeRouteTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.client = TestClient(app)
+        self.client = TestClient(
+            create_app(replace(settings, app_env="local", rate_limit_enabled=False))
+        )
         self.task_settings_patch = patch.object(task_routes, "settings", SimpleNamespace(database_path="postgresql://example/db"))
         self.entity_settings_patch = patch.object(entity_routes, "settings", SimpleNamespace(database_path="postgresql://example/db"))
         self.task_settings_patch.start()

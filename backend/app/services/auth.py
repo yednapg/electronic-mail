@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import base64
 import hashlib
 import secrets
 
@@ -13,7 +14,8 @@ from app.core.config import Settings
 from app.db.models import StoredUser
 from app.db.repository import (
     DEFAULT_USER_ID,
-    consume_mobile_login_code,
+    IdentityConflictError,
+    consume_bound_mobile_login_code,
     create_app_session,
     create_mobile_login_code,
     get_active_app_session,
@@ -27,7 +29,7 @@ from app.db.repository import (
 )
 from app.schemas.domain import DashboardProfile, GoogleAuthState
 from app.services.integrations.google import (
-    GMAIL_SEND_SCOPE,
+    GMAIL_FULL_SCOPE,
     check_user_google_credentials,
     missing_google_scopes,
 )
@@ -112,35 +114,56 @@ def auth_state_for_request(settings: Settings, request: Request, *, verify_googl
                 error=credential_status.error,
             )
 
-    missing_scopes = missing_google_scopes(settings, user_id=user.id, required_scopes=[GMAIL_SEND_SCOPE]) if has_token else [GMAIL_SEND_SCOPE]
+    missing_scopes = missing_google_scopes(settings, user_id=user.id, required_scopes=[GMAIL_FULL_SCOPE]) if has_token else [GMAIL_FULL_SCOPE]
+    reauth_required = has_token and bool(missing_scopes)
     return GoogleAuthState(
         available=True,
         connected=has_token,
-        connect_url=None if has_token else f"{settings.backend_origin}/auth/google",
+        connect_url=f"{settings.backend_origin}/auth/google" if not has_token or reauth_required else None,
         can_send_mail=has_token and not missing_scopes,
         missing_scopes=missing_scopes if has_token else [],
+        reauth_required=reauth_required,
+        error="Google needs full mail permission. Please sign in with Google again." if reauth_required else None,
     )
 
 
-def create_or_update_user(settings: Settings, *, profile: DashboardProfile, google_sub: str) -> StoredUser:
+def create_or_update_user(
+    settings: Settings,
+    *,
+    profile: DashboardProfile,
+    google_sub: str,
+    oauth_started_epoch: int,
+) -> StoredUser:
     """Create or update the user represented by a Google profile."""
     email = (profile.email or "").strip().lower()
     if not email:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Google profile did not include an email")
+    verified_sub = google_sub.strip()
+    if not verified_sub:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Google identity could not be verified")
     if not is_email_allowed(settings, email):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This Google account is not allowed")
-    return upsert_user(
-        str(settings.database_path),
-        email=email,
-        google_sub=google_sub or email,
-        display_name=profile.display_name,
-        access_enabled=True,
-    )
+    try:
+        return upsert_user(
+            str(settings.database_path),
+            email=email,
+            google_sub=verified_sub,
+            display_name=profile.display_name,
+            access_enabled=True,
+            oauth_started_epoch=oauth_started_epoch,
+        )
+    except IdentityConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This email is already linked to a different Google identity. Contact support to re-link it safely.",
+        ) from exc
 
 
 def is_email_allowed(settings: Settings, email: str) -> bool:
     """Check env and DB allowlists."""
     normalized = email.strip().lower()
+    if getattr(settings, "registration_mode", "allowlist") == "open":
+        return True
     if getattr(settings, "app_env", "local") == "local" and not getattr(settings, "allowed_emails", set()):
         return True
     if normalized in settings.allowed_emails:
@@ -152,7 +175,7 @@ def is_email_allowed(settings: Settings, email: str) -> bool:
 def issue_session(settings: Settings, *, user: StoredUser, platform: str) -> IssuedSession:
     """Create an app session and return the raw token for the caller."""
     token = secrets.token_urlsafe(32)
-    lifetime_days = MOBILE_SESSION_DAYS if platform == "ios" else WEB_SESSION_DAYS
+    lifetime_days = MOBILE_SESSION_DAYS if platform in {"ios", "macos"} else WEB_SESSION_DAYS
     expires_at = (datetime.now(timezone.utc) + timedelta(days=lifetime_days)).isoformat()
     create_app_session(
         str(settings.database_path),
@@ -187,10 +210,18 @@ def create_mobile_code(settings: Settings, *, user_id: str) -> str:
     return code
 
 
-def exchange_mobile_code(settings: Settings, *, code: str) -> IssuedSession:
-    """Exchange one iOS login code for a bearer app session."""
-    login_code = consume_mobile_login_code(
+def exchange_mobile_code(
+    settings: Settings,
+    *,
+    code: str,
+    handoff_id: str,
+    code_verifier: str,
+) -> IssuedSession:
+    """Exchange one verifier-bound native login code for a bearer session."""
+    login_code = consume_bound_mobile_login_code(
         str(settings.database_path),
+        handoff_id=handoff_id,
+        exchange_code_challenge=mobile_exchange_code_challenge(code_verifier),
         code_hash=hash_token(settings, code),
         now=_utc_now_iso(),
     )
@@ -199,15 +230,28 @@ def exchange_mobile_code(settings: Settings, *, code: str) -> IssuedSession:
     user = get_user(str(settings.database_path), login_code.user_id)
     if user is None or not user.access_enabled:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
-    return issue_session(settings, user=user, platform="ios")
+    return issue_session(settings, user=user, platform="macos")
 
 
-def save_user_google_tokens(settings: Settings, *, user_id: str, tokens: dict[str, object]) -> None:
+def mobile_exchange_code_challenge(code_verifier: str) -> str:
+    """Return the RFC 7636 S256 challenge for a native handoff verifier."""
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def save_user_google_tokens(
+    settings: Settings,
+    *,
+    user_id: str,
+    tokens: dict[str, object],
+    oauth_started_epoch: int,
+) -> None:
     """Encrypt and persist one user's Google OAuth credentials."""
     upsert_google_oauth_token(
         str(settings.database_path),
         user_id=user_id,
         token_json_encrypted=encrypt_json(settings, tokens),
+        oauth_started_epoch=oauth_started_epoch,
     )
 
 

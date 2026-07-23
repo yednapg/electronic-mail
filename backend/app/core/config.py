@@ -4,16 +4,47 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Literal
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 import os
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
-load_dotenv(BACKEND_DIR / ".env")
-load_dotenv(BACKEND_DIR / ".env.local", override=True)
 POSTGRES_URL_PREFIXES = ("postgres://", "postgresql://")
+RESERVED_SERVICE_HOSTS = {
+    "0.0.0.0",
+    "127.0.0.1",
+    "::1",
+    "example.com",
+    "example.net",
+    "example.org",
+    "localhost",
+}
+RESERVED_SERVICE_HOST_SUFFIXES = (
+    ".example",
+    ".example.com",
+    ".example.net",
+    ".example.org",
+    ".invalid",
+    ".local",
+    ".localhost",
+    ".test",
+)
+
+
+def _load_environment_files() -> None:
+    """Load developer defaults without ever replacing process environment."""
+    # Explicit process variables are the deployment contract. Loading the local
+    # override first preserves its precedence over .env while override=False
+    # ensures a developer file cannot redirect a production migration or worker.
+    load_dotenv(BACKEND_DIR / ".env.local", override=False)
+    load_dotenv(BACKEND_DIR / ".env", override=False)
+
+
+_load_environment_files()
 
 
 @dataclass(frozen=True)
@@ -30,6 +61,7 @@ class Settings:
     session_cookie_domain: str
     session_cookie_samesite: Literal["lax", "strict", "none"]
     app_encryption_key: str
+    registration_mode: Literal["allowlist", "open"]
     allowed_emails: tuple[str, ...]
     gmail_sync_scope: str
     gmail_recent_days: int
@@ -48,6 +80,9 @@ class Settings:
     openai_required: bool
     openai_debug_logs: bool
     ai_grouping_enabled: bool
+    log_level: str
+    release_sha: str
+    rate_limit_enabled: bool
 
     @property
     def google_configured(self) -> bool:
@@ -113,28 +148,75 @@ class Settings:
             errors.append("DATABASE_URL must be Postgres. SQLite is no longer supported.")
 
         if self.is_production_like:
+            if self.gmail_sync_scope != "full":
+                errors.append("GMAIL_SYNC_SCOPE=full is required outside local development")
+            if self.registration_mode not in {"allowlist", "open"}:
+                errors.append("REGISTRATION_MODE must be either allowlist or open")
+            if self.app_env == "staging" and self.registration_mode != "allowlist":
+                errors.append("REGISTRATION_MODE=allowlist is required in staging")
             if not self.google_configured:
                 errors.append("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required")
             if not self.gmail_pubsub_topic:
                 errors.append("GMAIL_PUBSUB_TOPIC is required")
             if not self.gmail_pubsub_subscription:
                 errors.append("GMAIL_PUBSUB_SUBSCRIPTION is required")
-            if self.openai_required and not self.openai_configured:
-                errors.append("OPENAI_API_KEY is required because OPENAI_REQUIRED is enabled")
-            if not self.google_redirect_uri.startswith("https://"):
-                errors.append("GOOGLE_REDIRECT_URI must be HTTPS outside local development")
-            if not self.cors_origin.startswith("https://"):
-                errors.append("CORS_ORIGIN must be HTTPS outside local development")
-            if not self.web_app_url.startswith("https://"):
-                errors.append("WEB_APP_URL must be HTTPS outside local development")
-            if not self.mobile_redirect_uri:
-                errors.append("MOBILE_REDIRECT_URI is required")
-            if not self.allowed_emails:
-                errors.append("ALLOWED_EMAILS is required outside local development")
+            if not self.gmail_pubsub_push_service_account_email:
+                errors.append("GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL is required")
+            if self.ai_grouping_enabled or self.openai_required or self.openai_configured or self.openai_debug_logs:
+                errors.append("AI/OpenAI configuration must remain disabled for the no-AI production release")
+            if not _is_https_url(self.google_redirect_uri) or urlparse(self.google_redirect_uri).path != "/auth/google/callback":
+                errors.append("GOOGLE_REDIRECT_URI must be an HTTPS /auth/google/callback URL outside local development")
+            elif _uses_reserved_service_hostname(self.google_redirect_uri):
+                errors.append("GOOGLE_REDIRECT_URI must use a concrete non-reserved hostname")
+            if not _is_https_origin(self.cors_origin):
+                errors.append("CORS_ORIGIN must be one HTTPS origin outside local development")
+            elif _uses_reserved_service_hostname(self.cors_origin):
+                errors.append("CORS_ORIGIN must use a concrete non-reserved hostname")
+            if not _is_https_origin(self.web_app_url):
+                errors.append("WEB_APP_URL must be one HTTPS origin outside local development")
+            elif _uses_reserved_service_hostname(self.web_app_url):
+                errors.append("WEB_APP_URL must use a concrete non-reserved hostname")
+            if _url_origin(self.cors_origin) != _url_origin(self.web_app_url):
+                errors.append("CORS_ORIGIN and WEB_APP_URL must identify the same web origin")
+            if self.mobile_redirect_uri != "electronicmail://auth/callback":
+                errors.append("MOBILE_REDIRECT_URI must be electronicmail://auth/callback")
+            if self.registration_mode == "allowlist" and not self.allowed_emails:
+                errors.append("ALLOWED_EMAILS is required when REGISTRATION_MODE=allowlist")
             if not self.session_cookie_domain:
                 errors.append("SESSION_COOKIE_DOMAIN is required outside local development")
-            if self.session_cookie_samesite != "none":
-                errors.append("SESSION_COOKIE_SAMESITE=none is required for hosted web/backend auth")
+            elif not _cookie_domain_matches(self.session_cookie_domain, self.web_app_url, self.google_redirect_uri):
+                errors.append("SESSION_COOKIE_DOMAIN must cover both the web and API hosts")
+            if self.session_cookie_samesite != "lax":
+                errors.append(
+                    "SESSION_COOKIE_SAMESITE=lax is required for hosted auth so OAuth redirects work without exposing app sessions to cross-site requests"
+                )
+            if len(self.app_session_secret) < 32 or _looks_like_placeholder(self.app_session_secret):
+                errors.append("APP_SESSION_SECRET must be a unique secret of at least 32 characters")
+            if len(self.app_encryption_key) < 32 or _looks_like_placeholder(self.app_encryption_key):
+                errors.append("APP_ENCRYPTION_KEY must be unique key material of at least 32 characters")
+            if self.app_session_secret == self.app_encryption_key:
+                errors.append("APP_SESSION_SECRET and APP_ENCRYPTION_KEY must use different key material")
+            if _looks_like_placeholder(self.database_url):
+                errors.append("DATABASE_URL still contains placeholder connection details")
+            if _looks_like_placeholder(self.google_client_id) or _looks_like_placeholder(self.google_client_secret):
+                errors.append("Google OAuth credentials still contain placeholder values")
+            if _looks_like_placeholder(self.gmail_pubsub_topic) or not re.fullmatch(
+                r"projects/[^/]+/topics/[^/]+", self.gmail_pubsub_topic
+            ):
+                errors.append("GMAIL_PUBSUB_TOPIC must be a concrete projects/.../topics/... resource")
+            expected_push_audience = f"{self.backend_origin}/v1/mailbox/pubsub"
+            if not _is_https_url(self.gmail_pubsub_push_audience) or self.gmail_pubsub_push_audience != expected_push_audience:
+                errors.append("GMAIL_PUBSUB_PUSH_AUDIENCE must exactly match the deployed /v1/mailbox/pubsub URL")
+            if _uses_reserved_service_hostname(self.gmail_pubsub_push_audience):
+                errors.append("GMAIL_PUBSUB_PUSH_AUDIENCE must use a concrete non-reserved hostname")
+            if _looks_like_placeholder(self.gmail_pubsub_push_service_account_email):
+                errors.append("GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL still contains a placeholder value")
+            if self.cors_origin == "*":
+                errors.append("CORS_ORIGIN cannot be '*' when credentialed authentication is enabled")
+            if not self.rate_limit_enabled:
+                errors.append("RATE_LIMIT_ENABLED=true is required outside local development")
+            if self.release_sha == "local" or len(self.release_sha) < 7 or _looks_like_placeholder(self.release_sha):
+                errors.append("RELEASE_SHA must identify the deployed immutable revision")
 
         return errors
 
@@ -165,14 +247,15 @@ def load_settings() -> Settings:
         session_cookie_domain=os.getenv("SESSION_COOKIE_DOMAIN", "").strip().strip("\"'"),
         session_cookie_samesite=_resolve_session_cookie_samesite(),
         app_encryption_key=os.getenv("APP_ENCRYPTION_KEY", "local-dev-encryption-key").strip().strip("\"'"),
+        registration_mode=_resolve_registration_mode(),
         allowed_emails=_parse_email_list(os.getenv("ALLOWED_EMAILS", "")),
-        gmail_sync_scope=os.getenv("GMAIL_SYNC_SCOPE", "recent").strip().lower() or "recent",
+        gmail_sync_scope=os.getenv("GMAIL_SYNC_SCOPE", "full").strip().lower() or "full",
         gmail_recent_days=int(os.getenv("GMAIL_RECENT_DAYS", "90")),
-            gmail_pubsub_topic=os.getenv("GMAIL_PUBSUB_TOPIC", "").strip().strip("\"'"),
-            gmail_pubsub_subscription=os.getenv("GMAIL_PUBSUB_SUBSCRIPTION", "").strip().strip("\"'"),
-            gmail_pubsub_push_audience=os.getenv("GMAIL_PUBSUB_PUSH_AUDIENCE", "").strip().strip("\"'"),
-            gmail_pubsub_push_service_account_email=os.getenv("GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL", "").strip().strip("\"'").lower(),
-            gmail_watch_renewal_hours=int(os.getenv("GMAIL_WATCH_RENEWAL_HOURS", "24")),
+        gmail_pubsub_topic=os.getenv("GMAIL_PUBSUB_TOPIC", "").strip().strip("\"'"),
+        gmail_pubsub_subscription=os.getenv("GMAIL_PUBSUB_SUBSCRIPTION", "").strip().strip("\"'"),
+        gmail_pubsub_push_audience=os.getenv("GMAIL_PUBSUB_PUSH_AUDIENCE", "").strip().strip("\"'"),
+        gmail_pubsub_push_service_account_email=os.getenv("GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL", "").strip().strip("\"'").lower(),
+        gmail_watch_renewal_hours=int(os.getenv("GMAIL_WATCH_RENEWAL_HOURS", "24")),
         google_client_id=os.getenv("GOOGLE_CLIENT_ID", "").strip().strip("\"'"),
         google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET", "").strip().strip("\"'"),
         google_redirect_uri=os.getenv(
@@ -186,6 +269,9 @@ def load_settings() -> Settings:
         openai_required=os.getenv("OPENAI_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"},
         openai_debug_logs=os.getenv("OPENAI_DEBUG_LOGS", "").strip().lower() in {"1", "true", "yes", "on"},
         ai_grouping_enabled=os.getenv("AI_GROUPING_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"},
+        log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
+        release_sha=os.getenv("RELEASE_SHA", "local").strip()[:64] or "local",
+        rate_limit_enabled=_resolve_boolean("RATE_LIMIT_ENABLED", default=app_env in {"staging", "production"}),
     )
 
 
@@ -206,6 +292,13 @@ def _resolve_session_cookie_samesite() -> Literal["lax", "strict", "none"]:
     return "lax"
 
 
+def _resolve_registration_mode() -> Literal["allowlist", "open"]:
+    value = os.getenv("REGISTRATION_MODE", "allowlist").strip().strip("\"'").lower()
+    if value in {"allowlist", "open"}:
+        return value
+    return "allowlist"
+
+
 def _parse_email_list(value: str) -> tuple[str, ...]:
     """Parse comma-separated allowed email values."""
     emails = []
@@ -214,3 +307,59 @@ def _parse_email_list(value: str) -> tuple[str, ...]:
         if email:
             emails.append(email)
     return tuple(dict.fromkeys(emails))
+
+
+def _resolve_boolean(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    normalized = value.strip().lower()
+    return not normalized or any(
+        marker in normalized
+        for marker in (
+            "replace-me",
+            "replace-in-secret-store",
+            "local-dev-",
+            "generate-at-least-",
+            "generate-separate-",
+            "set-to-deployed-",
+            "user:password@host",
+            "project_id",
+            "placeholder",
+        )
+    )
+
+
+def _is_https_url(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return parsed.scheme == "https" and bool(parsed.hostname) and not parsed.username and not parsed.password
+
+
+def _is_https_origin(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return _is_https_url(value) and parsed.path in {"", "/"} and not parsed.params and not parsed.query and not parsed.fragment
+
+
+def _uses_reserved_service_hostname(value: str) -> bool:
+    host = (urlparse(value.strip()).hostname or "").lower().rstrip(".")
+    return host in RESERVED_SERVICE_HOSTS or host.endswith(RESERVED_SERVICE_HOST_SUFFIXES)
+
+
+def _url_origin(value: str) -> tuple[str, str, int | None]:
+    parsed = urlparse(value.strip())
+    return parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port
+
+
+def _cookie_domain_matches(cookie_domain: str, *urls: str) -> bool:
+    domain = cookie_domain.strip().lower().lstrip(".")
+    if not domain or "/" in domain or ":" in domain:
+        return False
+    for value in urls:
+        host = (urlparse(value.strip()).hostname or "").lower()
+        if host != domain and not host.endswith(f".{domain}"):
+            return False
+    return True

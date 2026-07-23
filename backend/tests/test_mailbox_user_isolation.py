@@ -97,6 +97,27 @@ class MailboxUserIsolationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         list_messages.assert_called_once_with("postgresql://example/db", user_id="user-b", message_ids=["msg-user-a"])
 
+    def test_attachment_download_safely_encodes_hostile_filename(self) -> None:
+        route_settings = SimpleNamespace(database_path="postgresql://example/db")
+        hostile = 'résumé"; foo=bar; filename="pwn.txt\r\nX-Evil: yes'
+        attachment = SimpleNamespace(filename=hostile, mime_type="text/plain", attachment_id="att-1")
+        with (
+            patch.object(mailbox_routes, "settings", route_settings),
+            patch.object(mailbox_routes, "require_current_user", return_value=SimpleNamespace(id="user-b")),
+            patch.object(mailbox_routes, "list_messages_by_ids", return_value=[SimpleNamespace(message_id="msg-1")]),
+            patch.object(mailbox_routes, "gmail_attachments_for_message", return_value=[attachment]),
+            patch.object(mailbox_routes, "fetch_gmail_attachment", return_value={"data": "aGVsbG8="}),
+        ):
+            response = self.client.get("/v1/mailbox/messages/msg-1/attachments/att-1")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"hello")
+        disposition = response.headers["content-disposition"]
+        self.assertNotIn("foo=bar", disposition)
+        self.assertNotIn("\r", disposition)
+        self.assertNotIn("\n", disposition)
+        self.assertIn("filename*=UTF-8''r%C3%A9sum%C3%A9_", disposition)
+
     def test_sync_job_is_enqueued_for_authenticated_user(self) -> None:
         state = MailboxSyncStateResponse(connected=True, total_threads=3)
 

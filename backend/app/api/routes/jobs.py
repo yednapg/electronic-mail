@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Durable job and ops endpoints."""
 
+import os
+
 from fastapi import APIRouter, HTTPException, Request, status
 
 from app.core.config import load_settings
@@ -25,17 +27,22 @@ def job_status(request: Request, job_id: str) -> BackgroundJobResponse:
 @router.get("/v1/ops/health", response_model=OpsHealthResponse)
 def ops_health(request: Request) -> OpsHealthResponse:
     user = require_current_user(settings, request)
-    admin_emails = {email.strip().lower() for email in __import__("os").getenv("OPS_ADMIN_EMAILS", "").split(",") if email.strip()}
-    if admin_emails and user.email.lower() not in admin_emails:
+    admin_emails = {email.strip().lower() for email in os.getenv("OPS_ADMIN_EMAILS", "").split(",") if email.strip()}
+    # Production config requires this allowlist, but the endpoint itself must
+    # still fail closed if a service is started with missing or malformed env.
+    if not admin_emails or user.email.lower() not in admin_emails:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Ops admin access required")
-    health = get_queue_health(str(settings.database_path))
+    health = get_queue_health(str(settings.database_path), expected_release_sha=settings.release_sha)
     return OpsHealthResponse(
+        environment=settings.app_env,
+        release=settings.release_sha,
         queue_depth=health.queue_depth,
         dead_jobs=health.dead_jobs,
         stale_running_jobs=health.stale_running_jobs,
         oldest_queued_age_seconds=health.oldest_queued_age_seconds,
         workers=health.workers,
         worker_online=health.worker_online,
+        worker_releases_match=health.worker_releases_match,
         required_queues_ready=health.required_queues_ready,
     )
 
