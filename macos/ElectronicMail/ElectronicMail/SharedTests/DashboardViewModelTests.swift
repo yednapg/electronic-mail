@@ -2,6 +2,12 @@ import XCTest
 @testable import ElectronicMailShared
 
 final class DashboardViewModelTests: XCTestCase {
+    override func tearDown() {
+        MobileAuthMockURLProtocol.responseData = nil
+        MobileAuthMockURLProtocol.transientFailure = nil
+        super.tearDown()
+    }
+
     func testDashboardFixtureBuildsSummarySectionsAndGmailAction() throws {
         let dashboard = try JSONDecoder.backend.decode(
             DashboardResponse.self,
@@ -101,6 +107,39 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertEqual(agenda[0].tone, .blue)
     }
 
+    func testInboxSnapshotPreservesAuthoritativeSectionAndRowOrder() {
+        let mailbox = MailboxResponse(
+            label: .inbox,
+            totalThreads: 4,
+            sections: [
+                GmailThreadSection(
+                    id: "yesterday:rank-1",
+                    title: "Yesterday",
+                    rows: [
+                        mobileInboxRow(id: "rank-1", receivedAt: "2026-07-10T08:00:00+00:00"),
+                        mobileInboxRow(id: "rank-2", receivedAt: "2026-07-15T18:00:00+00:00")
+                    ]
+                ),
+                GmailThreadSection(
+                    id: "today:rank-3",
+                    title: "Today",
+                    rows: [mobileInboxRow(id: "rank-3", receivedAt: "2026-07-12T12:00:00+00:00")]
+                ),
+                GmailThreadSection(
+                    id: "yesterday:rank-4",
+                    title: "Yesterday",
+                    rows: [mobileInboxRow(id: "rank-4", receivedAt: "2026-07-14T12:00:00+00:00")]
+                )
+            ]
+        )
+
+        let snapshot = MobileInboxViewModelBuilder.snapshot(from: mailbox)
+
+        XCTAssertEqual(snapshot.sections.map(\.id), ["yesterday:rank-1", "today:rank-3", "yesterday:rank-4"])
+        XCTAssertEqual(snapshot.sections.map(\.title), ["Yesterday", "Today", "Yesterday"])
+        XCTAssertEqual(snapshot.sections.flatMap(\.rows).map(\.id), ["rank-1", "rank-2", "rank-3", "rank-4"])
+    }
+
     func testMobileAuthURLAndCallbackParsing() throws {
         let baseURL = URL(string: "https://api.example.com")!
         let callbackURL = URL(string: MobileAuthFlow.callbackRedirectURI)!
@@ -118,6 +157,59 @@ final class DashboardViewModelTests: XCTestCase {
             MobileAuthFlow.handoffStatusURL(baseURL: baseURL, handoffID: "handoff-1").absoluteString,
             "https://api.example.com/v1/auth/mobile/handoff/handoff-1"
         )
+
+        XCTAssertThrowsError(
+            try MobileAuthFlow.loginCode(
+                from: URL(string: "electronicmail://auth/callback?status=cancelled&error=Google%20sign-in%20was%20cancelled.")!
+            )
+        ) { error in
+            XCTAssertEqual(error as? MobileAuthFlowError, .authenticationCancelled)
+        }
+    }
+
+    func testMobileAuthHandoffStopsImmediatelyOnTerminalFailure() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MobileAuthMockURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        MobileAuthMockURLProtocol.responseData = Data(
+            #"{"status":"failed","error":"Google sign-in failed. Please try again."}"#.utf8
+        )
+
+        do {
+            _ = try await MobileAuthFlow.pollForLoginCode(
+                baseURL: URL(string: "https://api.example.com")!,
+                handoffID: "handoff-1",
+                session: session,
+                maxAttempts: 1,
+                retryDelayNanoseconds: 0
+            )
+            XCTFail("Expected terminal handoff failure")
+        } catch {
+            XCTAssertEqual(
+                error as? MobileAuthFlowError,
+                .handoffRejected("Google sign-in failed. Please try again.")
+            )
+        }
+    }
+
+    func testMobileAuthHandoffRetriesTransientNetworkFailure() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MobileAuthMockURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        MobileAuthMockURLProtocol.transientFailure = URLError(.timedOut)
+        MobileAuthMockURLProtocol.responseData = Data(
+            #"{"status":"ready","login_code":"login-after-retry"}"#.utf8
+        )
+
+        let loginCode = try await MobileAuthFlow.pollForLoginCode(
+            baseURL: URL(string: "https://api.example.com")!,
+            handoffID: "handoff-1",
+            session: session,
+            maxAttempts: 2,
+            retryDelayNanoseconds: 0
+        )
+
+        XCTAssertEqual(loginCode, "login-after-retry")
     }
 
     private func contractFixtureData(_ name: String) throws -> Data {
@@ -137,4 +229,64 @@ final class DashboardViewModelTests: XCTestCase {
 
         throw CocoaError(.fileNoSuchFile)
     }
+}
+
+private func mobileInboxRow(id: String, receivedAt: String) -> GmailThreadRow {
+    GmailThreadRow(
+        threadID: id,
+        entityID: id,
+        title: id,
+        href: "/v1/mailbox/threads/\(id)",
+        latestSourceRecordID: "message-\(id)",
+        latestReceivedAt: receivedAt,
+        latestMessageAt: receivedAt,
+        latestSubject: id,
+        latestSender: "Sender",
+        sender: "Sender",
+        participants: ["Sender"],
+        messageCount: 1,
+        summary: id,
+        snippet: id,
+        labelIDs: ["INBOX"],
+        labels: ["INBOX"],
+        unread: false,
+        actionNeeded: false,
+        actionType: "open",
+        actionTypeKey: "open",
+        priority: nil,
+        dashboardVisible: false,
+        currentState: .waiting,
+        lifecycleState: "active",
+        outcomeType: nil,
+        lifecycleUpdates: [],
+        enrichmentStatus: "ready"
+    )
+}
+
+private final class MobileAuthMockURLProtocol: URLProtocol {
+    static var responseData: Data?
+    static var transientFailure: URLError?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        if let transientFailure = Self.transientFailure {
+            Self.transientFailure = nil
+            client?.urlProtocol(self, didFailWithError: transientFailure)
+            return
+        }
+        guard let responseData = Self.responseData,
+              let url = request.url,
+              let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil) else {
+            client?.urlProtocol(self, didFailWithError: MobileAuthFlowError.missingLoginCode)
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: responseData)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

@@ -23,7 +23,7 @@ let project = Project(
             product: .framework,
             bundleId: "app.electronicmail.shared",
             deploymentTargets: .multiplatform(iOS: "17.0", macOS: "14.0"),
-            infoPlist: .default,
+            infoPlist: .file(path: "Config/InfoPlists/ElectronicMailShared-Info.plist"),
             sources: portableCoreSources,
             dependencies: []
         ),
@@ -33,8 +33,11 @@ let project = Project(
             product: .framework,
             bundleId: "app.electronicmail.core",
             deploymentTargets: .macOS("14.0"),
-            infoPlist: .default,
+            infoPlist: .file(path: "Config/InfoPlists/ElectronicMailCore-Info.plist"),
             sources: ["ElectronicMail/Core/**"],
+            resources: [
+                "ElectronicMail/Mac/PrivacyInfo.xcprivacy"
+            ],
             dependencies: [
                 .sdk(name: "sqlite3", type: .library)
             ]
@@ -45,25 +48,35 @@ let project = Project(
             product: .app,
             bundleId: "app.electronicmail.mac",
             deploymentTargets: .macOS("14.0"),
-            infoPlist: .extendingDefault(with: [
-                "CFBundleDisplayName": "Electronic Mail",
-                "CFBundleName": "Electronic Mail",
-                "LSMinimumSystemVersion": "14.0",
-                "CFBundleURLTypes": [
-                    [
-                        "CFBundleURLName": "app.electronicmail.mac",
-                        "CFBundleURLSchemes": ["electronicmail"]
-                    ]
-                ],
-                "NSAppTransportSecurity": [
-                    "NSAllowsArbitraryLoads": true
-                ],
-                "NSRequiresAquaSystemAppearance": false
-            ]),
+            infoPlist: .file(path: "Config/InfoPlists/ElectronicMail-Info.plist"),
+            entitlements: .file(path: "ElectronicMail/Mac/ElectronicMail.entitlements"),
             sources: ["ElectronicMail/Mac/**"],
+            resources: [
+                "ElectronicMail/Mac/Assets.xcassets",
+                "ElectronicMail/Mac/PrivacyInfo.xcprivacy"
+            ],
             dependencies: [
                 .target(name: "ElectronicMailCore")
-            ]
+            ],
+            settings: .settings(
+                base: [
+                    "CURRENT_PROJECT_VERSION": "1",
+                    "ELECTRONIC_MAIL_SOURCE_COMMIT": "local",
+                    "ENABLE_HARDENED_RUNTIME": "YES",
+                    "MARKETING_VERSION": "1.0.0"
+                ],
+                configurations: [
+                    .debug(name: "Debug", settings: [
+                        "ELECTRONIC_MAIL_BACKEND_URL": "http://localhost:3001"
+                    ]),
+                    .release(name: "Release", settings: [
+                        "ELECTRONIC_MAIL_BACKEND_URL": "https://electronic-mail-backend.invalid",
+                        "ENABLE_PREVIEWS": "NO",
+                        "INFOPLIST_FILE": "Config/InfoPlists/ElectronicMail-Release-Info.plist",
+                        "ONLY_ACTIVE_ARCH": "NO"
+                    ])
+                ]
+            )
         ),
         .target(
             name: "ElectronicMailTests",
@@ -71,7 +84,7 @@ let project = Project(
             product: .unitTests,
             bundleId: "app.electronicmail.tests",
             deploymentTargets: .macOS("14.0"),
-            infoPlist: .default,
+            infoPlist: .file(path: "Config/InfoPlists/ElectronicMailTests-Info.plist"),
             sources: ["ElectronicMail/Tests/**"],
             dependencies: [
                 .target(name: "ElectronicMailCore")
@@ -83,21 +96,7 @@ let project = Project(
             product: .app,
             bundleId: "app.electronicmail.ios",
             deploymentTargets: .iOS("17.0"),
-            infoPlist: .extendingDefault(with: [
-                "CFBundleDisplayName": "Electronic Mail",
-                "CFBundleName": "Electronic Mail",
-                "CFBundleURLTypes": [
-                    [
-                        "CFBundleURLName": "app.electronicmail.ios",
-                        "CFBundleURLSchemes": ["electronicmail"]
-                    ]
-                ],
-                "BackendBaseURL": "$(ELECTRONIC_MAIL_IOS_BACKEND_URL)",
-                "UILaunchScreen": [:],
-                "UISupportedInterfaceOrientations": [
-                    "UIInterfaceOrientationPortrait"
-                ]
-            ]),
+            infoPlist: .file(path: "Config/InfoPlists/ElectronicMailiOS-Info.plist"),
             sources: ["ElectronicMail/iOS/**"],
             dependencies: [
                 .target(name: "ElectronicMailShared")
@@ -114,7 +113,7 @@ let project = Project(
             product: .unitTests,
             bundleId: "app.electronicmail.shared.tests",
             deploymentTargets: .macOS("14.0"),
-            infoPlist: .default,
+            infoPlist: .file(path: "Config/InfoPlists/ElectronicMailSharedTests-Info.plist"),
             sources: ["ElectronicMail/SharedTests/**"],
             dependencies: [
                 .target(name: "ElectronicMailShared")

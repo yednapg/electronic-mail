@@ -1,3 +1,4 @@
+#if DEBUG
 import Foundation
 
 public final class DemoAppClient: AppClient {
@@ -598,3 +599,4 @@ enum DemoAppFixtures {
         )
     }
 }
+#endif

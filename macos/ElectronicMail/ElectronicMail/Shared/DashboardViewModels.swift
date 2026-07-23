@@ -258,6 +258,8 @@ public enum DashboardViewModelBuilder {
                 return DashboardItemActionViewModel(label: "Unarchive", tone: .blue, operation: .unarchive, gmailThreadID: threadID)
             case .markRead:
                 return DashboardItemActionViewModel(label: "Mark Read", tone: .green, operation: .markRead, gmailThreadID: threadID)
+            case .markUnread, .moveTrash, .restoreTrash, .markSpam, .notSpam, .star, .unstar, .deleteForever:
+                return nil
             }
         }
 

@@ -1,46 +1,36 @@
 import Foundation
 
 public final class AppSessionCache {
-    private let defaults: UserDefaults
-    private let storagePrefix: String
-    private let currentUserKey: String
+    private static let legacySessionPrefix = "electronic-mail-app-session:"
+    private static let legacyCurrentUserPrefix = "electronic-mail-current-user:"
 
+    private let defaults: UserDefaults
+    private let lock = NSLock()
     private var memorySession: AppSessionResponse?
 
-    public init(defaults: UserDefaults = .standard, namespace: String = "live") {
+    public init(defaults: UserDefaults = .standard, namespace _: String = "live") {
         self.defaults = defaults
-        self.storagePrefix = "electronic-mail-app-session:\(namespace):v1:"
-        self.currentUserKey = "electronic-mail-current-user:\(namespace):v1"
+        purgeLegacyPreferences()
     }
 
     func read() -> AppSessionResponse? {
-        if let memorySession {
-            return memorySession
+        lock.withAppSessionCacheLock {
+            memorySession
         }
-        guard let userID = defaults.string(forKey: currentUserKey) else {
-            return nil
-        }
-        return read(userID: userID)
     }
 
     func read(userID: String) -> AppSessionResponse? {
-        guard let data = defaults.data(forKey: storagePrefix + userID) else {
-            return nil
-        }
-        do {
-            let session = try JSONDecoder.backend.decode(AppSessionResponse.self, from: data)
-            memorySession = session
-            return session
-        } catch {
-            return nil
+        lock.withAppSessionCacheLock {
+            guard memorySession?.user.id == userID else {
+                return nil
+            }
+            return memorySession
         }
     }
 
     func write(_ session: AppSessionResponse) {
-        memorySession = session
-        defaults.set(session.user.id, forKey: currentUserKey)
-        if let data = try? JSONEncoder.backend.encode(session) {
-            defaults.set(data, forKey: storagePrefix + session.user.id)
+        lock.withAppSessionCacheLock {
+            memorySession = session
         }
     }
 
@@ -68,10 +58,25 @@ public final class AppSessionCache {
     }
 
     func clear() {
-        memorySession = nil
-        if let userID = defaults.string(forKey: currentUserKey) {
-            defaults.removeObject(forKey: storagePrefix + userID)
+        lock.withAppSessionCacheLock {
+            memorySession = nil
         }
-        defaults.removeObject(forKey: currentUserKey)
+        purgeLegacyPreferences()
+    }
+
+    private func purgeLegacyPreferences() {
+        for key in defaults.dictionaryRepresentation().keys where
+            key.hasPrefix(Self.legacySessionPrefix) || key.hasPrefix(Self.legacyCurrentUserPrefix)
+        {
+            defaults.removeObject(forKey: key)
+        }
+    }
+}
+
+private extension NSLock {
+    func withAppSessionCacheLock<T>(_ body: () -> T) -> T {
+        lock()
+        defer { unlock() }
+        return body()
     }
 }
