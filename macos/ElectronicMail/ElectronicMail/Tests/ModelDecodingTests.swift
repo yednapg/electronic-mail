@@ -453,6 +453,87 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertFalse(MailComposerPolicy.shouldApplyDraftSaveResponse(state: .reauthRequired))
     }
 
+    func testComposerPolicyRetriesUnchangedUnresolvedDraftWithoutSaving() {
+        XCTAssertEqual(
+            MailComposerPolicy.draftSendPreparation(
+                hasUnchangedUnresolvedSendAttempt: true,
+                gmailDraftID: "gmail-draft-1",
+                clientSendID: "client-send-1"
+            ),
+            .retryExistingDraft(
+                gmailDraftID: "gmail-draft-1",
+                clientSendID: "client-send-1"
+            )
+        )
+    }
+
+    func testComposerPolicyEditingUnresolvedAttemptRequiresNewSaveAndSendIdentity() {
+        XCTAssertEqual(
+            MailComposerPolicy.contentChangeDecision(
+                hasUnresolvedSendAttempt: true,
+                existingDraftAttachmentCount: 2
+            ),
+            .forkDraftForNewSendAttempt(discardExistingDraftAttachments: true)
+        )
+        XCTAssertEqual(
+            MailComposerPolicy.contentChangeDecision(hasUnresolvedSendAttempt: false),
+            .keepCurrentSendAttempt
+        )
+        XCTAssertEqual(
+            MailComposerPolicy.contentChangeDecision(
+                hasUnresolvedSendAttempt: true,
+                existingDraftAttachmentCount: 0
+            ),
+            .forkDraftForNewSendAttempt(discardExistingDraftAttachments: false)
+        )
+        XCTAssertEqual(
+            MailComposerPolicy.draftSendPreparation(
+                hasUnchangedUnresolvedSendAttempt: false,
+                gmailDraftID: "gmail-draft-1",
+                clientSendID: "new-client-send-2"
+            ),
+            .saveDraft
+        )
+    }
+
+    func testComposerPolicyMissingGmailDraftRequiresSaveBeforeRetry() {
+        XCTAssertEqual(
+            MailComposerPolicy.draftSendPreparation(
+                hasUnchangedUnresolvedSendAttempt: true,
+                gmailDraftID: nil,
+                clientSendID: "client-send-1"
+            ),
+            .saveDraft
+        )
+        XCTAssertEqual(
+            MailComposerPolicy.draftSendPreparation(
+                hasUnchangedUnresolvedSendAttempt: true,
+                gmailDraftID: "",
+                clientSendID: "client-send-1"
+            ),
+            .saveDraft
+        )
+    }
+
+    func testComposerHydrationDoesNotForkAnUnresolvedSendUntilContentChanges() {
+        var changeTracker = MailComposerDraftChangeTracker()
+        changeTracker.synchronize(fingerprint: "recovered-content")
+
+        XCTAssertFalse(changeTracker.shouldHandleChange(fingerprint: "recovered-content"))
+        XCTAssertTrue(changeTracker.shouldHandleChange(fingerprint: "edited-content"))
+        XCTAssertEqual(
+            MailComposerPolicy.contentChangeDecision(
+                hasUnresolvedSendAttempt: true,
+                existingDraftAttachmentCount: 1
+            ),
+            .forkDraftForNewSendAttempt(discardExistingDraftAttachments: true)
+        )
+        XCTAssertFalse(changeTracker.shouldHandleChange(fingerprint: "edited-content"))
+
+        changeTracker.synchronize(fingerprint: "internally-forked-content")
+        XCTAssertFalse(changeTracker.shouldHandleChange(fingerprint: "internally-forked-content"))
+    }
+
     func testComposerPolicyPersistsEditedResponsesAsGmailDrafts() {
         XCTAssertNil(MailComposerPolicy.responseMode(for: .compose))
         XCTAssertNil(MailComposerPolicy.responseMode(for: .draft))
@@ -654,11 +735,34 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(DurableSendConfirmationPolicy.decision(for: sent), .confirmedSent)
         XCTAssertEqual(
             DurableSendConfirmationPolicy.decision(for: failed),
-            .preserveForRetry(message: "Try again.")
+            .definiteFailure(message: "Try again.")
         )
         guard case .preserveForRetry = DurableSendConfirmationPolicy.decision(for: untrackedQueue) else {
             return XCTFail("A queued response without a durable server ID must stay recoverable.")
         }
+    }
+
+    func testDefiniteSendFailureDoesNotRequireDraftForkOnNextEdit() {
+        guard case .definiteFailure = DurableSendConfirmationPolicy.decision(
+            for: makeSendResponse(state: .failed, serverSendID: "server-send-1")
+        ) else {
+            return XCTFail("A conclusive backend failure must clear ambiguous-send recovery.")
+        }
+
+        XCTAssertEqual(
+            MailComposerPolicy.contentChangeDecision(
+                hasUnresolvedSendAttempt: false,
+                existingDraftAttachmentCount: 2
+            ),
+            .keepCurrentSendAttempt
+        )
+        XCTAssertEqual(
+            MailComposerPolicy.contentChangeDecision(
+                hasUnresolvedSendAttempt: true,
+                existingDraftAttachmentCount: 2
+            ),
+            .forkDraftForNewSendAttempt(discardExistingDraftAttachments: true)
+        )
     }
 
     func testDurableSendConfirmationPolicyUsesBoundedBackoffAndMatchingIdentity() {

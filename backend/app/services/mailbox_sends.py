@@ -26,20 +26,21 @@ from app.db.mail_groups import (
     list_outbox_sends,
     list_messages_for_gmail_thread,
     mark_pending_send_failed,
-    mark_pending_send_queued,
     mark_pending_send_sent,
     upsert_gmail_messages,
     upsert_pending_send,
     user_can_write_gmail,
 )
 from app.db.repository import get_user
+from app.db.user_mail_guard import UserMailWorkBlocked, shared_user_mail_lock
 from app.schemas.domain import MailComposeRequest, MailReplyRequest, MailSendResponse
 from app.services.email_extraction import mark_full_gmail_payload_body_fetch_status, parse_gmail_message
 from app.services.integrations.google import (
     GMAIL_FULL_SCOPE,
+    MultipleSentGmailMessagesFound,
     fetch_gmail_attachment,
     fetch_gmail_message,
-    find_gmail_message_by_rfc822_message_id,
+    find_sent_gmail_message_by_rfc822_message_id,
     missing_google_scopes,
     send_gmail_raw_message,
 )
@@ -47,6 +48,9 @@ from app.services.mailbox_events import DASHBOARD_CHANGED, MAILBOX_CHANGED, emit
 from app.services.mail_groups import enqueue_projection_refresh, gmail_attachments_for_message, rebuild_touched_mail_groups, refresh_app_session_snapshot
 
 logger = logging.getLogger(__name__)
+
+_AMBIGUOUS_GOOGLE_HTTP_STATUSES = {408, 409, 425, 429}
+_GOOGLE_AUTH_HTTP_STATUSES = {401, 403}
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,10 @@ class PreparedResponseMessage:
     headers: dict[str, Any]
     attachments: list[dict[str, str]]
     gmail_thread_id: str | None
+
+
+class MailSendConfirmationPending(RuntimeError):
+    """Signal the worker to retry reconciliation without authorizing resend."""
 
 
 def send_compose(settings: Settings, *, user_id: str, request: MailComposeRequest) -> MailSendResponse:
@@ -273,7 +281,15 @@ def run_pending_send(settings: Settings, *, user_id: str, server_send_id: str) -
         return _response_from_record(record)
     try:
         sent = _perform_send(settings, user_id=user_id, record=record)
+        if sent.state == "sending" or (sent.state == "queued" and sent.error):
+            raise MailSendConfirmationPending(
+                f"Mail delivery confirmation is still pending for {sent.server_send_id}"
+            )
         return _response_from_record(sent)
+    except MailSendConfirmationPending:
+        raise
+    except UserMailWorkBlocked:
+        raise
     except GoogleCredentialsUnavailable as exc:
         safe_error = safe_google_error(exc, operation="mail delivery")
         mark_pending_send_failed(
@@ -283,15 +299,46 @@ def run_pending_send(settings: Settings, *, user_id: str, server_send_id: str) -
             error=safe_error,
         )
         raise
-    except Exception as exc:
+    except HttpError as exc:
         safe_error = safe_google_error(exc, operation="mail delivery")
-        failed = mark_pending_send_failed(
-            str(settings.database_path),
-            user_id=user_id,
-            server_send_id=record.server_send_id,
-            error=safe_error,
+        if _google_http_status(exc) in _GOOGLE_AUTH_HTTP_STATUSES:
+            failed = mark_pending_send_failed(
+                str(settings.database_path),
+                user_id=user_id,
+                server_send_id=record.server_send_id,
+                error="Google needs mail send permission.",
+            )
+            return _response_from_record(failed or record)
+        if _is_definite_google_client_rejection(exc):
+            failed = mark_pending_send_failed(
+                str(settings.database_path),
+                user_id=user_id,
+                server_send_id=record.server_send_id,
+                error=safe_error,
+            )
+            return _response_from_record(failed or record)
+        # Gmail may have accepted the message even though the response was
+        # lost. Keep the `sending` checkpoint so this worker can never turn a
+        # single search miss into permission to send the RFC message again.
+        current = _current_pending_send(settings, user_id=user_id, fallback=record)
+        if current.state == "sending" or (current.state == "queued" and current.error):
+            raise MailSendConfirmationPending(
+                f"Mail delivery confirmation is still pending for {current.server_send_id}"
+            ) from exc
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Mail delivery outcome remains ambiguous user_id=%s server_send_id=%s error=%s",
+            user_id,
+            record.server_send_id,
+            type(exc).__name__,
         )
-        raise RuntimeError((failed or record).error or safe_error) from exc
+        current = _current_pending_send(settings, user_id=user_id, fallback=record)
+        if current.state == "sending" or (current.state == "queued" and current.error):
+            raise MailSendConfirmationPending(
+                f"Mail delivery confirmation is still pending for {current.server_send_id}"
+            ) from exc
+        raise
 
 
 def _send_or_queue(settings: Settings, *, user_id: str, record: PendingSendRecord) -> MailSendResponse:
@@ -302,6 +349,12 @@ def _send_or_queue(settings: Settings, *, user_id: str, record: PendingSendRecor
     try:
         sent = _perform_send(settings, user_id=user_id, record=record)
         return _response_from_record(sent)
+    except UserMailWorkBlocked:
+        return _reauth_required(
+            settings,
+            record.client_send_id,
+            mailbox_thread_id=record.mailbox_thread_id,
+        )
     except GoogleCredentialsUnavailable as exc:
         safe_error = safe_google_error(exc, operation="mail delivery")
         failed = mark_pending_send_failed(
@@ -315,7 +368,7 @@ def _send_or_queue(settings: Settings, *, user_id: str, record: PendingSendRecor
         response.error = (failed or record).error or safe_error
         return response
     except HttpError as exc:
-        if getattr(exc.resp, "status", None) in {401, 403}:
+        if _google_http_status(exc) in _GOOGLE_AUTH_HTTP_STATUSES:
             failed = mark_pending_send_failed(
                 str(settings.database_path),
                 user_id=user_id,
@@ -326,11 +379,23 @@ def _send_or_queue(settings: Settings, *, user_id: str, record: PendingSendRecor
             response.server_send_id = record.server_send_id
             response.error = (failed or record).error
             return response
-        queued = _queue_send(settings, user_id=user_id, record=record, error=safe_google_error(exc, operation="mail delivery"))
-        return _response_from_record(queued)
+        if _is_definite_google_client_rejection(exc):
+            failed = mark_pending_send_failed(
+                str(settings.database_path),
+                user_id=user_id,
+                server_send_id=record.server_send_id,
+                error=safe_google_error(exc, operation="mail delivery"),
+            )
+            return _response_from_record(failed or record)
+        return _response_from_record(_current_pending_send(settings, user_id=user_id, fallback=record))
     except Exception as exc:
-        queued = _queue_send(settings, user_id=user_id, record=record, error=safe_google_error(exc, operation="mail delivery"))
-        return _response_from_record(queued)
+        logger.warning(
+            "Mail delivery outcome remains ambiguous user_id=%s server_send_id=%s error=%s",
+            user_id,
+            record.server_send_id,
+            type(exc).__name__,
+        )
+        return _response_from_record(_current_pending_send(settings, user_id=user_id, fallback=record))
 
 
 def get_send_status(settings: Settings, *, user_id: str, server_send_id: str) -> MailSendResponse | None:
@@ -349,7 +414,7 @@ def retry_send(settings: Settings, *, user_id: str, server_send_id: str) -> Mail
     record = get_pending_send(str(settings.database_path), user_id=user_id, server_send_id=server_send_id)
     if record is None:
         return None
-    if record.state in {"sent", "sending"}:
+    if record.state == "sent":
         return _response_from_record(record)
     if not _can_send(settings, user_id=user_id):
         response = _reauth_required(settings, record.client_send_id, mailbox_thread_id=record.mailbox_thread_id)
@@ -360,6 +425,13 @@ def retry_send(settings: Settings, *, user_id: str, server_send_id: str) -> Mail
 
 def _perform_send(settings: Settings, *, user_id: str, record: PendingSendRecord) -> PendingSendRecord:
     database_url = str(settings.database_path)
+    with shared_user_mail_lock(database_url, user_id=user_id):
+        return _perform_send_locked(settings, user_id=user_id, record=record)
+
+
+def _perform_send_locked(settings: Settings, *, user_id: str, record: PendingSendRecord) -> PendingSendRecord:
+    """Resolve, deliver, and durably finalize a send while deletion is excluded."""
+    database_url = str(settings.database_path)
     current = get_pending_send(database_url, user_id=user_id, server_send_id=record.server_send_id) or record
     if current.state == "sent":
         return current
@@ -368,13 +440,41 @@ def _perform_send(settings: Settings, *, user_id: str, record: PendingSendRecord
     # update) was lost. Search by our stable RFC Message-ID before retrying an
     # ambiguous delivery so a timeout or worker crash cannot create a second mail.
     if current.state == "sending" or current.error:
-        recovered = find_gmail_message_by_rfc822_message_id(
-            settings,
-            user_id=user_id,
-            rfc822_message_id=_send_rfc822_message_id(current.server_send_id),
-        )
+        try:
+            recovered = find_sent_gmail_message_by_rfc822_message_id(
+                settings,
+                user_id=user_id,
+                rfc822_message_id=_send_rfc822_message_id(current.server_send_id),
+            )
+        except MultipleSentGmailMessagesFound as exc:
+            if _is_ambiguous_pending_send(current):
+                raise MailSendConfirmationPending(
+                    f"Multiple deliveries require manual reconciliation for {current.server_send_id}"
+                ) from exc
+            raise
+        except Exception as exc:
+            if _is_ambiguous_pending_send(current):
+                # A credential, transport, or provider failure occurred while
+                # checking an earlier ambiguous attempt—not while sending a
+                # new message. Preserve the `sending` checkpoint so outer
+                # error classification cannot authorize another delivery.
+                raise MailSendConfirmationPending(
+                    f"Mail delivery confirmation is still pending for {current.server_send_id}"
+                ) from exc
+            raise
         if recovered:
             return _finalize_sent_message(settings, user_id=user_id, record=current, result=recovered)
+        if _is_ambiguous_pending_send(current):
+            # `sending` is an ambiguous provider outcome, not a stale lease.
+            # Search is reconciliation only; an empty result may mean Gmail's
+            # index has not caught up and must never authorize a second send.
+            return current
+
+    # Everything that can fail locally happens before the durable provider
+    # claim. If message construction or job persistence fails, the record stays
+    # queued/failed and a retry is conclusive because Gmail was never called.
+    raw = _raw_message(current)
+    _enqueue_send_job(settings, user_id=user_id, record=current, run_after_seconds=150)
 
     sending = claim_pending_send(database_url, user_id=user_id, server_send_id=current.server_send_id)
     if sending is None:
@@ -384,9 +484,7 @@ def _perform_send(settings: Settings, *, user_id: str, record: PendingSendRecord
 
     # This delayed durable job is a crash-recovery safety net for synchronous
     # sends. On success it observes `sent`; after a hard crash it searches Gmail
-    # and only then retries the stale claim.
-    _enqueue_send_job(settings, user_id=user_id, record=sending, run_after_seconds=150)
-    raw = _raw_message(sending)
+    # without ever converting an empty search result into resend authority.
     result = send_gmail_raw_message(settings, user_id=user_id, raw_message=raw, gmail_thread_id=sending.gmail_thread_id)
     return _finalize_sent_message(settings, user_id=user_id, record=sending, result=result)
 
@@ -432,15 +530,39 @@ def _finalize_sent_message(
     return sent
 
 
-def _queue_send(settings: Settings, *, user_id: str, record: PendingSendRecord, error: str) -> PendingSendRecord:
-    queued = mark_pending_send_queued(
+def _current_pending_send(
+    settings: Settings,
+    *,
+    user_id: str,
+    fallback: PendingSendRecord,
+) -> PendingSendRecord:
+    return get_pending_send(
         str(settings.database_path),
         user_id=user_id,
-        server_send_id=record.server_send_id,
-        error=error,
-    ) or record
-    _enqueue_send_job(settings, user_id=user_id, record=queued, error=error, run_after_seconds=15)
-    return queued
+        server_send_id=fallback.server_send_id,
+    ) or fallback
+
+
+def _is_ambiguous_pending_send(record: PendingSendRecord) -> bool:
+    return record.state == "sending" or (record.state == "queued" and bool(record.error))
+
+
+def _google_http_status(exc: HttpError) -> int | None:
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_definite_google_client_rejection(exc: HttpError) -> bool:
+    status = _google_http_status(exc)
+    return (
+        status is not None
+        and 400 <= status < 500
+        and status not in _GOOGLE_AUTH_HTTP_STATUSES
+        and status not in _AMBIGUOUS_GOOGLE_HTTP_STATUSES
+    )
 
 
 def _enqueue_send_job(

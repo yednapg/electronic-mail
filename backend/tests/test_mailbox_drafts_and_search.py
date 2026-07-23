@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from email import message_from_bytes, policy
 from types import SimpleNamespace
@@ -9,12 +9,25 @@ import unittest
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
+from googleapiclient.errors import HttpError
 
 from app.core.error_safety import GoogleCredentialsUnavailable
+from app.db import mail_groups as mail_group_db
 from app.db.mail_groups import ClientDraftRecord
 from app.main import app
 from app.schemas.domain import MailDraftResponse, MailDraftSaveRequest, MailboxResponse
-from app.services.mailbox_drafts import _preserved_attachment_inputs, get_draft, save_draft, send_saved_draft
+from app.services.integrations.google import (
+    MultipleSentGmailMessagesFound,
+    find_sent_gmail_message_by_rfc822_message_id,
+)
+from app.services.mailbox_drafts import (
+    MailDraftIdentityConflict,
+    _preserved_attachment_inputs,
+    delete_draft_by_id,
+    get_draft,
+    save_draft,
+    send_saved_draft,
+)
 from app.services.gmail_importer import (
     GMAIL_BACKFILL_JOB_PRIORITY,
     GMAIL_SEARCH_MAX_PAGES,
@@ -50,12 +63,22 @@ def draft_record(state: str = "saved") -> ClientDraftRecord:
     )
 
 
+def google_http_error(status: int) -> HttpError:
+    return HttpError(SimpleNamespace(status=status, reason="Provider rejection"), b"provider rejection")
+
+
 class MailboxDraftServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = SimpleNamespace(
             database_path="postgresql://example/db",
             backend_origin="http://127.0.0.1:3001",
         )
+        self.provider_lock_patch = patch(
+            "app.services.mailbox_drafts.shared_user_mail_lock",
+            return_value=nullcontext(),
+        )
+        self.provider_lock_patch.start()
+        self.addCleanup(self.provider_lock_patch.stop)
 
     def _save_response_draft(
         self,
@@ -120,6 +143,8 @@ class MailboxDraftServiceTests(unittest.TestCase):
             }
         }
         with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch(
             "app.services.mailbox_drafts.get_client_draft",
             return_value=draft_record(),
         ), patch("app.services.mailbox_drafts._local_draft_message", return_value=None), patch(
@@ -185,6 +210,8 @@ class MailboxDraftServiceTests(unittest.TestCase):
             }
         }
         with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch(
             "app.services.mailbox_drafts.get_client_draft",
             return_value=draft_record(),
         ), patch("app.services.mailbox_drafts._local_draft_message", return_value=None), patch(
@@ -206,6 +233,73 @@ class MailboxDraftServiceTests(unittest.TestCase):
         self.assertEqual(response.state, "saved")
         self.assertIn("Usable HTML draft", response.body_text)
         self.assertIsNotNone(response.body_html)
+
+    def test_get_draft_never_regresses_an_inflight_or_finalized_mapping(self) -> None:
+        for state in ("sending", "sent", "deleted"):
+            with self.subTest(state=state):
+                mapping = replace(
+                    draft_record(state="sent" if state == "sent" else "saved"),
+                    state=state,
+                    last_client_send_id="send-2" if state == "sending" else None,
+                )
+                with (
+                    patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True),
+                    patch("app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()),
+                    patch("app.services.mailbox_drafts.get_client_draft", return_value=mapping),
+                    patch("app.services.mailbox_drafts._local_draft_message", return_value=None),
+                    patch("app.services.mailbox_drafts.fetch_gmail_draft") as fetch,
+                    patch("app.services.mailbox_drafts.upsert_client_draft") as upsert,
+                ):
+                    response = get_draft(
+                        self.settings,
+                        user_id="user-1",
+                        mailbox_thread_id="draft-1",
+                    )
+
+                self.assertEqual(response.state, "failed" if state == "sending" else state)
+                fetch.assert_not_called()
+                upsert.assert_not_called()
+
+    def test_get_draft_does_not_bless_an_ambiguous_create_intent_hash(self) -> None:
+        body = base64.urlsafe_b64encode(b"Provider-observed body").decode("ascii").rstrip("=")
+        mapping = replace(
+            draft_record(),
+            state="creating",
+            content_hash="unconfirmed-newer-intent-hash",
+        )
+        payload = {
+            "message": {
+                "id": "message-1",
+                "threadId": "thread-1",
+                "labelIds": ["DRAFT"],
+                "payload": {
+                    "mimeType": "text/plain",
+                    "body": {"data": body},
+                },
+            }
+        }
+        with (
+            patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True),
+            patch("app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()),
+            patch("app.services.mailbox_drafts.get_client_draft", return_value=mapping),
+            patch("app.services.mailbox_drafts._local_draft_message", return_value=None),
+            patch("app.services.mailbox_drafts.fetch_gmail_draft", return_value=payload),
+            patch("app.services.mailbox_drafts.upsert_gmail_messages") as upsert_messages,
+            patch(
+                "app.services.mailbox_drafts.upsert_client_draft",
+                return_value=replace(mapping, state="saved"),
+            ) as upsert_draft,
+        ):
+            response = get_draft(
+                self.settings,
+                user_id="user-1",
+                mailbox_thread_id="draft-1",
+            )
+
+        imported = upsert_messages.call_args.args[1][0]
+        self.assertEqual(response.state, "saved")
+        self.assertNotEqual(imported.body_hash, mapping.content_hash)
+        self.assertEqual(upsert_draft.call_args.kwargs["content_hash"], imported.body_hash)
 
     @patch("app.services.mailbox_drafts._after_draft_change")
     @patch("app.services.mailbox_drafts.upsert_client_draft", return_value=draft_record())
@@ -245,6 +339,507 @@ class MailboxDraftServiceTests(unittest.TestCase):
         self.assertTrue(raw)
         self.assertEqual(mock_upsert.call_args.kwargs["client_draft_id"], "client-draft-1")
         self.assertEqual(mock_upsert.call_args.kwargs["gmail_message_id"], "message-1")
+
+    def test_create_checkpoints_provider_identity_before_best_effort_projection(self) -> None:
+        request = MailDraftSaveRequest(
+            client_draft_id="client-draft-1",
+            subject="Launch",
+            body_text="Draft body",
+            attachments=[],
+            created_at="2026-07-13T09:00:00+00:00",
+        )
+        states: list[str] = []
+
+        def checkpoint(*_args, **kwargs):
+            states.append(kwargs["state"])
+            return replace(
+                draft_record(),
+                gmail_draft_id=kwargs["gmail_draft_id"],
+                gmail_message_id=kwargs["gmail_message_id"],
+                gmail_thread_id=kwargs["gmail_thread_id"],
+                content_hash=kwargs["content_hash"],
+                state=kwargs["state"],
+            )
+
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=None), patch(
+            "app.services.mailbox_drafts.find_gmail_draft_by_rfc822_message_id", return_value=None
+        ), patch(
+            "app.services.mailbox_drafts.upsert_client_draft", side_effect=checkpoint
+        ), patch(
+            "app.services.mailbox_drafts.create_gmail_draft",
+            return_value={"id": "draft-1", "message": {"id": "message-1", "threadId": "thread-1"}},
+        ), patch(
+            "app.services.mailbox_drafts._import_gmail_message",
+            side_effect=GoogleCredentialsUnavailable("credentials expired after provider success"),
+        ), patch("app.services.mailbox_drafts._after_draft_change"):
+            response = save_draft(self.settings, user_id="user-1", request=request)
+
+        self.assertEqual(response.state, "saved")
+        self.assertEqual(response.gmail_draft_id, "draft-1")
+        self.assertEqual(states, ["creating", "saved"])
+
+    def test_delete_between_provider_create_and_checkpoint_never_persists_saved_mapping(self) -> None:
+        request = MailDraftSaveRequest(
+            client_draft_id="client-draft-1",
+            subject="Launch",
+            body_text="Draft body",
+            attachments=[],
+            created_at="2026-07-13T09:00:00+00:00",
+        )
+        states: list[str] = []
+        provider_deleted = False
+
+        def checkpoint(*_args, **kwargs):
+            states.append(kwargs["state"])
+            return replace(
+                draft_record(),
+                gmail_draft_id=kwargs["gmail_draft_id"],
+                gmail_message_id=kwargs["gmail_message_id"],
+                gmail_thread_id=kwargs["gmail_thread_id"],
+                content_hash=kwargs["content_hash"],
+                state=kwargs["state"],
+                error=kwargs.get("error"),
+            )
+
+        class LockHandle:
+            def adopt_gmail_draft_id(self, gmail_draft_id: str) -> None:
+                nonlocal provider_deleted
+                self_outer.assertEqual(gmail_draft_id, "draft-1")
+                deleted = delete_draft_by_id(
+                    self_outer.settings,
+                    user_id="user-1",
+                    gmail_draft_id=gmail_draft_id,
+                )
+                self_outer.assertTrue(deleted)
+                provider_deleted = True
+
+        @contextmanager
+        def draft_lock(*_args, **_kwargs):
+            yield LockHandle()
+
+        def verify_provider(*_args, **_kwargs):
+            if provider_deleted:
+                raise google_http_error(404)
+            return {"id": "draft-1", "message": {"id": "message-1", "threadId": "thread-1"}}
+
+        self_outer = self
+        with (
+            patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True),
+            patch("app.services.mailbox_drafts.client_draft_lock", side_effect=draft_lock),
+            patch("app.services.mailbox_drafts.get_client_draft", return_value=None),
+            patch("app.services.mailbox_drafts.find_gmail_draft_by_rfc822_message_id", return_value=None),
+            patch("app.services.mailbox_drafts.upsert_client_draft", side_effect=checkpoint),
+            patch(
+                "app.services.mailbox_drafts.create_gmail_draft",
+                return_value={"id": "draft-1", "message": {"id": "message-1", "threadId": "thread-1"}},
+            ),
+            patch("app.services.mailbox_drafts.fetch_gmail_draft", side_effect=verify_provider),
+            patch("app.services.mailbox_drafts._delete_draft_by_id_locked", return_value=True),
+            patch("app.services.mailbox_drafts._import_gmail_message") as import_message,
+        ):
+            response = save_draft(self.settings, user_id="user-1", request=request)
+
+        self.assertTrue(provider_deleted)
+        self.assertEqual(response.state, "failed")
+        self.assertEqual(states, ["creating", "deleted"])
+        self.assertNotIn("saved", states)
+        import_message.assert_not_called()
+
+    def test_provider_create_handoff_does_not_overwrite_a_waiters_newer_checkpoint(self) -> None:
+        request = MailDraftSaveRequest(
+            client_draft_id="client-draft-1",
+            subject="Older creator content",
+            body_text="Older body",
+            attachments=[],
+            created_at="2026-07-13T09:00:00+00:00",
+        )
+        creating = replace(
+            draft_record(),
+            gmail_draft_id=None,
+            gmail_message_id=None,
+            state="creating",
+            content_hash="creator-hash",
+        )
+        newer = replace(
+            draft_record(),
+            content_hash="newer-waiter-hash",
+            gmail_message_id="message-newer",
+        )
+        reads = iter([None, None, newer])
+        adopted: list[str] = []
+
+        class LockHandle:
+            def adopt_gmail_draft_id(self, gmail_draft_id: str) -> None:
+                adopted.append(gmail_draft_id)
+
+        @contextmanager
+        def draft_lock(*_args, **_kwargs):
+            yield LockHandle()
+
+        def checkpoint(*_args, **kwargs):
+            self.assertEqual(kwargs["state"], "creating")
+            return creating
+
+        with (
+            patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True),
+            patch("app.services.mailbox_drafts.client_draft_lock", side_effect=draft_lock),
+            patch("app.services.mailbox_drafts.get_client_draft", side_effect=lambda *_args, **_kwargs: next(reads)),
+            patch("app.services.mailbox_drafts.find_gmail_draft_by_rfc822_message_id", return_value=None),
+            patch("app.services.mailbox_drafts.upsert_client_draft", side_effect=checkpoint) as upsert,
+            patch(
+                "app.services.mailbox_drafts.create_gmail_draft",
+                return_value={"id": "draft-1", "message": {"id": "message-creator", "threadId": "thread-1"}},
+            ),
+            patch(
+                "app.services.mailbox_drafts.fetch_gmail_draft",
+                return_value={"id": "draft-1", "message": {"id": "message-newer", "threadId": "thread-1"}},
+            ),
+            patch("app.services.mailbox_drafts._import_gmail_message", return_value=sample_message()),
+            patch("app.services.mailbox_drafts._after_draft_change") as after_change,
+        ):
+            response = save_draft(self.settings, user_id="user-1", request=request)
+
+        self.assertEqual(response.state, "saved")
+        self.assertEqual(response.gmail_message_id, "message-newer")
+        self.assertEqual(adopted, ["draft-1"])
+        self.assertEqual([call.kwargs["state"] for call in upsert.call_args_list], ["creating"])
+        after_change.assert_not_called()
+
+    def test_provider_create_handoff_preserves_a_waiters_ambiguous_newer_create(self) -> None:
+        request = MailDraftSaveRequest(
+            client_draft_id="client-draft-1",
+            subject="Older creator content",
+            body_text="Older body",
+            attachments=[],
+            created_at="2026-07-13T09:00:00+00:00",
+        )
+        creator_checkpoint = replace(
+            draft_record(),
+            gmail_draft_id=None,
+            gmail_message_id=None,
+            state="creating",
+            content_hash="creator-hash",
+        )
+        newer_checkpoint = replace(
+            draft_record(),
+            state="creating",
+            content_hash="newer-waiter-hash",
+            gmail_message_id="message-newer",
+        )
+        reads = iter([None, None, newer_checkpoint])
+
+        class LockHandle:
+            def adopt_gmail_draft_id(self, _gmail_draft_id: str) -> None:
+                return None
+
+        @contextmanager
+        def draft_lock(*_args, **_kwargs):
+            yield LockHandle()
+
+        def checkpoint(*_args, **kwargs):
+            self.assertEqual(kwargs["state"], "creating")
+            return creator_checkpoint
+
+        with (
+            patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True),
+            patch("app.services.mailbox_drafts.client_draft_lock", side_effect=draft_lock),
+            patch("app.services.mailbox_drafts.get_client_draft", side_effect=lambda *_args, **_kwargs: next(reads)),
+            patch("app.services.mailbox_drafts.find_gmail_draft_by_rfc822_message_id", return_value=None),
+            patch("app.services.mailbox_drafts.upsert_client_draft", side_effect=checkpoint) as upsert,
+            patch(
+                "app.services.mailbox_drafts.create_gmail_draft",
+                return_value={"id": "draft-1", "message": {"id": "message-creator", "threadId": "thread-1"}},
+            ),
+            patch(
+                "app.services.mailbox_drafts.fetch_gmail_draft",
+                return_value={"id": "draft-1", "message": {"id": "message-newer", "threadId": "thread-1"}},
+            ),
+            patch("app.services.mailbox_drafts._import_gmail_message", return_value=sample_message()),
+            patch("app.services.mailbox_drafts._after_draft_change") as after_change,
+        ):
+            response = save_draft(self.settings, user_id="user-1", request=request)
+
+        self.assertEqual(response.state, "failed")
+        self.assertIn("newer draft save", response.error or "")
+        self.assertEqual([call.kwargs["state"] for call in upsert.call_args_list], ["creating"])
+        after_change.assert_not_called()
+
+    def test_delete_rejects_sending_or_sent_mapping_before_provider_mutation(self) -> None:
+        for state in ("sending", "sent"):
+            with self.subTest(state=state):
+                mapping = replace(
+                    draft_record(state="sent" if state == "sent" else "saved"),
+                    state=state,
+                    last_client_send_id="send-2",
+                )
+                with (
+                    patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True),
+                    patch("app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()),
+                    patch("app.services.mailbox_drafts.get_client_draft", return_value=mapping),
+                    patch("app.services.mailbox_drafts.fetch_gmail_draft") as fetch,
+                    patch("app.services.mailbox_drafts.delete_gmail_draft") as delete,
+                    patch("app.services.mailbox_drafts.mark_client_draft_deleted") as mark_deleted,
+                ):
+                    with self.assertRaisesRegex(MailDraftIdentityConflict, "cannot be deleted"):
+                        delete_draft_by_id(
+                            self.settings,
+                            user_id="user-1",
+                            gmail_draft_id="draft-1",
+                        )
+
+                fetch.assert_not_called()
+                delete.assert_not_called()
+                mark_deleted.assert_not_called()
+
+    def test_deleted_checkpoint_is_conditioned_against_send_states(self) -> None:
+        connection = Mock()
+        connection.execute.return_value.mappings.return_value.first.return_value = None
+        with (
+            patch("app.db.mail_groups.get_engine", return_value=object()),
+            patch(
+                "app.db.mail_groups.user_mail_write_transaction",
+                return_value=nullcontext(connection),
+            ),
+        ):
+            deleted = mail_group_db.mark_client_draft_deleted(
+                "postgresql://example/db",
+                user_id="user-1",
+                client_draft_id="client-draft-1",
+            )
+
+        self.assertIsNone(deleted)
+        sql = str(connection.execute.call_args.args[0])
+        self.assertIn("state NOT IN ('sending', 'sent')", sql)
+
+    def test_waiting_save_adopts_provider_lock_from_authoritative_reread_before_update(self) -> None:
+        request = MailDraftSaveRequest(
+            client_draft_id="client-draft-1",
+            subject="Changed after waiting",
+            body_text="Updated body",
+            attachments=[],
+            created_at="2026-07-13T09:00:00+00:00",
+        )
+        mapped = replace(draft_record(), content_hash="old-content")
+        reads = iter([None, mapped, mapped])
+        events: list[str] = []
+
+        class LockHandle:
+            def adopt_gmail_draft_id(self, gmail_draft_id: str) -> None:
+                self_outer.assertEqual(gmail_draft_id, "draft-1")
+                events.append("adopt")
+
+        @contextmanager
+        def draft_lock(*_args, **_kwargs):
+            yield LockHandle()
+
+        def fetch_existing(*_args, **_kwargs):
+            self.assertEqual(events, ["adopt"])
+            events.append("fetch")
+            return sample_message()
+
+        def update(*_args, **_kwargs):
+            events.append("update")
+            return {"id": "draft-1", "message": {"id": "message-1", "threadId": "thread-1"}}
+
+        self_outer = self
+        with (
+            patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True),
+            patch("app.services.mailbox_drafts.client_draft_lock", side_effect=draft_lock),
+            patch("app.services.mailbox_drafts.get_client_draft", side_effect=lambda *_args, **_kwargs: next(reads)),
+            patch("app.services.mailbox_drafts._gmail_draft_message", side_effect=fetch_existing),
+            patch("app.services.mailbox_drafts.update_gmail_draft", side_effect=update),
+            patch("app.services.mailbox_drafts.upsert_client_draft", return_value=mapped),
+            patch("app.services.mailbox_drafts._import_gmail_message", return_value=sample_message()),
+            patch("app.services.mailbox_drafts._after_draft_change"),
+        ):
+            response = save_draft(self.settings, user_id="user-1", request=request)
+
+        self.assertEqual(response.state, "saved")
+        self.assertEqual(events, ["adopt", "fetch", "update"])
+
+    def test_message_id_recovery_adopts_provider_lock_before_fetch_and_update(self) -> None:
+        creating = replace(
+            draft_record(),
+            gmail_draft_id=None,
+            gmail_message_id=None,
+            state="creating",
+            content_hash="old-content",
+        )
+        request = MailDraftSaveRequest(
+            client_draft_id=creating.client_draft_id,
+            subject="Recovered",
+            body_text="Recovered body",
+            attachments=[],
+            created_at=creating.created_at,
+        )
+        events: list[str] = []
+
+        class LockHandle:
+            def adopt_gmail_draft_id(self, gmail_draft_id: str) -> None:
+                self_outer.assertEqual(gmail_draft_id, "draft-1")
+                events.append("adopt")
+
+        @contextmanager
+        def draft_lock(*_args, **_kwargs):
+            yield LockHandle()
+
+        def fetch_existing(*_args, **_kwargs):
+            self.assertEqual(events, ["adopt"])
+            events.append("fetch")
+            return sample_message()
+
+        def update(*_args, **_kwargs):
+            events.append("update")
+            return {"id": "draft-1", "message": {"id": "message-1", "threadId": "thread-1"}}
+
+        def checkpoint(*_args, **kwargs):
+            return replace(
+                creating,
+                gmail_draft_id=kwargs["gmail_draft_id"],
+                gmail_message_id=kwargs["gmail_message_id"],
+                gmail_thread_id=kwargs["gmail_thread_id"],
+                content_hash=kwargs["content_hash"],
+                state=kwargs["state"],
+            )
+
+        self_outer = self
+        with (
+            patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True),
+            patch("app.services.mailbox_drafts.client_draft_lock", side_effect=draft_lock),
+            patch("app.services.mailbox_drafts.get_client_draft", return_value=creating),
+            patch(
+                "app.services.mailbox_drafts.find_gmail_draft_by_rfc822_message_id",
+                return_value={"id": "draft-1"},
+            ),
+            patch("app.services.mailbox_drafts._gmail_draft_message", side_effect=fetch_existing),
+            patch("app.services.mailbox_drafts.update_gmail_draft", side_effect=update),
+            patch("app.services.mailbox_drafts.upsert_client_draft", side_effect=checkpoint),
+            patch("app.services.mailbox_drafts._import_gmail_message", return_value=sample_message()),
+            patch("app.services.mailbox_drafts._after_draft_change"),
+        ):
+            response = save_draft(self.settings, user_id="user-1", request=request)
+
+        self.assertEqual(response.state, "saved")
+        self.assertEqual(events, ["adopt", "fetch", "update"])
+
+    def test_ambiguous_creating_draft_search_miss_never_blindly_recreates(self) -> None:
+        creating = replace(
+            draft_record(),
+            gmail_draft_id=None,
+            gmail_message_id=None,
+            state="creating",
+        )
+        request = MailDraftSaveRequest(
+            client_draft_id=creating.client_draft_id,
+            subject="Launch",
+            body_text="Draft body",
+            attachments=[],
+            created_at=creating.created_at,
+        )
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=creating), patch(
+            "app.services.mailbox_drafts.find_gmail_draft_by_rfc822_message_id", return_value=None
+        ), patch("app.services.mailbox_drafts.create_gmail_draft") as create:
+            response = save_draft(self.settings, user_id="user-1", request=request)
+
+        self.assertEqual(response.state, "failed")
+        self.assertIn("still being confirmed", response.error or "")
+        create.assert_not_called()
+
+    def test_saving_draft_while_send_is_pending_never_mutates_provider_draft(self) -> None:
+        request = MailDraftSaveRequest(
+            client_draft_id="client-draft-1",
+            gmail_draft_id="draft-1",
+            subject="Edited after send",
+            body_text="This must become a different draft.",
+            attachments=[],
+            created_at="2026-07-13T09:00:00+00:00",
+        )
+        sending = replace(draft_record(), state="sending", last_client_send_id="send-2")
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=sending), patch(
+            "app.services.mailbox_drafts.fetch_gmail_draft"
+        ) as fetch, patch("app.services.mailbox_drafts.update_gmail_draft") as update:
+            with self.assertRaisesRegex(MailDraftIdentityConflict, "being sent"):
+                save_draft(self.settings, user_id="user-1", request=request)
+
+        fetch.assert_not_called()
+        update.assert_not_called()
+
+    def test_definite_create_rejection_marks_checkpoint_failed(self) -> None:
+        request = MailDraftSaveRequest(
+            client_draft_id="client-draft-1",
+            subject="Rejected draft",
+            body_text="Draft body",
+            attachments=[],
+            created_at="2026-07-13T09:00:00+00:00",
+        )
+        creating = replace(
+            draft_record(),
+            gmail_draft_id=None,
+            gmail_message_id=None,
+            state="creating",
+        )
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=None), patch(
+            "app.services.mailbox_drafts.find_gmail_draft_by_rfc822_message_id", return_value=None
+        ), patch("app.services.mailbox_drafts.upsert_client_draft", return_value=creating) as upsert, patch(
+            "app.services.mailbox_drafts.create_gmail_draft", side_effect=google_http_error(400)
+        ):
+            response = save_draft(self.settings, user_id="user-1", request=request)
+
+        self.assertEqual(response.state, "failed")
+        self.assertEqual([entry.kwargs["state"] for entry in upsert.call_args_list], ["creating", "failed"])
+
+    def test_ambiguous_create_rejection_keeps_creating_checkpoint(self) -> None:
+        request = MailDraftSaveRequest(
+            client_draft_id="client-draft-1",
+            subject="Delayed draft",
+            body_text="Draft body",
+            attachments=[],
+            created_at="2026-07-13T09:00:00+00:00",
+        )
+        creating = replace(
+            draft_record(),
+            gmail_draft_id=None,
+            gmail_message_id=None,
+            state="creating",
+        )
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=None), patch(
+            "app.services.mailbox_drafts.find_gmail_draft_by_rfc822_message_id", return_value=None
+        ), patch("app.services.mailbox_drafts.upsert_client_draft", return_value=creating) as upsert, patch(
+            "app.services.mailbox_drafts.create_gmail_draft", side_effect=google_http_error(408)
+        ):
+            with self.assertRaises(HttpError):
+                save_draft(self.settings, user_id="user-1", request=request)
+
+        self.assertEqual([entry.kwargs["state"] for entry in upsert.call_args_list], ["creating"])
+
+    def test_durable_mapping_rejects_mismatched_provider_draft_before_mutation(self) -> None:
+        request = MailDraftSaveRequest(
+            client_draft_id="client-draft-1",
+            gmail_draft_id="another-draft",
+            subject="Launch",
+            body_text="Draft body",
+            attachments=[],
+            created_at="2026-07-13T09:00:00+00:00",
+        )
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=draft_record()), patch(
+            "app.services.mailbox_drafts.update_gmail_draft"
+        ) as update:
+            with self.assertRaises(MailDraftIdentityConflict):
+                save_draft(self.settings, user_id="user-1", request=request)
+
+        update.assert_not_called()
 
     def test_reply_draft_uses_response_recipient_thread_headers_and_quote(self) -> None:
         request = MailDraftSaveRequest(
@@ -653,16 +1248,197 @@ class MailboxDraftServiceTests(unittest.TestCase):
         _mock_send: Mock,
     ) -> None:
         mock_lock.return_value = nullcontext()
-
-        response = send_saved_draft(
-            self.settings,
-            user_id="user-1",
-            gmail_draft_id="draft-1",
-            request=SimpleNamespace(client_send_id="send-2", client_draft_id="client-draft-1"),
-        )
+        sending = replace(draft_record(), state="sending", last_client_send_id="send-2")
+        with patch(
+            "app.services.mailbox_drafts.mark_client_draft_sending",
+            return_value=sending,
+        ), patch("app.services.mailbox_drafts.restore_client_draft_after_definite_send_failure") as restore:
+            response = send_saved_draft(
+                self.settings,
+                user_id="user-1",
+                gmail_draft_id="draft-1",
+                request=SimpleNamespace(client_send_id="send-2", client_draft_id="client-draft-1"),
+            )
 
         self.assertEqual(response.state, "reauth_required")
         self.assertEqual(response.reauth_url, "http://127.0.0.1:3001/auth/google")
+        restore.assert_called_once()
+
+    def test_send_marks_sent_before_projection_and_projection_failure_stays_sent(self) -> None:
+        sending = replace(draft_record(), state="sending", last_client_send_id="send-2")
+        sent = replace(
+            draft_record(state="sent"),
+            last_client_send_id="send-2",
+            sent_message_id="sent-message-2",
+        )
+        order: list[str] = []
+
+        def mark_sent(*_args, **_kwargs):
+            order.append("sent-checkpoint")
+            return sent
+
+        def import_message(*_args, **_kwargs):
+            order.append("projection")
+            raise GoogleCredentialsUnavailable("credentials expired after provider success")
+
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=draft_record()), patch(
+            "app.services.mailbox_drafts.mark_client_draft_sending", return_value=sending
+        ), patch(
+            "app.services.mailbox_drafts.send_gmail_draft",
+            return_value={"id": "sent-message-2", "threadId": "thread-1"},
+        ), patch("app.services.mailbox_drafts.mark_client_draft_sent", side_effect=mark_sent), patch(
+            "app.services.mailbox_drafts._import_gmail_message", side_effect=import_message
+        ), patch("app.services.mailbox_drafts._after_draft_change"):
+            response = send_saved_draft(
+                self.settings,
+                user_id="user-1",
+                gmail_draft_id="draft-1",
+                request=SimpleNamespace(client_send_id="send-2", client_draft_id="client-draft-1"),
+            )
+
+        self.assertEqual(response.state, "sent")
+        self.assertEqual(order, ["sent-checkpoint", "projection"])
+
+    def test_sending_retry_search_miss_never_calls_provider_send_again(self) -> None:
+        sending = replace(draft_record(), state="sending", last_client_send_id="send-2")
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=sending), patch(
+            "app.services.mailbox_drafts.find_sent_gmail_message_by_rfc822_message_id", return_value=None
+        ), patch("app.services.mailbox_drafts.send_gmail_draft") as send:
+            response = send_saved_draft(
+                self.settings,
+                user_id="user-1",
+                gmail_draft_id="draft-1",
+                request=SimpleNamespace(client_send_id="send-2", client_draft_id="client-draft-1"),
+            )
+
+        self.assertEqual(response.state, "sending")
+        self.assertEqual(response.client_send_id, "send-2")
+        send.assert_not_called()
+
+    def test_definite_send_rejection_restores_saved_state(self) -> None:
+        sending = replace(draft_record(), state="sending", last_client_send_id="send-2")
+        restored = replace(sending, state="saved", error="Google rejected the send.")
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=draft_record()), patch(
+            "app.services.mailbox_drafts.mark_client_draft_sending", return_value=sending
+        ), patch(
+            "app.services.mailbox_drafts.send_gmail_draft", side_effect=google_http_error(400)
+        ), patch(
+            "app.services.mailbox_drafts.restore_client_draft_after_definite_send_failure",
+            return_value=restored,
+        ) as restore:
+            response = send_saved_draft(
+                self.settings,
+                user_id="user-1",
+                gmail_draft_id="draft-1",
+                request=SimpleNamespace(client_send_id="send-2", client_draft_id="client-draft-1"),
+            )
+
+        self.assertEqual(response.state, "failed")
+        restore.assert_called_once()
+
+    def test_ambiguous_send_rejection_keeps_sending_state(self) -> None:
+        sending = replace(draft_record(), state="sending", last_client_send_id="send-2")
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=draft_record()), patch(
+            "app.services.mailbox_drafts.mark_client_draft_sending", return_value=sending
+        ), patch(
+            "app.services.mailbox_drafts.send_gmail_draft", side_effect=google_http_error(409)
+        ), patch("app.services.mailbox_drafts.restore_client_draft_after_definite_send_failure") as restore:
+            response = send_saved_draft(
+                self.settings,
+                user_id="user-1",
+                gmail_draft_id="draft-1",
+                request=SimpleNamespace(client_send_id="send-2", client_draft_id="client-draft-1"),
+            )
+
+        self.assertEqual(response.state, "sending")
+        restore.assert_not_called()
+
+    def test_multiple_sent_matches_remain_ambiguous_without_finalizing(self) -> None:
+        sending = replace(draft_record(), state="sending", last_client_send_id="send-2")
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=sending), patch(
+            "app.services.mailbox_drafts.find_sent_gmail_message_by_rfc822_message_id",
+            side_effect=MultipleSentGmailMessagesFound("duplicate deliveries"),
+        ), patch("app.services.mailbox_drafts.mark_client_draft_sent") as mark_sent:
+            response = send_saved_draft(
+                self.settings,
+                user_id="user-1",
+                gmail_draft_id="draft-1",
+                request=SimpleNamespace(client_send_id="send-2", client_draft_id="client-draft-1"),
+            )
+
+        self.assertEqual(response.state, "sending")
+        self.assertIn("Multiple Sent copies", response.error or "")
+        mark_sent.assert_not_called()
+
+    def test_sending_retry_recovers_verified_sent_message_without_resending(self) -> None:
+        sending = replace(draft_record(), state="sending", last_client_send_id="send-2")
+        sent = replace(
+            draft_record(state="sent"),
+            last_client_send_id="send-2",
+            sent_message_id="sent-message-2",
+        )
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=sending), patch(
+            "app.services.mailbox_drafts.find_sent_gmail_message_by_rfc822_message_id",
+            return_value={"id": "sent-message-2", "threadId": "thread-1", "labelIds": ["SENT"]},
+        ), patch("app.services.mailbox_drafts.mark_client_draft_sent", return_value=sent), patch(
+            "app.services.mailbox_drafts._import_gmail_message", return_value=sample_message()
+        ), patch("app.services.mailbox_drafts._remove_local_messages"), patch(
+            "app.services.mailbox_drafts._after_draft_change"
+        ), patch("app.services.mailbox_drafts.send_gmail_draft") as send:
+            response = send_saved_draft(
+                self.settings,
+                user_id="user-1",
+                gmail_draft_id="draft-1",
+                request=SimpleNamespace(client_send_id="send-2", client_draft_id="client-draft-1"),
+            )
+
+        self.assertEqual(response.state, "sent")
+        self.assertEqual(response.gmail_message_id, "sent-message-2")
+        send.assert_not_called()
+
+    def test_sent_draft_rejects_a_different_send_identity(self) -> None:
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=draft_record(state="sent")), patch(
+            "app.services.mailbox_drafts.send_gmail_draft"
+        ) as send:
+            with self.assertRaises(MailDraftIdentityConflict):
+                send_saved_draft(
+                    self.settings,
+                    user_id="user-1",
+                    gmail_draft_id="draft-1",
+                    request=SimpleNamespace(client_send_id="send-2", client_draft_id="client-draft-1"),
+                )
+
+        send.assert_not_called()
+
+    def test_unmapped_draft_cannot_be_sent(self) -> None:
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.client_draft_lock", return_value=nullcontext()
+        ), patch("app.services.mailbox_drafts.get_client_draft", return_value=None), patch(
+            "app.services.mailbox_drafts.send_gmail_draft"
+        ) as send:
+            with self.assertRaises(MailDraftIdentityConflict):
+                send_saved_draft(
+                    self.settings,
+                    user_id="user-1",
+                    gmail_draft_id="draft-1",
+                    request=SimpleNamespace(client_send_id="send-2", client_draft_id="client-draft-1"),
+                )
+
+        send.assert_not_called()
 
     @patch("app.services.mailbox_drafts.fetch_gmail_attachment")
     @patch("app.services.mailbox_drafts.gmail_attachments_for_message")
@@ -697,6 +1473,51 @@ class MailboxDraftServiceTests(unittest.TestCase):
         )
 
 
+class GmailDraftRecoveryIntegrationTests(unittest.TestCase):
+    def test_sent_recovery_skips_draft_label_and_returns_verified_sent_message(self) -> None:
+        service = Mock()
+        messages = service.users.return_value.messages.return_value
+        messages.list.return_value.execute.return_value = {
+            "messages": [{"id": "draft-copy"}, {"id": "sent-copy"}],
+        }
+        messages.get.return_value.execute.side_effect = [
+            {"id": "draft-copy", "threadId": "thread-1", "labelIds": ["DRAFT"]},
+            {"id": "sent-copy", "threadId": "thread-1", "labelIds": ["SENT"]},
+        ]
+
+        with patch("app.services.integrations.google.create_gmail_service", return_value=service):
+            recovered = find_sent_gmail_message_by_rfc822_message_id(
+                SimpleNamespace(),
+                user_id="user-1",
+                rfc822_message_id="<draft.stable@example.test>",
+            )
+
+        self.assertEqual(recovered["id"] if recovered else None, "sent-copy")
+        self.assertEqual(
+            messages.list.call_args.kwargs["q"],
+            "in:sent rfc822msgid:<draft.stable@example.test>",
+        )
+
+    def test_sent_recovery_rejects_multiple_verified_messages(self) -> None:
+        service = Mock()
+        messages = service.users.return_value.messages.return_value
+        messages.list.return_value.execute.return_value = {
+            "messages": [{"id": "sent-copy-1"}, {"id": "sent-copy-2"}],
+        }
+        messages.get.return_value.execute.side_effect = [
+            {"id": "sent-copy-1", "threadId": "thread-1", "labelIds": ["SENT"]},
+            {"id": "sent-copy-2", "threadId": "thread-2", "labelIds": ["SENT"]},
+        ]
+
+        with patch("app.services.integrations.google.create_gmail_service", return_value=service):
+            with self.assertRaises(MultipleSentGmailMessagesFound):
+                find_sent_gmail_message_by_rfc822_message_id(
+                    SimpleNamespace(),
+                    user_id="user-1",
+                    rfc822_message_id="<draft.duplicated@example.test>",
+                )
+
+
 class MailboxDraftAndSearchRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(app)
@@ -714,6 +1535,43 @@ class MailboxDraftAndSearchRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json()["gmail_draft_id"], "draft-1")
+
+    @patch("app.api.routes.mailbox.save_draft", side_effect=MailDraftIdentityConflict("Draft identity mismatch."))
+    @patch("app.api.routes.mailbox.require_current_user")
+    def test_create_draft_route_returns_conflict_for_identity_mismatch(
+        self,
+        mock_user: Mock,
+        _mock_save: Mock,
+    ) -> None:
+        mock_user.return_value = SimpleNamespace(id="user-1")
+
+        response = self.client.post(
+            "/v1/mailbox/drafts",
+            json={"client_draft_id": "draft-client-1", "created_at": "2026-07-13T09:00:00+00:00"},
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"], "Draft identity mismatch.")
+
+    @patch(
+        "app.api.routes.mailbox.delete_draft_by_id",
+        side_effect=MailDraftIdentityConflict("This draft is being sent and cannot be deleted."),
+    )
+    @patch("app.api.routes.mailbox.require_current_user")
+    def test_delete_draft_route_returns_conflict_for_inflight_send(
+        self,
+        mock_user: Mock,
+        _mock_delete: Mock,
+    ) -> None:
+        mock_user.return_value = SimpleNamespace(id="user-1")
+
+        response = self.client.delete("/v1/mailbox/drafts/draft-1")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json()["detail"],
+            "This draft is being sent and cannot be deleted.",
+        )
 
     @patch("app.api.routes.mailbox.save_draft")
     @patch("app.api.routes.mailbox.require_current_user")

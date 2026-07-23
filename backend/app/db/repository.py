@@ -27,7 +27,11 @@ DEFAULT_USER_ID = os.getenv("APP_USER_ID", "local-user").strip() or "local-user"
 ALEMBIC_HEAD_REVISION = "20260723_0025"
 ALEMBIC_BASELINE_REVISION = ALEMBIC_HEAD_REVISION
 POSTGRES_URL_PREFIXES = ("postgres://", "postgresql://")
+ADVISORY_LOCK_POOL_SIZE = 10
+ADVISORY_LOCK_POOL_TIMEOUT_SECONDS = 30
+ADVISORY_LOCK_WAIT_TIMEOUT_SECONDS = 30
 _ENGINES: dict[str, Engine] = {}
+_ADVISORY_LOCK_ENGINES: dict[str, Engine] = {}
 _ENGINES_LOCK = Lock()
 logger = logging.getLogger(__name__)
 
@@ -146,12 +150,37 @@ def get_engine(database_path: str) -> Engine:
         return engine
 
 
+def get_advisory_lock_engine(database_path: str) -> Engine:
+    """Return a separate, bounded pool for session advisory locks.
+
+    Provider calls can hold advisory locks for seconds, so these connections
+    must not consume the ordinary repository pool. The hard cap also prevents
+    request concurrency from opening an unbounded number of PostgreSQL
+    sessions while provider I/O is slow.
+    """
+    url = _sqlalchemy_url(database_path)
+    with _ENGINES_LOCK:
+        engine = _ADVISORY_LOCK_ENGINES.get(url)
+        if engine is None:
+            engine = create_engine(
+                url,
+                pool_pre_ping=True,
+                pool_size=ADVISORY_LOCK_POOL_SIZE,
+                max_overflow=0,
+                pool_timeout=ADVISORY_LOCK_POOL_TIMEOUT_SECONDS,
+                pool_recycle=1800,
+            )
+            _ADVISORY_LOCK_ENGINES[url] = engine
+        return engine
+
+
 def dispose_cached_engines() -> None:
     """Dispose every process-cached DB pool once and clear the cache safely."""
 
     with _ENGINES_LOCK:
-        cached = list(_ENGINES.values())
+        cached = [*_ENGINES.values(), *_ADVISORY_LOCK_ENGINES.values()]
         _ENGINES.clear()
+        _ADVISORY_LOCK_ENGINES.clear()
     seen: set[int] = set()
     for engine in cached:
         identity = id(engine)
@@ -249,6 +278,16 @@ def get_user(database_path: str, user_id: str) -> StoredUser | None:
     """Load one app user."""
     with connect(database_path) as connection:
         row = connection.execute("SELECT * FROM users WHERE id = ? LIMIT 1", (user_id,)).fetchone()
+    return _to_user(row) if row is not None else None
+
+
+def get_user_by_google_subject(database_path: str, google_sub: str) -> StoredUser | None:
+    """Load an existing app user by Google's immutable subject identifier."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM users WHERE google_sub = ? LIMIT 1",
+            (google_sub.strip(),),
+        ).fetchone()
     return _to_user(row) if row is not None else None
 
 
@@ -621,6 +660,50 @@ def upsert_google_oauth_token(
             (user_id, token_json_encrypted, now),
         )
         row = connection.execute("SELECT * FROM google_oauth_tokens WHERE user_id = ?", (user_id,)).fetchone()
+    return _to_google_oauth_token(row)
+
+
+def reconnect_google_oauth_token(
+    database_path: str,
+    *,
+    user_id: str,
+    token_json_encrypted: str,
+    oauth_started_epoch: int,
+) -> StoredGoogleOAuthToken:
+    """Atomically clear deletion guards and persist a newer OAuth grant."""
+    now = utc_now_iso()
+    with connect(database_path) as connection:
+        connection.execute(
+            "SELECT set_config('electronic_mail.oauth_started_epoch', ?, TRUE)",
+            (str(oauth_started_epoch),),
+        )
+        connection.execute(
+            """
+            UPDATE users
+            SET google_disconnected_at = NULL,
+                google_data_delete_requested_at = NULL,
+                google_data_deleted_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, user_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO google_oauth_tokens (user_id, token_json_encrypted, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              token_json_encrypted = excluded.token_json_encrypted,
+              updated_at = excluded.updated_at
+            """,
+            (user_id, token_json_encrypted, now),
+        )
+        row = connection.execute(
+            "SELECT * FROM google_oauth_tokens WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("Failed to persist Google OAuth credentials")
     return _to_google_oauth_token(row)
 
 

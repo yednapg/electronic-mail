@@ -12,6 +12,7 @@ from fastapi import HTTPException, Request, status
 
 from app.core.config import Settings
 from app.db.models import StoredUser
+from app.db.user_mail_guard import UserMailWorkBlocked
 from app.db.repository import (
     DEFAULT_USER_ID,
     IdentityConflictError,
@@ -104,7 +105,21 @@ def auth_state_for_request(settings: Settings, request: Request, *, verify_googl
 
     has_token = get_google_oauth_token(str(settings.database_path), user_id=user.id) is not None
     if verify_google_credentials and has_token:
-        credential_status = check_user_google_credentials(settings, user_id=user.id, refresh_expired=True)
+        try:
+            credential_status = check_user_google_credentials(settings, user_id=user.id, refresh_expired=True)
+        except UserMailWorkBlocked:
+            # Disconnect and destructive-cleanup paths can deliberately retain
+            # the encrypted token when provider revocation has not yet been
+            # secured. The provider guard must continue rejecting that token,
+            # but the read-only state endpoint should report the durable
+            # disconnected state instead of turning it into a 500 response.
+            return GoogleAuthState(
+                available=True,
+                connected=False,
+                connect_url=f"{settings.backend_origin}/auth/google",
+                reauth_required=True,
+                error="Google is disconnected. Please sign in with Google again.",
+            )
         if not credential_status.connected:
             return GoogleAuthState(
                 available=True,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
@@ -11,7 +12,14 @@ from httplib2 import Response
 
 from app.db.mail_groups import GmailMessageRecord, MailGroupDetail, MailGroupRecord, PendingThreadActionRecord
 from app.main import app
-from app.services.mailbox_actions import ThreadActionIdempotencyConflict, _labels_after_action, enqueue_thread_action, rollback_failed_thread_action, run_pending_thread_action
+from app.services.mailbox_actions import (
+    _THREAD_ORDER_MEMBERSHIP_ACTIONS,
+    ThreadActionIdempotencyConflict,
+    _labels_after_action,
+    enqueue_thread_action,
+    rollback_failed_thread_action,
+    run_pending_thread_action,
+)
 
 
 def pending_action(state: str = "queued", action: str = "archive") -> PendingThreadActionRecord:
@@ -89,6 +97,12 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         self.event_patch = patch("app.services.mailbox_actions.emit_mailbox_event")
         self.event_patch.start()
         self.addCleanup(self.event_patch.stop)
+        self.provider_lock_patch = patch(
+            "app.services.mailbox_actions.shared_user_mail_lock",
+            return_value=nullcontext(),
+        )
+        self.provider_lock_patch.start()
+        self.addCleanup(self.provider_lock_patch.stop)
 
     def test_launch_actions_update_local_labels_optimistically(self) -> None:
         self.assertEqual(_labels_after_action(["INBOX"], "mark_unread"), ["INBOX", "UNREAD"])
@@ -97,6 +111,24 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         self.assertEqual(_labels_after_action(["SPAM", "UNREAD"], "not_spam"), ["UNREAD", "INBOX"])
         self.assertEqual(_labels_after_action(["INBOX"], "star"), ["INBOX", "STARRED"])
         self.assertEqual(_labels_after_action(["INBOX", "STARRED"], "unstar"), ["INBOX"])
+
+    def test_only_mailbox_membership_actions_require_authoritative_thread_order(self) -> None:
+        self.assertEqual(
+            _THREAD_ORDER_MEMBERSHIP_ACTIONS,
+            frozenset(
+                {
+                    "archive",
+                    "unarchive",
+                    "move_trash",
+                    "restore_trash",
+                    "mark_spam",
+                    "not_spam",
+                    "star",
+                    "unstar",
+                    "delete_forever",
+                }
+            ),
+        )
 
     def test_enqueue_thread_action_stores_local_state_and_enqueues_worker(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
@@ -219,7 +251,7 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
             "app.services.mailbox_actions.mark_pending_thread_action_applied", return_value=applied
         ) as mark_applied, patch(
             "app.services.mailbox_actions.enqueue_projection_refresh"
-        ) as refresh:
+        ) as refresh, patch("app.services.mailbox_actions.enqueue_job") as enqueue_order:
             response = run_pending_thread_action(settings, user_id="user-1", server_action_id="server-1")
 
         self.assertEqual(response.state, "applied")
@@ -227,6 +259,83 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         self.assertEqual([call.args[1] for call in archive.call_args_list], ["thread-a", "thread-b"])
         mark_applied.assert_called_once_with("postgresql://example/db", user_id="user-1", server_action_id="server-1")
         refresh.assert_called_once_with(settings, user_id="user-1", priority=10)
+        enqueue_order.assert_called_once_with(
+            "postgresql://example/db",
+            kind="gmail_thread_order_refresh",
+            queue="slow",
+            user_id="user-1",
+            dedupe_key="gmail-thread-order-refresh:user-1:membership-action",
+            priority=70,
+            payload={"user_id": "user-1", "target_history_id": None},
+            run_after_seconds=0,
+        )
+
+    def test_membership_refresh_runs_only_after_provider_and_durable_apply(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        record = pending_action(action="archive")
+        applied = replace(record, state="applied", applied_at="2026-05-21T09:01:00+00:00")
+        events: list[str] = []
+
+        def archive(*_args, **_kwargs):
+            events.append("provider")
+
+        def mark_applied(*_args, **_kwargs):
+            events.append("applied")
+            return applied
+
+        def enqueue(*_args, **_kwargs):
+            events.append("order_refresh")
+
+        with (
+            patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record),
+            patch("app.services.mailbox_actions.mark_pending_thread_action_applying"),
+            patch(
+                "app.services.mailbox_actions.list_messages_for_gmail_thread",
+                return_value=[sample_message("msg-1", "thread-a")],
+            ),
+            patch("app.services.mailbox_actions.archive_gmail_thread", side_effect=archive),
+            patch("app.services.mailbox_actions.mark_pending_thread_action_applied", side_effect=mark_applied),
+            patch("app.services.mailbox_actions.enqueue_job", side_effect=enqueue),
+            patch("app.services.mailbox_actions.enqueue_projection_refresh"),
+        ):
+            response = run_pending_thread_action(
+                settings,
+                user_id="user-1",
+                server_action_id="server-1",
+            )
+
+        self.assertEqual(response.state, "applied")
+        self.assertEqual(events, ["provider", "applied", "order_refresh"])
+
+    def test_provider_failure_does_not_enqueue_thread_order_refresh(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        record = pending_action(action="archive")
+
+        with (
+            patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record),
+            patch("app.services.mailbox_actions.mark_pending_thread_action_applying"),
+            patch(
+                "app.services.mailbox_actions.list_messages_for_gmail_thread",
+                return_value=[sample_message("msg-1", "thread-a")],
+            ),
+            patch(
+                "app.services.mailbox_actions.archive_gmail_thread",
+                side_effect=RuntimeError("provider unavailable"),
+            ),
+            patch("app.services.mailbox_actions.mark_pending_thread_action_applied") as mark_applied,
+            patch("app.services.mailbox_actions.mark_pending_thread_action_failed") as mark_failed,
+            patch("app.services.mailbox_actions.enqueue_job") as enqueue_order,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
+                run_pending_thread_action(
+                    settings,
+                    user_id="user-1",
+                    server_action_id="server-1",
+                )
+
+        mark_applied.assert_not_called()
+        enqueue_order.assert_not_called()
+        mark_failed.assert_called_once()
 
     def test_worker_resolves_canonical_gmail_thread_before_legacy_group_lookup(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
@@ -246,13 +355,14 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
             "app.services.mailbox_actions.mark_pending_thread_action_applied", return_value=applied
         ), patch(
             "app.services.mailbox_actions.enqueue_projection_refresh"
-        ):
+        ), patch("app.services.mailbox_actions.enqueue_job") as enqueue_order:
             response = run_pending_thread_action(settings, user_id="user-1", server_action_id="server-1")
 
         self.assertEqual(response.state, "applied")
         list_thread.assert_called_once_with("postgresql://example/db", user_id="user-1", gmail_thread_id="thread-a")
         get_detail.assert_not_called()
         mark_read.assert_called_once_with(settings, "thread-a", user_id="user-1")
+        enqueue_order.assert_not_called()
 
     def test_terminal_failure_rolls_back_optimistic_labels(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
@@ -267,7 +377,7 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         with (
             patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record),
             patch("app.services.mailbox_actions.list_messages_by_ids", return_value=[optimistic]),
-            patch("app.services.mailbox_actions.upsert_gmail_messages") as upsert_messages,
+            patch("app.services.mailbox_actions.force_update_gmail_message_labels") as update_labels,
             patch("app.services.mailbox_actions.rebuild_touched_mail_groups") as rebuild,
             patch("app.services.mailbox_actions.enqueue_projection_refresh") as refresh,
         ):
@@ -279,8 +389,8 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
 
         self.assertTrue(restored)
         self.assertEqual(
-            upsert_messages.call_args.args[1][0].label_ids,
-            ["INBOX", "UNREAD", "STARRED"],
+            update_labels.call_args.kwargs["labels_by_message_id"],
+            {"msg-1": ["INBOX", "UNREAD", "STARRED"]},
         )
         rebuild.assert_called_once_with(
             settings,
@@ -300,8 +410,8 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         ), patch(
             "app.services.mailbox_actions.get_mail_group_detail", return_value=detail
         ), patch(
-            "app.services.mailbox_actions.upsert_gmail_messages"
-        ) as upsert_messages, patch(
+            "app.services.mailbox_actions.force_update_gmail_message_labels"
+        ) as update_labels, patch(
             "app.services.mailbox_actions.rebuild_touched_mail_groups"
         ), patch("app.services.mailbox_actions.enqueue_job"), patch("app.services.mailbox_actions.enqueue_projection_refresh"):
             enqueue_thread_action(
@@ -315,8 +425,7 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
                 ),
             )
 
-        changed = upsert_messages.call_args.args[1][0]
-        self.assertEqual(changed.label_ids, ["UNREAD", "TRASH"])
+        self.assertEqual(update_labels.call_args.kwargs["labels_by_message_id"], {"msg-1": ["UNREAD", "TRASH"]})
 
         applied = replace(record, state="applied", applied_at="2026-05-21T09:01:00+00:00")
         with patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record), patch(
@@ -329,7 +438,7 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
             "app.services.mailbox_actions.mark_pending_thread_action_applied", return_value=applied
         ), patch(
             "app.services.mailbox_actions.enqueue_projection_refresh"
-        ):
+        ), patch("app.services.mailbox_actions.enqueue_job"):
             response = run_pending_thread_action(settings, user_id="user-1", server_action_id="server-1")
 
         self.assertEqual(response.action, "move_trash")
@@ -372,7 +481,7 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
             "app.services.mailbox_actions.mark_pending_thread_action_applied", return_value=applied
         ), patch(
             "app.services.mailbox_actions.enqueue_projection_refresh"
-        ):
+        ), patch("app.services.mailbox_actions.enqueue_job"):
             response = run_pending_thread_action(settings, user_id="user-1", server_action_id="server-1")
 
         self.assertEqual(response.action, "delete_forever")
@@ -397,6 +506,7 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
             patch("app.services.mailbox_actions.prune_empty_mail_groups"),
             patch("app.services.mailbox_actions.mark_pending_thread_action_applied", return_value=applied),
             patch("app.services.mailbox_actions.enqueue_projection_refresh"),
+            patch("app.services.mailbox_actions.enqueue_job"),
         ):
             response = run_pending_thread_action(
                 settings,
@@ -418,7 +528,7 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
 
         with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=(record, True)), patch(
             "app.services.mailbox_actions.list_messages_by_ids", return_value=[selected]
-        ) as list_by_ids, patch("app.services.mailbox_actions.upsert_gmail_messages") as upsert_messages, patch(
+        ) as list_by_ids, patch("app.services.mailbox_actions.force_update_gmail_message_labels") as update_labels, patch(
             "app.services.mailbox_actions.rebuild_touched_mail_groups"
         ), patch("app.services.mailbox_actions.enqueue_job"), patch("app.services.mailbox_actions.enqueue_projection_refresh"):
             enqueue_thread_action(
@@ -434,7 +544,7 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
             )
 
         list_by_ids.assert_called_once_with("postgresql://example/db", user_id="user-1", message_ids=["msg-2"])
-        self.assertEqual([message.message_id for message in upsert_messages.call_args.args[1]], ["msg-2"])
+        self.assertEqual(update_labels.call_args.kwargs["labels_by_message_id"], {"msg-2": ["UNREAD", "TRASH"]})
 
         applied = replace(record, state="applied", applied_at="2026-05-21T09:01:00+00:00")
         with patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record), patch(
@@ -447,11 +557,12 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
             "app.services.mailbox_actions.mark_pending_thread_action_applied", return_value=applied
         ), patch(
             "app.services.mailbox_actions.enqueue_projection_refresh"
-        ):
+        ), patch("app.services.mailbox_actions.enqueue_job") as enqueue_order:
             run_pending_thread_action(settings, user_id="user-1", server_action_id="server-1")
 
         move_message.assert_called_once_with(settings, "msg-2", user_id="user-1")
         move_thread.assert_not_called()
+        enqueue_order.assert_called_once()
 
     def test_target_message_mark_read_only_marks_selected_message(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
@@ -460,7 +571,7 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
 
         with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=(record, True)), patch(
             "app.services.mailbox_actions.list_messages_by_ids", return_value=[selected]
-        ) as list_by_ids, patch("app.services.mailbox_actions.upsert_gmail_messages") as upsert_messages, patch(
+        ) as list_by_ids, patch("app.services.mailbox_actions.force_update_gmail_message_labels") as update_labels, patch(
             "app.services.mailbox_actions.rebuild_touched_mail_groups"
         ), patch("app.services.mailbox_actions.enqueue_job"), patch("app.services.mailbox_actions.enqueue_projection_refresh"):
             enqueue_thread_action(
@@ -476,7 +587,7 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
             )
 
         list_by_ids.assert_called_once_with("postgresql://example/db", user_id="user-1", message_ids=["msg-2"])
-        self.assertEqual(upsert_messages.call_args.args[1][0].label_ids, ["INBOX"])
+        self.assertEqual(update_labels.call_args.kwargs["labels_by_message_id"], {"msg-2": ["INBOX"]})
 
         applied = replace(record, state="applied", applied_at="2026-05-21T09:01:00+00:00")
         with patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record), patch(
@@ -489,11 +600,12 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
             "app.services.mailbox_actions.mark_pending_thread_action_applied", return_value=applied
         ), patch(
             "app.services.mailbox_actions.enqueue_projection_refresh"
-        ):
+        ), patch("app.services.mailbox_actions.enqueue_job") as enqueue_order:
             run_pending_thread_action(settings, user_id="user-1", server_action_id="server-1")
 
         mark_message.assert_called_once_with(settings, "msg-2", user_id="user-1")
         mark_thread.assert_not_called()
+        enqueue_order.assert_not_called()
 
 
 class MailboxThreadActionRouteTests(unittest.TestCase):

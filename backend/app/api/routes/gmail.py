@@ -7,6 +7,7 @@ from googleapiclient.errors import HttpError
 
 from app.core.config import load_settings
 from app.core.error_safety import safe_google_error
+from app.db.user_mail_guard import shared_user_mail_lock
 from app.schemas.domain import GmailThreadMutationResponse
 from app.services.auth import require_current_user
 from app.services.integrations.google import (
@@ -25,7 +26,8 @@ def archive_thread(http_request: Request, thread_id: str) -> GmailThreadMutation
     user = require_current_user(settings, http_request)
     _require_google()
     try:
-        archive_gmail_thread_service(settings, thread_id, user_id=user.id)
+        with shared_user_mail_lock(str(settings.database_path), user_id=user.id):
+            archive_gmail_thread_service(settings, thread_id, user_id=user.id)
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=safe_google_error(exc, operation="archive")) from exc
     except HttpError as exc:
@@ -39,7 +41,8 @@ def unarchive_thread(http_request: Request, thread_id: str) -> GmailThreadMutati
     user = require_current_user(settings, http_request)
     _require_google()
     try:
-        unarchive_gmail_thread_service(settings, thread_id, user_id=user.id)
+        with shared_user_mail_lock(str(settings.database_path), user_id=user.id):
+            unarchive_gmail_thread_service(settings, thread_id, user_id=user.id)
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=safe_google_error(exc, operation="unarchive")) from exc
     except HttpError as exc:
@@ -53,7 +56,8 @@ def mark_thread_read(http_request: Request, thread_id: str) -> GmailThreadMutati
     user = require_current_user(settings, http_request)
     _require_google()
     try:
-        mark_gmail_thread_read(settings, thread_id, user_id=user.id)
+        with shared_user_mail_lock(str(settings.database_path), user_id=user.id):
+            mark_gmail_thread_read(settings, thread_id, user_id=user.id)
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=safe_google_error(exc, operation="mark-read")) from exc
     except HttpError as exc:

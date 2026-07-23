@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from app.core.error_safety import GoogleCredentialsUnavailable
 from app.db import jobs
+from app.services.mailbox_sends import MailSendConfirmationPending
 from app.workers import main as worker
 
 
@@ -162,6 +164,38 @@ class JobTerminalStateTests(unittest.TestCase):
             worker_id="worker-1",
         )
         fail.assert_not_called()
+
+    def test_ambiguous_send_worker_cycle_requeues_instead_of_completing(self) -> None:
+        gmail_job = replace(
+            _job(attempt_count=1, max_attempts=5),
+            kind="gmail_send_message",
+            payload={"user_id": "user-1", "server_send_id": "send-1"},
+        )
+        settings = SimpleNamespace(
+            database_path="postgresql://example/db",
+            release_sha="release-1",
+        )
+        with (
+            patch.object(worker, "renew_heartbeat"),
+            patch.object(worker, "claim_job", return_value=gmail_job),
+            patch.object(
+                worker,
+                "run_pending_send",
+                side_effect=MailSendConfirmationPending("delivery confirmation pending"),
+            ),
+            patch.object(worker, "fail_job", return_value=True) as fail,
+            patch.object(worker, "complete_job") as complete,
+        ):
+            worked = worker._run_worker_cycle(
+                settings,
+                worker_id="worker-1",
+                queues=["critical"],
+                heartbeat_interval=30,
+            )
+
+        self.assertTrue(worked)
+        fail.assert_called_once()
+        complete.assert_not_called()
 
 
 class _TransitionResult:

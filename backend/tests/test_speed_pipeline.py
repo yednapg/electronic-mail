@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
@@ -126,12 +127,18 @@ class SpeedPipelineTests(unittest.TestCase):
         self.importer_event_patch = patch("app.services.gmail_importer.emit_mailbox_event")
         self.importer_order_patch = patch("app.services.gmail_importer._refresh_gmail_thread_order_best_effort", return_value=True)
         self.worker_event_patch = patch("app.workers.main.emit_mailbox_event")
+        self.watch_lock_patch = patch(
+            "app.services.gmail_watch.shared_user_mail_lock",
+            return_value=nullcontext(),
+        )
         self.mock_importer_event = self.importer_event_patch.start()
         self.mock_importer_order = self.importer_order_patch.start()
         self.mock_worker_event = self.worker_event_patch.start()
+        self.watch_lock_patch.start()
         self.addCleanup(self.importer_event_patch.stop)
         self.addCleanup(self.importer_order_patch.stop)
         self.addCleanup(self.worker_event_patch.stop)
+        self.addCleanup(self.watch_lock_patch.stop)
 
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
     @patch("app.services.gmail_importer.enqueue_job")
@@ -478,6 +485,31 @@ class SpeedPipelineTests(unittest.TestCase):
 
         mock_delta.assert_called_once_with(self.settings, user_id="user-1", batch_size=100, target_history_id="123")
         mock_snapshot.assert_called_once_with(self.settings, user_id="user-1")
+
+    @patch("app.workers.main.retry_encrypted_google_token_revocation")
+    def test_worker_retries_abandoned_google_grant_from_encrypted_payload(
+        self,
+        mock_revoke: Mock,
+    ) -> None:
+        job = SimpleNamespace(
+            id="revocation-job-1",
+            payload_version=1,
+            kind="google_token_revoke",
+            payload={
+                "subject_hash": "subject-hash",
+                "token_json_encrypted": "encrypted-token-payload",
+            },
+            user_id=None,
+        )
+
+        _run_job(self.settings, job)
+
+        mock_revoke.assert_called_once_with(
+            self.settings,
+            job_id="revocation-job-1",
+            subject_hash="subject-hash",
+            token_json_encrypted="encrypted-token-payload",
+        )
 
     @patch("app.workers.main.get_import_state", return_value=SimpleNamespace(last_history_id="123"))
     @patch("app.workers.main.refresh_gmail_thread_order")
