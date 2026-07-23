@@ -60,6 +60,23 @@ class MacOSBetaPolicyTests(unittest.TestCase):
             },
         )
 
+    def test_beta_entitlements_add_only_the_local_library_validation_exception(self) -> None:
+        with (ROOT / "macos/ElectronicMail/ElectronicMail/Mac/ElectronicMail.entitlements").open("rb") as handle:
+            production = plistlib.load(handle)
+        with (ROOT / "macos/ElectronicMail/Config/Entitlements/ElectronicMail-Beta.entitlements").open("rb") as handle:
+            beta = plistlib.load(handle)
+
+        expected_production = {
+            "com.apple.security.app-sandbox": True,
+            "com.apple.security.files.user-selected.read-write": True,
+            "com.apple.security.network.client": True,
+        }
+        self.assertEqual(production, expected_production)
+        self.assertEqual(
+            beta,
+            expected_production | {"com.apple.security.cs.disable-library-validation": True},
+        )
+
     def test_default_and_canonical_public_inputs_validate_without_building(self) -> None:
         default = self.run_validation()
         self.assertEqual(default.returncode, 0, default.stderr)
@@ -128,7 +145,9 @@ class MacOSBetaPolicyTests(unittest.TestCase):
             'CODE_SIGNING_ALLOWED=NO',
             "ELECTRONIC_MAIL_LOCAL_BETA",
             'codesign --force --sign - --options runtime "$FRAMEWORK_PATH"',
-            'codesign --force --sign - --options runtime --entitlements "$ENTITLEMENTS_PATH" "$APP_PATH"',
+            'codesign --force --sign - --options runtime --entitlements "$BETA_ENTITLEMENTS_PATH" "$APP_PATH"',
+            '"$APP_PATH/Contents/MacOS/ElectronicMail" --electronic-mail-beta-launch-smoke',
+            '"$DMG_MOUNT_POINT/ElectronicMail.app/Contents/MacOS/ElectronicMail" --electronic-mail-beta-launch-smoke',
             'INFO_POLICY=local-beta',
             'REQUIRE_ADHOC_SIGNATURE=1',
             'REQUIRE_NOTARIZATION=0',
@@ -140,6 +159,8 @@ class MacOSBetaPolicyTests(unittest.TestCase):
             'shasum -a 256 -c "$CHECKSUM_NAME"',
             'github-prerelease-testing',
             'gatekeeper_acceptance_claimed',
+            '"hardened_runtime": True',
+            '"library_validation": False',
             '"performed": False',
         )
         for fragment in required_fragments:
@@ -152,6 +173,7 @@ class MacOSBetaPolicyTests(unittest.TestCase):
         self.assertIn('archive --format=tar "$SOURCE_COMMIT" -- macos/ElectronicMail', script)
         self.assertNotIn('ditto "$ROOT_DIR/macos/ElectronicMail"', script)
         self.assertIn("ElectronicMail-Beta-Info.plist", script)
+        self.assertIn("ElectronicMail-Beta.entitlements", script)
         self.assertNotIn("DEVELOPER_ID_APPLICATION", script)
         self.assertNotIn("APPLE_DEVELOPMENT_TEAM", script)
         self.assertNotIn("NOTARY_PROFILE", script)
@@ -160,8 +182,8 @@ class MacOSBetaPolicyTests(unittest.TestCase):
         self.assertNotIn("verify-macos-toolchain.sh", script)
         self.assertIn("local beta code must carry an ad-hoc signature", verifier)
         self.assertIn("local beta code must enable Hardened Runtime", verifier)
-        verifier = self.text("scripts/verify-macos-release.sh")
-        self.assertIn("local beta code must enable Hardened Runtime", verifier)
+        self.assertIn('SOURCE_BETA_ENTITLEMENTS=', verifier)
+        self.assertIn('"com.apple.security.cs.disable-library-validation": True', verifier)
 
     def test_beta_build_flag_cannot_leak_into_production_release(self) -> None:
         package_script = self.text("scripts/package-macos-beta.sh")
@@ -169,11 +191,19 @@ class MacOSBetaPolicyTests(unittest.TestCase):
         production_preflight = self.text("scripts/preflight-macos-release.sh")
         project = self.text("macos/ElectronicMail/Project.swift")
         generated_project = self.text("macos/ElectronicMail/ElectronicMail.xcodeproj/project.pbxproj")
+        mac_app = self.text("macos/ElectronicMail/ElectronicMail/Mac/ElectronicMailApp.swift")
 
         self.assertIn("ELECTRONIC_MAIL_LOCAL_BETA", package_script)
         for text in (production_release, production_preflight, project, generated_project):
             self.assertNotIn("ELECTRONIC_MAIL_LOCAL_BETA", text)
             self.assertNotIn("ElectronicMail-Beta-Info.plist", text)
+            self.assertNotIn("ElectronicMail-Beta.entitlements", text)
+            self.assertNotIn("--electronic-mail-beta-launch-smoke", text)
+
+        self.assertIn("#if ELECTRONIC_MAIL_LOCAL_BETA", mac_app)
+        self.assertEqual(mac_app.count("--electronic-mail-beta-launch-smoke"), 1)
+        self.assertIn("Darwin.exit(EXIT_SUCCESS)", mac_app)
+        self.assertEqual(package_script.count("--electronic-mail-beta-launch-smoke"), 2)
 
         self.assertIn('[ -n "$DEVELOPER_ID_APPLICATION" ] || fail', production_release)
         self.assertIn('[ -n "$NOTARY_PROFILE" ] || fail', production_release)
@@ -183,6 +213,7 @@ class MacOSBetaPolicyTests(unittest.TestCase):
         self.assertIn("INFO_POLICY=production", self.text("scripts/verify-launch.sh"))
         self.assertIn("SWIFT_ACTIVE_COMPILATION_CONDITIONS=", production_release)
         self.assertIn("SWIFT_ACTIVE_COMPILATION_CONDITIONS=", production_preflight)
+        self.assertIn('"com.apple.security.cs.disable-library-validation",', self.text("scripts/verify-macos-release.sh"))
 
     def test_beta_keychain_fallback_is_compiled_only_for_debug_or_explicit_beta(self) -> None:
         token_store = self.text("macos/ElectronicMail/ElectronicMail/Core/SessionTokenStore.swift")

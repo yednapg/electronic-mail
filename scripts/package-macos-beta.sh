@@ -150,7 +150,7 @@ DERIVED_DATA_PATH="$WORK_DIR/DerivedData"
 APP_PATH="$DERIVED_DATA_PATH/Build/Products/Release/ElectronicMail.app"
 DSYM_PATH="$DERIVED_DATA_PATH/Build/Products/Release/ElectronicMail.app.dSYM"
 FRAMEWORK_PATH="$APP_PATH/Contents/Frameworks/ElectronicMailCore.framework"
-ENTITLEMENTS_PATH="$SOURCE_COPY/ElectronicMail/Mac/ElectronicMail.entitlements"
+BETA_ENTITLEMENTS_PATH="$SOURCE_COPY/Config/Entitlements/ElectronicMail-Beta.entitlements"
 DMG_ROOT="$WORK_DIR/dmg-root"
 DMG_APP_PATH="$DMG_ROOT/ElectronicMail.app"
 BETA_README_PATH="$DMG_ROOT/README-BETA.txt"
@@ -214,7 +214,7 @@ echo "==> Building Electronic Mail local beta $VERSION ($BUILD_NUMBER) from $SOU
 
 echo "==> Applying explicit identity-free ad-hoc signatures"
 codesign --force --sign - --options runtime "$FRAMEWORK_PATH"
-codesign --force --sign - --options runtime --entitlements "$ENTITLEMENTS_PATH" "$APP_PATH"
+codesign --force --sign - --options runtime --entitlements "$BETA_ENTITLEMENTS_PATH" "$APP_PATH"
 
 APP_PATH="$APP_PATH" \
 EXPECTED_BACKEND_URL="$BACKEND_URL" \
@@ -227,6 +227,11 @@ INFO_POLICY=local-beta \
 REQUIRE_ADHOC_SIGNATURE=1 \
 REQUIRE_NOTARIZATION=0 \
 bash "$ROOT_DIR/scripts/verify-macos-release.sh"
+
+echo "==> Smoke-testing the signed app's dynamic-library launch policy"
+if ! "$APP_PATH/Contents/MacOS/ElectronicMail" --electronic-mail-beta-launch-smoke; then
+  fail "signed beta app failed its headless launch smoke"
+fi
 
 mkdir -p "$DMG_ROOT"
 ditto "$APP_PATH" "$DMG_APP_PATH"
@@ -250,6 +255,12 @@ Source commit: {source}
 Backend origin: {backend}
 Configuration: optimized Release, local-beta Keychain policy
 Architectures: arm64 and x86_64
+Hardened Runtime: enabled
+Library validation: disabled only for this identity-free local beta
+
+LIBRARY VALIDATION IS DISABLED IN THIS TEST BUILD. This narrow runtime
+exception lets the ad-hoc-signed app load its ad-hoc-signed embedded framework.
+The signed and notarized production release does not contain this exception.
 
 To install, drag ElectronicMail.app to the Applications shortcut. The app is
 named “Electronic Mail Beta” in Finder and in the menu bar. Because it is not
@@ -292,7 +303,7 @@ if not os.path.islink(applications) or os.readlink(applications) != "/Applicatio
 readme = os.path.join(root, "README-BETA.txt")
 with open(readme, encoding="utf-8") as handle:
     text = handle.read()
-for marker in ("UNNOTARIZED TEST SOFTWARE", "NOT A PRODUCTION RELEASE", "Gatekeeper-acceptance claim"):
+for marker in ("UNNOTARIZED TEST SOFTWARE", "NOT A PRODUCTION RELEASE", "LIBRARY VALIDATION IS DISABLED", "Gatekeeper-acceptance claim"):
     if marker not in text:
         raise SystemExit(f"mounted beta README is missing warning: {marker}")
 PY
@@ -307,6 +318,11 @@ INFO_POLICY=local-beta \
 REQUIRE_ADHOC_SIGNATURE=1 \
 REQUIRE_NOTARIZATION=0 \
 bash "$ROOT_DIR/scripts/verify-macos-release.sh"
+
+echo "==> Smoke-testing the mounted DMG app's dynamic-library launch policy"
+if ! "$DMG_MOUNT_POINT/ElectronicMail.app/Contents/MacOS/ElectronicMail" --electronic-mail-beta-launch-smoke; then
+  fail "mounted beta DMG app failed its headless launch smoke"
+fi
 
 hdiutil detach "$DMG_MOUNT_POINT" >/dev/null
 DMG_IS_MOUNTED=0
@@ -353,6 +369,9 @@ metadata = {
         "mode": "ad-hoc",
         "identity": "-",
         "developer_id": False,
+        "hardened_runtime": True,
+        "library_validation": False,
+        "runtime_exception_scope": "local-testing-beta-only",
     },
     "notarization": {
         "performed": False,
@@ -384,6 +403,10 @@ text = f"""# Electronic Mail {version} ({build}) — local testing beta
 > **Unnotarized test build.** This is an ad-hoc-signed local-testing artifact,
 > not a production release. No Developer ID, notarization, stapling, or
 > Gatekeeper-acceptance claim is made.
+>
+> Hardened Runtime remains enabled, but library validation is disabled only in
+> this beta so its identity-free app can load its ad-hoc embedded framework.
+> The production release forbids this runtime exception.
 
 - DMG: `{dmg}`
 - SHA-256: `{digest}`
@@ -400,7 +423,8 @@ override because this beta has not been notarized.
 
 Known distribution limitation: this artifact is intended only for trusted
 GitHub prerelease testers and must not replace the signed/notarized production
-release pipeline.
+release pipeline. It allows libraries signed outside an Apple Developer team,
+so run it only if the source commit and checksum match this release.
 """
 with open(path, "w", encoding="utf-8", newline="\n") as handle:
     handle.write(text)

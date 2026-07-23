@@ -40,13 +40,15 @@ npm run release:macos:beta
 
 No Developer ID identity or notarization credential is read. Any selected full Xcode can build this local-testing artifact; set `DEVELOPER_DIR` if needed. The script uses the Xcode Release configuration, forces `arm64` and `x86_64`, applies explicit ad-hoc signatures, and enables a local-beta-only non-synchronizing classic Keychain fallback because an identity-free app has no Apple team entitlement. The fallback flag is never supplied by production preflight or release scripts.
 
+Hardened Runtime remains enabled for the beta. An ad-hoc signature has no Apple Developer Team ID, so its embedded ad-hoc framework cannot satisfy Hardened Runtime's same-team library validation. The packaging path therefore applies a separate, exact beta entitlement set with `com.apple.security.cs.disable-library-validation` enabled. This is a narrow but meaningful security reduction: use the artifact only with trusted prerelease testers. The production entitlement file is unchanged, the production verifier explicitly forbids this exception, and the beta entitlement file is never referenced by the Xcode project, production preflight, or production release script.
+
 The DMG contains exactly:
 
 - `ElectronicMail.app`
 - an `Applications` symlink
 - `README-BETA.txt`, with the unnotarized warning and exact build binding
 
-Before returning success, the script verifies the compressed DMG, mounts it read-only, checks its exact contents, verifies both architectures, all bound Info.plist values, both privacy-manifest copies, strict ad-hoc signatures and entitlements, and then re-verifies the checksum manifest.
+Before returning success, the script verifies the compressed DMG, mounts it read-only, checks its exact contents, verifies both architectures, all bound Info.plist values, both privacy-manifest copies, strict ad-hoc signatures and the exact beta entitlement set, and then re-verifies the checksum manifest. A private beta-only headless launch mode exits before creating stores or UI; the packager runs it once after signing and once from the mounted DMG so dynamic-linker policy failures cannot pass static signature verification.
 
 Artifacts are written to `artifacts/macos-beta/`:
 
@@ -74,4 +76,4 @@ gh release create "v$VERSION-beta.$BUILD_NUMBER" \
   "artifacts/macos-beta/$STEM-SHA256SUMS.txt"
 ```
 
-Tell testers to use a dedicated Gmail account. For localhost builds, start the backend before opening the app. macOS may block an unnotarized download or require an explicit tester override; this beta path intentionally does not run `spctl` or claim that Gatekeeper will accept it. Record issues against the exact source SHA and DMG checksum in the metadata.
+Tell testers to use a dedicated Gmail account. For localhost builds, start the backend before opening the app. macOS may block an unnotarized download or require an explicit tester override; this beta path intentionally does not run `spctl` or claim that Gatekeeper will accept it. Library validation is disabled only in this local-testing artifact, so testers must verify the exact source SHA and DMG checksum recorded in the metadata before running it.
