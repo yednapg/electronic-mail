@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
@@ -186,6 +187,319 @@ def _postgres_integration_enabled() -> bool:
 )
 class UserMailGuardPostgresTests(unittest.TestCase):
     database_url = os.getenv("DATABASE_URL", "")
+
+    def test_fetched_attachment_only_message_replaces_metadata_payload(self) -> None:
+        user_id = f"guard-test-{uuid4()}"
+        message_id = f"attachment-only-{uuid4()}"
+        self._create_connected_user(user_id)
+        self.addCleanup(self._delete_test_user, user_id)
+
+        base = mail_groups.GmailMessageRecord(
+            user_id=user_id,
+            message_id=message_id,
+            gmail_thread_id=message_id,
+            history_id="1",
+            label_ids=["INBOX"],
+            internal_date=None,
+            subject="Attachment only",
+            sender="sender@example.test",
+            recipients={},
+            headers={},
+            snippet="Attached statement",
+            raw_payload={"payload": {"headers": []}},
+            html_body_sanitized=None,
+            html_render_document=None,
+            text_body=None,
+            extracted_signals={},
+            body_hash="metadata",
+            body_fetch_status="missing",
+            created_at="",
+            updated_at="",
+        )
+        mail_groups.upsert_gmail_messages(self.database_url, [base])
+        mail_groups.upsert_gmail_messages(
+            self.database_url,
+            [
+                replace(
+                    base,
+                    raw_payload={
+                        "payload": {
+                            "mimeType": "multipart/mixed",
+                            "parts": [
+                                {
+                                    "mimeType": "application/pdf",
+                                    "filename": "statement.pdf",
+                                    "body": {
+                                        "attachmentId": "attachment-1",
+                                        "size": 1024,
+                                    },
+                                }
+                            ],
+                        }
+                    },
+                    body_hash="full",
+                    body_fetch_status="fetched",
+                )
+            ],
+        )
+
+        messages = mail_groups.list_messages_for_gmail_thread(
+            self.database_url,
+            user_id=user_id,
+            gmail_thread_id=message_id,
+        )
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].body_fetch_status, "fetched")
+        parts = messages[0].raw_payload["payload"]["parts"]
+        self.assertEqual(parts[0]["body"]["attachmentId"], "attachment-1")
+
+    def test_body_fetch_bookkeeping_does_not_advance_mailbox_revision(self) -> None:
+        user_id = f"guard-test-{uuid4()}"
+        message_id = f"body-state-{uuid4()}"
+        self._create_connected_user(user_id)
+        self.addCleanup(self._delete_test_user, user_id)
+        self._insert_message(user_id, message_id)
+        revision_before = mail_groups.latest_gmail_mailbox_revision(
+            self.database_url,
+            user_id=user_id,
+        )
+
+        mail_groups.mark_gmail_messages_body_fetch_state(
+            self.database_url,
+            user_id=user_id,
+            message_ids=[message_id],
+            status="pending",
+        )
+        mail_groups.mark_gmail_messages_body_fetch_state(
+            self.database_url,
+            user_id=user_id,
+            message_ids=[message_id],
+            status="failed",
+            error="temporary attachment failure",
+        )
+
+        self.assertEqual(
+            mail_groups.latest_gmail_mailbox_revision(
+                self.database_url,
+                user_id=user_id,
+            ),
+            revision_before,
+        )
+        messages = mail_groups.list_messages_for_gmail_thread(
+            self.database_url,
+            user_id=user_id,
+            gmail_thread_id=message_id,
+        )
+        self.assertEqual(messages[0].body_fetch_status, "failed")
+        self.assertEqual(messages[0].body_fetch_error, "temporary attachment failure")
+
+    def test_stale_body_worker_cannot_downgrade_terminal_fetched_message(self) -> None:
+        user_id = f"guard-test-{uuid4()}"
+        message_id = f"body-race-{uuid4()}"
+        self._create_connected_user(user_id)
+        self.addCleanup(self._delete_test_user, user_id)
+        fetched = mail_groups.GmailMessageRecord(
+            user_id=user_id,
+            message_id=message_id,
+            gmail_thread_id=message_id,
+            history_id="1",
+            label_ids=["INBOX"],
+            internal_date=None,
+            subject="Attachment-only body race",
+            sender="sender@example.test",
+            recipients={},
+            headers={},
+            snippet="Attached statement",
+            raw_payload={
+                "payload": {
+                    "mimeType": "multipart/mixed",
+                    "parts": [
+                        {
+                            "mimeType": "application/pdf",
+                            "filename": "statement.pdf",
+                            "body": {"attachmentId": "attachment-1", "size": 1024},
+                        }
+                    ],
+                }
+            },
+            html_body_sanitized=None,
+            html_render_document=None,
+            text_body=None,
+            extracted_signals={},
+            body_hash="fetched-attachment",
+            body_fetch_status="fetched",
+            created_at="",
+            updated_at="",
+        )
+        mail_groups.upsert_gmail_messages(self.database_url, [fetched])
+
+        self.assertEqual(
+            mail_groups.mark_gmail_messages_body_fetch_state(
+                self.database_url,
+                user_id=user_id,
+                message_ids=[message_id],
+                status="pending",
+            ),
+            0,
+        )
+        self.assertEqual(
+            mail_groups.mark_gmail_messages_body_fetch_state(
+                self.database_url,
+                user_id=user_id,
+                message_ids=[message_id],
+                status="failed",
+                error="stale worker failure",
+            ),
+            0,
+        )
+        messages = mail_groups.list_messages_for_gmail_thread(
+            self.database_url,
+            user_id=user_id,
+            gmail_thread_id=message_id,
+        )
+        self.assertEqual(messages[0].body_fetch_status, "fetched")
+        self.assertIsNone(messages[0].body_fetch_error)
+
+    def test_stale_body_hydration_preserves_newer_labels_and_history(self) -> None:
+        user_id = f"guard-test-{uuid4()}"
+        message_id = f"body-metadata-race-{uuid4()}"
+        self._create_connected_user(user_id)
+        self.addCleanup(self._delete_test_user, user_id)
+        metadata = mail_groups.GmailMessageRecord(
+            user_id=user_id,
+            message_id=message_id,
+            gmail_thread_id=message_id,
+            history_id="200",
+            label_ids=["INBOX", "STARRED"],
+            internal_date=None,
+            subject="Newer metadata subject",
+            sender="sender@example.test",
+            recipients={"to": "recipient@example.test"},
+            headers={"subject": "Newer metadata subject"},
+            snippet="Metadata preview",
+            raw_payload={"payload": {"headers": []}},
+            html_body_sanitized=None,
+            html_render_document=None,
+            text_body=None,
+            extracted_signals={},
+            body_hash="metadata",
+            body_fetch_status="missing",
+            created_at="",
+            updated_at="",
+        )
+        mail_groups.upsert_gmail_messages(self.database_url, [metadata])
+        revision_before = mail_groups.latest_gmail_mailbox_revision(
+            self.database_url,
+            user_id=user_id,
+        )
+
+        mail_groups.update_gmail_message_bodies(
+            self.database_url,
+            [
+                replace(
+                    metadata,
+                    history_id="100",
+                    label_ids=["INBOX"],
+                    subject="Stale body-fetch subject",
+                    headers={"subject": "Stale body-fetch subject"},
+                    raw_payload={
+                        "payload": {
+                            "mimeType": "text/plain",
+                            "body": {"data": "RnVsbCBib2R5"},
+                        }
+                    },
+                    text_body="Full body",
+                    body_hash="full-body",
+                    body_fetch_status="fetched",
+                )
+            ],
+        )
+
+        messages = mail_groups.list_messages_for_gmail_thread(
+            self.database_url,
+            user_id=user_id,
+            gmail_thread_id=message_id,
+        )
+        self.assertEqual(messages[0].history_id, "200")
+        self.assertEqual(messages[0].label_ids, ["INBOX", "STARRED"])
+        self.assertEqual(messages[0].subject, "Newer metadata subject")
+        self.assertEqual(messages[0].text_body, "Full body")
+        self.assertEqual(messages[0].body_fetch_status, "fetched")
+        self.assertEqual(
+            mail_groups.latest_gmail_mailbox_revision(
+                self.database_url,
+                user_id=user_id,
+            ),
+            revision_before,
+        )
+
+    def test_stale_body_hydration_cannot_replace_a_concurrently_fetched_body(self) -> None:
+        user_id = f"guard-test-{uuid4()}"
+        message_id = f"body-content-race-{uuid4()}"
+        self._create_connected_user(user_id)
+        self.addCleanup(self._delete_test_user, user_id)
+        current = mail_groups.GmailMessageRecord(
+            user_id=user_id,
+            message_id=message_id,
+            gmail_thread_id=message_id,
+            history_id="200",
+            label_ids=["INBOX"],
+            internal_date=None,
+            subject="Concurrent body",
+            sender="sender@example.test",
+            recipients={},
+            headers={},
+            snippet="Preview",
+            raw_payload={
+                "payload": {
+                    "mimeType": "text/plain",
+                    "body": {"data": "Q3VycmVudCBmdWxsIGJvZHk"},
+                }
+            },
+            html_body_sanitized=None,
+            html_render_document=None,
+            text_body="Current full body",
+            extracted_signals={},
+            body_hash="current-body",
+            body_fetch_status="fetched",
+            created_at="",
+            updated_at="",
+        )
+        mail_groups.upsert_gmail_messages(self.database_url, [current])
+        stale_attachment_only = replace(
+            current,
+            raw_payload={
+                "payload": {
+                    "mimeType": "multipart/mixed",
+                    "parts": [
+                        {
+                            "mimeType": "application/pdf",
+                            "filename": "stale.pdf",
+                            "body": {"attachmentId": "stale-attachment", "size": 1024},
+                        }
+                    ],
+                }
+            },
+            text_body=None,
+            body_hash="stale-body",
+        )
+
+        self.assertEqual(
+            mail_groups.update_gmail_message_bodies(
+                self.database_url,
+                [stale_attachment_only],
+            ),
+            [],
+        )
+        messages = mail_groups.list_messages_for_gmail_thread(
+            self.database_url,
+            user_id=user_id,
+            gmail_thread_id=message_id,
+        )
+        self.assertEqual(messages[0].text_body, "Current full body")
+        self.assertEqual(messages[0].body_hash, "current-body")
+        self.assertEqual(messages[0].body_fetch_status, "fetched")
 
     def test_data_delete_blocks_stale_post_fetch_write(self) -> None:
         self._assert_destructive_race("data_delete")

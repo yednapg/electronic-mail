@@ -1382,10 +1382,12 @@ def build_group_detail_response(settings: Settings, *, user_id: str, group_id: s
         if _rebuild_missing_render_documents(settings, user_id=user_id, messages=canonical_messages):
             canonical_messages = list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=group_id) or canonical_messages
         if any(_needs_body_fetch(message) for message in canonical_messages):
-            if _fetch_body_for_reader_now(settings, user_id=user_id, gmail_thread_id=group_id):
-                canonical_messages = list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=group_id) or canonical_messages
-            if any(_needs_body_fetch(message) for message in canonical_messages):
-                _enqueue_body_fetch_for_gmail_thread(settings, user_id=user_id, gmail_thread_id=group_id, priority=90)
+            _enqueue_reader_body_fetch_best_effort(
+                settings,
+                user_id=user_id,
+                gmail_thread_id=group_id,
+                priority=90,
+            )
         messages = canonical_messages[offset : offset + limit]
         latest_message = max(canonical_messages, key=lambda item: item.internal_date or item.updated_at)
         return ThreadReaderResponse(
@@ -1411,10 +1413,12 @@ def build_group_detail_response(settings: Settings, *, user_id: str, group_id: s
     if _rebuild_missing_render_documents(settings, user_id=user_id, messages=detail.messages):
         detail = get_mail_group_detail(database_url, user_id=user_id, group_id=group_id) or detail
     if any(_needs_body_fetch(message) for message in detail.messages):
-        if _fetch_body_for_reader_now(settings, user_id=user_id, group_id=group_id):
-            detail = get_mail_group_detail(database_url, user_id=user_id, group_id=group_id) or detail
-        if any(_needs_body_fetch(message) for message in detail.messages):
-            _enqueue_body_fetch_for_group(settings, user_id=user_id, group_id=group_id, priority=90)
+        _enqueue_reader_body_fetch_best_effort(
+            settings,
+            user_id=user_id,
+            group_id=group_id,
+            priority=90,
+        )
     detail_messages = _expand_group_messages_to_canonical_threads(database_url, user_id=user_id, messages=detail.messages)
     if _rebuild_missing_render_documents(settings, user_id=user_id, messages=detail_messages):
         detail_messages = _expand_group_messages_to_canonical_threads(database_url, user_id=user_id, messages=detail.messages)
@@ -2658,6 +2662,7 @@ def _thread_message_from_gmail(message: GmailMessageRecord) -> ThreadMessage:
         bcc=message.recipients.get("bcc") if isinstance(message.recipients.get("bcc"), str) else None,
         subject=message.subject,
         body=message.text_body or message.snippet or "",
+        body_complete=not _needs_body_fetch(message),
         html_body=html_body,
         html_render_document=html_render_document,
         reader=build_thread_message_reader(
@@ -2689,6 +2694,8 @@ def _rebuild_missing_render_documents(settings: Settings, *, user_id: str, messa
 
 
 def _needs_body_fetch(message: GmailMessageRecord) -> bool:
+    if (message.body_fetch_status or "").lower() == "fetched":
+        return False
     return not has_persisted_renderable_body(
         text_body=message.text_body,
         html_body=message.html_body_sanitized,
@@ -2697,24 +2704,37 @@ def _needs_body_fetch(message: GmailMessageRecord) -> bool:
     )
 
 
-def _fetch_body_for_reader_now(
+def _enqueue_reader_body_fetch_best_effort(
     settings: Settings,
     *,
     user_id: str,
     group_id: str = "",
     gmail_thread_id: str = "",
-) -> bool:
+    priority: int,
+) -> None:
+    """Queue Gmail network work without making a reader request wait for it."""
     try:
-        from app.services.gmail_importer import run_gmail_body_fetch
-
-        return run_gmail_body_fetch(
-            settings,
-            user_id=user_id,
-            group_id=group_id,
-            gmail_thread_id=gmail_thread_id,
-        ) > 0
-    except Exception:
-        return False
+        if gmail_thread_id:
+            _enqueue_body_fetch_for_gmail_thread(
+                settings,
+                user_id=user_id,
+                gmail_thread_id=gmail_thread_id,
+                priority=priority,
+            )
+        elif group_id:
+            _enqueue_body_fetch_for_group(
+                settings,
+                user_id=user_id,
+                group_id=group_id,
+                priority=priority,
+            )
+    except Exception as exc:  # pragma: no cover - the cached reader must remain available.
+        logger.warning(
+            "Failed to enqueue reader body hydration user_id=%s thread_id=%s error=%s",
+            user_id,
+            gmail_thread_id or group_id,
+            type(exc).__name__,
+        )
 
 
 def _group_needs_body_warmup(messages: list[GmailMessageRecord]) -> bool:
@@ -2775,6 +2795,7 @@ def _enqueue_body_fetch_for_group(settings: Settings, *, user_id: str, group_id:
         dedupe_key=f"gmail-body-fetch:{user_id}:{group_id}",
         priority=priority,
         payload={"user_id": user_id, "group_id": group_id},
+        wake_existing=False,
     )
     return job.id
 
@@ -2788,6 +2809,7 @@ def _enqueue_body_fetch_for_gmail_thread(settings: Settings, *, user_id: str, gm
         dedupe_key=f"gmail-body-fetch-thread:{user_id}:{gmail_thread_id}",
         priority=priority,
         payload={"user_id": user_id, "gmail_thread_id": gmail_thread_id},
+        wake_existing=False,
     )
     return job.id
 
