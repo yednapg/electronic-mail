@@ -339,6 +339,7 @@ class MailboxSyncRouteTests(unittest.TestCase):
 
     def test_sse_format_and_last_event_id_parser(self) -> None:
         self.assertEqual(parse_last_event_id("42"), 42)
+        self.assertEqual(parse_last_event_id("0"), 0)
         self.assertIsNone(parse_last_event_id("not-a-number"))
         event = format_sse_event("mailbox-changed", {"ok": True}, event_id=42)
         self.assertIn("id: 42\n", event)
@@ -387,7 +388,7 @@ class MailboxSyncRouteTests(unittest.TestCase):
 class MailboxSSEConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_event_stream_offloads_blocking_database_poll(self) -> None:
         request = SimpleNamespace(
-            headers={},
+            headers={"last-event-id": "41"},
             is_disconnected=AsyncMock(return_value=False),
         )
         with (
@@ -407,9 +408,89 @@ class MailboxSSEConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             mailbox_routes.list_events_after,
             mailbox_routes.settings,
             user_id="user-1",
-            after_id=None,
+            after_id=41,
             limit=100,
         )
+
+    async def test_fresh_event_stream_uses_server_baseline_and_revision_handshake(self) -> None:
+        request = SimpleNamespace(
+            headers={},
+            is_disconnected=AsyncMock(return_value=False),
+        )
+        baseline = SimpleNamespace(id=88)
+        baseline_event = SimpleNamespace(
+            id=88,
+            event_type="thread-content-hydrated",
+            mailbox_label=None,
+            created_at="2026-07-23T10:00:00+00:00",
+            payload={"thread_id": "thread-88"},
+        )
+        state = SimpleNamespace(
+            model_dump=lambda **_kwargs: {
+                "connected": True,
+                "mailbox_revision": "rev-88",
+                "total_threads": 12,
+            }
+        )
+        with (
+            patch.object(
+                mailbox_routes,
+                "require_current_user",
+                return_value=SimpleNamespace(id="user-1"),
+            ),
+            patch.object(
+                mailbox_routes.asyncio,
+                "to_thread",
+                new=AsyncMock(side_effect=[baseline, state, [baseline_event]]),
+            ) as to_thread,
+        ):
+            response = await mailbox_routes.mailbox_events(request)
+            first_chunk = await response.body_iterator.__anext__()
+            second_chunk = await response.body_iterator.__anext__()
+            await response.body_iterator.aclose()
+
+        self.assertIn("event: sync-state", first_chunk)
+        self.assertIn("id: 87", first_chunk)
+        self.assertIn('"mailbox_revision":"rev-88"', first_chunk)
+        self.assertIn("event: thread-content-hydrated", second_chunk)
+        self.assertIn("id: 88", second_chunk)
+        self.assertEqual(to_thread.await_count, 3)
+        self.assertEqual(to_thread.await_args_list[0].args[0], mailbox_routes.latest_event)
+        self.assertEqual(to_thread.await_args_list[0].kwargs["user_id"], "user-1")
+        self.assertEqual(to_thread.await_args_list[1].args[0], mailbox_routes.build_mailbox_sync_state)
+        self.assertEqual(to_thread.await_args_list[2].args[0], mailbox_routes.list_events_after)
+        self.assertEqual(to_thread.await_args_list[2].kwargs["after_id"], 87)
+
+    async def test_fresh_empty_event_stream_establishes_zero_cursor(self) -> None:
+        request = SimpleNamespace(
+            headers={},
+            is_disconnected=AsyncMock(return_value=False),
+        )
+        state = SimpleNamespace(
+            model_dump=lambda **_kwargs: {
+                "connected": True,
+                "mailbox_revision": None,
+                "total_threads": 0,
+            }
+        )
+        with (
+            patch.object(
+                mailbox_routes,
+                "require_current_user",
+                return_value=SimpleNamespace(id="user-1"),
+            ),
+            patch.object(
+                mailbox_routes.asyncio,
+                "to_thread",
+                new=AsyncMock(side_effect=[None, state]),
+            ),
+        ):
+            response = await mailbox_routes.mailbox_events(request)
+            first_chunk = await response.body_iterator.__anext__()
+            await response.body_iterator.aclose()
+
+        self.assertIn("event: sync-state", first_chunk)
+        self.assertIn("id: 0", first_chunk)
 
 
 def _pubsub_data(email: str = "me@example.com", history_id: str = "123") -> str:

@@ -82,7 +82,11 @@ def parse_gmail_message(
     payload_part = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
     headers = _headers(payload_part)
     label_ids = [str(label) for label in payload.get("labelIds", []) if label]
-    html_body, text_body = _extract_bodies(payload_part)
+    html_body, text_body = _extract_bodies(
+        payload_part,
+        message_id=message_id,
+        attachment_resolver=inline_attachment_resolver,
+    )
     html_is_rich = _is_rich_email_html(html_body) if html_body else False
     sanitized_html = sanitize_email_html(html_body) if html_body and html_is_rich else None
     render_document = html_render_document(
@@ -242,6 +246,8 @@ def gmail_payload_has_renderable_body(payload: dict[str, Any]) -> bool:
     part = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
 
     def walk(node: dict[str, Any]) -> bool:
+        if _is_attachment_part(node):
+            return False
         mime_type = str(node.get("mimeType") or "").lower()
         body = node.get("body") if isinstance(node.get("body"), dict) else {}
         data = body.get("data") if isinstance(body, dict) else None
@@ -253,6 +259,43 @@ def gmail_payload_has_renderable_body(payload: dict[str, Any]) -> bool:
         return False
 
     return walk(part) if isinstance(part, dict) else False
+
+
+def gmail_payload_has_unresolved_text_body(payload: dict[str, Any]) -> bool:
+    """Return whether Gmail stored a text MIME body behind an unresolved attachment ID."""
+    part = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+
+    def walk(node: dict[str, Any]) -> bool:
+        if _is_attachment_part(node):
+            return False
+        mime_type = str(node.get("mimeType") or "").lower()
+        body = node.get("body") if isinstance(node.get("body"), dict) else {}
+        data = body.get("data") if isinstance(body, dict) else None
+        attachment_id = body.get("attachmentId") if isinstance(body, dict) else None
+        if (
+            mime_type in {"text/html", "text/plain"}
+            and isinstance(attachment_id, str)
+            and attachment_id
+            and not (isinstance(data, str) and data.strip())
+        ):
+            return True
+        for child in node.get("parts", []) if isinstance(node.get("parts"), list) else []:
+            if isinstance(child, dict) and walk(child):
+                return True
+        return False
+
+    return walk(part) if isinstance(part, dict) else False
+
+
+def mark_full_gmail_payload_body_fetch_status(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Mark a parsed Gmail full response terminal unless every body alternative is unresolved."""
+    has_resolved_body = any(
+        isinstance(parsed.get(field), str) and bool(str(parsed[field]).strip())
+        for field in ("text_body", "html_body_sanitized", "html_render_document")
+    )
+    unresolved_body = gmail_payload_has_unresolved_text_body(parsed.get("raw_payload") or {})
+    parsed["body_fetch_status"] = "missing" if unresolved_body and not has_resolved_body else "fetched"
+    return parsed
 
 
 def compact_text(value: str | None) -> str:
@@ -539,14 +582,39 @@ def _headers(part: dict[str, Any]) -> dict[str, str]:
     return headers
 
 
-def _extract_bodies(part: dict[str, Any]) -> tuple[str | None, str | None]:
+def _is_attachment_part(part: dict[str, Any]) -> bool:
+    mime_type = str(part.get("mimeType") or "").strip().lower()
+    filename = str(part.get("filename") or "").strip()
+    disposition = _headers(part).get("content-disposition", "").lower()
+    return mime_type == "message/rfc822" or bool(filename) or disposition.startswith("attachment")
+
+
+def _extract_bodies(
+    part: dict[str, Any],
+    *,
+    message_id: str,
+    attachment_resolver: InlineAttachmentResolver | None,
+) -> tuple[str | None, str | None]:
     html_parts: list[str] = []
     text_parts: list[str] = []
 
     def walk(node: dict[str, Any]) -> None:
+        if _is_attachment_part(node):
+            return
         mime_type = str(node.get("mimeType") or "").lower()
         body = node.get("body") if isinstance(node.get("body"), dict) else {}
         data = body.get("data") if isinstance(body, dict) else None
+        attachment_id = body.get("attachmentId") if isinstance(body, dict) else None
+        if (
+            mime_type in {"text/html", "text/plain"}
+            and not (isinstance(data, str) and data.strip())
+            and isinstance(attachment_id, str)
+            and attachment_id
+            and attachment_resolver is not None
+        ):
+            data = attachment_resolver(message_id, attachment_id)
+            if isinstance(data, str) and data:
+                body["data"] = data
         decoded = _decode_body(data) if isinstance(data, str) else ""
         if decoded:
             if mime_type == "text/html":
@@ -582,6 +650,8 @@ def _inline_image_data_urls(
     images: dict[str, str] = {}
 
     def walk(node: dict[str, Any]) -> None:
+        if str(node.get("mimeType") or "").strip().lower() == "message/rfc822":
+            return
         headers = _headers(node)
         content_id = _normalize_content_id(headers.get("content-id"))
         mime_type = str(node.get("mimeType") or "").lower()

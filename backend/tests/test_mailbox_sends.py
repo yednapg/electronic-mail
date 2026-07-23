@@ -15,7 +15,7 @@ from app.db.mail_groups import GmailMessageRecord, MailGroupDetail, MailGroupRec
 from app.main import app
 from app.schemas.domain import MailComposeRequest, MailReplyRequest, MailSendResponse
 from app.services.mail_groups import _thread_message_from_gmail
-from app.services.mailbox_sends import _perform_send, _raw_message, run_pending_send, send_compose, send_reply
+from app.services.mailbox_sends import _import_sent_message, _perform_send, _raw_message, run_pending_send, send_compose, send_reply
 
 
 def pending_send(state: str = "queued") -> PendingSendRecord:
@@ -99,6 +99,44 @@ def sample_message() -> GmailMessageRecord:
 class MailboxSendServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = SimpleNamespace(database_path="postgresql://example/db", backend_origin="http://127.0.0.1:3001")
+
+    def test_sent_import_resolves_large_text_body_and_marks_it_terminal(self) -> None:
+        encoded_body = base64.urlsafe_b64encode(b"Complete large sent body").decode("ascii").rstrip("=")
+        payload = {
+            "id": "sent-message-1",
+            "threadId": "sent-thread-1",
+            "labelIds": ["SENT"],
+            "payload": {
+                "mimeType": "text/plain",
+                "body": {"attachmentId": "large-sent-body", "size": 4096},
+            },
+        }
+        with patch(
+            "app.services.mailbox_sends.fetch_gmail_message",
+            return_value=payload,
+        ), patch(
+            "app.services.mailbox_sends.fetch_gmail_attachment",
+            return_value={"data": encoded_body},
+        ) as fetch_attachment, patch(
+            "app.services.mailbox_sends.upsert_gmail_messages"
+        ) as upsert_messages, patch(
+            "app.services.mailbox_sends.rebuild_touched_mail_groups"
+        ), patch("app.services.mailbox_sends.enqueue_projection_refresh"):
+            _import_sent_message(
+                self.settings,
+                user_id="user-1",
+                message_id="sent-message-1",
+            )
+
+        fetch_attachment.assert_called_once_with(
+            self.settings,
+            user_id="user-1",
+            message_id="sent-message-1",
+            attachment_id="large-sent-body",
+        )
+        imported = upsert_messages.call_args.args[1][0]
+        self.assertEqual(imported.text_body, "Complete large sent body")
+        self.assertEqual(imported.body_fetch_status, "fetched")
 
     @patch("app.services.mailbox_sends.upsert_pending_send")
     @patch("app.services.mailbox_sends.user_can_write_gmail", return_value=True)

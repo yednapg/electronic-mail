@@ -646,6 +646,7 @@ class ThreadMessage(BaseModel):
     bcc: str | None = None
     subject: str | None = None
     body: str
+    body_complete: bool = True
     html_body: str | None = None
     html_render_document: str | None = None
     reader: ThreadMessageReader | None = None

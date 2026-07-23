@@ -1165,7 +1165,10 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                       headers_json = excluded.headers_json,
                       snippet = excluded.snippet,
                       raw_payload_json = CASE
-                        WHEN excluded.html_render_document IS NOT NULL OR excluded.html_body_sanitized IS NOT NULL OR excluded.text_body IS NOT NULL
+                        WHEN excluded.body_fetch_status = 'fetched'
+                          OR excluded.html_render_document IS NOT NULL
+                          OR excluded.html_body_sanitized IS NOT NULL
+                          OR excluded.text_body IS NOT NULL
                         THEN excluded.raw_payload_json
                         ELSE gmail_messages.raw_payload_json
                       END,
@@ -1197,6 +1200,49 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                 _message_params(message),
             )
     return len(rows)
+
+
+def update_gmail_message_bodies(database_url: str, messages: Iterable[GmailMessageRecord]) -> list[str]:
+    """Persist full body data without allowing a stale body GET to overwrite mailbox metadata."""
+    rows = list(messages)
+    if not rows:
+        return []
+    user_ids = {message.user_id for message in rows}
+    if len(user_ids) != 1:
+        raise ValueError("A Gmail body write must contain exactly one user")
+    params = [_message_params(message) for message in rows]
+    if any(row["body_fetch_status"] != "fetched" for row in params):
+        raise ValueError("A Gmail body write must contain only terminal fetched messages")
+    updated_message_ids: list[str] = []
+    user_id = next(iter(user_ids))
+    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        for row in params:
+            result = connection.execute(
+                text(
+                    """
+                    UPDATE gmail_messages
+                    SET raw_payload_json = :raw_payload_json,
+                        html_body_sanitized = :html_body_sanitized,
+                        html_render_document = :html_render_document,
+                        text_body = :text_body,
+                        extracted_signals_json = :extracted_signals_json,
+                        body_hash = :body_hash,
+                        body_fetch_status = 'fetched',
+                        body_fetched_at = now(),
+                        body_fetch_error = NULL,
+                        render_doc_bytes = GREATEST(render_doc_bytes, :render_doc_bytes)
+                    WHERE user_id = :user_id
+                      AND message_id = :message_id
+                      AND body_fetch_status IS DISTINCT FROM 'fetched'
+                    RETURNING message_id
+                    """
+                ),
+                row,
+            )
+            updated_message_id = result.scalar_one_or_none()
+            if updated_message_id is not None:
+                updated_message_ids.append(str(updated_message_id))
+    return updated_message_ids
 
 
 def update_gmail_message_ai_titles(database_url: str, *, user_id: str, titles: dict[str, str], generated_at: str) -> int:
@@ -1251,10 +1297,10 @@ def mark_gmail_messages_body_fetch_state(
                 SET
                   body_fetch_status = :status,
                   body_fetched_at = CASE WHEN :status = 'fetched' THEN now() ELSE body_fetched_at END,
-                  body_fetch_error = :error,
-                  updated_at = now()
+                  body_fetch_error = :error
                 WHERE user_id = :user_id
                   AND message_id = ANY(:message_ids)
+                  AND (:status = 'fetched' OR body_fetch_status IS DISTINCT FROM 'fetched')
                 """
             ),
             {

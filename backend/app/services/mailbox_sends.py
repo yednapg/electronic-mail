@@ -34,7 +34,7 @@ from app.db.mail_groups import (
 )
 from app.db.repository import get_user
 from app.schemas.domain import MailComposeRequest, MailReplyRequest, MailSendResponse
-from app.services.email_extraction import parse_gmail_message
+from app.services.email_extraction import mark_full_gmail_payload_body_fetch_status, parse_gmail_message
 from app.services.integrations.google import (
     GMAIL_FULL_SCOPE,
     fetch_gmail_attachment,
@@ -468,11 +468,45 @@ def _enqueue_send_job(
 
 def _import_sent_message(settings: Settings, *, user_id: str, message_id: str) -> None:
     payload = fetch_gmail_message(settings, user_id=user_id, message_id=message_id, format="full")
-    parsed = parse_gmail_message(payload, user_id=user_id)
+    parsed = parse_gmail_message(
+        payload,
+        user_id=user_id,
+        inline_attachment_resolver=_gmail_body_attachment_resolver(settings, user_id=user_id),
+    )
+    parsed = mark_full_gmail_payload_body_fetch_status(parsed)
     record = GmailMessageRecord(created_at="", updated_at="", **parsed)
     upsert_gmail_messages(str(settings.database_path), [record])
     rebuild_touched_mail_groups(settings, user_id=user_id, message_ids=[record.message_id], use_ai=False)
     enqueue_projection_refresh(settings, user_id=user_id, priority=25)
+
+
+def _gmail_body_attachment_resolver(settings: Settings, *, user_id: str):
+    cache: dict[tuple[str, str], str | None] = {}
+
+    def resolve(message_id: str, attachment_id: str) -> str | None:
+        key = (message_id, attachment_id)
+        if key not in cache:
+            try:
+                payload = fetch_gmail_attachment(
+                    settings,
+                    user_id=user_id,
+                    message_id=message_id,
+                    attachment_id=attachment_id,
+                )
+                data = payload.get("data") if isinstance(payload, dict) else None
+                cache[key] = data if isinstance(data, str) and data else None
+            except GoogleCredentialsUnavailable:
+                raise
+            except HttpError as exc:
+                status = getattr(getattr(exc, "resp", None), "status", None)
+                if status in {401, 403, "401", "403"}:
+                    raise
+                cache[key] = None
+            except Exception:
+                cache[key] = None
+        return cache[key]
+
+    return resolve
 
 
 def _reply_context(
