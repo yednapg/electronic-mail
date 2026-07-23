@@ -56,9 +56,10 @@ export default function PrivacyPage() {
         <h2>Retention and deletion</h2>
         <p>
           Live mailbox-derived data is retained while your account is connected so the app can synchronize. You can
-          disconnect Google and request deletion using the app controls or by contacting support. Deleted data may
-          remain in protected backups for up to {config.backupRetentionDays} days before expiry. Legal or security
-          obligations may require limited records to be retained longer.
+          disconnect Google and request deletion using the app controls or by contacting support. Deleted data in
+          protected backups is scheduled to expire after {config.backupRetentionDays} days. An outage in the backup
+          expiry system may delay that deletion; access remains restricted while the overdue expiry is remediated.
+          Legal or security obligations may also require limited records to be retained longer.
         </p>
       </section>
       <section>

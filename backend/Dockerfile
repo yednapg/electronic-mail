@@ -14,7 +14,8 @@ WORKDIR /app
 
 COPY requirements.lock ./requirements.lock
 RUN python -m pip install --upgrade pip==26.1.2 \
-    && python -m pip install --no-deps --requirement requirements.lock
+    && python -m pip install --no-deps --requirement requirements.lock \
+    && python -m pip check
 
 COPY alembic.ini db_init.py ./
 COPY migrations ./migrations

@@ -103,23 +103,30 @@ Return `429` with `Retry-After`. Alert on sustained throttling, OAuth failures, 
 
 ## Backup and restore
 
-Managed PITR is the primary recovery mechanism. Also create encrypted, access-controlled logical backups from a private runner:
+Managed PITR is the primary recovery mechanism. Also create authenticated encrypted, access-controlled logical backups from a private runner. Provision a dedicated 32-byte backup key as exactly 64 lowercase hexadecimal characters (for example, from a managed KMS-backed secret), keep it separate from application encryption keys, and install the repository's exact locked Python environment before running the job:
 
 ```bash
-DATABASE_URL='postgresql://…' BACKUP_DIR=/secure/backups ./scripts/backup-postgres.sh
+BACKUP_ENCRYPTION_KEY="$BACKUP_KEY_FROM_SECRET_STORE" \
+DATABASE_URL='postgresql://…' \
+BACKUP_DIR=/secure/backups \
+LEGAL_BACKUP_RETENTION_DAYS=14 \
+./scripts/backup-postgres.sh
 ```
 
-Copy backups off-host to versioned encrypted object storage. The local script creates mode-restricted custom-format dumps and atomic SHA-256 sidecars, prevents concurrent runs, and applies the 14-day local retention policy only after a new backup completes; a failed run never prunes the last known-good recovery point. If a runner is forcibly terminated and leaves `.electronic-mail-backup.lock`, first prove no backup process is running before removing that lock manually. Restore only into an isolated database first:
+The script verifies the installed `cryptography` version against `backend/requirements.lock`, streams the custom-format dump directly through AES-256-GCM, and atomically publishes only a mode-0600 `.dump.enc` artifact plus its SHA-256 transport-integrity sidecar. It never writes the plaintext dump or encryption key to a temporary file. The key and raw database URL are removed from the inherited environment before any external helper runs; the key is exposed only to the pinned crypto helper during validation and encryption, while the raw URL is exposed only to the sanitizer. Copy the encrypted artifacts off-host to versioned encrypted object storage and retain the corresponding secret version for the full retention window.
+
+The backup job prevents concurrent runs and removes local artifacts whose exact age exceeds `LEGAL_BACKUP_RETENTION_DAYS` (14 days by default) only after a new encrypted backup completes; a failed run never prunes the last known-good recovery point. This is a recovery-safety policy, not a hard deletion guarantee: monitor the scheduled job and alert on any overdue encrypted artifact, because a prolonged runner outage delays local expiry. The published privacy notice discloses that operational exception. Managed object storage must have an independently configured lifecycle rule and alert so its expiry does not depend on this backup command. If a runner is forcibly terminated and leaves `.electronic-mail-backup.lock`, first prove no backup process is running before removing that lock manually. Restore only into an isolated database first:
 
 ```bash
 CONFIRM_RESTORE=RESTORE \
+BACKUP_ENCRYPTION_KEY="$BACKUP_KEY_FROM_SECRET_STORE" \
 RESTORE_DATABASE_URL='postgresql://…/electronic_mail_restore' \
 EXPECTED_RESTORE_DATABASE=electronic_mail_restore \
-BACKUP_FILE=/secure/backups/electronic-mail-TIMESTAMP.dump \
+BACKUP_FILE=/secure/backups/electronic-mail-TIMESTAMP.dump.enc \
 ./scripts/restore-postgres.sh
 ```
 
-`EXPECTED_RESTORE_DATABASE` must exactly match the URL database name, preventing a copied command from silently targeting another database. The default target class is `isolated` and rejects the conventional primary database names. A reviewed production restore additionally requires `RESTORE_TARGET_CLASS=production` and `CONFIRM_PRODUCTION_RESTORE=RESTORE_PRODUCTION_DATABASE`; do not use that path for routine drills. After restore, run migrations, `/ready`, data-count checks, and a Gmail sync using a test account before switching traffic. Record a quarterly restore drill with restore time and data-loss window.
+Restore verifies the SHA-256 sidecar and authenticates the complete AES-GCM archive before streaming plaintext directly into a single-transaction `pg_restore`; it never stores a decrypted dump or key on disk. The key and raw restore URL are removed from the inherited environment before any external helper runs. The key is exposed only to the pinned crypto helper during validation and decryption, while the raw URL is exposed only to the sanitizer; neither reaches `pg_restore`. `ALLOW_UNVERIFIED_RESTORE=1` can bypass a missing sidecar only for a reviewed isolated recovery; it never bypasses authenticated decryption and is rejected for `RESTORE_TARGET_CLASS=production`. `EXPECTED_RESTORE_DATABASE` must exactly match the URL database name, preventing a copied command from silently targeting another database. The default target class is `isolated` and rejects the conventional primary database names. A reviewed production restore additionally requires `RESTORE_TARGET_CLASS=production` and `CONFIRM_PRODUCTION_RESTORE=RESTORE_PRODUCTION_DATABASE`; do not use that path for routine drills. After restore, run migrations, `/ready`, data-count checks, and a Gmail sync using a test account before switching traffic. Record a quarterly restore drill with restore time and data-loss window.
 
 ## Deploy and rollback
 

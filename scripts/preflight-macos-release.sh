@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=macos-release-toolchain.env
+source "$ROOT_DIR/scripts/macos-release-toolchain.env"
 PREFLIGHT_WORK_DIR="${PREFLIGHT_WORK_DIR:-/tmp/ElectronicMailReleasePreflight}"
 VERSION="${VERSION:-0.0.0}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
@@ -21,6 +23,12 @@ fail() {
 for command in date lipo plutil python3; do
   command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
+
+DEVELOPER_DIR="${DEVELOPER_DIR:-$APPROVED_DEVELOPER_DIR}"
+EXPECTED_XCODE_VERSION="${EXPECTED_XCODE_VERSION:-$APPROVED_XCODE_VERSION}"
+EXPECTED_XCODE_BUILD="${EXPECTED_XCODE_BUILD:-$APPROVED_XCODE_BUILD}"
+export DEVELOPER_DIR EXPECTED_XCODE_VERSION EXPECTED_XCODE_BUILD
+bash "$ROOT_DIR/scripts/verify-macos-toolchain.sh"
 
 python3 - "$BACKEND_URL" <<'PY'
 import sys

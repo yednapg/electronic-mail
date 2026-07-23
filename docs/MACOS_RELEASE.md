@@ -8,7 +8,7 @@ The public artifact must be a universal (`arm64` + `x86_64`) Developer ID-signed
 
 ## Credential-free preflight
 
-Run this first on any Mac with full Xcode. It never reads a signing identity or notarization credential and produces only an explicitly non-distributable, identity-free app under `/tmp`. The linker may add an ad-hoc marker, but the verifier rejects any certificate authority or Apple team identity:
+Run this first on a Mac with the reviewed release toolchain: Xcode 16.4, build 16F6, installed at `/Applications/Xcode_16.4.app/Contents/Developer`. The approved version, build, and path live in `scripts/macos-release-toolchain.env`; both preflight and release fail closed on any mismatch. Preflight never reads a signing identity or notarization credential and produces only an explicitly non-distributable, identity-free app under `/tmp`. The linker may add an ad-hoc marker, but the verifier rejects any certificate authority or Apple team identity:
 
 ```bash
 npm run release:macos:preflight
@@ -65,7 +65,7 @@ npm run release:macos:validate
 1. Enroll the legal publisher in the Apple Developer Program.
 2. Register `app.electronicmail.mac` under that team.
 3. Create and install a **Developer ID Application** certificate with its private key.
-4. Use stable, public Xcode—not an Xcode beta—for the distributable build.
+4. Install the approved stable public Xcode 16.4 (build 16F6) at `/Applications/Xcode_16.4.app`; beta, unversioned, newer, and older toolchains are rejected until the reviewed pin is deliberately updated.
 5. Create App Store Connect notarization credentials and store them in Keychain:
 
 ```bash
@@ -93,13 +93,13 @@ npm run release:macos
 
 The release script:
 
-1. rejects placeholder/local backend origins, beta Xcode, missing credentials, missing signing identities, and a dirty production source tree;
+1. requires `/Applications/Xcode_16.4.app/Contents/Developer` to report exactly Xcode 16.4 build 16F6, and rejects beta or drifted toolchains, placeholder/local backend origins, missing credentials, missing signing identities, and a dirty production source tree;
 2. creates a signed universal archive and requires matching universal dSYMs;
 3. verifies Developer ID authority/team, Hardened Runtime, minimal sandbox entitlements, the team-bound application identifier, privacy manifest, icon, and injected configuration;
 4. notarizes and staples the app;
 5. creates and signs the DMG, then notarizes, staples, and Gatekeeper-assesses both deliverables;
 6. packages the final ZIP only after the app is stapled, then reopens and fully verifies both the ZIP and mounted DMG contents;
-7. requires clean notarization logs with no reported issues, writes those logs, submission results, release metadata, dSYMs, and the final archive under `artifacts/macos/`, then generates and immediately re-verifies the SHA-256 manifest.
+7. requires clean notarization logs with no reported issues, records the exact approved Xcode version/build in release metadata, writes those logs, submission results, metadata, dSYMs, and the final archive under `artifacts/macos/`, then generates and immediately re-verifies the SHA-256 manifest.
 
 `SKIP_NOTARIZATION=1` is only for debugging the signing/package pipeline. It writes to `artifacts/macos-local-unnotarized/`, adds `NOT_FOR_DISTRIBUTION.txt`, and must never be published.
 
@@ -115,7 +115,7 @@ The manually dispatched **Build notarized macOS release** workflow uses the prot
 - `APP_STORE_CONNECT_ISSUER_ID`
 - `APP_STORE_CONNECT_PRIVATE_KEY_BASE64`
 
-The workflow only releases the reviewed `main` branch and requires a successful **Quality and release gates** push run for that exact commit. It validates the requested version/build/backend and runs native tests plus an exact-candidate credential-free preflight in a separate `macos-15` job. Only after those checks succeed does the protected release job gain access to signing/notarization credentials. Release-job actions are pinned to reviewed commit hashes. The workflow uploads a private artifact for review with 90-day GitHub retention; it deliberately does not create a public GitHub Release or publish a download automatically. Before publication, copy the candidate, dSYMs, notarization records, checksums, metadata, and approval record into the publisher's access-controlled durable archive. GitHub artifact retention is not that archive.
+The workflow only releases the reviewed `main` branch and requires a successful **Quality and release gates** push run for that exact commit. Quality, credential-free preflight, and protected release jobs all set the same versioned `DEVELOPER_DIR` and independently verify Xcode 16.4 build 16F6 before building. It validates the requested version/build/backend and runs native tests plus an exact-candidate credential-free preflight in a separate `macos-15` job. Only after those checks succeed does the protected release job gain access to signing/notarization credentials. The launch verifier rejects metadata from any other Xcode version/build. Release-job actions are pinned to reviewed commit hashes. The workflow uploads a private artifact for review with 90-day GitHub retention; it deliberately does not create a public GitHub Release or publish a download automatically. Before publication, copy the candidate, dSYMs, notarization records, checksums, metadata, and approval record into the publisher's access-controlled durable archive. GitHub artifact retention is not that archive.
 
 ## Debug versus Release Keychain policy
 

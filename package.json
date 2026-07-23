@@ -60,7 +60,7 @@
     "release:macos": "bash scripts/release-macos.sh",
     "verify": "npm run verify:macos",
     "verify:macos": "npm run macos:typecheck && npm run macos:test",
-    "verify:all": "npm run reproducibility:verify:test && npm run reproducibility:verify && npm run verify:macos && npm run backend:test && npm run backend:compile && npm run database:scripts:test && npm run web:typecheck && npm run web:test && npm run web:build && npm run web:verify:assets:test && npm run web:verify:assets && npm run launch:verify:test && npm run security:audit"
+    "verify:all": "npm run reproducibility:verify && npm run reproducibility:verify:test && npm run verify:macos && npm run backend:test && npm run backend:compile && npm run database:scripts:test && npm run web:typecheck && npm run web:test && npm run web:build && npm run web:verify:assets:test && npm run web:verify:assets && npm run launch:verify:test && npm run security:audit"
   },
   "overrides": {
     "next": {

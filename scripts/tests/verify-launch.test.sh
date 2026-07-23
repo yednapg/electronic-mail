@@ -14,6 +14,8 @@ BACKEND_ORIGIN=https://api.launch-test.electronicmail.dev
 WEB_ORIGIN=https://www.launch-test.electronicmail.dev
 EVIDENCE_ORIGIN=https://evidence.electronicmail.dev
 TEAM_ID=ABCD123456
+XCODE_VERSION=16.4
+XCODE_BUILD=16F6
 DEFAULT_QUEUE_DEPTH_JSON='{"critical":1,"default":2}'
 
 fail() {
@@ -64,6 +66,7 @@ EOF
 
 write_metadata() {
   local version="$1"
+  local xcode_build="${2:-$XCODE_BUILD}"
   local created_at
   created_at="$(python3 - <<'PY'
 from datetime import datetime, timedelta, timezone
@@ -81,7 +84,9 @@ PY
   "product": "Electronic Mail",
   "source_commit": "$RELEASE_SHA",
   "source_tree_clean": true,
-  "version": "$version"
+  "version": "$version",
+  "xcode_version": "$XCODE_VERSION",
+  "xcode_build": "$xcode_build"
 }
 EOF
 }
@@ -303,6 +308,12 @@ write_checksums
 write_metadata 9.9.9
 write_checksums
 expect_failure metadata-version 'release metadata version mismatch' run_verify
+write_metadata "$VERSION"
+write_checksums
+
+write_metadata "$VERSION" 99Z999
+write_checksums
+expect_failure metadata-xcode-build "release metadata xcode_build mismatch: expected '16F6'" run_verify
 write_metadata "$VERSION"
 write_checksums
 
