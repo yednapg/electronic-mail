@@ -35,12 +35,17 @@ from app.db.mail_groups import (
     replace_gmail_thread_orders,
     reset_gmail_reconciliation,
     start_gmail_reconciliation,
+    update_gmail_message_bodies,
     upsert_gmail_messages,
     user_can_write_gmail,
 )
-from app.services.email_extraction import has_persisted_renderable_body, parse_gmail_message
+from app.services.email_extraction import (
+    has_persisted_renderable_body,
+    mark_full_gmail_payload_body_fetch_status,
+    parse_gmail_message,
+)
 from app.services.integrations.google import build_google_service, create_authorized_credentials
-from app.services.mailbox_events import MAILBOX_CHANGED, emit_mailbox_event
+from app.services.mailbox_events import MAILBOX_CHANGED, THREAD_CONTENT_HYDRATED, emit_mailbox_event
 from app.services.mail_groups import enqueue_projection_refresh, rebuild_touched_mail_groups
 
 FIRST_BATCH_SIZE = 50
@@ -792,19 +797,12 @@ def run_gmail_body_fetch(settings: Settings, *, user_id: str, group_id: str = ""
         if credentials is None:
             raise GoogleCredentialsUnavailable("Google credentials are not connected")
         service = build_google_service("gmail", "v1", credentials)
-        payloads = _batch_get_message_payloads(service, missing, format="full")
-        parsed_messages = [
-            GmailMessageRecord(
-                created_at="",
-                updated_at="",
-                **parse_gmail_message(
-                    payload,
-                    user_id=user_id,
-                    inline_attachment_resolver=_inline_attachment_resolver(service),
-                ),
-            )
-            for payload in payloads.values()
-        ]
+        payloads = _batch_get_message_payloads(
+            service,
+            missing,
+            format="full",
+            continue_on_error=True,
+        )
     except Exception as exc:
         mark_gmail_messages_body_fetch_state(
             database_url,
@@ -814,11 +812,96 @@ def run_gmail_body_fetch(settings: Settings, *, user_id: str, group_id: str = ""
             error=safe_google_error(exc, operation="message download"),
         )
         raise
-    upsert_gmail_messages(database_url, parsed_messages)
-    rebuild_touched_mail_groups(settings, user_id=user_id, message_ids=[message.message_id for message in parsed_messages], use_ai=False)
+
+    attachment_resolver = _inline_attachment_resolver(service)
+    hydrated_messages: list[GmailMessageRecord] = []
+    unresolved_ids: list[str] = []
+    parse_error: Exception | None = None
+    for message_id in missing:
+        payload = payloads.get(message_id)
+        if payload is None:
+            unresolved_ids.append(message_id)
+            continue
+        try:
+            parsed = _mark_full_payload_body_fetch_status(
+                parse_gmail_message(
+                    payload,
+                    user_id=user_id,
+                    inline_attachment_resolver=attachment_resolver,
+                )
+            )
+            message = GmailMessageRecord(created_at="", updated_at="", **parsed)
+        except Exception as exc:
+            unresolved_ids.append(message_id)
+            parse_error = parse_error or exc
+            continue
+        if message.body_fetch_status == "fetched":
+            hydrated_messages.append(message)
+        else:
+            unresolved_ids.append(message_id)
+
+    persisted_count = 0
+    if hydrated_messages:
+        persisted_count = _persist_hydrated_body_messages(
+            settings,
+            user_id=user_id,
+            messages=hydrated_messages,
+        )
+
+    if unresolved_ids:
+        retry_error = parse_error or RuntimeError("Gmail returned a text body attachment that could not be downloaded")
+        mark_gmail_messages_body_fetch_state(
+            database_url,
+            user_id=user_id,
+            message_ids=unresolved_ids,
+            status="failed",
+            error=safe_google_error(retry_error, operation="message download"),
+        )
+        raise retry_error
+
+    return persisted_count
+
+
+def _persist_hydrated_body_messages(
+    settings: Settings,
+    *,
+    user_id: str,
+    messages: list[GmailMessageRecord],
+) -> int:
+    database_url = str(settings.database_path)
+    updated_message_ids = set(update_gmail_message_bodies(database_url, messages))
+    updated_messages = [message for message in messages if message.message_id in updated_message_ids]
+    if not updated_messages:
+        return 0
+    rebuild_touched_mail_groups(settings, user_id=user_id, message_ids=[message.message_id for message in updated_messages], use_ai=False)
     if _ai_grouping_enabled(settings):
         enqueue_projection_refresh(settings, user_id=user_id)
-    return len(parsed_messages)
+    hydrated_thread_ids = list(
+        dict.fromkeys(
+            message.gmail_thread_id
+            for message in updated_messages
+            if message.gmail_thread_id
+        )
+    )
+    if hydrated_thread_ids:
+        try:
+            emit_mailbox_event(
+                settings,
+                user_id=user_id,
+                event_type=THREAD_CONTENT_HYDRATED,
+                payload={
+                    "source": "gmail_body_fetch",
+                    "thread_ids": hydrated_thread_ids,
+                    "hydrated_message_count": len(updated_messages),
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "Body hydration event could not be emitted user_id=%s error=%s",
+                user_id,
+                type(exc).__name__,
+            )
+    return len(updated_messages)
 
 
 def hydrate_gmail_search_results(
@@ -912,6 +995,8 @@ def hydrate_gmail_search_results(
 
 
 def _has_body_for_reader(message: GmailMessageRecord) -> bool:
+    if (message.body_fetch_status or "").lower() == "fetched":
+        return True
     return has_persisted_renderable_body(
         text_body=message.text_body,
         html_body=message.html_body_sanitized,
@@ -1262,6 +1347,8 @@ def _hydrate_messages(
             user_id=user_id,
             inline_attachment_resolver=_inline_attachment_resolver(service) if format == "full" else None,
         )
+        if format == "full":
+            parsed = _mark_full_payload_body_fetch_status(parsed)
         latest_history_id = _max_history_id(latest_history_id, parsed.get("history_id"))
         messages.append(GmailMessageRecord(created_at="", updated_at="", **parsed))
     return messages, latest_history_id
@@ -1287,6 +1374,10 @@ def _inline_attachment_resolver(service: Any):
         return cache[key]
 
     return resolve
+
+
+def _mark_full_payload_body_fetch_status(parsed: dict[str, Any]) -> dict[str, Any]:
+    return mark_full_gmail_payload_body_fetch_status(parsed)
 
 
 def _hydrate_message_ids(
@@ -1374,6 +1465,7 @@ def _batch_get_message_payloads(
     *,
     format: str,
     skip_not_found: bool = False,
+    continue_on_error: bool = False,
 ) -> dict[str, dict[str, Any]]:
     if not message_ids:
         return {}
@@ -1398,7 +1490,9 @@ def _batch_get_message_payloads(
                 )
             batch.execute()
     except Exception:
-        payloads = {}
+        # Keep responses completed before a batch-level failure. The direct
+        # fallback below retries only the IDs that are still missing.
+        pass
 
     missing = [message_id for message_id in missing_ids if message_id not in payloads]
     for message_id in missing:
@@ -1410,6 +1504,20 @@ def _batch_get_message_payloads(
         except HttpError as exc:
             if skip_not_found and _is_history_cursor_expired(exc):
                 continue
+            raw_status = getattr(getattr(exc, "resp", None), "status", None)
+            try:
+                status = int(raw_status)
+            except (TypeError, ValueError):
+                status = None
+            # A missing message is a terminal per-ID result and must not discard
+            # other successful responses from the batch. Quota, server, auth,
+            # and transport failures are global/transient signals: propagate
+            # them immediately so the worker backs off instead of amplifying an
+            # outage with one direct request per remaining message.
+            if continue_on_error and status == 404:
+                continue
+            raise
+        except Exception:
             raise
         if isinstance(payload, dict):
             payloads[message_id] = payload

@@ -14,7 +14,7 @@ from app.core.error_safety import GoogleCredentialsUnavailable
 from app.db.mail_groups import ClientDraftRecord
 from app.main import app
 from app.schemas.domain import MailDraftResponse, MailDraftSaveRequest, MailboxResponse
-from app.services.mailbox_drafts import _preserved_attachment_inputs, save_draft, send_saved_draft
+from app.services.mailbox_drafts import _preserved_attachment_inputs, get_draft, save_draft, send_saved_draft
 from app.services.gmail_importer import hydrate_gmail_search_results
 from app.services.mailbox_search import enqueue_mailbox_search_hydration, mailbox_search_key, run_mailbox_search_hydration
 from app.workers.main import _run_job
@@ -94,6 +94,107 @@ class MailboxDraftServiceTests(unittest.TestCase):
             )
             response = save_draft(self.settings, user_id="user-1", request=request)
         return response, mocks
+
+    def test_get_draft_resolves_large_text_body_before_returning_editable_content(self) -> None:
+        encoded_body = base64.urlsafe_b64encode(b"Complete large draft body").decode("ascii").rstrip("=")
+        payload = {
+            "message": {
+                "id": "message-1",
+                "threadId": "thread-1",
+                "labelIds": ["DRAFT"],
+                "payload": {
+                    "mimeType": "text/plain",
+                    "body": {"attachmentId": "large-draft-body", "size": 4096},
+                },
+            }
+        }
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.get_client_draft",
+            return_value=draft_record(),
+        ), patch("app.services.mailbox_drafts._local_draft_message", return_value=None), patch(
+            "app.services.mailbox_drafts.fetch_gmail_draft",
+            return_value=payload,
+        ), patch(
+            "app.services.mailbox_drafts.fetch_gmail_attachment",
+            return_value={"data": encoded_body},
+        ) as fetch_attachment, patch(
+            "app.services.mailbox_drafts.upsert_gmail_messages"
+        ) as upsert_messages, patch(
+            "app.services.mailbox_drafts.upsert_client_draft",
+            return_value=draft_record(),
+        ):
+            response = get_draft(
+                self.settings,
+                user_id="user-1",
+                mailbox_thread_id="draft-1",
+            )
+
+        self.assertEqual(response.state, "saved")
+        self.assertEqual(response.body_text, "Complete large draft body")
+        fetch_attachment.assert_called_once_with(
+            self.settings,
+            user_id="user-1",
+            message_id="message-1",
+            attachment_id="large-draft-body",
+        )
+        imported = upsert_messages.call_args.args[1][0]
+        self.assertEqual(imported.body_fetch_status, "fetched")
+        self.assertEqual(imported.text_body, "Complete large draft body")
+
+    def test_get_draft_keeps_usable_html_when_optional_parts_fail_to_download(self) -> None:
+        html = base64.urlsafe_b64encode(
+            b'<html><body><table><tr><td>Usable HTML draft</td></tr></table>'
+            b'<img src="cid:missing-logo" width="120"></body></html>'
+        ).decode("ascii").rstrip("=")
+        payload = {
+            "message": {
+                "id": "message-1",
+                "threadId": "thread-1",
+                "labelIds": ["DRAFT"],
+                "payload": {
+                    "mimeType": "multipart/related",
+                    "parts": [
+                        {
+                            "mimeType": "multipart/alternative",
+                            "parts": [
+                                {
+                                    "mimeType": "text/plain",
+                                    "body": {"attachmentId": "missing-plain", "size": 4096},
+                                },
+                                {"mimeType": "text/html", "body": {"data": html}},
+                            ],
+                        },
+                        {
+                            "mimeType": "image/png",
+                            "headers": [{"name": "Content-ID", "value": "<missing-logo>"}],
+                            "body": {"attachmentId": "missing-cid", "size": 1024},
+                        },
+                    ],
+                },
+            }
+        }
+        with patch("app.services.mailbox_drafts._can_manage_drafts", return_value=True), patch(
+            "app.services.mailbox_drafts.get_client_draft",
+            return_value=draft_record(),
+        ), patch("app.services.mailbox_drafts._local_draft_message", return_value=None), patch(
+            "app.services.mailbox_drafts.fetch_gmail_draft",
+            return_value=payload,
+        ), patch(
+            "app.services.mailbox_drafts.fetch_gmail_attachment",
+            side_effect=RuntimeError("optional attachment unavailable"),
+        ), patch("app.services.mailbox_drafts.upsert_gmail_messages"), patch(
+            "app.services.mailbox_drafts.upsert_client_draft",
+            return_value=draft_record(),
+        ):
+            response = get_draft(
+                self.settings,
+                user_id="user-1",
+                mailbox_thread_id="draft-1",
+            )
+
+        self.assertEqual(response.state, "saved")
+        self.assertIn("Usable HTML draft", response.body_text)
+        self.assertIsNotNone(response.body_html)
 
     @patch("app.services.mailbox_drafts._after_draft_change")
     @patch("app.services.mailbox_drafts.upsert_client_draft", return_value=draft_record())

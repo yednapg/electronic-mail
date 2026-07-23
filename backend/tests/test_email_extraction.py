@@ -3,8 +3,10 @@ from __future__ import annotations
 from base64 import urlsafe_b64encode
 import unittest
 
+from app.services.gmail_importer import _mark_full_payload_body_fetch_status
 from app.services.email_extraction import (
     build_thread_message_reader,
+    gmail_payload_has_unresolved_text_body,
     has_persisted_renderable_body,
     html_body_for_reader,
     html_render_document_for_reader,
@@ -19,6 +21,175 @@ def encoded(value: str) -> str:
 
 
 class EmailExtractionTests(unittest.TestCase):
+    def test_text_file_attachment_is_not_resolved_or_treated_as_message_body(self) -> None:
+        resolver_calls: list[tuple[str, str]] = []
+
+        parsed = parse_gmail_message(
+            {
+                "id": "msg-text-file",
+                "threadId": "thread-text-file",
+                "snippet": "Attached notes",
+                "payload": {
+                    "mimeType": "multipart/mixed",
+                    "parts": [
+                        {
+                            "mimeType": "text/plain",
+                            "filename": "notes.txt",
+                            "body": {"attachmentId": "text-file-1", "size": 42},
+                        }
+                    ],
+                },
+            },
+            user_id="user-1",
+            inline_attachment_resolver=lambda message_id, attachment_id: (
+                resolver_calls.append((message_id, attachment_id)) or encoded("Attachment contents")
+            ),
+        )
+
+        self.assertEqual(resolver_calls, [])
+        self.assertIsNone(parsed["text_body"])
+        self.assertIsNone(parsed["html_render_document"])
+        self.assertFalse(gmail_payload_has_unresolved_text_body(parsed["raw_payload"]))
+
+    def test_small_inline_data_text_attachment_is_not_treated_as_message_body(self) -> None:
+        parsed = parse_gmail_message(
+            {
+                "id": "msg-small-text-file",
+                "threadId": "thread-small-text-file",
+                "payload": {
+                    "mimeType": "multipart/mixed",
+                    "parts": [
+                        {
+                            "mimeType": "text/plain",
+                            "filename": "notes.txt",
+                            "body": {"data": encoded("Small attachment contents"), "size": 25},
+                        }
+                    ],
+                },
+            },
+            user_id="user-1",
+        )
+
+        self.assertIsNone(parsed["text_body"])
+        self.assertFalse(gmail_payload_has_unresolved_text_body(parsed["raw_payload"]))
+        self.assertFalse(
+            has_persisted_renderable_body(
+                text_body=parsed["text_body"],
+                html_body=parsed["html_body_sanitized"],
+                html_render_document=parsed["html_render_document"],
+                raw_payload=parsed["raw_payload"],
+            )
+        )
+
+    def test_attached_rfc822_message_subtree_is_skipped(self) -> None:
+        resolver_calls: list[tuple[str, str]] = []
+        parsed = parse_gmail_message(
+            {
+                "id": "msg-attached-email",
+                "threadId": "thread-attached-email",
+                "payload": {
+                    "mimeType": "multipart/mixed",
+                    "parts": [
+                        {
+                            "mimeType": "message/rfc822",
+                            "body": {"size": 2048},
+                            "parts": [
+                                {
+                                    "mimeType": "text/plain",
+                                    "body": {"attachmentId": "attached-email-text", "size": 200},
+                                },
+                                {
+                                    "mimeType": "text/html",
+                                    "body": {"data": encoded("<html><body>Attached email body</body></html>")},
+                                },
+                            ],
+                        }
+                    ],
+                },
+            },
+            user_id="user-1",
+            inline_attachment_resolver=lambda message_id, attachment_id: (
+                resolver_calls.append((message_id, attachment_id)) or encoded("Attached email plain body")
+            ),
+        )
+
+        self.assertEqual(resolver_calls, [])
+        self.assertIsNone(parsed["text_body"])
+        self.assertIsNone(parsed["html_render_document"])
+        self.assertFalse(gmail_payload_has_unresolved_text_body(parsed["raw_payload"]))
+
+    def test_resolved_html_makes_unresolved_plain_alternative_terminal(self) -> None:
+        parsed = parse_gmail_message(
+            {
+                "id": "msg-alternative",
+                "threadId": "thread-alternative",
+                "payload": {
+                    "mimeType": "multipart/alternative",
+                    "parts": [
+                        {
+                            "mimeType": "text/plain",
+                            "body": {"attachmentId": "large-plain", "size": 4096},
+                        },
+                        {
+                            "mimeType": "text/html",
+                            "body": {"data": encoded("<html><body>Complete HTML alternative</body></html>")},
+                        },
+                    ],
+                },
+            },
+            user_id="user-1",
+            inline_attachment_resolver=lambda _message_id, _attachment_id: None,
+        )
+
+        self.assertTrue(gmail_payload_has_unresolved_text_body(parsed["raw_payload"]))
+        self.assertIn("Complete HTML alternative", parsed["html_render_document"] or "")
+        self.assertEqual(_mark_full_payload_body_fetch_status(parsed)["body_fetch_status"], "fetched")
+
+    def test_large_text_body_is_resolved_from_gmail_attachment(self) -> None:
+        payload = {
+            "id": "msg-large-text",
+            "threadId": "thread-large-text",
+            "snippet": "Metadata preview",
+            "payload": {
+                "mimeType": "text/plain",
+                "body": {"attachmentId": "large-text-1", "size": 42},
+            },
+        }
+        resolver_calls: list[tuple[str, str]] = []
+
+        def resolve(message_id: str, attachment_id: str) -> str:
+            resolver_calls.append((message_id, attachment_id))
+            return encoded("Complete large plain-text body")
+
+        parsed = parse_gmail_message(
+            payload,
+            user_id="user-1",
+            inline_attachment_resolver=resolve,
+        )
+
+        self.assertEqual(resolver_calls, [("msg-large-text", "large-text-1")])
+        self.assertEqual(parsed["text_body"], "Complete large plain-text body")
+        self.assertFalse(gmail_payload_has_unresolved_text_body(parsed["raw_payload"]))
+
+    def test_failed_large_text_body_resolution_remains_incomplete(self) -> None:
+        parsed = parse_gmail_message(
+            {
+                "id": "msg-large-text",
+                "threadId": "thread-large-text",
+                "snippet": "Metadata preview",
+                "payload": {
+                    "mimeType": "text/html",
+                    "body": {"attachmentId": "large-html-1", "size": 42},
+                },
+            },
+            user_id="user-1",
+            inline_attachment_resolver=lambda _message_id, _attachment_id: None,
+        )
+
+        self.assertIsNone(parsed["text_body"])
+        self.assertIsNone(parsed["html_render_document"])
+        self.assertTrue(gmail_payload_has_unresolved_text_body(parsed["raw_payload"]))
+
     def test_metadata_snippet_is_not_treated_as_full_text_body(self) -> None:
         parsed = parse_gmail_message(
             {

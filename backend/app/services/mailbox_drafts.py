@@ -27,7 +27,7 @@ from app.db.mail_groups import (
     user_can_write_gmail,
 )
 from app.schemas.domain import MailDraftAttachment, MailDraftResponse, MailDraftSaveRequest, MailDraftSendRequest, MailSendResponse
-from app.services.email_extraction import parse_gmail_message
+from app.services.email_extraction import mark_full_gmail_payload_body_fetch_status, parse_gmail_message
 from app.services.integrations.google import (
     GMAIL_FULL_SCOPE,
     create_gmail_draft,
@@ -316,7 +316,14 @@ def get_draft(settings: Settings, *, user_id: str, mailbox_thread_id: str) -> Ma
     message_payload = draft.get("message") if isinstance(draft.get("message"), dict) else None
     if message_payload is None:
         return MailDraftResponse(client_draft_id=mapping.client_draft_id if mapping else f"gmail:{gmail_draft_id}", state="failed", error="Draft message is missing.")
-    imported = _record_from_payload(message_payload, user_id=user_id)
+    try:
+        imported = _record_from_payload(settings, message_payload, user_id=user_id)
+    except GoogleCredentialsUnavailable:
+        return _reauth_required(settings, mapping.client_draft_id if mapping else f"gmail:{gmail_draft_id}")
+    except HttpError as exc:
+        if getattr(exc.resp, "status", None) in {401, 403}:
+            return _reauth_required(settings, mapping.client_draft_id if mapping else f"gmail:{gmail_draft_id}")
+        raise
     upsert_gmail_messages(database_url, [imported])
     client_draft_id = mapping.client_draft_id if mapping else f"gmail:{gmail_draft_id}"
     record = upsert_client_draft(
@@ -565,7 +572,7 @@ def _gmail_draft_message(
 ) -> GmailMessageRecord | None:
     draft = fetch_gmail_draft(settings, user_id=user_id, gmail_draft_id=gmail_draft_id, format="full")
     message_payload = draft.get("message") if isinstance(draft.get("message"), dict) else None
-    return _record_from_payload(message_payload, user_id=user_id) if message_payload else None
+    return _record_from_payload(settings, message_payload, user_id=user_id) if message_payload else None
 
 
 def _preserved_thread_headers(message: GmailMessageRecord | None) -> dict[str, str]:
@@ -600,16 +607,52 @@ def _local_draft_message(settings: Settings, *, user_id: str, mailbox_thread_id:
     return max(drafts, key=lambda item: item.internal_date or item.updated_at) if drafts else None
 
 
-def _record_from_payload(payload: dict[str, Any], *, user_id: str) -> GmailMessageRecord:
-    parsed = parse_gmail_message(payload, user_id=user_id)
+def _record_from_payload(settings: Settings, payload: dict[str, Any], *, user_id: str) -> GmailMessageRecord:
+    parsed = parse_gmail_message(
+        payload,
+        user_id=user_id,
+        inline_attachment_resolver=_gmail_body_attachment_resolver(settings, user_id=user_id),
+    )
+    parsed = mark_full_gmail_payload_body_fetch_status(parsed)
+    if parsed["body_fetch_status"] != "fetched":
+        raise RuntimeError("Gmail draft body could not be downloaded")
     return GmailMessageRecord(created_at="", updated_at="", **parsed)
+
+
+def _gmail_body_attachment_resolver(settings: Settings, *, user_id: str):
+    cache: dict[tuple[str, str], str | None] = {}
+
+    def resolve(message_id: str, attachment_id: str) -> str | None:
+        key = (message_id, attachment_id)
+        if key not in cache:
+            try:
+                payload = fetch_gmail_attachment(
+                    settings,
+                    user_id=user_id,
+                    message_id=message_id,
+                    attachment_id=attachment_id,
+                )
+                data = payload.get("data") if isinstance(payload, dict) else None
+                cache[key] = data if isinstance(data, str) and data else None
+            except GoogleCredentialsUnavailable:
+                raise
+            except HttpError as exc:
+                status = getattr(getattr(exc, "resp", None), "status", None)
+                if status in {401, 403, "401", "403"}:
+                    raise
+                cache[key] = None
+            except Exception:
+                cache[key] = None
+        return cache[key]
+
+    return resolve
 
 
 def _import_gmail_message(settings: Settings, *, user_id: str, message_id: str | None) -> GmailMessageRecord | None:
     if not message_id:
         return None
     payload = fetch_gmail_message(settings, user_id=user_id, message_id=message_id, format="full")
-    record = _record_from_payload(payload, user_id=user_id)
+    record = _record_from_payload(settings, payload, user_id=user_id)
     upsert_gmail_messages(str(settings.database_path), [record])
     rebuild_touched_mail_groups(settings, user_id=user_id, message_ids=[record.message_id], use_ai=False)
     enqueue_projection_refresh(settings, user_id=user_id, priority=25)

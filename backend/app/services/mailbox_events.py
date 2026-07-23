@@ -15,6 +15,7 @@ GMAIL_PUBSUB_RECEIVED = "gmail-pubsub-received"
 SYNC_STATE = "sync-state"
 HEARTBEAT = "heartbeat"
 MAILBOX_SEARCH_HYDRATED = "mailbox-search-hydrated"
+THREAD_CONTENT_HYDRATED = "thread-content-hydrated"
 
 
 def emit_mailbox_event(
@@ -54,7 +55,9 @@ def parse_last_event_id(value: str | None) -> int | None:
         parsed = int(value.strip())
     except ValueError:
         return None
-    return parsed if parsed > 0 else None
+    # Zero is a valid stream-start sentinel. Preserving it lets a fresh client
+    # resume safely when the event table was empty at handshake time.
+    return parsed if parsed >= 0 else None
 
 
 def format_sse_event(event: str, data: dict[str, Any], *, event_id: int | str | None = None) -> str:

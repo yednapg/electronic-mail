@@ -66,6 +66,7 @@ def enqueue_job(
     max_attempts: int = 5,
     payload_version: int = 1,
     run_after_seconds: int = 0,
+    wake_existing: bool = True,
 ) -> BackgroundJob:
     engine = get_engine(database_url)
     job_id = str(uuid4())
@@ -91,21 +92,35 @@ def enqueue_job(
             ).mappings().first()
             if existing is not None:
                 if str(existing["status"]) == "queued":
-                    existing = connection.execute(
-                        text(
-                            """
-                            UPDATE background_jobs
-                            SET run_after = LEAST(run_after, now() + (:run_after_seconds * interval '1 second')),
-                                priority = GREATEST(priority, :priority),
-                                updated_at = now()
-                            WHERE id = :id
-                            RETURNING *
-                            """
-                        ),
-                        {"id": existing["id"], "priority": priority, "run_after_seconds": run_after_seconds},
-                    ).mappings().first()
-                    if existing is not None:
-                        _insert_event(connection, str(existing["id"]), "progress", None, {"reason": "dedupe_woke_queued_job"})
+                    if wake_existing:
+                        existing = connection.execute(
+                            text(
+                                """
+                                UPDATE background_jobs
+                                SET run_after = LEAST(run_after, now() + (:run_after_seconds * interval '1 second')),
+                                    priority = GREATEST(priority, :priority),
+                                    updated_at = now()
+                                WHERE id = :id
+                                RETURNING *
+                                """
+                            ),
+                            {"id": existing["id"], "priority": priority, "run_after_seconds": run_after_seconds},
+                        ).mappings().first()
+                        if existing is not None:
+                            _insert_event(connection, str(existing["id"]), "progress", None, {"reason": "dedupe_woke_queued_job"})
+                    elif priority > int(existing["priority"]):
+                        existing = connection.execute(
+                            text(
+                                """
+                                UPDATE background_jobs
+                                SET priority = :priority,
+                                    updated_at = now()
+                                WHERE id = :id
+                                RETURNING *
+                                """
+                            ),
+                            {"id": existing["id"], "priority": priority},
+                        ).mappings().first()
                 return _job_from_row(existing)
 
         row = connection.execute(

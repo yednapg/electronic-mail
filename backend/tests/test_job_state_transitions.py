@@ -11,6 +11,33 @@ from app.workers import main as worker
 
 
 class JobTerminalStateTests(unittest.TestCase):
+    def test_deduped_reader_job_preserves_worker_retry_backoff(self) -> None:
+        existing = _job_row(
+            kind="gmail_body_fetch",
+            status="queued",
+            priority=90,
+            attempt_count=2,
+            run_after="2026-07-23T12:10:00+00:00",
+        )
+        connection = _EnqueueConnection(existing)
+
+        with patch.object(jobs, "get_engine", return_value=_TransitionEngine(connection)):
+            result = jobs.enqueue_job(
+                "postgresql://example/db",
+                kind="gmail_body_fetch",
+                queue="reader",
+                dedupe_key="gmail-body-fetch-thread:user-1:thread-1",
+                priority=90,
+                payload={"user_id": "user-1", "gmail_thread_id": "thread-1"},
+                wake_existing=False,
+            )
+
+        self.assertEqual(result.id, "job-1")
+        self.assertEqual(result.attempt_count, 2)
+        self.assertEqual(result.run_after, "2026-07-23T12:10:00+00:00")
+        self.assertEqual(len(connection.calls), 1)
+        self.assertIn("SELECT * FROM background_jobs", connection.calls[0][0])
+
     def test_cancelled_job_cannot_be_completed_by_its_former_worker(self) -> None:
         connection = _TransitionConnection(updated_id=None)
 
@@ -145,6 +172,30 @@ class _TransitionResult:
         return self.value
 
 
+class _EnqueueResult:
+    def __init__(self, row: dict[str, object] | None) -> None:
+        self.row = row
+
+    def mappings(self) -> "_EnqueueResult":
+        return self
+
+    def first(self) -> dict[str, object] | None:
+        return self.row
+
+
+class _EnqueueConnection:
+    def __init__(self, existing: dict[str, object]) -> None:
+        self.existing = existing
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def execute(self, statement, params=None) -> _EnqueueResult:
+        sql = str(statement)
+        self.calls.append((sql, dict(params or {})))
+        if "SELECT * FROM background_jobs" in sql:
+            return _EnqueueResult(self.existing)
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+
 class _TransitionConnection:
     def __init__(self, *, updated_id: str | None) -> None:
         self.updated_id = updated_id
@@ -189,6 +240,38 @@ def _job(*, attempt_count: int, max_attempts: int) -> jobs.BackgroundJob:
         completed_at=None,
         updated_at="2026-07-21T00:00:00+00:00",
     )
+
+
+def _job_row(
+    *,
+    kind: str,
+    status: str,
+    priority: int,
+    attempt_count: int,
+    run_after: str,
+) -> dict[str, object]:
+    return {
+        "id": "job-1",
+        "kind": kind,
+        "queue": "reader",
+        "status": status,
+        "user_id": None,
+        "dedupe_key": "gmail-body-fetch-thread:user-1:thread-1",
+        "priority": priority,
+        "payload_version": 1,
+        "payload_json": '{"user_id":"user-1","gmail_thread_id":"thread-1"}',
+        "attempt_count": attempt_count,
+        "max_attempts": 5,
+        "run_after": run_after,
+        "lease_owner": None,
+        "lease_expires_at": None,
+        "last_error": "gmail timeout",
+        "trace_id": None,
+        "created_at": "2026-07-23T12:00:00+00:00",
+        "started_at": "2026-07-23T12:00:01+00:00",
+        "completed_at": None,
+        "updated_at": "2026-07-23T12:00:02+00:00",
+    }
 
 
 if __name__ == "__main__":

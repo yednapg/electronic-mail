@@ -27,7 +27,7 @@ from app.services.gmail_watch import ensure_gmail_watch
 from app.services.integrations.google import fetch_gmail_attachment
 from app.services.mailbox_actions import ThreadActionIdempotencyConflict, enqueue_thread_action
 from app.services.mailbox_drafts import delete_draft_by_id, get_draft, save_draft, send_saved_draft
-from app.services.mailbox_events import GMAIL_PUBSUB_RECEIVED, HEARTBEAT, SYNC_STATE, emit_mailbox_event, event_payload, format_sse_event, list_events_after, parse_last_event_id
+from app.services.mailbox_events import GMAIL_PUBSUB_RECEIVED, HEARTBEAT, SYNC_STATE, emit_mailbox_event, event_payload, format_sse_event, latest_event, list_events_after, parse_last_event_id
 from app.services.mailbox_search import enqueue_mailbox_search_hydration
 from app.services.mailbox_sends import _validate_subject, _validated_addresses, _validated_attachments, get_send_status, list_outbox_statuses, retry_send, send_compose, send_reply
 from app.services.mail_groups import build_app_session_response, build_group_detail_response, build_mailbox_realtime_state, build_mailbox_response, build_mailbox_sync_state, enqueue_mailbox_sync, gmail_attachments_for_message, refresh_app_session_snapshot
@@ -278,10 +278,36 @@ def mailbox_sync_now(request: Request) -> MailboxSyncTriggerResponse:
 async def mailbox_events(request: Request) -> StreamingResponse:
     user = require_current_user(settings, request)
     last_event_id = parse_last_event_id(request.headers.get("last-event-id"))
+    initial_state: MailboxSyncStateResponse | None = None
+    if last_event_id is None:
+        # A fresh native process has already loaded an authoritative session and
+        # mailbox snapshot. Start immediately before the latest durable event
+        # instead of replaying up to seven days, then send a revision handshake
+        # so a change racing that snapshot still triggers one refresh. Replaying
+        # that single event preserves targeted hydration/search invalidations
+        # which do not necessarily advance the mailbox revision.
+        baseline = await asyncio.to_thread(
+            latest_event,
+            settings,
+            user_id=user.id,
+        )
+        last_event_id = max(baseline.id - 1, 0) if baseline is not None else 0
+        initial_state = await asyncio.to_thread(
+            build_mailbox_sync_state,
+            settings,
+            user_id=user.id,
+        )
 
     async def event_stream():
-        nonlocal last_event_id
+        nonlocal initial_state, last_event_id
         heartbeat_ticks = 0
+        if initial_state is not None:
+            yield format_sse_event(
+                SYNC_STATE,
+                initial_state.model_dump(mode="json"),
+                event_id=last_event_id,
+            )
+            initial_state = None
         while True:
             if await request.is_disconnected():
                 break
