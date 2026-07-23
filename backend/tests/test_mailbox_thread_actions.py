@@ -6,10 +6,12 @@ import unittest
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
+from googleapiclient.errors import HttpError
+from httplib2 import Response
 
 from app.db.mail_groups import GmailMessageRecord, MailGroupDetail, MailGroupRecord, PendingThreadActionRecord
 from app.main import app
-from app.services.mailbox_actions import enqueue_thread_action, run_pending_thread_action
+from app.services.mailbox_actions import ThreadActionIdempotencyConflict, _labels_after_action, enqueue_thread_action, rollback_failed_thread_action, run_pending_thread_action
 
 
 def pending_action(state: str = "queued", action: str = "archive") -> PendingThreadActionRecord:
@@ -88,15 +90,25 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         self.event_patch.start()
         self.addCleanup(self.event_patch.stop)
 
+    def test_launch_actions_update_local_labels_optimistically(self) -> None:
+        self.assertEqual(_labels_after_action(["INBOX"], "mark_unread"), ["INBOX", "UNREAD"])
+        self.assertEqual(_labels_after_action(["TRASH"], "restore_trash"), ["INBOX"])
+        self.assertEqual(_labels_after_action(["INBOX", "UNREAD"], "mark_spam"), ["UNREAD", "SPAM"])
+        self.assertEqual(_labels_after_action(["SPAM", "UNREAD"], "not_spam"), ["UNREAD", "INBOX"])
+        self.assertEqual(_labels_after_action(["INBOX"], "star"), ["INBOX", "STARRED"])
+        self.assertEqual(_labels_after_action(["INBOX", "STARRED"], "unstar"), ["INBOX"])
+
     def test_enqueue_thread_action_stores_local_state_and_enqueues_worker(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
         record = pending_action()
 
-        with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=record) as upsert, patch(
+        with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=(record, True)) as upsert, patch(
             "app.services.mailbox_actions._apply_local_action"
         ) as apply_local, patch("app.services.mailbox_actions.enqueue_job") as enqueue_job, patch(
             "app.services.mailbox_actions.enqueue_projection_refresh"
-        ) as refresh:
+        ) as refresh, patch(
+            "app.services.mailbox_actions._resolve_action_messages", return_value=([], [])
+        ):
             response = enqueue_thread_action(
                 settings,
                 user_id="user-1",
@@ -111,7 +123,14 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         self.assertEqual(response.server_action_id, "server-1")
         self.assertEqual(response.state, "queued")
         upsert.assert_called_once()
-        apply_local.assert_called_once_with(settings, user_id="user-1", mailbox_thread_id="group-1", action="archive", target_message_id=None)
+        apply_local.assert_called_once_with(
+            settings,
+            user_id="user-1",
+            mailbox_thread_id="group-1",
+            action="archive",
+            target_message_id=None,
+            resolved_messages=[],
+        )
         enqueue_job.assert_called_once_with(
             "postgresql://example/db",
             kind="gmail_thread_action",
@@ -122,6 +141,60 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
             payload={"user_id": "user-1", "server_action_id": "server-1"},
         )
         refresh.assert_called_once_with(settings, user_id="user-1", priority=10)
+
+    def test_exact_client_action_replay_returns_existing_without_side_effects(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        record = pending_action()
+        request = SimpleNamespace(
+            client_action_id="client-1",
+            mailbox_thread_id="group-1",
+            target_message_id=None,
+            action="archive",
+            created_at="2026-05-21T09:00:00Z",
+        )
+        with (
+            patch("app.services.mailbox_actions._resolve_action_messages", return_value=([], [])),
+            patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=(record, False)),
+            patch("app.services.mailbox_actions._apply_local_action") as apply_local,
+            patch("app.services.mailbox_actions.enqueue_job") as enqueue,
+            patch("app.services.mailbox_actions.enqueue_projection_refresh") as refresh,
+        ):
+            response = enqueue_thread_action(settings, user_id="user-1", request=request)
+
+        self.assertEqual(response.server_action_id, "server-1")
+        apply_local.assert_not_called()
+        enqueue.assert_not_called()
+        refresh.assert_not_called()
+
+    def test_client_action_replay_rejects_different_thread_or_action(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        record = pending_action()
+        mismatches = [
+            {"mailbox_thread_id": "group-2", "action": "archive"},
+            {"mailbox_thread_id": "group-1", "action": "mark_read"},
+        ]
+        for mismatch in mismatches:
+            with self.subTest(mismatch=mismatch):
+                with (
+                    patch("app.services.mailbox_actions._resolve_action_messages", return_value=([], [])),
+                    patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=(record, False)),
+                    patch("app.services.mailbox_actions._apply_local_action") as apply_local,
+                    patch("app.services.mailbox_actions.enqueue_job") as enqueue,
+                ):
+                    with self.assertRaises(ThreadActionIdempotencyConflict):
+                        enqueue_thread_action(
+                            settings,
+                            user_id="user-1",
+                            request=SimpleNamespace(
+                                client_action_id="client-1",
+                                mailbox_thread_id=mismatch["mailbox_thread_id"],
+                                target_message_id=None,
+                                action=mismatch["action"],
+                                created_at="2026-05-21T09:00:00+00:00",
+                            ),
+                        )
+                    apply_local.assert_not_called()
+                    enqueue.assert_not_called()
 
     def test_worker_resolves_mailbox_group_to_gmail_thread_ids(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
@@ -181,12 +254,48 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         get_detail.assert_not_called()
         mark_read.assert_called_once_with(settings, "thread-a", user_id="user-1")
 
+    def test_terminal_failure_rolls_back_optimistic_labels(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        record = replace(
+            pending_action(state="failed"),
+            previous_labels={"msg-1": ["INBOX", "UNREAD"]},
+        )
+        # A later star action succeeded after the archive was applied locally.
+        # Rolling back archive must restore INBOX without removing STARRED.
+        optimistic = replace(sample_message("msg-1", "thread-a"), label_ids=["UNREAD", "STARRED"])
+
+        with (
+            patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record),
+            patch("app.services.mailbox_actions.list_messages_by_ids", return_value=[optimistic]),
+            patch("app.services.mailbox_actions.upsert_gmail_messages") as upsert_messages,
+            patch("app.services.mailbox_actions.rebuild_touched_mail_groups") as rebuild,
+            patch("app.services.mailbox_actions.enqueue_projection_refresh") as refresh,
+        ):
+            restored = rollback_failed_thread_action(
+                settings,
+                user_id="user-1",
+                server_action_id="server-1",
+            )
+
+        self.assertTrue(restored)
+        self.assertEqual(
+            upsert_messages.call_args.args[1][0].label_ids,
+            ["INBOX", "UNREAD", "STARRED"],
+        )
+        rebuild.assert_called_once_with(
+            settings,
+            user_id="user-1",
+            message_ids=["msg-1"],
+            use_ai=False,
+        )
+        refresh.assert_called_once_with(settings, user_id="user-1", priority=10)
+
     def test_move_trash_updates_local_labels_and_calls_gmail_trash(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
         record = pending_action(action="move_trash")
         detail = MailGroupDetail(group=sample_group(), messages=[sample_message("msg-1", "thread-a")])
 
-        with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=record), patch(
+        with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=(record, True)), patch(
             "app.services.mailbox_actions.list_messages_for_gmail_thread", return_value=[]
         ), patch(
             "app.services.mailbox_actions.get_mail_group_detail", return_value=detail
@@ -232,7 +341,7 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         applied = replace(record, state="applied", applied_at="2026-05-21T09:01:00+00:00")
         detail = MailGroupDetail(group=sample_group(), messages=[sample_message("msg-1", "thread-a")])
 
-        with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=record), patch(
+        with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=(record, True)), patch(
             "app.services.mailbox_actions._apply_local_action"
         ) as apply_local, patch("app.services.mailbox_actions.enqueue_job"), patch(
             "app.services.mailbox_actions.enqueue_projection_refresh"
@@ -271,12 +380,43 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         delete_messages.assert_called_once_with("postgresql://example/db", user_id="user-1", message_ids=["msg-1"])
         prune_groups.assert_called_once_with("postgresql://example/db", user_id="user-1", group_ids=["group-1"])
 
+    def test_delete_forever_treats_gmail_not_found_as_crash_recovery_success(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        record = pending_action(action="delete_forever")
+        applied = replace(record, state="applied", applied_at="2026-05-21T09:01:00+00:00")
+        detail = MailGroupDetail(group=sample_group(), messages=[sample_message("msg-1", "thread-a")])
+        missing = HttpError(Response({"status": "404"}), b"already deleted")
+
+        with (
+            patch("app.services.mailbox_actions.get_pending_thread_action", return_value=record),
+            patch("app.services.mailbox_actions.mark_pending_thread_action_applying"),
+            patch("app.services.mailbox_actions.list_messages_for_gmail_thread", return_value=[]),
+            patch("app.services.mailbox_actions.get_mail_group_detail", return_value=detail),
+            patch("app.services.mailbox_actions.delete_gmail_thread_forever", side_effect=missing),
+            patch("app.services.mailbox_actions.delete_gmail_messages", return_value=["group-1"]) as delete_messages,
+            patch("app.services.mailbox_actions.prune_empty_mail_groups"),
+            patch("app.services.mailbox_actions.mark_pending_thread_action_applied", return_value=applied),
+            patch("app.services.mailbox_actions.enqueue_projection_refresh"),
+        ):
+            response = run_pending_thread_action(
+                settings,
+                user_id="user-1",
+                server_action_id="server-1",
+            )
+
+        self.assertEqual(response.state, "applied")
+        delete_messages.assert_called_once_with(
+            "postgresql://example/db",
+            user_id="user-1",
+            message_ids=["msg-1"],
+        )
+
     def test_target_message_action_only_trashes_selected_message(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
         record = replace(pending_action(action="move_trash"), target_message_id="msg-2")
         selected = sample_message("msg-2", "thread-b")
 
-        with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=record), patch(
+        with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=(record, True)), patch(
             "app.services.mailbox_actions.list_messages_by_ids", return_value=[selected]
         ) as list_by_ids, patch("app.services.mailbox_actions.upsert_gmail_messages") as upsert_messages, patch(
             "app.services.mailbox_actions.rebuild_touched_mail_groups"
@@ -318,7 +458,7 @@ class MailboxThreadActionServiceTests(unittest.TestCase):
         record = replace(pending_action(action="mark_read"), target_message_id="msg-2")
         selected = sample_message("msg-2", "thread-b")
 
-        with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=record), patch(
+        with patch("app.services.mailbox_actions.upsert_pending_thread_action", return_value=(record, True)), patch(
             "app.services.mailbox_actions.list_messages_by_ids", return_value=[selected]
         ) as list_by_ids, patch("app.services.mailbox_actions.upsert_gmail_messages") as upsert_messages, patch(
             "app.services.mailbox_actions.rebuild_touched_mail_groups"
@@ -390,6 +530,30 @@ class MailboxThreadActionRouteTests(unittest.TestCase):
         request = mock_enqueue.call_args.kwargs["request"]
         self.assertEqual(request.mailbox_thread_id, "group-1")
         self.assertEqual(request.action, "archive")
+
+    @patch(
+        "app.api.routes.mailbox.enqueue_thread_action",
+        side_effect=ThreadActionIdempotencyConflict(
+            "client_action_id is already bound to a different mailbox action"
+        ),
+    )
+    @patch("app.api.routes.mailbox.require_current_user", return_value=SimpleNamespace(id="user-1"))
+    def test_thread_action_endpoint_rejects_idempotency_payload_mismatch(
+        self,
+        _mock_user: Mock,
+        _mock_enqueue: Mock,
+    ) -> None:
+        response = self.client.post(
+            "/v1/mailbox/thread-actions",
+            json={
+                "client_action_id": "client-1",
+                "mailbox_thread_id": "group-2",
+                "action": "mark_read",
+                "created_at": "2026-05-21T09:00:00+00:00",
+            },
+        )
+
+        self.assertEqual(response.status_code, 409)
 
 
 if __name__ == "__main__":

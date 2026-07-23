@@ -17,28 +17,55 @@ from app.api.routes.post_login import router as post_login_router
 from app.api.routes.system import router as system_router
 from app.api.routes.mailbox import router as mailbox_router
 from app.api.routes.tasks import router as tasks_router
-from app.core.config import load_settings
+from app.core.config import Settings, load_settings
+from app.core.observability import RequestObservabilityMiddleware, configure_observability
+from app.core.rate_limit import RateLimitMiddleware
 
 
 settings = load_settings()
+configure_observability(settings)
 
-app = FastAPI(title="Mail Groups Backend")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[settings.cors_origin],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.include_router(system_router)
-app.include_router(auth_google_router)
-app.include_router(app_session_router)
-app.include_router(first_run_router)
-app.include_router(post_login_router)
-app.include_router(dashboard_router)
-app.include_router(gmail_router)
-app.include_router(tasks_router)
-app.include_router(entities_router)
-app.include_router(mailbox_router)
-app.include_router(mail_groups_router)
-app.include_router(jobs_router)
+
+def create_app(runtime_settings: Settings) -> FastAPI:
+    """Build the API surface for one resolved deployment environment."""
+    production_like = runtime_settings.is_production_like
+    application = FastAPI(
+        title="Electronic Mail Backend",
+        docs_url=None if production_like else "/docs",
+        redoc_url=None if production_like else "/redoc",
+        openapi_url=None if production_like else "/openapi.json",
+    )
+    application.state.settings = runtime_settings
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=[runtime_settings.cors_origin],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    application.add_middleware(
+        RateLimitMiddleware,
+        enabled=runtime_settings.rate_limit_enabled,
+        trust_proxy_headers=production_like,
+    )
+    application.add_middleware(RequestObservabilityMiddleware, production=production_like)
+
+    application.include_router(system_router)
+    application.include_router(auth_google_router)
+    application.include_router(app_session_router)
+    application.include_router(mailbox_router)
+    application.include_router(jobs_router)
+
+    if not production_like:
+        application.include_router(first_run_router)
+        application.include_router(post_login_router)
+        application.include_router(dashboard_router)
+        application.include_router(gmail_router)
+        application.include_router(tasks_router)
+        application.include_router(entities_router)
+        application.include_router(mail_groups_router)
+
+    return application
+
+
+app = create_app(settings)

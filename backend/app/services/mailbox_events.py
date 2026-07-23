@@ -14,6 +14,7 @@ DASHBOARD_CHANGED = "dashboard-changed"
 GMAIL_PUBSUB_RECEIVED = "gmail-pubsub-received"
 SYNC_STATE = "sync-state"
 HEARTBEAT = "heartbeat"
+MAILBOX_SEARCH_HYDRATED = "mailbox-search-hydrated"
 
 
 def emit_mailbox_event(

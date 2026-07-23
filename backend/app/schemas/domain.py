@@ -15,10 +15,22 @@ TimingBand = Literal["now", "today", "later", "hidden"]
 ActionConfidence = Literal["high", "medium", "low"]
 LifecycleState = Literal["active", "scheduled", "resolved", "suppressed"]
 EntityCurrentState = Literal["open", "waiting", "done"]
-GmailThreadAction = Literal["archive", "unarchive", "mark_read", "move_trash", "delete_forever"]
+GmailThreadAction = Literal[
+    "archive",
+    "unarchive",
+    "mark_read",
+    "mark_unread",
+    "move_trash",
+    "restore_trash",
+    "mark_spam",
+    "not_spam",
+    "star",
+    "unstar",
+    "delete_forever",
+]
 QueuedThreadActionState = Literal["queued", "applying", "applied", "failed"]
 MailSendState = Literal["queued", "sending", "sent", "failed", "reauth_required"]
-MailboxLabel = Literal["inbox", "sent", "drafts", "spam", "trash", "archive", "all"]
+MailboxLabel = Literal["inbox", "sent", "drafts", "spam", "trash", "archive", "starred", "all"]
 JobStatus = Literal["queued", "running", "succeeded", "failed"]
 ThreadMessageReaderMarkerKind = Literal["external_warning", "classification"]
 
@@ -131,9 +143,11 @@ class AuthMeResponse(BaseModel):
 
 
 class MobileSessionExchangeRequest(BaseModel):
-    """One-time iOS login code exchange request."""
+    """Verifier-bound one-time native login-code exchange request."""
 
-    login_code: str
+    login_code: str = Field(min_length=16, max_length=256)
+    handoff_id: str = Field(min_length=16, max_length=128)
+    code_verifier: str = Field(min_length=43, max_length=128, pattern=r"^[A-Za-z0-9._~-]+$")
 
 
 class MobileSessionExchangeResponse(BaseModel):
@@ -268,28 +282,107 @@ class QueuedThreadActionResponse(BaseModel):
     error: str | None = None
 
 
+class MailAttachmentInput(BaseModel):
+    """One RFC 4648 base64 attachment supplied by the native composer."""
+
+    filename: str = Field(min_length=1, max_length=255)
+    mime_type: str = Field(default="application/octet-stream", min_length=1, max_length=127)
+    data_base64: str = Field(min_length=1, max_length=14_000_000)
+
+
 class MailComposeRequest(BaseModel):
     """Native compose payload sent through Gmail."""
 
-    client_send_id: str
-    to: list[str] = Field(default_factory=list)
-    cc: list[str] = Field(default_factory=list)
-    bcc: list[str] = Field(default_factory=list)
-    subject: str
-    body_text: str
-    body_html: str | None = None
-    created_at: str
+    client_send_id: str = Field(min_length=1, max_length=128)
+    to: list[str] = Field(default_factory=list, max_length=100)
+    cc: list[str] = Field(default_factory=list, max_length=100)
+    bcc: list[str] = Field(default_factory=list, max_length=100)
+    subject: str = Field(max_length=998)
+    body_text: str = Field(max_length=5_000_000)
+    body_html: str | None = Field(default=None, max_length=5_000_000)
+    attachments: list[MailAttachmentInput] = Field(default_factory=list, max_length=20)
+    created_at: str = Field(min_length=1, max_length=64)
 
 
 class MailReplyRequest(BaseModel):
     """Native reply payload for an existing mailbox conversation."""
 
-    client_send_id: str
+    client_send_id: str = Field(min_length=1, max_length=128)
+    source_message_id: str | None = Field(default=None, min_length=1, max_length=256)
+    mode: Literal["reply", "reply_all", "forward"] = "reply"
+    to: list[str] = Field(default_factory=list, max_length=100)
+    cc: list[str] = Field(default_factory=list, max_length=100)
+    bcc: list[str] = Field(default_factory=list, max_length=100)
+    subject: str | None = Field(default=None, max_length=998)
+    body_text: str = Field(max_length=5_000_000)
+    body_html: str | None = Field(default=None, max_length=5_000_000)
+    attachments: list[MailAttachmentInput] = Field(default_factory=list, max_length=20)
+    include_quoted_original: bool = True
+    include_original_attachments: bool = True
+    created_at: str = Field(min_length=1, max_length=64)
+
+
+class MailDraftSaveRequest(BaseModel):
+    """Create or update a Gmail draft using a stable client identity."""
+
+    client_draft_id: str = Field(min_length=1, max_length=128)
+    gmail_draft_id: str | None = None
+    gmail_thread_id: str | None = None
+    to: list[str] = Field(default_factory=list, max_length=100)
+    cc: list[str] = Field(default_factory=list, max_length=100)
+    bcc: list[str] = Field(default_factory=list, max_length=100)
+    subject: str = Field(default="", max_length=998)
+    body_text: str = Field(default="", max_length=5_000_000)
+    body_html: str | None = Field(default=None, max_length=5_000_000)
+    # Omitted preserves current Gmail attachments; an explicit [] removes them.
+    attachments: list[MailAttachmentInput] | None = Field(default=None, max_length=20)
+    retained_attachment_ids: list[str] | None = Field(default=None, max_length=20)
+    # Response context is optional so existing compose-draft clients keep the
+    # exact same contract. When present, mailbox_thread_id is the app group ID
+    # (or Gmail thread ID fallback) used to resolve the source message safely.
+    response_mode: Literal["reply", "reply_all", "forward"] | None = None
+    mailbox_thread_id: str | None = Field(default=None, min_length=1, max_length=256)
+    source_message_id: str | None = Field(default=None, min_length=1, max_length=256)
+    include_quoted_original: bool = True
+    include_original_attachments: bool = True
+    created_at: str = Field(min_length=1, max_length=64)
+
+
+class MailDraftResponse(BaseModel):
+    """Current durable identity and save state for a Gmail draft."""
+
+    client_draft_id: str
+    gmail_draft_id: str | None = None
+    gmail_message_id: str | None = None
+    gmail_thread_id: str | None = None
+    to: list[str] = Field(default_factory=list)
     cc: list[str] = Field(default_factory=list)
     bcc: list[str] = Field(default_factory=list)
-    body_text: str
+    subject: str = ""
+    body_text: str = ""
     body_html: str | None = None
-    created_at: str
+    attachments: list["MailDraftAttachment"] = Field(default_factory=list)
+    state: Literal["saved", "deleted", "sent", "failed", "reauth_required"]
+    saved_at: str | None = None
+    error: str | None = None
+    reauth_url: str | None = None
+
+
+class MailDraftSendRequest(BaseModel):
+    """Idempotent send request for a previously saved Gmail draft."""
+
+    client_send_id: str = Field(min_length=1, max_length=128)
+    client_draft_id: str = Field(min_length=1, max_length=128)
+
+
+class MailDraftAttachment(BaseModel):
+    """Existing Gmail draft attachment that can be downloaded by the editor."""
+
+    filename: str
+    mime_type: str = "application/octet-stream"
+    message_id: str
+    attachment_id: str
+    download_url: str
 
 
 class MailSendResponse(BaseModel):
@@ -440,6 +533,7 @@ class MailboxResponse(BaseModel):
 
     label: MailboxLabel
     total_threads: int
+    unread_threads: int = 0
     next_cursor: str | None = None
     loaded_threads: int = 0
     window_days: int | None = None
@@ -546,6 +640,7 @@ class ThreadMessage(BaseModel):
     source: SourceType
     thread_id: str | None = None
     from_address: str | None = None
+    reply_to: str | None = None
     to: str | None = None
     cc: str | None = None
     bcc: str | None = None
@@ -597,12 +692,15 @@ class BackgroundJobResponse(BaseModel):
 class OpsHealthResponse(BaseModel):
     """Small operational snapshot for production debugging."""
 
+    environment: str
+    release: str
     queue_depth: dict[str, int] = Field(default_factory=dict)
     dead_jobs: int = 0
     stale_running_jobs: int = 0
     oldest_queued_age_seconds: int | None = None
     workers: list[dict[str, Any]] = Field(default_factory=list)
     worker_online: bool = False
+    worker_releases_match: bool = False
     required_queues_ready: bool = False
 
 

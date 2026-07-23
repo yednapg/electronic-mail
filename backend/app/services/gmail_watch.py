@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from app.core.config import Settings
+from app.core.error_safety import safe_google_error
 from app.db.jobs import enqueue_job
 from app.db.mail_groups import (
     get_import_state,
@@ -40,7 +41,7 @@ def ensure_gmail_watch(settings: Settings, *, user_id: str, force: bool = False)
     try:
         response = start_gmail_watch(settings, user_id=user_id)
     except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
+        error = safe_google_error(exc, operation="mail sync registration")
         mark_gmail_watch_error(str(settings.database_path), user_id=user_id, error=error)
         return GmailWatchResult(status="failed", error=error)
 

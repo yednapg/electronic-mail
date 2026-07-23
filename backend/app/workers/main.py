@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from base64 import urlsafe_b64decode
 import json
+import logging
 import signal
 import threading
 import time
@@ -12,26 +13,29 @@ from typing import Any
 from uuid import uuid4
 
 from app.core.config import load_settings
-from app.db.jobs import claim_job, cleanup_old_jobs, complete_job, enqueue_job, fail_job, renew_heartbeat
+from app.core.error_safety import GoogleCredentialsUnavailable, safe_job_error
+from app.core.observability import configure_observability
+from app.db.jobs import cancel_claimed_job, claim_job, cleanup_old_jobs, complete_job, fail_job, renew_heartbeat
 from app.db.repository import get_user_by_email
-from app.services.gmail_importer import run_gmail_backfill, run_gmail_delta_sync, run_gmail_import_batch
+from app.db.user_mail_guard import UserMailWorkBlocked
+from app.services.gmail_importer import refresh_gmail_thread_order, run_gmail_backfill, run_gmail_delta_sync, run_gmail_full_reconciliation, run_gmail_import_batch
 from app.services.gmail_watch import ensure_gmail_watch
-from app.services.mailbox_events import DASHBOARD_CHANGED, emit_mailbox_event
-from app.services.mailbox_actions import run_pending_thread_action
+from app.services.mailbox_events import DASHBOARD_CHANGED, MAILBOX_CHANGED, emit_mailbox_event
+from app.services.mailbox_actions import rollback_failed_thread_action, run_pending_thread_action
 from app.services.mailbox_sends import run_pending_send
+from app.services.mailbox_search import run_mailbox_search_hydration
 from app.services.mail_groups import (
-    FIRST_BATCH_SIZE,
     MAILBOX_REBUILD_LIMIT,
-    MAIL_GROUP_ENRICH_BATCH_SIZE,
     enqueue_projection_refresh,
-    enrich_pending_mail_groups,
+    get_import_state,
     rebuild_mail_groups,
     refresh_app_session_snapshot,
     refresh_visible_mail_projection,
-    run_first_run_ai_grouping,
 )
 
 STOP = False
+logger = logging.getLogger(__name__)
+LOOP_ERROR_BACKOFF_SECONDS = 5.0
 
 
 def main() -> None:
@@ -43,33 +47,102 @@ def main() -> None:
     queues = [item.strip() for item in args.queues.split(",") if item.strip()]
     worker_id = f"worker-{uuid4()}"
     settings = load_settings()
+    configure_observability(settings)
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
     while not STOP:
-        renew_heartbeat(str(settings.database_path), worker_id=worker_id, queues=queues)
-        job = claim_job(str(settings.database_path), worker_id=worker_id, queues=queues)
-        if job is None:
-            time.sleep(args.sleep)
-            continue
-        renew_heartbeat(str(settings.database_path), worker_id=worker_id, queues=queues, current_job_id=job.id)
-        stop_heartbeat = threading.Event()
-        heartbeat_thread = threading.Thread(
-            target=_job_heartbeat_loop,
-            args=(str(settings.database_path), worker_id, queues, job.id, args.heartbeat_interval, stop_heartbeat),
-            daemon=True,
-        )
-        heartbeat_thread.start()
         try:
-            _run_job(settings, job)
-            complete_job(str(settings.database_path), job.id)
+            worked = _run_worker_cycle(
+                settings,
+                worker_id=worker_id,
+                queues=queues,
+                heartbeat_interval=args.heartbeat_interval,
+            )
         except Exception as exc:
-            fail_job(str(settings.database_path), job, f"{type(exc).__name__}: {exc}")
-        finally:
-            stop_heartbeat.set()
-            heartbeat_thread.join(timeout=1.0)
-            renew_heartbeat(str(settings.database_path), worker_id=worker_id, queues=queues)
+            logger.warning(
+                "worker.loop_error",
+                extra={
+                    "event_fields": {
+                        "event": "worker.loop_error",
+                        "exception_type": type(exc).__name__,
+                    }
+                },
+            )
+            time.sleep(min(LOOP_ERROR_BACKOFF_SECONDS, max(0.1, args.sleep)))
+            continue
+        if not worked:
+            time.sleep(max(0.1, args.sleep))
+
+
+def _run_worker_cycle(settings, *, worker_id: str, queues: list[str], heartbeat_interval: float) -> bool:
+    """Claim and process at most one job; callers retry transient DB failures."""
+    database_url = str(settings.database_path)
+    renew_heartbeat(
+        database_url,
+        worker_id=worker_id,
+        queues=queues,
+        release_sha=settings.release_sha,
+    )
+    job = claim_job(database_url, worker_id=worker_id, queues=queues)
+    if job is None:
+        return False
+    renew_heartbeat(
+        database_url,
+        worker_id=worker_id,
+        queues=queues,
+        release_sha=settings.release_sha,
+        current_job_id=job.id,
+    )
+    stop_heartbeat = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_job_heartbeat_loop,
+        args=(
+            database_url,
+            worker_id,
+            queues,
+            settings.release_sha,
+            job.id,
+            heartbeat_interval,
+            stop_heartbeat,
+        ),
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    try:
+        _run_job(settings, job)
+        complete_job(database_url, job.id, worker_id=worker_id)
+    except UserMailWorkBlocked:
+        cancel_claimed_job(database_url, job.id, worker_id=worker_id)
+    except GoogleCredentialsUnavailable:
+        # Retrying cannot repair revoked or expired credentials. Preserve the
+        # local mailbox and wait for the user to complete Google OAuth again.
+        cancel_claimed_job(database_url, job.id, worker_id=worker_id)
+    except Exception as exc:
+        failed = fail_job(database_url, job, safe_job_error(exc), worker_id=worker_id)
+        action_user_id = job.payload.get("user_id") or job.user_id
+        if (
+            failed
+            and job.attempt_count >= job.max_attempts
+            and job.kind == "gmail_thread_action"
+            and isinstance(action_user_id, str)
+        ):
+            rollback_failed_thread_action(
+                settings,
+                user_id=action_user_id,
+                server_action_id=str(job.payload.get("server_action_id") or ""),
+            )
+    finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=1.0)
+        renew_heartbeat(
+            database_url,
+            worker_id=worker_id,
+            queues=queues,
+            release_sha=settings.release_sha,
+        )
+    return True
 
 
 def _run_job(settings, job) -> None:
@@ -96,6 +169,36 @@ def _run_job(settings, job) -> None:
         refresh_app_session_snapshot(settings, user_id=user_id)
         emit_mailbox_event(settings, user_id=user_id, event_type=DASHBOARD_CHANGED, payload={"source": "gmail_backfill"})
         return
+    if job.kind == "gmail_full_reconcile":
+        if not isinstance(user_id, str):
+            raise RuntimeError("gmail_full_reconcile missing user_id")
+        run_gmail_full_reconciliation(
+            settings,
+            user_id=user_id,
+            batch_size=int(payload.get("batch_size") or 250),
+        )
+        try:
+            refresh_app_session_snapshot(settings, user_id=user_id)
+            emit_mailbox_event(
+                settings,
+                user_id=user_id,
+                event_type=DASHBOARD_CHANGED,
+                payload={"source": "gmail_full_reconcile"},
+            )
+        except Exception as exc:
+            # Reconciliation may already have atomically published its cursor.
+            # A snapshot/event failure must not restart the full remote scan.
+            logger.warning(
+                "gmail_full_reconcile.post_refresh_failed",
+                extra={
+                    "event_fields": {
+                        "event": "gmail_full_reconcile.post_refresh_failed",
+                        "user_id": user_id,
+                        "exception_type": type(exc).__name__,
+                    }
+                },
+            )
+        return
     if job.kind == "gmail_delta_sync":
         if not isinstance(user_id, str):
             raise RuntimeError("gmail_delta_sync missing user_id")
@@ -120,6 +223,18 @@ def _run_job(settings, job) -> None:
             gmail_thread_id=str(payload.get("gmail_thread_id") or ""),
         )
         return
+    if job.kind == "gmail_search_hydrate":
+        if not isinstance(user_id, str):
+            raise RuntimeError("gmail_search_hydrate missing user_id")
+        run_mailbox_search_hydration(
+            settings,
+            user_id=user_id,
+            query=str(payload.get("query") or ""),
+            label=str(payload.get("label") or "all"),
+            limit=int(payload.get("limit") or 100),
+            search_key=str(payload.get("search_key") or ""),
+        )
+        return
     if job.kind == "gmail_thread_action":
         if not isinstance(user_id, str):
             raise RuntimeError("gmail_thread_action missing user_id")
@@ -135,49 +250,14 @@ def _run_job(settings, job) -> None:
             raise RuntimeError(f"{job.kind} missing user_id")
         rebuild_mail_groups(settings, user_id=user_id, limit=MAILBOX_REBUILD_LIMIT, use_ai=False)
         enqueue_projection_refresh(settings, user_id=user_id)
-        enqueue_job(
-            str(settings.database_path),
-            kind="mail_group_enrich",
-            queue="default",
-            user_id=user_id,
-            dedupe_key=f"mail-group-enrich:{user_id}",
-            priority=10,
-            payload={"user_id": user_id},
-        )
         return
     if job.kind == "mail_group_enrich":
-        if not isinstance(user_id, str):
-            raise RuntimeError(f"{job.kind} missing user_id")
-        preferred_group_ids = payload.get("preferred_group_ids")
-        touched = enrich_pending_mail_groups(
-            settings,
-            user_id=user_id,
-            limit=MAIL_GROUP_ENRICH_BATCH_SIZE,
-            preferred_group_ids=[str(group_id) for group_id in preferred_group_ids] if isinstance(preferred_group_ids, list) else None,
-        )
-        enqueue_projection_refresh(settings, user_id=user_id, priority=20)
-        if touched >= MAIL_GROUP_ENRICH_BATCH_SIZE:
-            enqueue_job(
-                str(settings.database_path),
-                kind="mail_group_enrich",
-                queue="default",
-                user_id=user_id,
-                dedupe_key=f"mail-group-enrich:{user_id}:{uuid4()}",
-                priority=40,
-                payload={"user_id": user_id},
-            )
+        # Historical AI-enrichment jobs may survive a deployment. They are a
+        # deliberate no-op in the no-AI mailbox release.
         return
     if job.kind == "first_run_ai_grouping":
-        if not isinstance(user_id, str):
-            raise RuntimeError("first_run_ai_grouping missing user_id")
-        run_first_run_ai_grouping(settings, user_id=user_id, limit=int(payload.get("batch_size") or FIRST_BATCH_SIZE))
-        emit_mailbox_event(settings, user_id=user_id, event_type=DASHBOARD_CHANGED, payload={"source": "first_run_ai_grouping"})
         return
     if job.kind == "first_run_ready_check":
-        if not isinstance(user_id, str):
-            raise RuntimeError("first_run_ready_check missing user_id")
-        run_first_run_ai_grouping(settings, user_id=user_id, limit=int(payload.get("batch_size") or FIRST_BATCH_SIZE))
-        emit_mailbox_event(settings, user_id=user_id, event_type=DASHBOARD_CHANGED, payload={"source": "first_run_ready_check"})
         return
     if job.kind == "gmail_pubsub_sync":
         resolved_user_id = _user_id_from_pubsub(settings, payload) or user_id
@@ -196,6 +276,29 @@ def _run_job(settings, job) -> None:
         if not isinstance(user_id, str):
             raise RuntimeError("gmail_watch_renewal missing user_id")
         ensure_gmail_watch(settings, user_id=user_id, force=True)
+        return
+    if job.kind == "gmail_thread_order_refresh":
+        if not isinstance(user_id, str):
+            raise RuntimeError("gmail_thread_order_refresh missing user_id")
+        target_history_id = str(payload.get("target_history_id") or "") or None
+        state = get_import_state(str(settings.database_path), user_id=user_id)
+        current_history_id = str(state.last_history_id or "") if state is not None else ""
+        if (
+            target_history_id
+            and target_history_id.isdigit()
+            and current_history_id.isdigit()
+            and int(target_history_id) < int(current_history_id)
+        ):
+            return
+        refresh_gmail_thread_order(settings, user_id=user_id)
+        refresh_app_session_snapshot(settings, user_id=user_id)
+        emit_mailbox_event(
+            settings,
+            user_id=user_id,
+            event_type=MAILBOX_CHANGED,
+            mailbox_label="all",
+            payload={"source": "gmail_thread_order_refresh"},
+        )
         return
     if job.kind == "projection_refresh":
         if not isinstance(user_id, str):
@@ -219,12 +322,30 @@ def _job_heartbeat_loop(
     database_url: str,
     worker_id: str,
     queues: list[str],
+    release_sha: str,
     job_id: str,
     interval_seconds: float,
     stop_event: threading.Event,
 ) -> None:
     while not stop_event.wait(max(1.0, interval_seconds)):
-        renew_heartbeat(database_url, worker_id=worker_id, queues=queues, current_job_id=job_id)
+        try:
+            renew_heartbeat(
+                database_url,
+                worker_id=worker_id,
+                queues=queues,
+                release_sha=release_sha,
+                current_job_id=job_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "worker.heartbeat_error",
+                extra={
+                    "event_fields": {
+                        "event": "worker.heartbeat_error",
+                        "exception_type": type(exc).__name__,
+                    }
+                },
+            )
 
 
 def _user_id_from_pubsub(settings, payload: dict[str, Any]) -> str | None:
@@ -245,5 +366,17 @@ def _user_id_from_pubsub(settings, payload: dict[str, Any]) -> str | None:
     return user.id if user is not None else None
 
 
+def _run_cli() -> int:
+    try:
+        main()
+    except Exception as exc:
+        logger.error(
+            "worker.fatal",
+            extra={"event_fields": {"event": "worker.fatal", "exception_type": type(exc).__name__}},
+        )
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(_run_cli())
