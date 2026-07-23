@@ -6,6 +6,8 @@ In production, the web service returns `404` for `/gmail`, `/dashboard`, their n
 
 The public artifact must be a universal (`arm64` + `x86_64`) Developer ID-signed app with Hardened Runtime, App Sandbox, a production HTTPS backend origin, a valid privacy manifest, successful Apple notarization, a stapled ticket, and Gatekeeper acceptance.
 
+For an earlier ad-hoc DMG that can be attached to a GitHub prerelease for trusted testing, use the isolated [local-testing beta path](MACOS_BETA.md). That artifact is conspicuously unnotarized and does not weaken or replace any production requirement below.
+
 ## Credential-free preflight
 
 Run this first on a Mac with the reviewed release toolchain: Xcode 16.4, build 16F6, installed at `/Applications/Xcode_16.4.app/Contents/Developer`. The approved version, build, and path live in `scripts/macos-release-toolchain.env`; both preflight and release fail closed on any mismatch. Preflight never reads a signing identity or notarization credential and produces only an explicitly non-distributable, identity-free app under `/tmp`. The linker may add an ad-hoc marker, but the verifier rejects any certificate authority or Apple team identity:

@@ -49,7 +49,7 @@ public final class KeychainSessionTokenStore: SessionTokenStoring {
     }
 
     #if os(macOS)
-    static var classicMacDebugPolicyAttributes: [String: Any] {
+    static var classicMacLocalTestingPolicyAttributes: [String: Any] {
         [
             kSecAttrSynchronizable as String: false,
         ]
@@ -57,7 +57,7 @@ public final class KeychainSessionTokenStore: SessionTokenStoring {
     #endif
 
     static var classicMacFallbackEnabled: Bool {
-        #if os(macOS) && DEBUG
+        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
         return true
         #else
         return false
@@ -86,7 +86,7 @@ public final class KeychainSessionTokenStore: SessionTokenStoring {
             return String(data: synchronizedData, encoding: .utf8)
         }
 
-        #if os(macOS) && DEBUG
+        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
         if let classicData = readData(query: classicMacQuery()) {
             migrateClassicMacDataToDataProtectionKeychain(classicData)
             return String(data: classicData, encoding: .utf8)
@@ -117,7 +117,7 @@ public final class KeychainSessionTokenStore: SessionTokenStoring {
 
     private enum StorageDestination: Equatable {
         case dataProtection
-        #if os(macOS) && DEBUG
+        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
         case classicMac
         #endif
     }
@@ -128,7 +128,7 @@ public final class KeychainSessionTokenStore: SessionTokenStoring {
             try writeData(data, query: secureQuery(synchronizable: false), enforcesDeviceOnlyAccessibility: true)
             return .dataProtection
         } catch KeychainError.status(let status) {
-            #if os(macOS) && DEBUG
+            #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
             if Self.shouldUseClassicMacFallback(for: status, debugBuild: Self.classicMacFallbackEnabled) {
                 try writeData(data, query: classicMacQuery(), enforcesDeviceOnlyAccessibility: false)
                 return .classicMac
@@ -197,11 +197,11 @@ public final class KeychainSessionTokenStore: SessionTokenStoring {
     #if os(macOS)
     private func classicMacQuery() -> [String: Any] {
         var query = baseQuery()
-        query[kSecAttrSynchronizable as String] = Self.classicMacDebugPolicyAttributes[kSecAttrSynchronizable as String]
+        query[kSecAttrSynchronizable as String] = Self.classicMacLocalTestingPolicyAttributes[kSecAttrSynchronizable as String]
         return query
     }
 
-    #if DEBUG
+    #if DEBUG || ELECTRONIC_MAIL_LOCAL_BETA
 
     private func migrateClassicMacDataToDataProtectionKeychain(_ data: Data) {
         do {
@@ -212,9 +212,9 @@ public final class KeychainSessionTokenStore: SessionTokenStoring {
             )
             _ = SecItemDelete(classicMacQuery() as CFDictionary)
         } catch {
-            // Local ad-hoc Xcode builds can lack the entitlement required by the
-            // Data Protection Keychain. Keep the DEBUG-only classic Keychain item
-            // intact; Release builds never read from or write to this fallback.
+            // Local ad-hoc builds can lack the entitlement required by the Data
+            // Protection Keychain. Keep the local-testing classic Keychain item
+            // intact; production Release builds never compile this fallback.
         }
     }
     #endif

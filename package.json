@@ -56,11 +56,14 @@
     "launch:verify:test": "python3 -m unittest scripts/tests/test_verify_launch_acceptance.py && bash scripts/tests/verify-launch.test.sh",
     "database:scripts:test": "bash scripts/tests/backup-postgres.test.sh && bash scripts/tests/restore-postgres.test.sh",
     "release:macos:preflight": "bash scripts/preflight-macos-release.sh",
+    "release:macos:beta:test": "python3 -m unittest scripts/tests/test_macos_beta_policy.py",
+    "release:macos:beta:validate": "bash scripts/package-macos-beta.sh --validate-inputs",
+    "release:macos:beta": "bash scripts/package-macos-beta.sh",
     "release:macos:validate": "bash scripts/release-macos.sh --validate-inputs",
     "release:macos": "bash scripts/release-macos.sh",
     "verify": "npm run verify:macos",
     "verify:macos": "npm run macos:typecheck && npm run macos:test",
-    "verify:all": "npm run reproducibility:verify && npm run reproducibility:verify:test && npm run verify:macos && npm run backend:test && npm run backend:compile && npm run database:scripts:test && npm run web:typecheck && npm run web:test && npm run web:build && npm run web:verify:assets:test && npm run web:verify:assets && npm run launch:verify:test && npm run security:audit"
+    "verify:all": "npm run reproducibility:verify && npm run reproducibility:verify:test && npm run release:macos:beta:test && npm run verify:macos && npm run backend:test && npm run backend:compile && npm run database:scripts:test && npm run web:typecheck && npm run web:test && npm run web:build && npm run web:verify:assets:test && npm run web:verify:assets && npm run launch:verify:test && npm run security:audit"
   },
   "overrides": {
     "next": {

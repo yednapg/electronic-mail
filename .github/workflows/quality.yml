@@ -28,6 +28,7 @@ jobs:
           python-version: "3.12.13"
       - run: python3 scripts/verify-reproducibility.py
       - run: python3 -m unittest scripts/tests/test_verify_reproducibility.py
+      - run: npm run release:macos:beta:test
 
   backend:
     runs-on: ubuntu-24.04

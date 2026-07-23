@@ -23,6 +23,8 @@ npm run verify:all
 npm run release:macos:preflight
 ```
 
+For a clean-commit, universal ad-hoc DMG intended only for a GitHub prerelease test group, see `docs/MACOS_BETA.md` and run `npm run release:macos:beta:test` before `npm run release:macos:beta`.
+
 `verify:all` is a source gate, not approval to distribute. A public build additionally requires a clean reviewed commit, the protected Developer ID/notarization workflow, a migrated healthy production deployment, the exact-artifact manual matrix, publisher/legal/security/support/operations approvals, and the fail-closed production launch verifier.
 
 ## Launch documents
