@@ -183,6 +183,14 @@ require(
     '"ENABLE_PREVIEWS": "NO"' in release_settings[0],
     "Project.swift must disable previews for the macOS app Release configuration",
 )
+require(
+    re.search(
+        r'name:\s*"ElectronicMailCore".*?settings:\s*\.settings\(base:\s*\[\s*"ENABLE_HARDENED_RUNTIME":\s*"YES"\s*\]\)',
+        project_manifest,
+        re.DOTALL,
+    ) is not None,
+    "Project.swift must enable Hardened Runtime for ElectronicMailCore",
+)
 
 with open(source_xcode_project_path, encoding="utf-8") as handle:
     xcode_project = handle.read()
@@ -200,6 +208,16 @@ require(
     "ENABLE_PREVIEWS = NO;" in generated_release_settings[0]
     and "ENABLE_PREVIEWS = YES;" not in generated_release_settings[0],
     "generated Xcode project must disable previews for the macOS app Release configuration",
+)
+generated_core_settings = [
+    body
+    for body in re.findall(r"buildSettings = \{(.*?)\n\s*\};", xcode_project, re.DOTALL)
+    if "PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.core;" in body
+]
+require(
+    len(generated_core_settings) == 2
+    and all("ENABLE_HARDENED_RUNTIME = YES;" in body for body in generated_core_settings),
+    "generated Xcode project must enable Hardened Runtime for every ElectronicMailCore configuration",
 )
 
 with open(source_demo_client_path, encoding="utf-8") as handle:
@@ -388,8 +406,11 @@ if [ "$SIGNING_MODE" = "developer-id" ]; then
     [ "$ACTUAL_TEAM_ID" = "$EXPECTED_TEAM_ID" ] || fail "signature team mismatch: expected $EXPECTED_TEAM_ID, found ${ACTUAL_TEAM_ID:-none}: $code_path"
   done
 
-  SIGNATURE_DETAILS="$(codesign -dvvv "$APP_PATH" 2>&1)"
-  printf '%s\n' "$SIGNATURE_DETAILS" | grep -q 'flags=.*runtime' || fail "Hardened Runtime is missing from the app"
+  for code_path in "$APP_PATH" "$FRAMEWORK"; do
+    SIGNATURE_DETAILS="$(codesign -dvvv "$code_path" 2>&1)"
+    printf '%s\n' "$SIGNATURE_DETAILS" | grep -q 'flags=.*runtime' || \
+      fail "Hardened Runtime is missing from signed code: $code_path"
+  done
 
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf "$TMP_DIR"' EXIT
