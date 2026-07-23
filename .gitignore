@@ -5,6 +5,8 @@ build
 .next
 .turbo
 .env
+.env.local
+.env.production
 backend/.env
 backend/.env.local
 web/.env
@@ -18,6 +20,9 @@ __pycache__
 .pytest_cache
 .venv
 .DS_Store
+*.swp
+*.swo
+*~
 *.tsbuildinfo
 backend/dev.db
 backend/dev.db-journal
@@ -27,6 +32,25 @@ backend/dev.db-journal
 **/Derived/
 DerivedData/
 .build/
+.release/
+artifacts/
+backups/
+
+# Local test/browser artifacts and mailbox exports
+.playwright-cli/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.eml
+*.mbox
+
+# Local Apple signing and release artifacts
+*.p8
+*.p12
+*.pem
+*.key
+*.dmg
+*.xcarchive/
 
 *.log
 .coverage

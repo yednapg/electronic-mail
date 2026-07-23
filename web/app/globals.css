@@ -1,80 +1,7 @@
-@font-face {
-  font-family: "SF Pro Rounded";
-  src: url("../font/SF-Pro-Rounded-Thin.otf") format("opentype");
-  font-display: block;
-  font-style: normal;
-  font-weight: 100;
-}
-
-@font-face {
-  font-family: "SF Pro Rounded";
-  src: url("../font/SF-Pro-Rounded-Ultralight.otf") format("opentype");
-  font-display: block;
-  font-style: normal;
-  font-weight: 200;
-}
-
-@font-face {
-  font-family: "SF Pro Rounded";
-  src: url("../font/SF-Pro-Rounded-Light.otf") format("opentype");
-  font-display: block;
-  font-style: normal;
-  font-weight: 300;
-}
-
-@font-face {
-  font-family: "SF Pro Rounded";
-  src: url("../font/SF-Pro-Rounded-Regular.otf") format("opentype");
-  font-display: block;
-  font-style: normal;
-  font-weight: 400;
-}
-
-@font-face {
-  font-family: "SF Pro Rounded";
-  src: url("../font/SF-Pro-Rounded-Medium.otf") format("opentype");
-  font-display: block;
-  font-style: normal;
-  font-weight: 500;
-}
-
-@font-face {
-  font-family: "SF Pro Rounded";
-  src: url("../font/SF-Pro-Rounded-Semibold.otf") format("opentype");
-  font-display: block;
-  font-style: normal;
-  font-weight: 600;
-}
-
-@font-face {
-  font-family: "SF Pro Rounded";
-  src: url("../font/SF-Pro-Rounded-Bold.otf") format("opentype");
-  font-display: block;
-  font-style: normal;
-  font-weight: 700;
-}
-
-@font-face {
-  font-family: "SF Pro Rounded";
-  src: url("../font/SF-Pro-Rounded-Heavy.otf") format("opentype");
-  font-display: block;
-  font-style: normal;
-  font-weight: 800;
-}
-
-@font-face {
-  font-family: "SF Pro Rounded";
-  src: url("../font/SF-Pro-Rounded-Black.otf") format("opentype");
-  font-display: block;
-  font-style: normal;
-  font-weight: 900;
-}
-
 :root {
   color-scheme: light;
   --font-rounded:
-    var(--font-sf-pro-rounded, "SF Pro Rounded"),
-    "SF Pro Rounded",
+    ui-rounded,
     -apple-system,
     BlinkMacSystemFont,
     system-ui,
@@ -154,6 +81,117 @@
   --type-mobile-copy: 16px;
   --type-mobile-detail: 15px;
   --type-mobile-detail-source: 14px;
+}
+
+.login-legal-links,
+.legal-nav {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+}
+
+.login-legal-links {
+  justify-content: center;
+  margin-top: 22px;
+  font-size: 13px;
+}
+
+.login-legal-links a,
+.legal-nav a,
+.legal-document a {
+  color: var(--page-text-muted);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.legal-page {
+  min-height: 100vh;
+  background: var(--page-bg);
+  color: var(--page-text);
+  padding: 28px clamp(20px, 5vw, 72px) 80px;
+}
+
+.legal-header {
+  max-width: 860px;
+  margin: 0 auto 64px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+}
+
+.legal-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--page-text);
+  text-decoration: none;
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.legal-mark {
+  width: 34px;
+  height: 34px;
+}
+
+.legal-document {
+  max-width: 720px;
+  margin: 0 auto;
+  font-family: var(--font-rounded);
+  line-height: 1.65;
+}
+
+.legal-document h1 {
+  margin: 4px 0 8px;
+  font-size: clamp(38px, 7vw, 64px);
+  line-height: 1;
+  letter-spacing: -0.045em;
+}
+
+.legal-document h2 {
+  margin: 40px 0 10px;
+  font-size: 21px;
+  letter-spacing: -0.02em;
+}
+
+.legal-document p,
+.legal-document li {
+  color: var(--page-text-muted);
+  font-size: 16px;
+}
+
+.legal-document li + li {
+  margin-top: 8px;
+}
+
+.legal-eyebrow,
+.legal-effective {
+  color: var(--page-text-subtle) !important;
+  font-size: 13px !important;
+  letter-spacing: 0.02em;
+}
+
+.legal-review-banner {
+  padding: 13px 16px;
+  border: 1px solid #b55b00;
+  border-radius: 10px;
+  background: color-mix(in srgb, #ff9d00 12%, var(--page-bg));
+  color: var(--page-text) !important;
+  font-weight: 650;
+}
+
+@media (max-width: 620px) {
+  .legal-header {
+    align-items: flex-start;
+    flex-direction: column;
+    margin-bottom: 46px;
+  }
+
+  .legal-nav {
+    width: 100%;
+    justify-content: space-between;
+  }
 }
 
 @media (prefers-color-scheme: dark) {
@@ -789,6 +827,8 @@ a {
 
 .login-copy {
   display: grid;
+  justify-items: center;
+  gap: 18px;
   text-align: center;
 }
 
@@ -808,14 +848,21 @@ a {
   white-space: nowrap;
 }
 
-.login-google-button {
+.login-native-description {
+  max-width: 31rem;
+  margin: 0;
+  color: var(--page-text-muted);
+  font-size: 17px;
+  line-height: 1.55;
+}
+
+.login-primary-link {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 15px;
   min-height: 50px;
-  width: min(100%, 291px);
-  padding: 0 15px;
+  width: min(100%, 190px);
+  padding: 0 20px;
   border: 1px solid var(--button-border);
   border-radius: 6px;
   background-color: var(--button-bg);
@@ -832,26 +879,14 @@ a {
     transform 160ms ease;
 }
 
-.login-google-button:hover {
+.login-primary-link:hover {
   background-color: var(--button-bg-hover);
   transform: translateY(-1px);
 }
 
-.login-google-button:focus-visible {
+.login-primary-link:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 3px;
-}
-
-.login-google-icon {
-  width: 30px;
-  height: 30px;
-  display: inline-flex;
-  flex-shrink: 0;
-}
-
-.login-google-icon svg {
-  width: 100%;
-  height: 100%;
 }
 
 .post-login-page {
@@ -865,31 +900,43 @@ a {
 }
 
 .post-login-shell {
-  width: 100%;
+  width: min(100%, 34rem);
   display: grid;
   justify-items: center;
-  gap: 0;
+  gap: 24px;
   transform: none;
 }
 
 .post-login-mark {
-  display: none;
+  display: block;
+  font-size: var(--type-transition-mark);
 }
 
 .post-login-copy {
   display: grid;
   justify-items: center;
-  gap: 0;
+  gap: 14px;
   text-align: center;
 }
 
 .post-login-title {
-  display: none;
+  margin: 0;
+  color: var(--page-text);
+  font-size: var(--type-transition-title);
+  line-height: 1.08;
 }
 
 .post-login-title-line {
   display: block;
   white-space: nowrap;
+}
+
+.post-login-completion-copy {
+  max-width: 29rem;
+  margin: 0;
+  color: var(--page-text-muted);
+  font-size: var(--type-transition-copy);
+  line-height: 1.55;
 }
 
 .post-login-rotating-status {
@@ -936,7 +983,16 @@ a {
 }
 
 .post-login-fallback-link {
-  display: none;
+  display: inline-flex;
+  color: var(--page-text-muted);
+  font-size: 14px;
+  text-underline-offset: 3px;
+}
+
+.post-login-fallback-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 20px;
 }
 
 .post-login-fallback-link:hover {
@@ -2553,7 +2609,7 @@ body:has(.thread-reader-shell) [title="Open Next.js Dev Tools"] {
   .attention-detail,
   .attention-item,
   .post-login-status-text,
-  .login-google-button,
+  .login-primary-link,
   .attention-checkbox,
   .theme-toggle,
   .app-chrome-link,
@@ -2623,15 +2679,14 @@ body:has(.thread-reader-shell) [title="Open Next.js Dev Tools"] {
     white-space: normal;
   }
 
-  .login-google-button {
+  .login-primary-link {
     min-height: 58px;
     width: min(100%, 24rem);
     font-size: var(--type-mobile-control);
   }
 
-  .login-google-icon {
-    width: 31px;
-    height: 31px;
+  .login-native-description {
+    font-size: 16px;
   }
 
   .post-login-page {
@@ -2639,21 +2694,27 @@ body:has(.thread-reader-shell) [title="Open Next.js Dev Tools"] {
   }
 
   .post-login-shell {
-    width: 100%;
-    gap: 0;
+    width: min(100%, 30rem);
+    gap: 22px;
     transform: none;
   }
 
   .post-login-mark {
-    display: none;
+    display: block;
+    font-size: var(--type-mobile-transition-mark);
   }
 
   .post-login-title {
-    display: none;
+    display: block;
+    font-size: var(--type-mobile-transition-title);
   }
 
   .post-login-title-line {
     white-space: normal;
+  }
+
+  .post-login-completion-copy {
+    font-size: var(--type-mobile-transition-copy);
   }
 
   .post-login-rotating-status {

@@ -19,6 +19,7 @@
     "components/**/*.ts",
     "components/**/*.tsx",
     "lib/**/*.ts",
+    "proxy.ts",
     ".next/types/**/*.ts"
   ]
 }
