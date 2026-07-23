@@ -11,10 +11,13 @@ EXPECTED_TEAM_ID="${EXPECTED_TEAM_ID:-}"
 DSYM_PATH="${DSYM_PATH:-}"
 SIGNING_MODE="${SIGNING_MODE:-identity-free}"
 REQUIRE_NOTARIZATION="${REQUIRE_NOTARIZATION:-0}"
+INFO_POLICY="${INFO_POLICY:-production}"
+REQUIRE_ADHOC_SIGNATURE="${REQUIRE_ADHOC_SIGNATURE:-0}"
 
 SOURCE_ENTITLEMENTS="$ROOT_DIR/macos/ElectronicMail/ElectronicMail/Mac/ElectronicMail.entitlements"
 SOURCE_PRIVACY_MANIFEST="$ROOT_DIR/macos/ElectronicMail/ElectronicMail/Mac/PrivacyInfo.xcprivacy"
 SOURCE_RELEASE_INFO="$ROOT_DIR/macos/ElectronicMail/Config/InfoPlists/ElectronicMail-Release-Info.plist"
+SOURCE_BETA_INFO="$ROOT_DIR/macos/ElectronicMail/Config/InfoPlists/ElectronicMail-Beta-Info.plist"
 SOURCE_PROJECT_MANIFEST="$ROOT_DIR/macos/ElectronicMail/Project.swift"
 SOURCE_XCODE_PROJECT="$ROOT_DIR/macos/ElectronicMail/ElectronicMail.xcodeproj/project.pbxproj"
 SOURCE_DEMO_CLIENT="$ROOT_DIR/macos/ElectronicMail/ElectronicMail/Core/DemoAppClient.swift"
@@ -36,9 +39,17 @@ case "$SIGNING_MODE" in
   identity-free | developer-id) ;;
   *) fail "SIGNING_MODE must be identity-free or developer-id" ;;
 esac
+case "$INFO_POLICY" in
+  production | local-beta) ;;
+  *) fail "INFO_POLICY must be production or local-beta" ;;
+esac
 case "$REQUIRE_NOTARIZATION" in
   0 | 1) ;;
   *) fail "REQUIRE_NOTARIZATION must be 0 or 1" ;;
+esac
+case "$REQUIRE_ADHOC_SIGNATURE" in
+  0 | 1) ;;
+  *) fail "REQUIRE_ADHOC_SIGNATURE must be 0 or 1" ;;
 esac
 if [ "$SIGNING_MODE" = "developer-id" ]; then
   [ -n "$EXPECTED_TEAM_ID" ] || fail "EXPECTED_TEAM_ID is required for Developer ID verification"
@@ -46,6 +57,9 @@ if [ "$SIGNING_MODE" = "developer-id" ]; then
 fi
 if [ "$REQUIRE_NOTARIZATION" = "1" ] && [ "$SIGNING_MODE" != "developer-id" ]; then
   fail "notarization cannot be required for an identity-free artifact"
+fi
+if [ "$REQUIRE_ADHOC_SIGNATURE" = "1" ] && [ "$SIGNING_MODE" != "identity-free" ]; then
+  fail "an ad-hoc signature can be required only for an identity-free artifact"
 fi
 
 for command in codesign grep lipo plutil python3 xcrun; do
@@ -79,6 +93,7 @@ done
 plutil -lint "$SOURCE_ENTITLEMENTS" >/dev/null
 plutil -lint "$SOURCE_PRIVACY_MANIFEST" >/dev/null
 plutil -lint "$SOURCE_RELEASE_INFO" >/dev/null
+plutil -lint "$SOURCE_BETA_INFO" >/dev/null
 plutil -lint "$INFO_PLIST" >/dev/null
 plutil -lint "$PRIVACY_MANIFEST" >/dev/null
 plutil -lint "$FRAMEWORK_PRIVACY_MANIFEST" >/dev/null
@@ -118,7 +133,7 @@ if [ -n "$DSYM_PATH" ]; then
   [ "$EXECUTABLE_UUIDS" = "$DSYM_UUIDS" ] || fail "dSYM UUIDs do not match the packaged executable"
 fi
 
-python3 - "$SOURCE_ENTITLEMENTS" "$SOURCE_PRIVACY_MANIFEST" "$SOURCE_RELEASE_INFO" "$SOURCE_PROJECT_MANIFEST" "$SOURCE_XCODE_PROJECT" "$SOURCE_DEMO_CLIENT" "$PRIVACY_MANIFEST" "$FRAMEWORK_PRIVACY_MANIFEST" "$INFO_PLIST" <<'PY'
+python3 - "$SOURCE_ENTITLEMENTS" "$SOURCE_PRIVACY_MANIFEST" "$SOURCE_RELEASE_INFO" "$SOURCE_BETA_INFO" "$SOURCE_PROJECT_MANIFEST" "$SOURCE_XCODE_PROJECT" "$SOURCE_DEMO_CLIENT" "$PRIVACY_MANIFEST" "$FRAMEWORK_PRIVACY_MANIFEST" "$INFO_PLIST" "$INFO_POLICY" <<'PY'
 import plistlib
 import re
 import sys
@@ -126,13 +141,15 @@ import sys
 (
     source_entitlements_path,
     source_privacy_path,
-    source_info_path,
+    source_release_info_path,
+    source_beta_info_path,
     source_project_manifest_path,
     source_xcode_project_path,
     source_demo_client_path,
     packaged_privacy_path,
     framework_privacy_path,
     packaged_info_path,
+    info_policy,
 ) = sys.argv[1:]
 
 def load(path):
@@ -207,12 +224,37 @@ expected_entitlements = {
 }
 require(entitlements == expected_entitlements, f"source entitlements differ from the approved minimal set: {entitlements}")
 
-source_info = load(source_info_path)
+source_release_info = load(source_release_info_path)
+source_beta_info = load(source_beta_info_path)
 packaged_info = load(packaged_info_path)
-require(source_info.get("BackendBaseURL") == "$(ELECTRONIC_MAIL_BACKEND_URL)", "Release Info.plist must use backend build-setting injection")
-require(source_info.get("ElectronicMailSourceCommit") == "$(ELECTRONIC_MAIL_SOURCE_COMMIT)", "Release Info.plist must use source-commit build-setting injection")
-require("NSAppTransportSecurity" not in source_info, "Release Info.plist must not contain local or insecure ATS exceptions")
-require("NSAppTransportSecurity" not in packaged_info, "packaged Release app contains an ATS exception")
+for label, source_info in (("Release", source_release_info), ("Beta", source_beta_info)):
+    require(source_info.get("BackendBaseURL") == "$(ELECTRONIC_MAIL_BACKEND_URL)", f"{label} Info.plist must use backend build-setting injection")
+    require(source_info.get("ElectronicMailSourceCommit") == "$(ELECTRONIC_MAIL_SOURCE_COMMIT)", f"{label} Info.plist must use source-commit build-setting injection")
+
+require("NSAppTransportSecurity" not in source_release_info, "Release Info.plist must not contain local or insecure ATS exceptions")
+expected_beta_ats = {
+    "NSExceptionDomains": {
+        "localhost": {
+            "NSExceptionAllowsInsecureHTTPLoads": True,
+            "NSIncludesSubdomains": False,
+        }
+    }
+}
+require(source_beta_info.get("NSAppTransportSecurity") == expected_beta_ats, "Beta Info.plist must contain only the exact localhost HTTP exception")
+require(source_beta_info.get("ElectronicMailDistributionChannel") == "local-testing-beta", "Beta Info.plist must identify the local-testing distribution channel")
+require(source_beta_info.get("ElectronicMailNotarized") is False, "Beta Info.plist must explicitly mark the app as unnotarized")
+
+if info_policy == "production":
+    require("NSAppTransportSecurity" not in packaged_info, "packaged Release app contains an ATS exception")
+    require("ElectronicMailDistributionChannel" not in packaged_info, "packaged production app claims a beta distribution channel")
+    require("ElectronicMailNotarized" not in packaged_info, "packaged production app contains a beta notarization marker")
+elif info_policy == "local-beta":
+    require(packaged_info.get("NSAppTransportSecurity") == expected_beta_ats, "packaged beta app must contain only the exact localhost HTTP exception")
+    require(packaged_info.get("ElectronicMailDistributionChannel") == "local-testing-beta", "packaged beta app is missing its local-testing marker")
+    require(packaged_info.get("ElectronicMailNotarized") is False, "packaged beta app must explicitly say it is unnotarized")
+    require(packaged_info.get("CFBundleDisplayName") == "Electronic Mail Beta", "packaged beta app must have a conspicuous beta display name")
+else:
+    raise SystemExit(f"unsupported Info.plist policy: {info_policy}")
 require(any("electronicmail" in item.get("CFBundleURLSchemes", []) for item in packaged_info.get("CFBundleURLTypes", [])), "OAuth callback URL scheme is missing")
 copyright_text = packaged_info.get("NSHumanReadableCopyright", "")
 require("$(" not in copyright_text and re.search(r"\b20\d{2}\b", copyright_text), "copyright year was not expanded")
@@ -287,7 +329,33 @@ if [ "$SIGNING_MODE" = "identity-free" ]; then
     if ! printf '%s\n' "$SIGNATURE_DETAILS" | grep -Eq '^(Signature=adhoc|.*code object is not signed at all)'; then
       fail "identity-free preflight has an unexpected signature state: $code_path"
     fi
+    if [ "$REQUIRE_ADHOC_SIGNATURE" = "1" ] && ! printf '%s\n' "$SIGNATURE_DETAILS" | grep -q '^Signature=adhoc'; then
+      fail "local beta code must carry an ad-hoc signature: $code_path"
+    fi
+    if [ "$REQUIRE_ADHOC_SIGNATURE" = "1" ] && ! printf '%s\n' "$SIGNATURE_DETAILS" | grep -q 'flags=.*runtime'; then
+      fail "local beta code must enable Hardened Runtime: $code_path"
+    fi
   done
+
+  if [ "$REQUIRE_ADHOC_SIGNATURE" = "1" ]; then
+    codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+    codesign --verify --strict --verbose=2 "$FRAMEWORK"
+    ADHOC_ENTITLEMENTS_DIR="$(mktemp -d)"
+    trap 'rm -rf "$ADHOC_ENTITLEMENTS_DIR"' EXIT
+    codesign -d --entitlements - --xml "$APP_PATH" > "$ADHOC_ENTITLEMENTS_DIR/embedded-entitlements.plist" 2> "$ADHOC_ENTITLEMENTS_DIR/codesign-entitlements.log"
+    plutil -lint "$ADHOC_ENTITLEMENTS_DIR/embedded-entitlements.plist" >/dev/null
+    python3 - "$SOURCE_ENTITLEMENTS" "$ADHOC_ENTITLEMENTS_DIR/embedded-entitlements.plist" <<'PY'
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as handle:
+    expected = plistlib.load(handle)
+with open(sys.argv[2], "rb") as handle:
+    actual = plistlib.load(handle)
+if actual != expected:
+    raise SystemExit(f"ad-hoc app entitlements differ from the approved source policy: {actual}")
+PY
+  fi
 fi
 
 if [ "$SIGNING_MODE" = "developer-id" ]; then

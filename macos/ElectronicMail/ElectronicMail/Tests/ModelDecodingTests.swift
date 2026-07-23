@@ -45,8 +45,8 @@ final class ModelDecodingTests: XCTestCase {
         )
     }
 
-    func testClassicMacKeychainFallbackIsDebugOnlyAndNonSynchronizable() {
-        let policy = KeychainSessionTokenStore.classicMacDebugPolicyAttributes
+    func testClassicMacKeychainFallbackIsLocalTestingOnlyAndNonSynchronizable() {
+        let policy = KeychainSessionTokenStore.classicMacLocalTestingPolicyAttributes
 
         XCTAssertNil(policy[kSecUseDataProtectionKeychain as String])
         XCTAssertEqual(policy[kSecAttrSynchronizable as String] as? Bool, false)
