@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import unittest
+from unittest.mock import patch
 
-from app.db import repository
+from sqlalchemy.pool import QueuePool
+
+from app.db import mail_groups, repository
 
 
 class _DisposableEngine:
@@ -20,12 +24,15 @@ class RepositoryEngineLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         with repository._ENGINES_LOCK:
             self.original_engines = dict(repository._ENGINES)
+            self.original_advisory_lock_engines = dict(repository._ADVISORY_LOCK_ENGINES)
             repository._ENGINES.clear()
+            repository._ADVISORY_LOCK_ENGINES.clear()
 
     def tearDown(self) -> None:
         repository.dispose_cached_engines()
         with repository._ENGINES_LOCK:
             repository._ENGINES.update(self.original_engines)
+            repository._ADVISORY_LOCK_ENGINES.update(self.original_advisory_lock_engines)
 
     def test_disposal_clears_cache_and_disposes_each_engine_exactly_once(self) -> None:
         shared = _DisposableEngine()
@@ -35,9 +42,9 @@ class RepositoryEngineLifecycleTests(unittest.TestCase):
                 {
                     "postgresql+psycopg://first": shared,
                     "postgresql+psycopg://same-engine-alias": shared,
-                    "postgresql+psycopg://second": second,
                 }
             )
+            repository._ADVISORY_LOCK_ENGINES["postgresql+psycopg://second"] = second
 
         repository.dispose_cached_engines()
         repository.dispose_cached_engines()
@@ -45,6 +52,7 @@ class RepositoryEngineLifecycleTests(unittest.TestCase):
         self.assertEqual(shared.dispose_calls, 1)
         self.assertEqual(second.dispose_calls, 1)
         self.assertEqual(repository._ENGINES, {})
+        self.assertEqual(repository._ADVISORY_LOCK_ENGINES, {})
 
     def test_disposal_failure_does_not_leave_or_skip_other_cached_engines(self) -> None:
         broken = _DisposableEngine(fail=True)
@@ -63,3 +71,42 @@ class RepositoryEngineLifecycleTests(unittest.TestCase):
         self.assertEqual(broken.dispose_calls, 1)
         self.assertEqual(healthy.dispose_calls, 1)
         self.assertEqual(repository._ENGINES, {})
+        self.assertEqual(repository._ADVISORY_LOCK_ENGINES, {})
+
+    def test_advisory_sessions_use_a_distinct_bounded_pool_engine(self) -> None:
+        database_url = "postgresql://localhost/electronic_mail_lock_test"
+
+        main_engine = repository.get_engine(database_url)
+        lock_engine = repository.get_advisory_lock_engine(database_url)
+
+        self.assertIsNot(main_engine, lock_engine)
+        self.assertIsInstance(lock_engine.pool, QueuePool)
+        self.assertIsInstance(main_engine.pool, QueuePool)
+        self.assertEqual(lock_engine.pool.size(), repository.ADVISORY_LOCK_POOL_SIZE)
+        self.assertEqual(lock_engine.pool._max_overflow, 0)
+        self.assertEqual(
+            lock_engine.pool._timeout,
+            repository.ADVISORY_LOCK_POOL_TIMEOUT_SECONDS,
+        )
+        self.assertIs(repository.get_advisory_lock_engine(database_url), lock_engine)
+
+    def test_draft_session_lock_does_not_consume_the_main_queue_pool(self) -> None:
+        with patch.object(
+            mail_groups,
+            "advisory_session_locks",
+            return_value=nullcontext(),
+        ) as session_lock, patch.object(
+            mail_groups,
+            "get_engine",
+        ) as main_engine:
+            with mail_groups.client_draft_lock(
+                "postgresql://example/db",
+                user_id="user-1",
+                client_draft_id="draft-1",
+            ):
+                main_engine.assert_not_called()
+
+        session_lock.assert_called_once_with(
+            "postgresql://example/db",
+            lock_keys=[mail_groups.client_draft_lock_key("user-1", "draft-1")],
+        )

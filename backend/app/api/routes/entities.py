@@ -13,6 +13,7 @@ from app.db.mail_groups import (
     get_manual_task_by_entity_id,
     update_manual_task,
 )
+from app.db.user_mail_guard import shared_user_mail_lock
 from app.schemas.domain import EntityOutcomeRequest, EntityOutcomeResponse
 from app.services.auth import require_current_user
 from app.services.integrations.google import archive_gmail_thread as archive_gmail_thread_service
@@ -45,23 +46,26 @@ def complete_entity(http_request: Request, entity_id: str, request: EntityOutcom
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entity not found")
 
     thread_ids = sorted({message.gmail_thread_id for message in detail.messages if message.gmail_thread_id})
-    for thread_id in thread_ids:
-        try:
-            archive_gmail_thread_service(settings, thread_id, user_id=user.id)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=safe_google_error(exc, operation="archive")) from exc
-        except HttpError as exc:
-            raise HTTPException(status_code=_http_status(exc), detail=safe_google_error(exc, operation="archive")) from exc
-
-    outcome = append_entity_outcome(
-        database_url,
-        user_id=user.id,
-        entity_id=entity_id,
-        outcome_type="complete",
-        note=request.note if request is not None else None,
-    )
-    refresh_app_session_snapshot(settings, user_id=user.id)
-    return _outcome_response(outcome)
+    with shared_user_mail_lock(database_url, user_id=user.id):
+        for thread_id in thread_ids:
+            try:
+                archive_gmail_thread_service(settings, thread_id, user_id=user.id)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=safe_google_error(exc, operation="archive")) from exc
+            except HttpError as exc:
+                raise HTTPException(status_code=_http_status(exc), detail=safe_google_error(exc, operation="archive")) from exc
+        # Keep the Gmail-backed outcome write in the same shared scope. If the
+        # user deletes mailbox data, this write either precedes and is purged by
+        # deletion, or loses the lock race and never runs after deletion.
+        outcome = append_entity_outcome(
+            database_url,
+            user_id=user.id,
+            entity_id=entity_id,
+            outcome_type="complete",
+            note=request.note if request is not None else None,
+        )
+        refresh_app_session_snapshot(settings, user_id=user.id)
+        return _outcome_response(outcome)
 
 
 def _outcome_response(outcome) -> EntityOutcomeResponse:

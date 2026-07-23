@@ -9,13 +9,31 @@ import unittest
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
+from googleapiclient.errors import HttpError
 
 from app.core.error_safety import GoogleCredentialsUnavailable
-from app.db.mail_groups import GmailMessageRecord, MailGroupDetail, MailGroupRecord, MailSendIdempotencyConflict, PendingSendRecord, mark_pending_send_sent
+from app.db.mail_groups import (
+    GmailMessageRecord,
+    MailGroupDetail,
+    MailGroupRecord,
+    MailSendIdempotencyConflict,
+    PendingSendRecord,
+    claim_pending_send,
+    mark_pending_send_sent,
+)
 from app.main import app
 from app.schemas.domain import MailComposeRequest, MailReplyRequest, MailSendResponse
 from app.services.mail_groups import _thread_message_from_gmail
-from app.services.mailbox_sends import _import_sent_message, _perform_send, _raw_message, run_pending_send, send_compose, send_reply
+from app.services.mailbox_sends import (
+    _import_sent_message,
+    _perform_send,
+    _raw_message,
+    MailSendConfirmationPending,
+    retry_send,
+    run_pending_send,
+    send_compose,
+    send_reply,
+)
 
 
 def pending_send(state: str = "queued") -> PendingSendRecord:
@@ -41,6 +59,10 @@ def pending_send(state: str = "queued") -> PendingSendRecord:
         error=None,
         updated_at="2026-05-21T09:00:00+00:00",
     )
+
+
+def google_http_error(status: int) -> HttpError:
+    return HttpError(SimpleNamespace(status=status, reason="Provider rejection"), b"provider rejection")
 
 
 def sample_group() -> MailGroupRecord:
@@ -99,6 +121,12 @@ def sample_message() -> GmailMessageRecord:
 class MailboxSendServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = SimpleNamespace(database_path="postgresql://example/db", backend_origin="http://127.0.0.1:3001")
+        self.provider_lock_patch = patch(
+            "app.services.mailbox_sends.shared_user_mail_lock",
+            return_value=nullcontext(),
+        )
+        self.provider_lock_patch.start()
+        self.addCleanup(self.provider_lock_patch.stop)
 
     def test_sent_import_resolves_large_text_body_and_marks_it_terminal(self) -> None:
         encoded_body = base64.urlsafe_b64encode(b"Complete large sent body").decode("ascii").rstrip("=")
@@ -163,23 +191,19 @@ class MailboxSendServiceTests(unittest.TestCase):
         self.assertEqual(response.reauth_url, "http://127.0.0.1:3001/auth/google")
         mock_upsert.assert_not_called()
 
+    @patch("app.services.mailbox_sends.get_pending_send", return_value=pending_send("sending"))
     @patch("app.services.mailbox_sends._perform_send", side_effect=TimeoutError("gmail timeout"))
     @patch("app.services.mailbox_sends.enqueue_job")
-    @patch("app.services.mailbox_sends.mark_pending_send_queued", return_value=pending_send())
     @patch("app.services.mailbox_sends.upsert_pending_send", return_value=pending_send())
     @patch("app.services.mailbox_sends._can_send", return_value=True)
-    def test_transient_compose_failure_queues_critical_send_job(
+    def test_ambiguous_compose_failure_stays_sending_without_retry_job(
         self,
         _mock_can_send: Mock,
         _mock_upsert: Mock,
-        _mock_mark_queued: Mock,
         mock_enqueue: Mock,
         _mock_perform: Mock,
+        _mock_get: Mock,
     ) -> None:
-        _mock_mark_queued.return_value = replace(
-            pending_send(),
-            error="Google mail delivery is temporarily unavailable.",
-        )
         response = send_compose(
             self.settings,
             user_id="user-1",
@@ -192,23 +216,36 @@ class MailboxSendServiceTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(response.state, "queued")
-        self.assertEqual(response.error, "Google mail delivery is temporarily unavailable.")
-        self.assertNotIn("gmail timeout", response.error or "")
-        mock_enqueue.assert_called_once_with(
-            "postgresql://example/db",
-            kind="gmail_send_message",
-            queue="critical",
+        self.assertEqual(response.state, "sending")
+        mock_enqueue.assert_not_called()
+
+    @patch("app.services.mailbox_sends.mark_pending_send_failed")
+    @patch("app.services.mailbox_sends._perform_send", side_effect=google_http_error(400))
+    @patch("app.services.mailbox_sends.upsert_pending_send", return_value=pending_send())
+    @patch("app.services.mailbox_sends._can_send", return_value=True)
+    def test_definite_provider_rejection_becomes_retryable_failed_send(
+        self,
+        _mock_can_send: Mock,
+        _mock_upsert: Mock,
+        _mock_perform: Mock,
+        mock_failed: Mock,
+    ) -> None:
+        mock_failed.return_value = replace(pending_send("failed"), error="Google rejected mail delivery.")
+
+        response = send_compose(
+            self.settings,
             user_id="user-1",
-            dedupe_key="gmail-send:user-1:server-send-1",
-            priority=90,
-            payload={
-                "user_id": "user-1",
-                "server_send_id": "server-send-1",
-                "last_error": "Google mail delivery is temporarily unavailable.",
-            },
-            run_after_seconds=15,
+            request=MailComposeRequest(
+                client_send_id="client-send-1",
+                to=["recipient@example.com"],
+                subject="Hello",
+                body_text="Body",
+                created_at="2026-05-21T09:00:00+00:00",
+            ),
         )
+
+        self.assertEqual(response.state, "failed")
+        mock_failed.assert_called_once()
 
     @patch("app.services.mailbox_sends.enqueue_job")
     @patch("app.services.mailbox_sends.mark_pending_send_failed")
@@ -263,6 +300,40 @@ class MailboxSendServiceTests(unittest.TestCase):
         with self.assertRaises(GoogleCredentialsUnavailable):
             run_pending_send(self.settings, user_id="user-1", server_send_id="server-send-1")
 
+        mock_failed.assert_called_once()
+
+    @patch("app.services.mailbox_sends.mark_pending_send_failed")
+    @patch("app.services.mailbox_sends._perform_send", side_effect=TimeoutError("response lost"))
+    @patch("app.services.mailbox_sends.get_pending_send", return_value=pending_send("sending"))
+    def test_background_ambiguous_send_never_becomes_retryable_failed(
+        self,
+        _mock_get: Mock,
+        _mock_perform: Mock,
+        mock_failed: Mock,
+    ) -> None:
+        with self.assertRaises(MailSendConfirmationPending):
+            run_pending_send(self.settings, user_id="user-1", server_send_id="server-send-1")
+
+        mock_failed.assert_not_called()
+
+    @patch("app.services.mailbox_sends.mark_pending_send_failed")
+    @patch("app.services.mailbox_sends._perform_send", side_effect=google_http_error(401))
+    @patch("app.services.mailbox_sends.get_pending_send", return_value=pending_send())
+    def test_background_new_send_auth_rejection_is_conclusive_failed_state(
+        self,
+        _mock_get: Mock,
+        _mock_perform: Mock,
+        mock_failed: Mock,
+    ) -> None:
+        mock_failed.return_value = replace(
+            pending_send("failed"),
+            error="Google needs mail send permission.",
+        )
+
+        response = run_pending_send(self.settings, user_id="user-1", server_send_id="server-send-1")
+
+        self.assertIsNotNone(response)
+        self.assertEqual(response.state, "failed")
         mock_failed.assert_called_once()
 
     @patch("app.services.mailbox_sends._send_or_queue", return_value=MailSendResponse(client_send_id="client-send-1", state="queued"))
@@ -679,8 +750,48 @@ class MailboxSendServiceTests(unittest.TestCase):
         self.assertRegex(str(parsed["Message-ID"]), r"^<send\.[0-9a-f]{32}@electronic-mail\.local>$")
 
     @patch("app.services.mailbox_sends.send_gmail_raw_message")
+    @patch("app.services.mailbox_sends.claim_pending_send")
+    @patch(
+        "app.services.mailbox_sends.find_sent_gmail_message_by_rfc822_message_id",
+        side_effect=google_http_error(401),
+    )
+    @patch("app.services.mailbox_sends.get_pending_send", return_value=pending_send("sending"))
+    def test_ambiguous_reconciliation_auth_error_never_authorizes_resend(
+        self,
+        _mock_get: Mock,
+        _mock_find: Mock,
+        mock_claim: Mock,
+        mock_send: Mock,
+    ) -> None:
+        with self.assertRaises(MailSendConfirmationPending):
+            _perform_send(self.settings, user_id="user-1", record=pending_send("sending"))
+
+        mock_claim.assert_not_called()
+        mock_send.assert_not_called()
+
+    @patch("app.services.mailbox_sends.send_gmail_raw_message")
+    @patch("app.services.mailbox_sends.claim_pending_send")
+    @patch(
+        "app.services.mailbox_sends.find_sent_gmail_message_by_rfc822_message_id",
+        side_effect=GoogleCredentialsUnavailable("Google credentials are not connected"),
+    )
+    @patch("app.services.mailbox_sends.get_pending_send", return_value=pending_send("sending"))
+    def test_ambiguous_reconciliation_credential_failure_never_authorizes_resend(
+        self,
+        _mock_get: Mock,
+        _mock_find: Mock,
+        mock_claim: Mock,
+        mock_send: Mock,
+    ) -> None:
+        with self.assertRaises(MailSendConfirmationPending):
+            _perform_send(self.settings, user_id="user-1", record=pending_send("sending"))
+
+        mock_claim.assert_not_called()
+        mock_send.assert_not_called()
+
+    @patch("app.services.mailbox_sends.send_gmail_raw_message")
     @patch("app.services.mailbox_sends.claim_pending_send", return_value=None)
-    @patch("app.services.mailbox_sends.find_gmail_message_by_rfc822_message_id", return_value=None)
+    @patch("app.services.mailbox_sends.find_sent_gmail_message_by_rfc822_message_id", return_value=None)
     @patch("app.services.mailbox_sends.get_pending_send")
     def test_concurrent_send_owner_prevents_second_gmail_send(
         self,
@@ -695,12 +806,13 @@ class MailboxSendServiceTests(unittest.TestCase):
         result = _perform_send(self.settings, user_id="user-1", record=pending_send())
 
         self.assertEqual(result.state, "sending")
+        _mock_claim.assert_not_called()
         mock_send.assert_not_called()
 
     @patch("app.services.mailbox_sends.send_gmail_raw_message")
     @patch("app.services.mailbox_sends.claim_pending_send")
     @patch("app.services.mailbox_sends._finalize_sent_message")
-    @patch("app.services.mailbox_sends.find_gmail_message_by_rfc822_message_id")
+    @patch("app.services.mailbox_sends.find_sent_gmail_message_by_rfc822_message_id")
     @patch("app.services.mailbox_sends.get_pending_send")
     def test_ambiguous_retry_recovers_existing_gmail_message_without_resending(
         self,
@@ -724,6 +836,27 @@ class MailboxSendServiceTests(unittest.TestCase):
         mock_finalize.assert_called_once_with(self.settings, user_id="user-1", record=retry, result=recovered)
         mock_claim.assert_not_called()
         mock_send.assert_not_called()
+
+    @patch("app.services.mailbox_sends._send_or_queue")
+    @patch("app.services.mailbox_sends._can_send", return_value=True)
+    @patch("app.services.mailbox_sends.get_pending_send", return_value=pending_send("sending"))
+    def test_manual_retry_of_ambiguous_send_only_enters_reconciliation(
+        self,
+        _mock_get: Mock,
+        _mock_can_send: Mock,
+        mock_send_or_queue: Mock,
+    ) -> None:
+        mock_send_or_queue.return_value = MailSendResponse(
+            client_send_id="client-send-1",
+            server_send_id="server-send-1",
+            state="sending",
+        )
+
+        response = retry_send(self.settings, user_id="user-1", server_send_id="server-send-1")
+
+        self.assertIsNotNone(response)
+        self.assertEqual(response.state, "sending")
+        mock_send_or_queue.assert_called_once()
 
 
 class MailboxSendRouteTests(unittest.TestCase):
@@ -870,6 +1003,26 @@ class MailboxSendRouteTests(unittest.TestCase):
 
 
 class MailboxSendRepositoryTests(unittest.TestCase):
+    def test_claim_never_treats_stale_sending_as_resend_authority(self) -> None:
+        connection = _SentRedactionConnection()
+        with (
+            patch("app.db.mail_groups.get_engine", return_value=object()),
+            patch(
+                "app.db.mail_groups.user_mail_write_transaction",
+                return_value=nullcontext(connection),
+            ),
+        ):
+            result = claim_pending_send(
+                "postgresql://example/db",
+                user_id="user-1",
+                server_send_id="server-send-1",
+            )
+
+        self.assertIsNone(result)
+        self.assertIn("state IN ('queued', 'failed')", connection.sql)
+        self.assertNotIn("OR (state = 'sending'", connection.sql)
+        self.assertNotIn("interval '2 minutes'", connection.sql)
+
     def test_sent_delivery_redacts_recipient_body_header_and_attachment_payloads(self) -> None:
         connection = _SentRedactionConnection()
         with (

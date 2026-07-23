@@ -3,6 +3,7 @@ from __future__ import annotations
 """Google OAuth endpoints used to bootstrap local Gmail/Calendar sync."""
 
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from html import escape
 import json
 import re
@@ -29,7 +30,6 @@ from app.services.auth import (
     hash_token,
     issue_session,
     revoke_request_session,
-    save_user_google_tokens,
 )
 from app.db.repository import (
     create_mobile_oauth_handoff,
@@ -39,18 +39,29 @@ from app.db.repository import (
     get_mobile_oauth_handoff,
     get_oauth_login_session,
     get_user,
+    get_user_by_google_subject,
     oauth_session_is_after_google_subject_deletion,
+    reconnect_google_oauth_token,
     record_google_subject_revocation,
     revoke_user_app_sessions,
 )
-from app.db.jobs import cancel_user_jobs
-from app.db.mail_groups import clear_google_guard_state, delete_user_mail_data, mark_google_disconnected
+from app.db.jobs import cancel_user_jobs, has_active_google_token_revocation
+from app.db.mail_groups import delete_user_mail_data, mark_google_disconnected
 from app.db.user_mail_guard import (
+    AdvisoryLockUnavailable,
     exclusive_google_subject_lock,
     exclusive_user_mail_lock,
     google_subject_tombstone_hash,
 )
-from app.services.integrations.google import get_google_auth_url, handle_google_callback, revoke_stored_google_token, stop_gmail_watch
+from app.services.integrations.google import (
+    enqueue_google_token_revocation_payload,
+    get_google_auth_url,
+    handle_google_callback,
+    revoke_google_token_payload,
+    revoke_or_enqueue_google_token_payload,
+    revoke_or_enqueue_stored_google_token,
+    stop_gmail_watch,
+)
 from app.services.token_crypto import decrypt_json, encrypt_json
 from app.services.gmail_watch import ensure_gmail_watch
 from app.services.mail_groups import enqueue_first_run
@@ -62,6 +73,98 @@ _MOBILE_HANDOFF_TTL_SECONDS = 5 * 60
 _NO_STORE_HEADERS = {"Cache-Control": "no-store, private", "Pragma": "no-cache"}
 _HANDOFF_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _CODE_CHALLENGE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43}$")
+
+
+def _prepare_google_token_revocation_or_fail(
+    *,
+    database_url: str,
+    user_id: str,
+    subject_hash: str,
+) -> None:
+    """Keep a failed revocation tracked and block further Gmail work."""
+    try:
+        revoke_or_enqueue_stored_google_token(
+            settings,
+            user_id=user_id,
+            subject_hash=subject_hash,
+        )
+    except Exception as exc:
+        # Never destroy the only local copy of a provider grant unless it was
+        # revoked or durably queued. Close the Gmail guard so the retained
+        # credential cannot continue syncing while the user retries cleanup.
+        mark_google_disconnected(database_url, user_id=user_id)
+        cancel_user_jobs(database_url, user_id=user_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Google authorization cleanup could not be secured. Please try again.",
+        ) from exc
+
+
+def _disconnect_callback_google_connection(*, database_url: str, user_id: str) -> None:
+    """Make an existing local grant unusable before callback cleanup can revoke it."""
+    with exclusive_user_mail_lock(database_url, user_id=user_id):
+        delete_google_oauth_token(database_url, user_id=user_id)
+        mark_google_disconnected(database_url, user_id=user_id)
+        cancel_user_jobs(database_url, user_id=user_id)
+
+
+def _cleanup_unpersisted_callback_grant(
+    *,
+    database_url: str,
+    subject_hash: str,
+    tokens: dict[str, object],
+    user_id: str | None,
+) -> None:
+    """Best-effort terminal cleanup while the caller owns the subject lock."""
+    if user_id is not None:
+        try:
+            _disconnect_callback_google_connection(
+                database_url=database_url,
+                user_id=user_id,
+            )
+        except Exception:
+            pass
+    try:
+        resolved = revoke_google_token_payload(tokens)
+    except Exception:
+        resolved = False
+    if resolved:
+        try:
+            # Force every later OAuth attempt to have started after this
+            # provider cleanup outcome, even when durable job creation failed.
+            record_google_subject_revocation(
+                database_url,
+                subject_hash=subject_hash,
+            )
+        except Exception:
+            pass
+
+
+def _queue_callback_grant_cleanup(
+    *,
+    subject_hash: str,
+    tokens: dict[str, object],
+) -> bool:
+    """Try to hand cleanup to a worker that will obey subject ordering."""
+    try:
+        enqueue_google_token_revocation_payload(
+            settings,
+            subject_hash=subject_hash,
+            tokens=tokens,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _queue_callback_grant_cleanup_or_revoke(
+    *,
+    subject_hash: str,
+    tokens: dict[str, object],
+) -> None:
+    """Revoke directly only when durable ordered cleanup cannot be secured."""
+    if not _queue_callback_grant_cleanup(subject_hash=subject_hash, tokens=tokens):
+        revoke_google_token_payload(tokens)
 
 
 @router.get("/auth/google")
@@ -128,15 +231,19 @@ def auth_delete_google_data(request: Request) -> Response:
     subject_hash = google_subject_tombstone_hash(stored_user.google_sub)
     with exclusive_google_subject_lock(database_url, subject_hash=subject_hash):
         record_google_subject_revocation(database_url, subject_hash=subject_hash)
-        try:
-            stop_gmail_watch(settings, user_id=user.id)
-        except Exception:
-            pass
-        try:
-            revoke_stored_google_token(settings, user_id=user.id)
-        except Exception:
-            pass
         with exclusive_user_mail_lock(database_url, user_id=user.id):
+            # Subject -> user is the global lock order. The exclusive user lock
+            # drains provider mutations/watch renewal before cancellation, and
+            # remains held until durable guards and data deletion are complete.
+            try:
+                stop_gmail_watch(settings, user_id=user.id)
+            except Exception:
+                pass
+            _prepare_google_token_revocation_or_fail(
+                database_url=database_url,
+                user_id=user.id,
+                subject_hash=subject_hash,
+            )
             # A retained token would make /v1/auth/google/state report connected
             # even though the durable deletion guard rejects every later sync.
             # Remove it so the UI truthfully requires an explicit reconnect and
@@ -166,15 +273,16 @@ def auth_google_disconnect(
 
     with exclusive_google_subject_lock(database_url, subject_hash=subject_hash):
         record_google_subject_revocation(database_url, subject_hash=subject_hash)
-        try:
-            stop_gmail_watch(settings, user_id=user.id)
-        except Exception:
-            pass
-        try:
-            revoke_stored_google_token(settings, user_id=user.id)
-        except Exception:
-            pass
         with exclusive_user_mail_lock(database_url, user_id=user.id):
+            try:
+                stop_gmail_watch(settings, user_id=user.id)
+            except Exception:
+                pass
+            _prepare_google_token_revocation_or_fail(
+                database_url=database_url,
+                user_id=user.id,
+                subject_hash=subject_hash,
+            )
             mark_google_disconnected(database_url, user_id=user.id)
             cancel_user_jobs(database_url, user_id=user.id)
             delete_google_oauth_token(database_url, user_id=user.id)
@@ -205,15 +313,16 @@ def auth_delete_account(request: Request) -> Response:
     # callback that loses observes the tombstone before it can recreate a user.
     with exclusive_google_subject_lock(database_url, subject_hash=subject_hash):
         record_google_subject_revocation(database_url, subject_hash=subject_hash)
-        try:
-            stop_gmail_watch(settings, user_id=user.id)
-        except Exception:
-            pass
-        try:
-            revoke_stored_google_token(settings, user_id=user.id)
-        except Exception:
-            pass
         with exclusive_user_mail_lock(database_url, user_id=user.id):
+            try:
+                stop_gmail_watch(settings, user_id=user.id)
+            except Exception:
+                pass
+            _prepare_google_token_revocation_or_fail(
+                database_url=database_url,
+                user_id=user.id,
+                subject_hash=subject_hash,
+            )
             cancel_user_jobs(database_url, user_id=user.id)
             delete_user_mail_data(database_url, user_id=user.id)
             revoke_user_app_sessions(database_url, user_id=user.id)
@@ -370,44 +479,93 @@ def auth_google_callback(
             return terminal_response
         raise HTTPException(status_code=400, detail="Missing OAuth code")
 
+    unpersisted_google_tokens: dict[str, object] | None = None
+    unpersisted_google_subject_hash: str | None = None
+    callback_user_id: str | None = None
+    oauth_login_session_delete_attempted = False
     try:
         result = handle_google_callback(settings, code, state)
         if isinstance(result, str):
             return _no_store_redirect(result)
+        unpersisted_google_tokens = result.tokens
         database_url = str(settings.database_path)
         subject_hash = google_subject_tombstone_hash(result.google_sub)
+        unpersisted_google_subject_hash = subject_hash
         with exclusive_google_subject_lock(database_url, subject_hash=subject_hash):
-            if not oauth_session_is_after_google_subject_deletion(
-                database_url,
-                subject_hash=subject_hash,
-                oauth_started_epoch=result.oauth_started_epoch,
-            ):
-                raise RuntimeError("OAuth session predates account deletion. Start again from /auth/google.")
-            user = create_or_update_user(
-                settings,
-                profile=result.profile,
-                google_sub=result.google_sub,
-                oauth_started_epoch=result.oauth_started_epoch,
-            )
-            with exclusive_user_mail_lock(database_url, user_id=user.id):
-                clear_google_guard_state(
-                    database_url,
-                    user_id=user.id,
-                    oauth_started_epoch=result.oauth_started_epoch,
-                )
-                save_user_google_tokens(
-                    settings,
-                    user_id=user.id,
-                    tokens=result.tokens,
-                    oauth_started_epoch=result.oauth_started_epoch,
-                )
-            ensure_gmail_watch(settings, user_id=user.id)
+            existing_user = get_user_by_google_subject(database_url, result.google_sub)
+            callback_user_id = existing_user.id if existing_user is not None else None
             try:
-                enqueue_first_run(settings, user_id=user.id)
-            except Exception:
-                pass
+                if state:
+                    oauth_login_session_delete_attempted = True
+                    delete_oauth_login_session(database_url, state=state)
+                if not oauth_session_is_after_google_subject_deletion(
+                    database_url,
+                    subject_hash=subject_hash,
+                    oauth_started_epoch=result.oauth_started_epoch,
+                ):
+                    raise RuntimeError("OAuth session predates account deletion. Start again from /auth/google.")
+                if has_active_google_token_revocation(
+                    database_url,
+                    subject_hash=subject_hash,
+                ):
+                    raise RuntimeError("Previous Google authorization cleanup is still pending. Please try again later.")
+                user = create_or_update_user(
+                    settings,
+                    profile=result.profile,
+                    google_sub=result.google_sub,
+                    oauth_started_epoch=result.oauth_started_epoch,
+                )
+                callback_user_id = user.id
+                with exclusive_user_mail_lock(database_url, user_id=user.id):
+                    # Google revocation is project/user-wide, so replacing an
+                    # ordinary active grant must be an atomic overwrite only.
+                    reconnect_google_oauth_token(
+                        database_url,
+                        user_id=user.id,
+                        token_json_encrypted=encrypt_json(settings, result.tokens),
+                        oauth_started_epoch=result.oauth_started_epoch,
+                    )
+                    # Ownership transfers only after the atomic guard-clear and
+                    # token transaction commits. Later callback work must not
+                    # revoke that durable credential.
+                    unpersisted_google_tokens = None
+                ensure_gmail_watch(settings, user_id=user.id)
+                try:
+                    enqueue_first_run(settings, user_id=user.id)
+                except Exception:
+                    pass
+            finally:
+                if unpersisted_google_tokens is not None:
+                    tracked_user_id = callback_user_id
+                    try:
+                        revoke_or_enqueue_google_token_payload(
+                            settings,
+                            subject_hash=subject_hash,
+                            tokens=unpersisted_google_tokens,
+                            on_tracked=(
+                                partial(
+                                    _disconnect_callback_google_connection,
+                                    database_url=database_url,
+                                    user_id=tracked_user_id,
+                                )
+                                if tracked_user_id is not None
+                                else None
+                            ),
+                        )
+                    except Exception:
+                        # Do not let cleanup ownership escape the subject lock.
+                        # A concurrent newer callback must not persist between
+                        # this grant failing and its project-wide revocation.
+                        _cleanup_unpersisted_callback_grant(
+                            database_url=database_url,
+                            subject_hash=subject_hash,
+                            tokens=unpersisted_google_tokens,
+                            user_id=tracked_user_id,
+                        )
+                    finally:
+                        unpersisted_google_tokens = None
     except HTTPException:
-        if state:
+        if state and not oauth_login_session_delete_attempted:
             delete_oauth_login_session(str(settings.database_path), state=state)
         terminal_response = _persist_terminal_mobile_handoff(
             redirect_to,
@@ -418,7 +576,7 @@ def auth_google_callback(
             return terminal_response
         raise
     except RuntimeError as exc:
-        if state:
+        if state and not oauth_login_session_delete_attempted:
             delete_oauth_login_session(str(settings.database_path), state=state)
         terminal_response = _persist_terminal_mobile_handoff(
             redirect_to,
@@ -431,7 +589,7 @@ def auth_google_callback(
             return _no_store_redirect("/auth/google")
         raise HTTPException(status_code=400, detail="Google sign-in failed. Please try again.") from None
     except Exception:
-        if state:
+        if state and not oauth_login_session_delete_attempted:
             delete_oauth_login_session(str(settings.database_path), state=state)
         terminal_response = _persist_terminal_mobile_handoff(
             redirect_to,
@@ -441,6 +599,41 @@ def auth_google_callback(
         if terminal_response is not None:
             return terminal_response
         raise HTTPException(status_code=400, detail="Google sign-in failed. Please try again.") from None
+    finally:
+        # A database failure can prevent durable tracking itself. The normal
+        # path above always queues first under the subject lock; this fallback
+        # is reserved for failure to enter that lock at all. Reacquire subject
+        # ownership before touching a stored connection whenever possible.
+        if unpersisted_google_tokens is not None and unpersisted_google_subject_hash is not None:
+            try:
+                with exclusive_google_subject_lock(
+                    str(settings.database_path),
+                    subject_hash=unpersisted_google_subject_hash,
+                ):
+                    _cleanup_unpersisted_callback_grant(
+                        database_url=str(settings.database_path),
+                        subject_hash=unpersisted_google_subject_hash,
+                        tokens=unpersisted_google_tokens,
+                        user_id=callback_user_id,
+                    )
+            except AdvisoryLockUnavailable:
+                # Contention is not permission to escape subject ordering. A
+                # critical worker will take the same lock before provider I/O.
+                # If even enqueueing fails, leave this credential unresolved;
+                # revoking here could invalidate the callback holding the lock.
+                _queue_callback_grant_cleanup(
+                    subject_hash=unpersisted_google_subject_hash,
+                    tokens=unpersisted_google_tokens,
+                )
+            except Exception:
+                # The lock session itself may be unavailable. Try to secure a
+                # durable job first; direct revocation is the last resort only
+                # when that database write also cannot be completed.
+                _queue_callback_grant_cleanup_or_revoke(
+                    subject_hash=unpersisted_google_subject_hash,
+                    tokens=unpersisted_google_tokens,
+                )
+            unpersisted_google_tokens = None
 
     if result.redirect_to is not None and _is_mobile_handoff_redirect(result.redirect_to):
         login_code = create_mobile_code(settings, user_id=user.id)

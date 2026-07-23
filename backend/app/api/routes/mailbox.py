@@ -26,7 +26,13 @@ from app.services.gmail_importer import run_gmail_delta_sync
 from app.services.gmail_watch import ensure_gmail_watch
 from app.services.integrations.google import fetch_gmail_attachment
 from app.services.mailbox_actions import ThreadActionIdempotencyConflict, enqueue_thread_action
-from app.services.mailbox_drafts import delete_draft_by_id, get_draft, save_draft, send_saved_draft
+from app.services.mailbox_drafts import (
+    MailDraftIdentityConflict,
+    delete_draft_by_id,
+    get_draft,
+    save_draft,
+    send_saved_draft,
+)
 from app.services.mailbox_events import GMAIL_PUBSUB_RECEIVED, HEARTBEAT, SYNC_STATE, emit_mailbox_event, event_payload, format_sse_event, latest_event, list_events_after, parse_last_event_id
 from app.services.mailbox_search import enqueue_mailbox_search_hydration
 from app.services.mailbox_sends import _validate_subject, _validated_addresses, _validated_attachments, get_send_status, list_outbox_statuses, retry_send, send_compose, send_reply
@@ -200,7 +206,10 @@ def mailbox_reply(request: Request, mailbox_thread_id: str, payload: MailReplyRe
 def mailbox_draft_create(request: Request, payload: MailDraftSaveRequest) -> MailDraftResponse:
     user = require_current_user(settings, request)
     _validate_outgoing_payload(payload, require_to=False)
-    return save_draft(settings, user_id=user.id, request=payload)
+    try:
+        return save_draft(settings, user_id=user.id, request=payload)
+    except MailDraftIdentityConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.get("/v1/mailbox/drafts/{mailbox_thread_id}", response_model=MailDraftResponse)
@@ -216,21 +225,30 @@ def mailbox_draft_get(request: Request, mailbox_thread_id: str) -> MailDraftResp
 def mailbox_draft_update(request: Request, gmail_draft_id: str, payload: MailDraftSaveRequest) -> MailDraftResponse:
     user = require_current_user(settings, request)
     _validate_outgoing_payload(payload, require_to=False)
-    return save_draft(settings, user_id=user.id, request=payload.model_copy(update={"gmail_draft_id": gmail_draft_id}))
+    try:
+        return save_draft(settings, user_id=user.id, request=payload.model_copy(update={"gmail_draft_id": gmail_draft_id}))
+    except MailDraftIdentityConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.delete("/v1/mailbox/drafts/{gmail_draft_id}", status_code=204)
 def mailbox_draft_delete(request: Request, gmail_draft_id: str) -> Response:
     user = require_current_user(settings, request)
-    if not delete_draft_by_id(settings, user_id=user.id, gmail_draft_id=gmail_draft_id):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Google needs full mail permission.")
+    try:
+        if not delete_draft_by_id(settings, user_id=user.id, gmail_draft_id=gmail_draft_id):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Google needs full mail permission.")
+    except MailDraftIdentityConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     return Response(status_code=204)
 
 
 @router.post("/v1/mailbox/drafts/{gmail_draft_id}/send", response_model=MailSendResponse)
 def mailbox_draft_send(request: Request, gmail_draft_id: str, payload: MailDraftSendRequest) -> MailSendResponse:
     user = require_current_user(settings, request)
-    return send_saved_draft(settings, user_id=user.id, gmail_draft_id=gmail_draft_id, request=payload)
+    try:
+        return send_saved_draft(settings, user_id=user.id, gmail_draft_id=gmail_draft_id, request=payload)
+    except MailDraftIdentityConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.get("/v1/mailbox/sync-state", response_model=MailboxSyncStateResponse)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
@@ -366,10 +367,17 @@ class TaskOutcomeRouteTests(unittest.TestCase):
         )
         self.task_settings_patch = patch.object(task_routes, "settings", SimpleNamespace(database_path="postgresql://example/db"))
         self.entity_settings_patch = patch.object(entity_routes, "settings", SimpleNamespace(database_path="postgresql://example/db"))
+        self.entity_lock_patch = patch.object(
+            entity_routes,
+            "shared_user_mail_lock",
+            return_value=nullcontext(),
+        )
         self.task_settings_patch.start()
         self.entity_settings_patch.start()
+        self.mock_entity_lock = self.entity_lock_patch.start()
         self.addCleanup(self.task_settings_patch.stop)
         self.addCleanup(self.entity_settings_patch.stop)
+        self.addCleanup(self.entity_lock_patch.stop)
 
     @patch("app.api.routes.tasks.refresh_app_session_snapshot")
     @patch("app.api.routes.tasks.create_manual_task", return_value=sample_task())
@@ -442,6 +450,26 @@ class TaskOutcomeRouteTests(unittest.TestCase):
                 SimpleNamespace(gmail_thread_id="thread-2"),
             ]
         )
+        guard_state = {"active": False}
+
+        @contextmanager
+        def recording_lock(*_args, **_kwargs):
+            guard_state["active"] = True
+            try:
+                yield
+            finally:
+                guard_state["active"] = False
+
+        def assert_guarded(*_args, **_kwargs):
+            self.assertTrue(guard_state["active"])
+
+        self.mock_entity_lock.side_effect = recording_lock
+        mock_archive.side_effect = assert_guarded
+        mock_append.side_effect = lambda *_args, **_kwargs: (
+            assert_guarded(),
+            sample_outcome("group-1"),
+        )[1]
+        mock_refresh.side_effect = assert_guarded
 
         response = self.client.post("/v1/entities/group-1/complete", json={})
 
@@ -452,6 +480,7 @@ class TaskOutcomeRouteTests(unittest.TestCase):
         ])
         mock_append.assert_called_once()
         mock_refresh.assert_called_once()
+        self.assertFalse(guard_state["active"])
 
     @patch("app.api.routes.entities.refresh_app_session_snapshot")
     @patch("app.api.routes.entities.append_entity_outcome")

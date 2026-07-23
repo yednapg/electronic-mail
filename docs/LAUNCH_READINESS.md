@@ -4,7 +4,7 @@ This is the fail-closed status ledger for the no-AI Electronic Mail macOS launch
 
 Status vocabulary:
 
-- **Passed (local)**: the named deterministic command passed in the current worktree on 2026-07-23. It must pass again on the reviewed release commit in CI.
+- **Passed (local)**: the named deterministic command passed in the current worktree on the date recorded below. It must pass again on the reviewed release commit in CI.
 - **Configured**: implementation exists, but the exact release/deployment has not supplied the required evidence.
 - **Pending candidate**: requires the clean, committed, signed/notarized release candidate.
 - **Pending external**: requires publisher-owned infrastructure, credentials, review, or accountable human evidence.
@@ -35,11 +35,11 @@ This ledger does not alter or approve the user-owned UI. Visual polish and acces
 | Reproducibility policy | `npm run reproducibility:verify:test && npm run reproducibility:verify` | **Partially passed (local), 2026-07-23:** 50/50 fail-closed policy tests pass, including manifest-to-lock, installed-graph, canonical integrity, per-step workflow-runtime, and YAML/container-parser policy. The full verifier correctly fails before success because this host and `.venv` do not match the pinned Node 22.22.0/Python 3.12.13 runtimes |
 | Lockfile install | Node 22.22.0: `npm ci` | Pending canonical Node 22.22.0 CI evidence; the local host is Node 26 and is now correctly rejected by `engine-strict=true` |
 | Installed production dependency graph | `npm ls --all --omit=dev` | **Passed (local), 2026-07-23**; platform-specific unmet optional packages are expected |
-| Native compile/tests | `npm run macos:typecheck && npm run macos:test` | **Passed (local): test build succeeded; 211/211 tests, 0 failures, 2026-07-23.** xcresult: `/tmp/ElectronicMailDerivedData/Logs/Test/Test-ElectronicMail-2026.07.23_21-25-12-+0530.xcresult` |
+| Native compile/tests | `npm run macos:typecheck && npm run macos:test` | **Passed (local): test build succeeded; 216/216 tests, 0 failures, 2026-07-24.** xcresult: `/tmp/ElectronicMailDerivedData/Logs/Test/Test-ElectronicMail-2026.07.24_00-07-26-+0530.xcresult` |
 | Universal unsigned policy preflight | Xcode 16.4 (16F6): `VERSION=1.0.0 BUILD_NUMBER=1 BACKEND_URL=https://api.electronicmail.app npm run release:macos:preflight` | **Not yet evidenced under the approved toolchain.** The prior local universal identity-free build used Xcode beta and no longer satisfies this exact-toolchain gate; only Xcode beta is installed locally |
-| Backend unit/integration tests | `npm run backend:test`; `APP_ENV=staging DATABASE_URL=postgresql://localhost/electronic_mail npm run backend:test` | **Passed (local), 2026-07-23:** the default runner passed 331 tests with 17 staging-only skips; the staging/Postgres run passed 331 tests with 0 skips |
+| Backend unit/integration tests | `npm run backend:test`; `APP_ENV=staging DATABASE_URL=postgresql://localhost/electronic_mail npm run backend:test` | **Passed (local), 2026-07-24:** the default runner passed 425 tests with 20 staging-only skips; the staging/Postgres run passed 425 tests with 0 skips |
 | Local runtime readiness/auth-failure behavior | `bash scripts/dev-backend-runtime.sh`; HTTP checks for `/health` and `/ready`; worker/poller observation with a revoked Google refresh credential; Computer Use smoke of the rebuilt native app | **Passed (local), 2026-07-23:** `/health` and `/ready` returned HTTP 200 with AI disabled and the current schema head; credential expiry remained reauthorization-required without a retry storm. The rebuilt signed-in app relaunched without losing its session, defaulted to a hidden sidebar, rendered a known read message from a 5.12 ms reader response, showed/hid its sidebar with one bounded count sweep, and completed/cleared native search from a 103.75 ms response |
-| Backend bytecode/dependency consistency | `npm run backend:compile && .venv/bin/pip check` | **Passed (local), 2026-07-23** |
+| Backend bytecode/dependency consistency | `npm run backend:compile && .venv/bin/pip check` | **Passed (local), 2026-07-24** |
 | Deployment configuration guard | Production-shaped CI-valued `npm run deploy:check` | **Passed (local), 2026-07-23**; real production secret/origin values remain external evidence |
 | Migration | `alembic heads`; local Postgres revision; `scripts/migrate-production.sh`; exact `/ready` schema head | **Passed (local):** one linear migration head and the local staging database are both at `20260723_0025`. Execution against production Postgres and live `/ready` remain pending external evidence |
 | Database script contracts | `npm run database:scripts:test` | **Passed (local), 2026-07-23** |
@@ -55,7 +55,7 @@ This ledger does not alter or approve the user-owned UI. Visual polish and acces
 | Exact-commit hosted CI | Green `.github/workflows/quality.yml` push run for release SHA | Pending exact-SHA push and hosted CI |
 | Signed/notarized archive | Protected `.github/workflows/release-macos.yml` run | Pending candidate and Apple credentials |
 | Full production verification | Production-valued `npm run launch:verify` | Pending all live, artifact, acceptance, and approval inputs |
-| Patch hygiene | `git diff --check` | **Passed (local), 2026-07-23** |
+| Patch hygiene | `git diff --check` | **Passed (local), 2026-07-24** |
 
 ## Repository publication risks
 

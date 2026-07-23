@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
+from io import BytesIO
 import json
 import logging
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
+from urllib.error import HTTPError
+from urllib.parse import parse_qs
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -73,6 +76,20 @@ class GoogleAuthRouteTests(unittest.TestCase):
         )
         self.mock_oauth_freshness = self.oauth_freshness_patch.start()
         self.addCleanup(self.oauth_freshness_patch.stop)
+        self.revocation_guard_patch = patch.object(
+            auth_routes,
+            "has_active_google_token_revocation",
+            return_value=False,
+        )
+        self.mock_revocation_guard = self.revocation_guard_patch.start()
+        self.addCleanup(self.revocation_guard_patch.stop)
+        self.subject_user_patch = patch.object(
+            auth_routes,
+            "get_user_by_google_subject",
+            return_value=None,
+        )
+        self.mock_subject_user = self.subject_user_patch.start()
+        self.addCleanup(self.subject_user_patch.stop)
 
     def assert_no_store(self, response) -> None:
         self.assertEqual(response.headers["cache-control"], "no-store, private")
@@ -201,12 +218,14 @@ class GoogleAuthRouteTests(unittest.TestCase):
     @patch("app.api.routes.auth_google.create_mobile_oauth_handoff")
     @patch("app.api.routes.auth_google.delete_oauth_login_session")
     @patch("app.api.routes.auth_google.create_or_update_user")
+    @patch("app.api.routes.auth_google.revoke_or_enqueue_google_token_payload")
     @patch("app.api.routes.auth_google.handle_google_callback")
     @patch("app.api.routes.auth_google.get_oauth_login_session")
     def test_allowlist_failure_stores_terminal_durable_handoff(
         self,
         mock_session: Mock,
         mock_callback: Mock,
+        mock_cleanup_payload: Mock,
         mock_user: Mock,
         mock_delete: Mock,
         mock_create: Mock,
@@ -234,16 +253,24 @@ class GoogleAuthRouteTests(unittest.TestCase):
         self.assertEqual(mock_create.call_args.kwargs["error"], "Google sign-in failed. Please try again.")
         self.assertIsNone(mock_create.call_args.kwargs["login_code_hash"])
         self.assertEqual(mock_create.call_args.kwargs["exchange_code_challenge"], CODE_CHALLENGE)
+        mock_cleanup_payload.assert_called_once_with(
+            self.settings,
+            subject_hash=auth_routes.google_subject_tombstone_hash("google-sub-blocked"),
+            tokens={"token": "secret-provider-token"},
+            on_tracked=None,
+        )
         self.assert_no_store(response)
 
     @patch("app.api.routes.auth_google.delete_oauth_login_session")
     @patch("app.api.routes.auth_google.create_or_update_user")
+    @patch("app.api.routes.auth_google.revoke_or_enqueue_google_token_payload")
     @patch("app.api.routes.auth_google.handle_google_callback")
     @patch("app.api.routes.auth_google.get_oauth_login_session")
     def test_callback_started_before_account_deletion_cannot_recreate_user(
         self,
         mock_session: Mock,
         mock_callback: Mock,
+        mock_cleanup_payload: Mock,
         mock_create_user: Mock,
         mock_delete_session: Mock,
     ) -> None:
@@ -267,6 +294,12 @@ class GoogleAuthRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 307)
         self.assertEqual(response.headers["location"], "/auth/google")
         mock_create_user.assert_not_called()
+        mock_cleanup_payload.assert_called_once_with(
+            self.settings,
+            subject_hash=subject_hash,
+            tokens={"token": "stale-provider-token"},
+            on_tracked=None,
+        )
         mock_delete_session.assert_called_once_with(self.settings.database_path, state="old-state")
         self.mock_oauth_freshness.assert_called_once_with(
             self.settings.database_path,
@@ -279,11 +312,322 @@ class GoogleAuthRouteTests(unittest.TestCase):
         )
         self.assert_no_store(response)
 
+    @patch("app.services.integrations.google.enqueue_job")
+    @patch("app.services.integrations.google.urlopen")
+    @patch("app.api.routes.auth_google.delete_oauth_login_session")
+    @patch("app.api.routes.auth_google.create_or_update_user")
+    @patch("app.api.routes.auth_google.handle_google_callback")
+    @patch("app.api.routes.auth_google.get_oauth_login_session")
+    def test_stale_callback_revocation_failure_does_not_leak_provider_tokens(
+        self,
+        mock_session: Mock,
+        mock_callback: Mock,
+        mock_create_user: Mock,
+        _mock_delete_session: Mock,
+        mock_urlopen: Mock,
+        mock_enqueue: Mock,
+    ) -> None:
+        access_token = "stale-access-token-must-not-leak"
+        refresh_token = "stale-refresh-token-must-not-leak"
+        mock_session.return_value = SimpleNamespace(redirect_to=None, started_epoch=41)
+        mock_callback.return_value = SimpleNamespace(
+            redirect_to=None,
+            profile=DashboardProfile(email="owner@example.com", display_name="Owner"),
+            google_sub="google-sub-owner",
+            tokens={"token": access_token, "refresh_token": refresh_token},
+            oauth_started_epoch=41,
+        )
+        self.mock_oauth_freshness.return_value = False
+        mock_urlopen.side_effect = RuntimeError(f"provider rejected {refresh_token}")
+
+        with self.assertLogs("electronic_mail.http", level=logging.INFO) as captured:
+            response = self.client.get(
+                "/auth/google/callback",
+                params={"code": "stale-code", "state": "old-state"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(response.headers["location"], "/auth/google")
+        mock_create_user.assert_not_called()
+        mock_urlopen.assert_called_once()
+        self.assertEqual(mock_enqueue.call_args.kwargs["kind"], "google_token_revoke")
+        request = mock_urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://oauth2.googleapis.com/revoke")
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(parse_qs(request.data.decode("ascii")), {"token": [refresh_token]})
+        public_output = "\n".join([response.text, str(dict(response.headers)), *captured.output])
+        self.assertNotIn(access_token, public_output)
+        self.assertNotIn(refresh_token, public_output)
+
+    @patch("app.api.routes.auth_google.revoke_or_enqueue_google_token_payload", return_value=False)
+    @patch("app.api.routes.auth_google.create_or_update_user")
+    @patch("app.api.routes.auth_google.handle_google_callback")
+    def test_callback_rejects_and_tracks_transient_grant_while_subject_revocation_is_active(
+        self,
+        mock_callback: Mock,
+        mock_create_user: Mock,
+        mock_cleanup_payload: Mock,
+    ) -> None:
+        tokens = {"token": "new-access-token", "refresh_token": "new-refresh-token"}
+        mock_callback.return_value = SimpleNamespace(
+            redirect_to=None,
+            profile=DashboardProfile(email="owner@example.com", display_name="Owner"),
+            google_sub="google-sub-owner",
+            tokens=tokens,
+            oauth_started_epoch=42,
+        )
+        self.mock_revocation_guard.return_value = True
+
+        response = self.client.get(
+            "/auth/google/callback",
+            params={"code": "fresh-code"},
+            follow_redirects=False,
+        )
+
+        subject_hash = auth_routes.google_subject_tombstone_hash("google-sub-owner")
+        self.assertEqual(response.status_code, 400)
+        mock_create_user.assert_not_called()
+        self.mock_revocation_guard.assert_called_once_with(
+            self.settings.database_path,
+            subject_hash=subject_hash,
+        )
+        mock_cleanup_payload.assert_called_once_with(
+            self.settings,
+            subject_hash=subject_hash,
+            tokens=tokens,
+            on_tracked=None,
+        )
+
+    @patch("app.api.routes.auth_google.revoke_or_enqueue_google_token_payload", return_value=False)
+    @patch("app.api.routes.auth_google.delete_oauth_login_session", side_effect=RuntimeError("delete failed"))
+    @patch("app.api.routes.auth_google.create_or_update_user")
+    @patch("app.api.routes.auth_google.handle_google_callback")
+    @patch("app.api.routes.auth_google.get_oauth_login_session")
+    def test_session_cleanup_failure_keeps_verified_callback_grant_durably_tracked(
+        self,
+        mock_session: Mock,
+        mock_callback: Mock,
+        mock_create_user: Mock,
+        mock_delete_session: Mock,
+        mock_cleanup_payload: Mock,
+    ) -> None:
+        tokens = {"token": "new-access-token", "refresh_token": "new-refresh-token"}
+        mock_session.return_value = SimpleNamespace(redirect_to=None, started_epoch=42)
+        mock_callback.return_value = SimpleNamespace(
+            redirect_to=None,
+            profile=DashboardProfile(email="owner@example.com", display_name="Owner"),
+            google_sub="google-sub-owner",
+            tokens=tokens,
+            oauth_started_epoch=42,
+        )
+
+        response = self.client.get(
+            "/auth/google/callback",
+            params={"code": "fresh-code", "state": "state-1"},
+            follow_redirects=False,
+        )
+
+        subject_hash = auth_routes.google_subject_tombstone_hash("google-sub-owner")
+        self.assertEqual(response.status_code, 400)
+        mock_delete_session.assert_called_once_with(self.settings.database_path, state="state-1")
+        mock_create_user.assert_not_called()
+        mock_cleanup_payload.assert_called_once_with(
+            self.settings,
+            subject_hash=subject_hash,
+            tokens=tokens,
+            on_tracked=None,
+        )
+
+    def test_callback_tracking_failure_cleans_owned_grant_before_subject_unlock(self) -> None:
+        tokens = {"token": "new-access-token", "refresh_token": "new-refresh-token"}
+        subject_state = {"active": False}
+        self.mock_subject_guard.side_effect = lambda *_args, **_kwargs: _recording_guard(subject_state)
+
+        def assert_subject_owned(*_args, **_kwargs) -> None:
+            self.assertTrue(subject_state["active"])
+
+        with (
+            patch.object(
+                auth_routes,
+                "handle_google_callback",
+                return_value=SimpleNamespace(
+                    redirect_to=None,
+                    profile=DashboardProfile(email="blocked@example.com", display_name="Blocked"),
+                    google_sub="google-sub-blocked",
+                    tokens=tokens,
+                    oauth_started_epoch=42,
+                ),
+            ),
+            patch.object(
+                auth_routes,
+                "create_or_update_user",
+                side_effect=HTTPException(status_code=403, detail="blocked"),
+            ),
+            patch.object(
+                auth_routes,
+                "revoke_or_enqueue_google_token_payload",
+                side_effect=RuntimeError("queue unavailable"),
+            ) as mock_track,
+            patch.object(
+                auth_routes,
+                "_cleanup_unpersisted_callback_grant",
+                side_effect=assert_subject_owned,
+            ) as mock_fallback,
+        ):
+            response = self.client.get(
+                "/auth/google/callback",
+                params={"code": "fresh-code"},
+                follow_redirects=False,
+            )
+
+        subject_hash = auth_routes.google_subject_tombstone_hash("google-sub-blocked")
+        self.assertEqual(response.status_code, 403)
+        mock_track.assert_called_once_with(
+            self.settings,
+            subject_hash=subject_hash,
+            tokens=tokens,
+            on_tracked=None,
+        )
+        mock_fallback.assert_called_once_with(
+            database_url=self.settings.database_path,
+            subject_hash=subject_hash,
+            tokens=tokens,
+            user_id=None,
+        )
+        self.mock_subject_guard.assert_called_once_with(
+            self.settings.database_path,
+            subject_hash=subject_hash,
+        )
+
+    def test_callback_subject_lock_contention_queues_cleanup_without_unordered_revocation(self) -> None:
+        tokens = {"token": "new-access-token", "refresh_token": "new-refresh-token"}
+        self.mock_subject_guard.side_effect = auth_routes.AdvisoryLockUnavailable("busy")
+
+        with (
+            patch.object(
+                auth_routes,
+                "handle_google_callback",
+                return_value=SimpleNamespace(
+                    redirect_to=None,
+                    profile=DashboardProfile(email="owner@example.com", display_name="Owner"),
+                    google_sub="google-sub-owner",
+                    tokens=tokens,
+                    oauth_started_epoch=42,
+                ),
+            ),
+            patch.object(
+                auth_routes,
+                "enqueue_google_token_revocation_payload",
+                side_effect=RuntimeError("queue unavailable"),
+            ) as mock_enqueue,
+            patch.object(auth_routes, "revoke_google_token_payload") as mock_direct_revoke,
+            patch.object(auth_routes, "revoke_or_enqueue_google_token_payload") as mock_track_and_revoke,
+        ):
+            response = self.client.get(
+                "/auth/google/callback",
+                params={"code": "fresh-code"},
+                follow_redirects=False,
+            )
+
+        subject_hash = auth_routes.google_subject_tombstone_hash("google-sub-owner")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.mock_subject_guard.call_count, 2)
+        mock_enqueue.assert_called_once_with(
+            self.settings,
+            subject_hash=subject_hash,
+            tokens=tokens,
+        )
+        mock_direct_revoke.assert_not_called()
+        mock_track_and_revoke.assert_not_called()
+
+    @patch("app.api.routes.auth_google.delete_google_oauth_token")
+    @patch("app.api.routes.auth_google.mark_google_disconnected")
+    @patch("app.api.routes.auth_google.cancel_user_jobs")
+    @patch("app.api.routes.auth_google.revoke_or_enqueue_google_token_payload")
+    @patch("app.api.routes.auth_google.ensure_gmail_watch")
+    @patch("app.api.routes.auth_google.reconnect_google_oauth_token", side_effect=RuntimeError("save failed"))
+    @patch("app.api.routes.auth_google.create_or_update_user")
+    @patch("app.api.routes.auth_google.handle_google_callback")
+    def test_callback_tracks_payload_and_disconnects_existing_grant_when_token_save_fails(
+        self,
+        mock_callback: Mock,
+        mock_create_user: Mock,
+        _mock_reconnect: Mock,
+        mock_watch: Mock,
+        mock_cleanup_payload: Mock,
+        mock_cancel_jobs: Mock,
+        mock_mark_disconnected: Mock,
+        mock_delete_token: Mock,
+    ) -> None:
+        tokens = {"token": "unpersisted-access-token", "refresh_token": "unpersisted-refresh-token"}
+        mock_callback.return_value = SimpleNamespace(
+            redirect_to=None,
+            profile=DashboardProfile(email="owner@example.com", display_name="Owner"),
+            google_sub="google-sub-owner",
+            tokens=tokens,
+            oauth_started_epoch=42,
+        )
+        mock_create_user.return_value = SimpleNamespace(id="user-1")
+        mock_cleanup_payload.side_effect = lambda *_args, **kwargs: kwargs["on_tracked"]() or False
+
+        response = self.client.get(
+            "/auth/google/callback",
+            params={"code": "fresh-code"},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        mock_cleanup_payload.assert_called_once_with(
+            self.settings,
+            subject_hash=auth_routes.google_subject_tombstone_hash("google-sub-owner"),
+            tokens=tokens,
+            on_tracked=ANY,
+        )
+        mock_delete_token.assert_called_once_with(self.settings.database_path, user_id="user-1")
+        mock_mark_disconnected.assert_called_once_with(self.settings.database_path, user_id="user-1")
+        mock_cancel_jobs.assert_called_once_with(self.settings.database_path, user_id="user-1")
+        mock_watch.assert_not_called()
+
+    @patch("app.api.routes.auth_google.revoke_or_enqueue_google_token_payload")
+    @patch("app.api.routes.auth_google.ensure_gmail_watch", side_effect=RuntimeError("watch failed"))
+    @patch("app.api.routes.auth_google.reconnect_google_oauth_token")
+    @patch("app.api.routes.auth_google.create_or_update_user")
+    @patch("app.api.routes.auth_google.handle_google_callback")
+    def test_callback_never_revokes_payload_after_token_save_succeeds(
+        self,
+        mock_callback: Mock,
+        mock_create_user: Mock,
+        mock_reconnect: Mock,
+        _mock_watch: Mock,
+        mock_cleanup_payload: Mock,
+    ) -> None:
+        tokens = {"token": "persisted-access-token", "refresh_token": "persisted-refresh-token"}
+        mock_callback.return_value = SimpleNamespace(
+            redirect_to=None,
+            profile=DashboardProfile(email="owner@example.com", display_name="Owner"),
+            google_sub="google-sub-owner",
+            tokens=tokens,
+            oauth_started_epoch=42,
+        )
+        mock_create_user.return_value = SimpleNamespace(id="user-1")
+
+        response = self.client.get(
+            "/auth/google/callback",
+            params={"code": "fresh-code"},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        mock_reconnect.assert_called_once()
+        mock_cleanup_payload.assert_not_called()
+
     @patch("app.api.routes.auth_google.issue_session")
     @patch("app.api.routes.auth_google.enqueue_first_run")
     @patch("app.api.routes.auth_google.ensure_gmail_watch")
-    @patch("app.api.routes.auth_google.clear_google_guard_state")
-    @patch("app.api.routes.auth_google.save_user_google_tokens")
+    @patch("app.api.routes.auth_google.delete_oauth_login_session")
+    @patch("app.api.routes.auth_google.encrypt_json", return_value="encrypted-provider-token")
+    @patch("app.api.routes.auth_google.reconnect_google_oauth_token")
     @patch("app.api.routes.auth_google.create_or_update_user")
     @patch("app.api.routes.auth_google.handle_google_callback")
     @patch("app.api.routes.auth_google.get_oauth_login_session")
@@ -292,8 +636,9 @@ class GoogleAuthRouteTests(unittest.TestCase):
         mock_session: Mock,
         mock_callback: Mock,
         mock_create_user: Mock,
-        mock_save_tokens: Mock,
-        mock_clear_guard: Mock,
+        mock_reconnect: Mock,
+        _mock_encrypt: Mock,
+        mock_delete_session: Mock,
         mock_watch: Mock,
         _mock_enqueue: Mock,
         mock_issue_session: Mock,
@@ -318,11 +663,10 @@ class GoogleAuthRouteTests(unittest.TestCase):
         self.mock_mail_guard.side_effect = enter_user_guard
         self.mock_oauth_freshness.side_effect = lambda *_args, **_kwargs: self.assertTrue(state["subject"]) or True
         mock_create_user.side_effect = lambda *_args, **_kwargs: self.assertTrue(state["subject"]) or user
-        mock_save_tokens.side_effect = lambda *_args, **_kwargs: (
+        mock_reconnect.side_effect = lambda *_args, **_kwargs: (
             self.assertTrue(state["subject"]),
             self.assertTrue(state["user"]),
         )
-        mock_clear_guard.side_effect = lambda *_args, **_kwargs: self.assertTrue(state["user"])
         mock_watch.side_effect = lambda *_args, **_kwargs: (
             self.assertTrue(state["subject"]),
             self.assertFalse(state["user"]),
@@ -342,15 +686,11 @@ class GoogleAuthRouteTests(unittest.TestCase):
             subject_hash=subject_hash,
         )
         self.mock_mail_guard.assert_called_once_with(self.settings.database_path, user_id="user-1")
-        mock_save_tokens.assert_called_once_with(
-            self.settings,
-            user_id="user-1",
-            tokens={"token": "fresh-provider-token"},
-            oauth_started_epoch=42,
-        )
-        mock_clear_guard.assert_called_once_with(
+        mock_delete_session.assert_called_once_with(self.settings.database_path, state="new-state")
+        mock_reconnect.assert_called_once_with(
             self.settings.database_path,
             user_id="user-1",
+            token_json_encrypted="encrypted-provider-token",
             oauth_started_epoch=42,
         )
         mock_create_user.assert_called_once_with(
@@ -504,7 +844,7 @@ class GoogleAuthRouteTests(unittest.TestCase):
     @patch("app.api.routes.auth_google.revoke_user_app_sessions")
     @patch("app.api.routes.auth_google.delete_user_mail_data")
     @patch("app.api.routes.auth_google.cancel_user_jobs")
-    @patch("app.api.routes.auth_google.revoke_stored_google_token", side_effect=OSError("provider unavailable"))
+    @patch("app.api.routes.auth_google.revoke_or_enqueue_stored_google_token", return_value=False)
     @patch("app.api.routes.auth_google.stop_gmail_watch", side_effect=OSError("provider unavailable"))
     @patch("app.api.routes.auth_google.record_google_subject_revocation")
     @patch("app.api.routes.auth_google.get_user")
@@ -538,7 +878,13 @@ class GoogleAuthRouteTests(unittest.TestCase):
             self.assertTrue(guard_state["subject"])
             self.assertTrue(guard_state["user"])
 
+        def provider_unavailable(*_args, **_kwargs):
+            assert_nested_guards()
+            raise OSError("provider unavailable")
+
         self.mock_mail_guard.side_effect = enter_user_guard
+        _mock_stop.side_effect = provider_unavailable
+        _mock_revoke_google.side_effect = lambda *_args, **_kwargs: assert_nested_guards() or False
         mock_cancel.side_effect = assert_nested_guards
         mock_delete_mail_data.side_effect = assert_nested_guards
         mock_revoke_sessions.side_effect = assert_nested_guards
@@ -567,7 +913,7 @@ class GoogleAuthRouteTests(unittest.TestCase):
     @patch("app.api.routes.auth_google.delete_google_oauth_token")
     @patch("app.api.routes.auth_google.cancel_user_jobs")
     @patch("app.api.routes.auth_google.mark_google_disconnected")
-    @patch("app.api.routes.auth_google.revoke_stored_google_token", return_value=True)
+    @patch("app.api.routes.auth_google.revoke_or_enqueue_stored_google_token", return_value=True)
     @patch("app.api.routes.auth_google.stop_gmail_watch")
     @patch("app.api.routes.auth_google.record_google_subject_revocation")
     @patch("app.api.routes.auth_google.get_user")
@@ -590,8 +936,14 @@ class GoogleAuthRouteTests(unittest.TestCase):
         self.mock_subject_guard.side_effect = lambda *_args, **_kwargs: _recording_guard(guard_state, "subject")
         self.mock_mail_guard.side_effect = lambda *_args, **_kwargs: _recording_guard(guard_state, "user")
         mock_record_revocation.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["subject"])
-        mock_stop.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["subject"])
-        mock_revoke_google.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["subject"]) or True
+        mock_stop.side_effect = lambda *_args, **_kwargs: (
+            self.assertTrue(guard_state["subject"]),
+            self.assertTrue(guard_state["user"]),
+        )
+        mock_revoke_google.side_effect = lambda *_args, **_kwargs: (
+            self.assertTrue(guard_state["subject"]),
+            self.assertTrue(guard_state["user"]),
+        ) or True
         mock_mark_disconnected.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["user"])
         mock_cancel.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["user"])
         mock_delete_token.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["user"])
@@ -601,7 +953,11 @@ class GoogleAuthRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 204)
         mock_stop.assert_called_once_with(self.settings, user_id="user-1")
-        mock_revoke_google.assert_called_once_with(self.settings, user_id="user-1")
+        mock_revoke_google.assert_called_once_with(
+            self.settings,
+            user_id="user-1",
+            subject_hash=auth_routes.google_subject_tombstone_hash("google-sub-owner"),
+        )
         mock_mark_disconnected.assert_called_once_with(self.settings.database_path, user_id="user-1")
         mock_cancel.assert_called_once_with(self.settings.database_path, user_id="user-1")
         mock_delete_token.assert_called_once_with(self.settings.database_path, user_id="user-1")
@@ -620,7 +976,7 @@ class GoogleAuthRouteTests(unittest.TestCase):
     @patch("app.api.routes.auth_google.delete_google_oauth_token")
     @patch("app.api.routes.auth_google.cancel_user_jobs")
     @patch("app.api.routes.auth_google.mark_google_disconnected")
-    @patch("app.api.routes.auth_google.revoke_stored_google_token", return_value=True)
+    @patch("app.api.routes.auth_google.revoke_or_enqueue_stored_google_token", return_value=True)
     @patch("app.api.routes.auth_google.stop_gmail_watch")
     @patch("app.api.routes.auth_google.record_google_subject_revocation")
     @patch("app.api.routes.auth_google.get_user")
@@ -647,8 +1003,14 @@ class GoogleAuthRouteTests(unittest.TestCase):
 
         self.mock_mail_guard.side_effect = enter_user_guard
         mock_record_revocation.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["subject"])
-        mock_stop.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["subject"])
-        mock_revoke_google.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["subject"]) or True
+        mock_stop.side_effect = lambda *_args, **_kwargs: (
+            self.assertTrue(guard_state["subject"]),
+            self.assertTrue(guard_state["user"]),
+        )
+        mock_revoke_google.side_effect = lambda *_args, **_kwargs: (
+            self.assertTrue(guard_state["subject"]),
+            self.assertTrue(guard_state["user"]),
+        ) or True
         mock_mark_disconnected.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["user"])
         mock_cancel.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["user"])
         mock_delete_token.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["user"])
@@ -657,7 +1019,11 @@ class GoogleAuthRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 204)
         mock_stop.assert_called_once_with(self.settings, user_id="user-1")
-        mock_revoke_google.assert_called_once_with(self.settings, user_id="user-1")
+        mock_revoke_google.assert_called_once_with(
+            self.settings,
+            user_id="user-1",
+            subject_hash=auth_routes.google_subject_tombstone_hash("google-sub-owner"),
+        )
         mock_mark_disconnected.assert_called_once_with(self.settings.database_path, user_id="user-1")
         mock_cancel.assert_called_once_with(self.settings.database_path, user_id="user-1")
         mock_delete_token.assert_called_once_with(self.settings.database_path, user_id="user-1")
@@ -676,7 +1042,7 @@ class GoogleAuthRouteTests(unittest.TestCase):
     @patch("app.api.routes.auth_google.delete_google_oauth_token")
     @patch("app.api.routes.auth_google.cancel_user_jobs")
     @patch("app.api.routes.auth_google.mark_google_disconnected")
-    @patch("app.api.routes.auth_google.revoke_stored_google_token", return_value=True)
+    @patch("app.api.routes.auth_google.revoke_or_enqueue_stored_google_token", return_value=True)
     @patch("app.api.routes.auth_google.stop_gmail_watch")
     @patch("app.api.routes.auth_google.record_google_subject_revocation")
     @patch("app.api.routes.auth_google.get_user")
@@ -698,6 +1064,8 @@ class GoogleAuthRouteTests(unittest.TestCase):
         guard_state = {"subject": False, "user": False}
         self.mock_subject_guard.side_effect = lambda *_args, **_kwargs: _recording_guard(guard_state, "subject")
         self.mock_mail_guard.side_effect = lambda *_args, **_kwargs: _recording_guard(guard_state, "user")
+        _mock_stop.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["user"])
+        _mock_revoke_google.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["user"]) or True
         _mock_mark_disconnected.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["user"])
         _mock_cancel.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["user"])
         _mock_delete_token.side_effect = lambda *_args, **_kwargs: self.assertTrue(guard_state["user"])
@@ -708,6 +1076,611 @@ class GoogleAuthRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 204)
         mock_delete_mail_data.assert_called_once_with(self.settings.database_path, user_id="user-1")
         self.mock_mail_guard.assert_called_once_with(self.settings.database_path, user_id="user-1")
+
+
+class GoogleTokenRevocationTests(unittest.TestCase):
+    def test_provider_http_holds_deletion_barrier_across_authorized_request(self) -> None:
+        events: list[str] = []
+
+        @contextmanager
+        def guard(_database_url: str, *, user_id: str):
+            self.assertEqual(user_id, "user-1")
+            events.append("guard-enter")
+            try:
+                yield
+            finally:
+                events.append("guard-exit")
+
+        authorized_http = SimpleNamespace(
+            request=lambda *_args, **_kwargs: events.append("request") or ("response", b"body")
+        )
+        guarded = google_service._ProviderGuardedHttp(
+            authorized_http,
+            database_url="postgresql://example/db",
+            user_id="user-1",
+        )
+
+        with patch("app.services.integrations.google.shared_user_mail_lock", side_effect=guard):
+            result = guarded.request("https://gmail.googleapis.test/messages")
+
+        self.assertEqual(result, ("response", b"body"))
+        self.assertEqual(events, ["guard-enter", "request", "guard-exit"])
+
+    @patch("app.services.integrations.google.urlopen")
+    def test_transient_payload_revokes_refresh_token_with_post_body(self, mock_urlopen: Mock) -> None:
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b""
+        mock_urlopen.return_value = response
+
+        revoked = google_service.revoke_google_token_payload(
+            {"token": "transient-access-token", "refresh_token": "transient-refresh-token"}
+        )
+
+        self.assertTrue(revoked)
+        mock_urlopen.assert_called_once()
+        request = mock_urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://oauth2.googleapis.com/revoke")
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(
+            parse_qs(request.data.decode("ascii")),
+            {"token": ["transient-refresh-token"]},
+        )
+        self.assertEqual(mock_urlopen.call_args.kwargs, {"timeout": 10})
+
+    @patch("app.services.integrations.google.urlopen")
+    def test_already_revoked_invalid_token_response_completes_cleanup(self, mock_urlopen: Mock) -> None:
+        mock_urlopen.side_effect = HTTPError(
+            "https://oauth2.googleapis.com/revoke",
+            400,
+            "Bad Request",
+            {},
+            BytesIO(b'{"error":"invalid_token"}'),
+        )
+
+        revoked = google_service.revoke_google_token_payload({"refresh_token": "already-revoked"})
+
+        self.assertTrue(revoked)
+
+    @patch("app.services.integrations.google.urlopen")
+    def test_other_provider_400_remains_pending(self, mock_urlopen: Mock) -> None:
+        mock_urlopen.side_effect = HTTPError(
+            "https://oauth2.googleapis.com/revoke",
+            400,
+            "Bad Request",
+            {},
+            BytesIO(b'{"error":"invalid_request"}'),
+        )
+
+        revoked = google_service.revoke_google_token_payload({"refresh_token": "still-uncertain"})
+
+        self.assertFalse(revoked)
+
+    @patch("app.services.integrations.google.revoke_google_token_payload", return_value=True)
+    @patch("app.services.integrations.google.decrypt_json")
+    @patch("app.services.integrations.google.get_google_oauth_token")
+    def test_stored_revocation_reuses_payload_helper(
+        self,
+        mock_get_token: Mock,
+        mock_decrypt: Mock,
+        mock_revoke_payload: Mock,
+    ) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        mock_get_token.return_value = SimpleNamespace(token_json_encrypted="encrypted")
+        payload = {"token": "stored-access-token", "refresh_token": "stored-refresh-token"}
+        mock_decrypt.return_value = payload
+
+        revoked = google_service.revoke_stored_google_token(settings, user_id="user-1")
+
+        self.assertTrue(revoked)
+        mock_get_token.assert_called_once_with(settings.database_path, user_id="user-1")
+        mock_decrypt.assert_called_once_with(settings, "encrypted")
+        mock_revoke_payload.assert_called_once_with(payload)
+
+    def test_failed_provider_revocation_is_durably_queued_as_encrypted_material(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        encrypted = "encrypted-token-payload"
+        tokens = {"token": "private-access-token", "refresh_token": "private-refresh-token"}
+        events: list[str] = []
+        with (
+            patch.object(
+                google_service,
+                "get_google_oauth_token",
+                return_value=SimpleNamespace(token_json_encrypted=encrypted),
+            ),
+            patch.object(google_service, "decrypt_json", return_value=tokens),
+            patch.object(
+                google_service,
+                "enqueue_job",
+                side_effect=lambda *_args, **_kwargs: events.append("enqueue")
+                or SimpleNamespace(id="job-1"),
+            ) as mock_enqueue,
+            patch.object(
+                google_service,
+                "exclusive_google_subject_lock",
+                side_effect=lambda *_args, **_kwargs: nullcontext(),
+            ),
+            patch.object(
+                google_service,
+                "get_job",
+                return_value=SimpleNamespace(id="job-1", status="queued"),
+            ),
+            patch.object(
+                google_service,
+                "_revoke_google_token_payload_outcome",
+                side_effect=lambda *_args, **_kwargs: events.append("revoke")
+                or google_service._GoogleTokenRevocationOutcome.RETRY,
+            ),
+            patch.object(google_service, "record_google_subject_revocation") as mock_barrier,
+            patch.object(google_service, "complete_google_token_revocations_for_subject") as mock_complete_subject,
+            patch.object(google_service, "complete_google_token_revocation_job") as mock_complete_job,
+        ):
+            revoked = google_service.revoke_or_enqueue_stored_google_token(
+                settings,
+                user_id="user-1",
+                subject_hash="subject-hash",
+            )
+
+        self.assertFalse(revoked)
+        self.assertEqual(events, ["enqueue", "revoke"])
+        kwargs = mock_enqueue.call_args.kwargs
+        self.assertEqual(kwargs["kind"], "google_token_revoke")
+        self.assertEqual(kwargs["queue"], "critical")
+        self.assertEqual(kwargs["priority"], 100)
+        self.assertEqual(kwargs["max_attempts"], google_service.GOOGLE_TOKEN_REVOCATION_MAX_ATTEMPTS)
+        self.assertEqual(
+            kwargs["payload"],
+            {"subject_hash": "subject-hash", "token_json_encrypted": encrypted},
+        )
+        self.assertTrue(kwargs["dedupe_key"].startswith("google-token-revoke:subject-hash:"))
+        self.assertNotIn(tokens["token"], str(mock_enqueue.call_args))
+        self.assertNotIn(tokens["refresh_token"], str(mock_enqueue.call_args))
+        mock_barrier.assert_not_called()
+        mock_complete_subject.assert_not_called()
+        mock_complete_job.assert_not_called()
+
+    def test_transient_revocation_is_tracked_before_provider_and_resolves_subject_jobs(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        tokens = {"token": "new-access", "refresh_token": "new-refresh"}
+        events: list[str] = []
+        with (
+            patch.object(google_service, "encrypt_json", return_value="encrypted-new-grant"),
+            patch.object(
+                google_service,
+                "enqueue_job",
+                side_effect=lambda *_args, **_kwargs: events.append("enqueue")
+                or SimpleNamespace(id="job-1"),
+            ) as mock_enqueue,
+            patch.object(
+                google_service,
+                "exclusive_google_subject_lock",
+                side_effect=lambda *_args, **_kwargs: nullcontext(),
+            ),
+            patch.object(
+                google_service,
+                "get_job",
+                return_value=SimpleNamespace(id="job-1", status="queued"),
+            ),
+            patch.object(
+                google_service,
+                "_revoke_google_token_payload_outcome",
+                side_effect=lambda *_args, **_kwargs: events.append("revoke")
+                or google_service._GoogleTokenRevocationOutcome.PROJECT_REVOKED,
+            ),
+            patch.object(
+                google_service,
+                "record_google_subject_revocation",
+                side_effect=lambda *_args, **_kwargs: events.append("barrier"),
+            ) as mock_barrier,
+            patch.object(
+                google_service,
+                "complete_google_token_revocations_for_subject",
+                side_effect=lambda *_args, **_kwargs: events.append("complete"),
+            ) as mock_complete_subject,
+            patch.object(google_service, "complete_google_token_revocation_job") as mock_complete_job,
+        ):
+            revoked = google_service.revoke_or_enqueue_google_token_payload(
+                settings,
+                subject_hash="subject-hash",
+                tokens=tokens,
+            )
+
+        self.assertTrue(revoked)
+        self.assertEqual(events, ["enqueue", "revoke", "barrier", "complete"])
+        self.assertEqual(
+            mock_enqueue.call_args.kwargs["payload"],
+            {"subject_hash": "subject-hash", "token_json_encrypted": "encrypted-new-grant"},
+        )
+        mock_complete_subject.assert_called_once_with(
+            settings.database_path,
+            subject_hash="subject-hash",
+        )
+        mock_barrier.assert_called_once_with(settings.database_path, subject_hash="subject-hash")
+        mock_complete_job.assert_not_called()
+
+    def test_invalid_credential_completes_only_its_own_revocation_job(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        tokens = {"refresh_token": "expired-refresh-token"}
+        with (
+            patch.object(google_service, "encrypt_json", return_value="encrypted-expired-grant"),
+            patch.object(google_service, "enqueue_job", return_value=SimpleNamespace(id="job-expired")),
+            patch.object(
+                google_service,
+                "exclusive_google_subject_lock",
+                side_effect=lambda *_args, **_kwargs: nullcontext(),
+            ),
+            patch.object(
+                google_service,
+                "get_job",
+                return_value=SimpleNamespace(id="job-expired", status="queued"),
+            ),
+            patch.object(
+                google_service,
+                "_revoke_google_token_payload_outcome",
+                return_value=google_service._GoogleTokenRevocationOutcome.CREDENTIAL_INVALID,
+            ),
+            patch.object(google_service, "record_google_subject_revocation") as mock_barrier,
+            patch.object(google_service, "complete_google_token_revocations_for_subject") as mock_complete_subject,
+            patch.object(google_service, "complete_google_token_revocation_job") as mock_complete_job,
+        ):
+            revoked = google_service.revoke_or_enqueue_google_token_payload(
+                settings,
+                subject_hash="subject-hash",
+                tokens=tokens,
+            )
+
+        self.assertTrue(revoked)
+        mock_barrier.assert_called_once_with(settings.database_path, subject_hash="subject-hash")
+        mock_complete_job.assert_called_once_with(settings.database_path, job_id="job-expired")
+        mock_complete_subject.assert_not_called()
+
+    def test_worker_confirmation_advances_subject_barrier_before_completing_siblings(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        tokens = {"refresh_token": "queued-refresh-token"}
+        events: list[str] = []
+
+        @contextmanager
+        def subject_guard(*_args, **_kwargs):
+            events.append("subject-enter")
+            try:
+                yield
+            finally:
+                events.append("subject-exit")
+
+        with (
+            patch.object(google_service, "decrypt_json", return_value=tokens),
+            patch.object(google_service, "exclusive_google_subject_lock", side_effect=subject_guard),
+            patch.object(
+                google_service,
+                "get_job",
+                return_value=SimpleNamespace(id="job-1", status="running"),
+            ),
+            patch.object(
+                google_service,
+                "_revoke_google_token_payload_outcome",
+                side_effect=lambda *_args, **_kwargs: events.append("provider-confirmed")
+                or google_service._GoogleTokenRevocationOutcome.PROJECT_REVOKED,
+            ),
+            patch.object(
+                google_service,
+                "record_google_subject_revocation",
+                side_effect=lambda *_args, **_kwargs: events.append("barrier"),
+            ) as mock_barrier,
+            patch.object(
+                google_service,
+                "complete_google_token_revocations_for_subject",
+                side_effect=lambda *_args, **_kwargs: events.append("complete-subject"),
+            ) as mock_complete_subject,
+            patch.object(google_service, "complete_google_token_revocation_job") as mock_complete_job,
+        ):
+            google_service.retry_encrypted_google_token_revocation(
+                settings,
+                job_id="job-1",
+                subject_hash="subject-hash",
+                token_json_encrypted="encrypted-token-payload",
+            )
+
+        self.assertEqual(
+            events,
+            ["subject-enter", "provider-confirmed", "barrier", "complete-subject", "subject-exit"],
+        )
+        mock_barrier.assert_called_once_with(settings.database_path, subject_hash="subject-hash")
+        mock_complete_subject.assert_called_once_with(settings.database_path, subject_hash="subject-hash")
+        mock_complete_job.assert_not_called()
+
+    def test_worker_invalid_credential_keeps_sibling_revocations_active(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        with (
+            patch.object(google_service, "decrypt_json", return_value={"refresh_token": "expired"}),
+            patch.object(
+                google_service,
+                "exclusive_google_subject_lock",
+                side_effect=lambda *_args, **_kwargs: nullcontext(),
+            ),
+            patch.object(
+                google_service,
+                "get_job",
+                return_value=SimpleNamespace(id="job-expired", status="running"),
+            ),
+            patch.object(
+                google_service,
+                "_revoke_google_token_payload_outcome",
+                return_value=google_service._GoogleTokenRevocationOutcome.CREDENTIAL_INVALID,
+            ),
+            patch.object(google_service, "record_google_subject_revocation") as mock_barrier,
+            patch.object(google_service, "complete_google_token_revocations_for_subject") as mock_complete_subject,
+            patch.object(google_service, "complete_google_token_revocation_job") as mock_complete_job,
+        ):
+            google_service.retry_encrypted_google_token_revocation(
+                settings,
+                job_id="job-expired",
+                subject_hash="subject-hash",
+                token_json_encrypted="encrypted-token-payload",
+            )
+
+        mock_barrier.assert_called_once_with(settings.database_path, subject_hash="subject-hash")
+        mock_complete_job.assert_called_once_with(settings.database_path, job_id="job-expired")
+        mock_complete_subject.assert_not_called()
+
+    @patch("app.services.integrations.google.revoke_google_token_payload")
+    @patch(
+        "app.services.integrations.google.persist_token_payload",
+        side_effect=google_service.UserMailWorkBlocked("disconnected"),
+    )
+    @patch("app.services.integrations.google.Credentials.from_authorized_user_info")
+    @patch("app.services.integrations.google.decrypt_json")
+    @patch("app.services.integrations.google.get_google_oauth_token")
+    def test_refreshed_payload_is_revoked_when_guard_rejects_persistence(
+        self,
+        mock_get_token: Mock,
+        mock_decrypt: Mock,
+        mock_from_info: Mock,
+        _mock_persist: Mock,
+        mock_revoke: Mock,
+    ) -> None:
+        settings = SimpleNamespace(
+            google_configured=True,
+            database_path="postgresql://example/db",
+            google_client_id="client-id",
+            google_client_secret="client-secret",
+        )
+        mock_get_token.return_value = SimpleNamespace(token_json_encrypted="encrypted")
+        mock_decrypt.return_value = {
+            "token": "expired-access-token",
+            "refresh_token": "refresh-token",
+            "scopes": [google_service.GMAIL_FULL_SCOPE],
+        }
+        credentials = SimpleNamespace(
+            expired=True,
+            token="refreshed-access-token",
+            refresh_token="refresh-token",
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id="client-id",
+            client_secret="client-secret",
+            scopes=[google_service.GMAIL_FULL_SCOPE],
+            expiry=None,
+            refresh=Mock(),
+        )
+        mock_from_info.return_value = credentials
+
+        result = google_service._load_authorized_credentials(
+            settings,
+            user_id="user-1",
+            refresh_expired=True,
+            persist_updates=True,
+        )
+
+        self.assertFalse(result.status.connected)
+        self.assertIsInstance(credentials.refresh.call_args.args[0], google_service._BoundedGoogleAuthRequest)
+        mock_revoke.assert_called_once_with(
+            {
+                "token": "refreshed-access-token",
+                "refresh_token": "refresh-token",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+                "scopes": [google_service.GMAIL_FULL_SCOPE],
+                "expiry": None,
+            }
+        )
+
+    @patch("app.services.integrations.google.revoke_google_token_payload")
+    @patch("app.services.integrations.google.fetch_google_account_identity_from_credentials", return_value=None)
+    @patch("app.services.integrations.google.token_payload_from_credentials")
+    @patch("app.services.integrations.google.create_flow")
+    @patch("app.services.integrations.google.get_oauth_login_session")
+    def test_unverified_callback_identity_revokes_unpersisted_payload(
+        self,
+        mock_session: Mock,
+        mock_create_flow: Mock,
+        mock_token_payload: Mock,
+        _mock_identity: Mock,
+        mock_revoke_payload: Mock,
+    ) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        mock_session.return_value = SimpleNamespace(
+            state="state-1",
+            code_verifier="verifier-1",
+            redirect_to=None,
+            started_epoch=1,
+        )
+        credentials = SimpleNamespace(token="transient-access-token")
+        mock_create_flow.return_value = SimpleNamespace(
+            code_verifier=None,
+            fetch_token=Mock(),
+            credentials=credentials,
+        )
+        payload = {"token": "transient-access-token", "refresh_token": "transient-refresh-token"}
+        mock_token_payload.return_value = payload
+
+        with self.assertRaisesRegex(RuntimeError, "identity could not be verified"):
+            google_service.handle_google_callback(settings, "callback-code", "state-1")
+
+        mock_revoke_payload.assert_called_once_with(payload)
+
+    @patch("app.services.integrations.google.revoke_google_token_payload")
+    @patch("app.services.integrations.google.delete_db_oauth_login_session")
+    @patch("app.services.integrations.google.fetch_google_account_identity_from_credentials")
+    @patch("app.services.integrations.google.token_payload_from_credentials")
+    @patch("app.services.integrations.google.create_flow")
+    @patch("app.services.integrations.google.get_oauth_login_session")
+    def test_verified_callback_result_transfers_session_and_token_cleanup_to_route(
+        self,
+        mock_session: Mock,
+        mock_create_flow: Mock,
+        mock_token_payload: Mock,
+        mock_identity: Mock,
+        mock_delete_session: Mock,
+        mock_revoke_payload: Mock,
+    ) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        mock_session.return_value = SimpleNamespace(
+            state="state-1",
+            code_verifier="verifier-1",
+            redirect_to=None,
+            started_epoch=1,
+        )
+        credentials = SimpleNamespace(token="transient-access-token")
+        mock_create_flow.return_value = SimpleNamespace(
+            code_verifier=None,
+            fetch_token=Mock(),
+            credentials=credentials,
+        )
+        payload = {"token": "transient-access-token", "refresh_token": "transient-refresh-token"}
+        mock_token_payload.return_value = payload
+        mock_identity.return_value = SimpleNamespace(
+            profile=DashboardProfile(email="owner@example.com", display_name="Owner"),
+            google_sub="google-sub-owner",
+        )
+
+        result = google_service.handle_google_callback(settings, "callback-code", "state-1")
+
+        self.assertEqual(result.google_sub, "google-sub-owner")
+        self.assertEqual(result.tokens, payload)
+        mock_delete_session.assert_not_called()
+        mock_revoke_payload.assert_not_called()
+
+    @patch("app.services.integrations.google.build_google_service")
+    @patch("app.services.integrations.google._load_authorized_credentials")
+    def test_stop_watch_loads_credentials_without_persisted_refresh(
+        self,
+        mock_load_credentials: Mock,
+        mock_build_service: Mock,
+    ) -> None:
+        settings = SimpleNamespace()
+        credentials = object()
+        mock_load_credentials.return_value = SimpleNamespace(credentials=credentials)
+        stop = Mock()
+        mock_build_service.return_value = SimpleNamespace(
+            users=Mock(return_value=SimpleNamespace(stop=Mock(return_value=SimpleNamespace(execute=stop))))
+        )
+
+        google_service.stop_gmail_watch(settings, user_id="user-1")
+
+        mock_load_credentials.assert_called_once_with(
+            settings,
+            user_id="user-1",
+            refresh_expired=False,
+            persist_updates=False,
+        )
+        mock_build_service.assert_called_once_with("gmail", "v1", credentials)
+        stop.assert_called_once_with()
+
+    @patch("app.services.integrations.google.build_google_service")
+    @patch("app.services.integrations.google.create_authorized_credentials")
+    def test_normal_gmail_service_keeps_persisted_refresh_enabled(
+        self,
+        mock_credentials: Mock,
+        _mock_build_service: Mock,
+    ) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        mock_credentials.return_value = object()
+
+        google_service.create_gmail_service(settings, user_id="user-1")
+
+        mock_credentials.assert_called_once_with(
+            settings,
+            user_id="user-1",
+            refresh_expired=True,
+            persist_updates=True,
+        )
+
+    @patch("app.services.integrations.google.persist_token_payload")
+    @patch("app.services.integrations.google.Credentials.from_authorized_user_info")
+    @patch("app.services.integrations.google.decrypt_json")
+    @patch("app.services.integrations.google.get_google_oauth_token")
+    @patch("app.services.integrations.google.shared_user_mail_lock", return_value=nullcontext())
+    def test_read_only_load_does_not_persist_nonexpired_normalization(
+        self,
+        _mock_guard: Mock,
+        mock_get_token: Mock,
+        mock_decrypt: Mock,
+        mock_from_info: Mock,
+        mock_persist: Mock,
+    ) -> None:
+        settings = SimpleNamespace(
+            google_configured=True,
+            database_path="postgresql://example/db",
+            google_client_id="client-id",
+            google_client_secret="client-secret",
+        )
+        mock_get_token.return_value = SimpleNamespace(token_json_encrypted="encrypted")
+        mock_decrypt.return_value = {
+            "token": "access-token",
+            "refresh_token": "refresh-token",
+            "scopes": [google_service.GMAIL_FULL_SCOPE],
+        }
+        credentials = SimpleNamespace(expired=False, refresh_token="refresh-token")
+        mock_from_info.return_value = credentials
+
+        loaded = google_service.create_authorized_credentials(
+            settings,
+            user_id="user-1",
+            refresh_expired=False,
+            persist_updates=False,
+        )
+
+        self.assertIs(loaded, credentials)
+        mock_persist.assert_not_called()
+
+    @patch("app.services.integrations.google.persist_token_payload")
+    @patch("app.services.integrations.google.Credentials.from_authorized_user_info")
+    @patch("app.services.integrations.google.decrypt_json")
+    @patch("app.services.integrations.google.get_google_oauth_token")
+    @patch("app.services.integrations.google.shared_user_mail_lock", return_value=nullcontext())
+    def test_read_only_load_does_not_refresh_or_persist_expired_credentials(
+        self,
+        _mock_guard: Mock,
+        mock_get_token: Mock,
+        mock_decrypt: Mock,
+        mock_from_info: Mock,
+        mock_persist: Mock,
+    ) -> None:
+        settings = SimpleNamespace(
+            google_configured=True,
+            database_path="postgresql://example/db",
+            google_client_id="client-id",
+            google_client_secret="client-secret",
+        )
+        mock_get_token.return_value = SimpleNamespace(token_json_encrypted="encrypted")
+        mock_decrypt.return_value = {
+            "token": "expired-access-token",
+            "refresh_token": "refresh-token",
+            "scopes": [google_service.GMAIL_FULL_SCOPE],
+        }
+        refresh = Mock()
+        credentials = SimpleNamespace(expired=True, refresh_token="refresh-token", refresh=refresh)
+        mock_from_info.return_value = credentials
+
+        loaded = google_service.create_authorized_credentials(
+            settings,
+            user_id="user-1",
+            refresh_expired=False,
+            persist_updates=False,
+        )
+
+        self.assertIs(loaded, credentials)
+        refresh.assert_not_called()
+        mock_persist.assert_not_called()
 
 
 class VerifiedGoogleIdentityTests(unittest.TestCase):

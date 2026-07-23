@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from hashlib import sha256
 import json
+import logging
 from typing import Any
 
 from googleapiclient.errors import HttpError
@@ -20,16 +21,20 @@ from app.db.mail_groups import (
     get_mail_group_detail,
     list_messages_for_gmail_thread,
     mark_client_draft_deleted,
+    mark_client_draft_sending,
     mark_client_draft_sent,
     prune_empty_mail_groups,
+    restore_client_draft_after_definite_send_failure,
     upsert_client_draft,
     upsert_gmail_messages,
     user_can_write_gmail,
 )
+from app.db.user_mail_guard import shared_user_mail_lock
 from app.schemas.domain import MailDraftAttachment, MailDraftResponse, MailDraftSaveRequest, MailDraftSendRequest, MailSendResponse
 from app.services.email_extraction import mark_full_gmail_payload_body_fetch_status, parse_gmail_message
 from app.services.integrations.google import (
     GMAIL_FULL_SCOPE,
+    MultipleSentGmailMessagesFound,
     create_gmail_draft,
     delete_gmail_draft,
     fetch_gmail_attachment,
@@ -37,7 +42,7 @@ from app.services.integrations.google import (
     fetch_gmail_message,
     find_gmail_draft_by_message_id,
     find_gmail_draft_by_rfc822_message_id,
-    find_gmail_message_by_rfc822_message_id,
+    find_sent_gmail_message_by_rfc822_message_id,
     missing_google_scopes,
     send_gmail_draft,
     update_gmail_draft,
@@ -54,6 +59,33 @@ from app.services.mailbox_sends import (
 from app.services.mail_groups import enqueue_projection_refresh, gmail_attachments_for_message, rebuild_touched_mail_groups, refresh_app_session_snapshot
 
 _FORWARD_ORIGINALS_HASH_PREFIX = "forward-originals:"
+_AMBIGUOUS_GOOGLE_HTTP_STATUSES = {408, 409, 425, 429}
+_GOOGLE_AUTH_HTTP_STATUSES = {401, 403}
+logger = logging.getLogger(__name__)
+
+
+class MailDraftIdentityConflict(RuntimeError):
+    """A client draft identity was bound to a different provider operation."""
+
+
+def _require_mutable_draft_mapping(
+    existing: ClientDraftRecord | None,
+    *,
+    requested_gmail_draft_id: str | None,
+) -> None:
+    if existing and existing.state in {"sent", "deleted"}:
+        raise MailDraftIdentityConflict("This draft is already finalized.")
+    if existing and existing.state == "sending":
+        raise MailDraftIdentityConflict(
+            "This draft is being sent and cannot be changed until delivery is confirmed."
+        )
+    if (
+        existing
+        and existing.gmail_draft_id
+        and requested_gmail_draft_id
+        and existing.gmail_draft_id != requested_gmail_draft_id
+    ):
+        raise MailDraftIdentityConflict("This client draft is already bound to a different Gmail draft.")
 
 
 def save_draft(settings: Settings, *, user_id: str, request: MailDraftSaveRequest) -> MailDraftResponse:
@@ -68,9 +100,46 @@ def save_draft(settings: Settings, *, user_id: str, request: MailDraftSaveReques
         return MailDraftResponse(client_draft_id=request.client_draft_id, state="failed", error=str(exc))
 
     database_url = str(settings.database_path)
-    with client_draft_lock(database_url, user_id=user_id, client_draft_id=request.client_draft_id):
+    # Resolve an already-established provider identity before entering the
+    # ordered provider->client lock scope. The mapping is read again inside the
+    # lock and remains authoritative there.
+    lock_gmail_draft_id = request.gmail_draft_id
+    if not lock_gmail_draft_id:
+        preexisting = get_client_draft(
+            database_url,
+            user_id=user_id,
+            client_draft_id=request.client_draft_id,
+        )
+        lock_gmail_draft_id = preexisting.gmail_draft_id if preexisting else None
+    # Always acquire user -> provider draft -> client draft. Every mutation uses
+    # this global order, so delete and adoption cannot form a lock cycle.
+    with shared_user_mail_lock(database_url, user_id=user_id), client_draft_lock(
+        database_url,
+        user_id=user_id,
+        client_draft_id=request.client_draft_id,
+        gmail_draft_id=lock_gmail_draft_id,
+    ) as draft_lock:
         existing = get_client_draft(database_url, user_id=user_id, client_draft_id=request.client_draft_id)
-        gmail_draft_id = request.gmail_draft_id or (existing.gmail_draft_id if existing else None)
+        _require_mutable_draft_mapping(
+            existing,
+            requested_gmail_draft_id=request.gmail_draft_id,
+        )
+        # Once established, the durable mapping is authoritative over a stale
+        # client/path value. A record without a provider ID may still adopt the
+        # ID returned to a client before an earlier checkpoint response failed.
+        gmail_draft_id = (existing.gmail_draft_id if existing else None) or request.gmail_draft_id
+        if gmail_draft_id and gmail_draft_id != lock_gmail_draft_id and draft_lock is not None:
+            draft_lock.adopt_gmail_draft_id(gmail_draft_id)
+            lock_gmail_draft_id = gmail_draft_id
+            existing = get_client_draft(
+                database_url,
+                user_id=user_id,
+                client_draft_id=request.client_draft_id,
+            )
+            _require_mutable_draft_mapping(
+                existing,
+                requested_gmail_draft_id=gmail_draft_id,
+            )
         message_header = _draft_rfc822_message_id(request.client_draft_id)
         try:
             if not gmail_draft_id:
@@ -80,6 +149,24 @@ def save_draft(settings: Settings, *, user_id: str, request: MailDraftSaveReques
                     rfc822_message_id=message_header,
                 )
                 gmail_draft_id = str(recovered.get("id") or "") if recovered else None
+                if gmail_draft_id and gmail_draft_id != lock_gmail_draft_id and draft_lock is not None:
+                    draft_lock.adopt_gmail_draft_id(gmail_draft_id)
+                    lock_gmail_draft_id = gmail_draft_id
+                    existing = get_client_draft(
+                        database_url,
+                        user_id=user_id,
+                        client_draft_id=request.client_draft_id,
+                    )
+                    _require_mutable_draft_mapping(
+                        existing,
+                        requested_gmail_draft_id=gmail_draft_id,
+                    )
+                if not gmail_draft_id and existing and existing.state == "creating":
+                    return MailDraftResponse(
+                        client_draft_id=request.client_draft_id,
+                        state="failed",
+                        error="The earlier draft save is still being confirmed. Retry shortly.",
+                    )
 
             existing_message = (
                 _gmail_draft_message(settings, user_id=user_id, gmail_draft_id=gmail_draft_id)
@@ -199,6 +286,25 @@ def save_draft(settings: Settings, *, user_id: str, request: MailDraftSaveReques
         if existing and existing.state == "saved" and existing.content_hash == content_hash and existing.gmail_draft_id:
             return get_draft(settings, user_id=user_id, mailbox_thread_id=existing.gmail_draft_id)
 
+        provider_create = not gmail_draft_id
+        if existing is None or existing.state in {"creating", "failed"}:
+            # This checkpoint closes the otherwise unavoidable gap between a
+            # successful Gmail create and learning its provider ID locally. A
+            # retry of an ambiguous create reconciles by Message-ID and never
+            # treats a temporarily empty search result as permission to create
+            # a second draft.
+            existing = upsert_client_draft(
+                database_url,
+                user_id=user_id,
+                client_draft_id=request.client_draft_id,
+                gmail_draft_id=gmail_draft_id,
+                gmail_message_id=existing.gmail_message_id if existing else None,
+                gmail_thread_id=effective_gmail_thread_id,
+                content_hash=content_hash,
+                state="creating",
+                created_at=existing.created_at if existing else request.created_at,
+            )
+
         raw = _raw_message_from_fields(
             to=effective_to,
             cc=effective_cc,
@@ -227,42 +333,140 @@ def save_draft(settings: Settings, *, user_id: str, request: MailDraftSaveReques
                 )
             )
         except GoogleCredentialsUnavailable:
+            if provider_create:
+                _mark_definite_create_failure(
+                    settings,
+                    user_id=user_id,
+                    record=existing,
+                    error="Google credentials are not connected.",
+                )
             return _reauth_required(settings, request.client_draft_id)
         except HttpError as exc:
-            if getattr(exc.resp, "status", None) in {401, 403}:
+            status = _google_http_status(exc)
+            if status in _GOOGLE_AUTH_HTTP_STATUSES:
+                if provider_create:
+                    _mark_definite_create_failure(
+                        settings,
+                        user_id=user_id,
+                        record=existing,
+                        error="Google needs full mail permission.",
+                    )
                 return _reauth_required(settings, request.client_draft_id)
+            if provider_create and _is_definite_google_client_rejection(exc):
+                error = "Google rejected the draft. Check its fields and try saving again."
+                _mark_definite_create_failure(
+                    settings,
+                    user_id=user_id,
+                    record=existing,
+                    error=error,
+                )
+                return MailDraftResponse(
+                    client_draft_id=request.client_draft_id,
+                    state="failed",
+                    error=error,
+                )
             raise
 
         gmail_draft_id = str(result.get("id") or gmail_draft_id or "") or None
         result_message = result.get("message") if isinstance(result.get("message"), dict) else {}
         gmail_message_id = str(result_message.get("id") or "") or None
         gmail_thread_id = str(result_message.get("threadId") or effective_gmail_thread_id or "") or None
-        if gmail_draft_id and not gmail_message_id:
+        if not gmail_draft_id:
+            return MailDraftResponse(
+                client_draft_id=request.client_draft_id,
+                state="failed",
+                error="The draft was accepted but its Gmail identity is still being confirmed. Retry shortly.",
+            )
+
+        authoritative_rebound: ClientDraftRecord | None = None
+        if provider_create and draft_lock is not None:
+            # Gmail identity did not exist when this operation began. Drop the
+            # client-only lock and reacquire provider -> client before making
+            # the provider success durable. Delete can win this handoff, but it
+            # can no longer race a blind `saved` checkpoint.
+            draft_lock.adopt_gmail_draft_id(gmail_draft_id)
+            rebound = get_client_draft(
+                database_url,
+                user_id=user_id,
+                client_draft_id=request.client_draft_id,
+            )
+            _require_mutable_draft_mapping(
+                rebound,
+                requested_gmail_draft_id=gmail_draft_id,
+            )
+            existing = rebound or existing
+            if rebound is not None and (
+                rebound.state == "saved"
+                or (rebound.state == "creating" and rebound.content_hash != content_hash)
+            ):
+                # Releasing the client-only lock is required to establish the
+                # global provider -> client order. A waiter can finish a newer
+                # save—or leave an ambiguous newer create—during that handoff,
+                # so its durable checkpoint is now authoritative. Confirm the
+                # provider still exists, but never overwrite the waiter's
+                # content hash with this older request.
+                authoritative_rebound = rebound
             try:
-                hydrated = fetch_gmail_draft(settings, user_id=user_id, gmail_draft_id=gmail_draft_id, format="minimal")
+                confirmed = fetch_gmail_draft(
+                    settings,
+                    user_id=user_id,
+                    gmail_draft_id=gmail_draft_id,
+                    format="minimal",
+                )
             except GoogleCredentialsUnavailable:
                 return _reauth_required(settings, request.client_draft_id)
             except HttpError as exc:
-                if getattr(exc.resp, "status", None) in {401, 403}:
+                status = _google_http_status(exc)
+                if status in _GOOGLE_AUTH_HTTP_STATUSES:
                     return _reauth_required(settings, request.client_draft_id)
+                if status == 404:
+                    error = "The new Gmail draft was deleted before saving completed. Create a new draft."
+                    upsert_client_draft(
+                        database_url,
+                        user_id=user_id,
+                        client_draft_id=request.client_draft_id,
+                        gmail_draft_id=gmail_draft_id,
+                        gmail_message_id=gmail_message_id,
+                        gmail_thread_id=gmail_thread_id,
+                        content_hash=content_hash,
+                        state="deleted",
+                        created_at=existing.created_at if existing else request.created_at,
+                        error=error,
+                    )
+                    return MailDraftResponse(
+                        client_draft_id=request.client_draft_id,
+                        gmail_draft_id=gmail_draft_id,
+                        state="failed",
+                        error=error,
+                    )
                 raise
-            result_message = hydrated.get("message") if isinstance(hydrated.get("message"), dict) else {}
-            gmail_message_id = str(result_message.get("id") or "") or None
-            gmail_thread_id = str(result_message.get("threadId") or gmail_thread_id or "") or None
+            confirmed_message = confirmed.get("message") if isinstance(confirmed.get("message"), dict) else {}
+            gmail_message_id = str(confirmed_message.get("id") or gmail_message_id or "") or None
+            gmail_thread_id = str(confirmed_message.get("threadId") or gmail_thread_id or "") or None
 
-        old_message_id = existing.gmail_message_id if existing else None
-        try:
-            imported = _import_gmail_message(settings, user_id=user_id, message_id=gmail_message_id)
-        except GoogleCredentialsUnavailable:
-            # The Gmail draft already exists and is recoverable through its
-            # stable Message-ID on the next save attempt.
-            return _reauth_required(settings, request.client_draft_id)
-        except HttpError as exc:
-            if getattr(exc.resp, "status", None) in {401, 403}:
-                return _reauth_required(settings, request.client_draft_id)
-            raise
-        if old_message_id and old_message_id != gmail_message_id:
-            _remove_local_messages(settings, user_id=user_id, message_ids=[old_message_id])
+        if authoritative_rebound is not None:
+            imported: GmailMessageRecord | None = None
+            try:
+                imported = _import_gmail_message(
+                    settings,
+                    user_id=user_id,
+                    message_id=gmail_message_id or authoritative_rebound.gmail_message_id,
+                )
+            except Exception as exc:
+                _log_post_checkpoint_failure("draft_handoff_projection", user_id=user_id, exc=exc)
+            fallback = effective_request if authoritative_rebound.content_hash == content_hash else None
+            response = _draft_response(authoritative_rebound, imported, fallback=fallback)
+            if authoritative_rebound.state == "creating":
+                return response.model_copy(
+                    update={
+                        "state": "failed",
+                        "error": "A newer draft save is still being confirmed. Retry shortly.",
+                    }
+                )
+            return response
+
+        # Provider success is the durable save boundary. Persist its identity
+        # before any optional hydration, parsing, projection, or notification.
         record = upsert_client_draft(
             database_url,
             user_id=user_id,
@@ -272,9 +476,37 @@ def save_draft(settings: Settings, *, user_id: str, request: MailDraftSaveReques
             gmail_thread_id=gmail_thread_id,
             content_hash=content_hash,
             state="saved",
-            created_at=request.created_at,
+            created_at=existing.created_at if existing else request.created_at,
         )
-        _after_draft_change(settings, user_id=user_id, source="draft_saved")
+        old_message_id = existing.gmail_message_id if existing else None
+        imported: GmailMessageRecord | None = None
+        try:
+            if not gmail_message_id:
+                hydrated = fetch_gmail_draft(settings, user_id=user_id, gmail_draft_id=gmail_draft_id, format="minimal")
+                result_message = hydrated.get("message") if isinstance(hydrated.get("message"), dict) else {}
+                gmail_message_id = str(result_message.get("id") or "") or None
+                gmail_thread_id = str(result_message.get("threadId") or gmail_thread_id or "") or None
+                if gmail_message_id:
+                    record = upsert_client_draft(
+                        database_url,
+                        user_id=user_id,
+                        client_draft_id=request.client_draft_id,
+                        gmail_draft_id=gmail_draft_id,
+                        gmail_message_id=gmail_message_id,
+                        gmail_thread_id=gmail_thread_id,
+                        content_hash=content_hash,
+                        state="saved",
+                        created_at=record.created_at,
+                    )
+            imported = _import_gmail_message(settings, user_id=user_id, message_id=gmail_message_id)
+            if old_message_id and old_message_id != gmail_message_id:
+                _remove_local_messages(settings, user_id=user_id, message_ids=[old_message_id])
+        except Exception as exc:
+            _log_post_checkpoint_failure("draft_projection", user_id=user_id, exc=exc)
+        try:
+            _after_draft_change(settings, user_id=user_id, source="draft_saved")
+        except Exception as exc:
+            _log_post_checkpoint_failure("draft_notification", user_id=user_id, exc=exc)
         return _draft_response(record, imported, fallback=effective_request)
 
 
@@ -303,48 +535,114 @@ def get_draft(settings: Settings, *, user_id: str, mailbox_thread_id: str) -> Ma
     if not gmail_draft_id:
         # The path may itself be a Gmail draft ID from a create response.
         gmail_draft_id = mailbox_thread_id
-    try:
-        draft = fetch_gmail_draft(settings, user_id=user_id, gmail_draft_id=gmail_draft_id, format="full")
-    except GoogleCredentialsUnavailable:
-        return _reauth_required(settings, mapping.client_draft_id if mapping else f"gmail:{gmail_draft_id}")
-    except HttpError as exc:
-        if getattr(exc.resp, "status", None) in {401, 403}:
-            return _reauth_required(settings, mapping.client_draft_id if mapping else f"gmail:{gmail_draft_id}")
-        if getattr(exc.resp, "status", None) == 404:
-            return MailDraftResponse(client_draft_id=mapping.client_draft_id if mapping else f"gmail:{gmail_draft_id}", state="failed", error="Draft not found.")
-        raise
-    message_payload = draft.get("message") if isinstance(draft.get("message"), dict) else None
-    if message_payload is None:
-        return MailDraftResponse(client_draft_id=mapping.client_draft_id if mapping else f"gmail:{gmail_draft_id}", state="failed", error="Draft message is missing.")
-    try:
-        imported = _record_from_payload(settings, message_payload, user_id=user_id)
-    except GoogleCredentialsUnavailable:
-        return _reauth_required(settings, mapping.client_draft_id if mapping else f"gmail:{gmail_draft_id}")
-    except HttpError as exc:
-        if getattr(exc.resp, "status", None) in {401, 403}:
-            return _reauth_required(settings, mapping.client_draft_id if mapping else f"gmail:{gmail_draft_id}")
-        raise
-    upsert_gmail_messages(database_url, [imported])
     client_draft_id = mapping.client_draft_id if mapping else f"gmail:{gmail_draft_id}"
-    record = upsert_client_draft(
+    with shared_user_mail_lock(database_url, user_id=user_id), client_draft_lock(
         database_url,
         user_id=user_id,
         client_draft_id=client_draft_id,
         gmail_draft_id=gmail_draft_id,
-        gmail_message_id=imported.message_id,
-        gmail_thread_id=imported.gmail_thread_id,
-        content_hash=mapping.content_hash if mapping else imported.body_hash,
-        state="saved",
-        created_at=mapping.created_at if mapping else imported.created_at,
-    )
-    return _draft_response(record, imported)
+    ):
+        # Send/delete/save all hold the same provider lock. Re-read after any
+        # waiter finishes and never let a late GET regress a finalized mapping.
+        current = get_client_draft(database_url, user_id=user_id, gmail_draft_id=gmail_draft_id)
+        if current is not None:
+            mapping = current
+            client_draft_id = current.client_draft_id
+            if current.state in {"sending", "sent", "deleted"}:
+                return _noneditable_draft_response(current)
+        try:
+            draft = fetch_gmail_draft(settings, user_id=user_id, gmail_draft_id=gmail_draft_id, format="full")
+        except GoogleCredentialsUnavailable:
+            return _reauth_required(settings, client_draft_id)
+        except HttpError as exc:
+            if getattr(exc.resp, "status", None) in {401, 403}:
+                return _reauth_required(settings, client_draft_id)
+            if getattr(exc.resp, "status", None) == 404:
+                return MailDraftResponse(client_draft_id=client_draft_id, state="failed", error="Draft not found.")
+            raise
+        message_payload = draft.get("message") if isinstance(draft.get("message"), dict) else None
+        if message_payload is None:
+            return MailDraftResponse(client_draft_id=client_draft_id, state="failed", error="Draft message is missing.")
+        try:
+            imported = _record_from_payload(settings, message_payload, user_id=user_id)
+        except GoogleCredentialsUnavailable:
+            return _reauth_required(settings, client_draft_id)
+        except HttpError as exc:
+            if getattr(exc.resp, "status", None) in {401, 403}:
+                return _reauth_required(settings, client_draft_id)
+            raise
+        upsert_gmail_messages(database_url, [imported])
+        record = upsert_client_draft(
+            database_url,
+            user_id=user_id,
+            client_draft_id=client_draft_id,
+            gmail_draft_id=gmail_draft_id,
+            gmail_message_id=imported.message_id,
+            gmail_thread_id=imported.gmail_thread_id,
+            # Only a completed save has a request hash known to match the
+            # provider. A GET that resolves an ambiguous `creating` checkpoint
+            # must not bless its intended hash when Gmail may contain older
+            # content; using the observed body hash forces the next explicit
+            # save to compare unequal and update Gmail.
+            content_hash=(
+                mapping.content_hash
+                if mapping is not None and mapping.state == "saved"
+                else imported.body_hash
+            ),
+            state="saved",
+            created_at=mapping.created_at if mapping else imported.created_at,
+        )
+        return _draft_response(record, imported)
 
 
 def delete_draft_by_id(settings: Settings, *, user_id: str, gmail_draft_id: str) -> bool:
     if not _can_manage_drafts(settings, user_id=user_id):
         return False
     database_url = str(settings.database_path)
-    mapping = get_client_draft(database_url, user_id=user_id, gmail_draft_id=gmail_draft_id)
+    with shared_user_mail_lock(database_url, user_id=user_id):
+        mapping = get_client_draft(
+            database_url,
+            user_id=user_id,
+            gmail_draft_id=gmail_draft_id,
+        )
+        # App-created drafts resolve to the same client identity used by save
+        # and send. An unmapped provider draft has no returned client identity
+        # known to this app, so its Gmail ID is the only deterministic fallback.
+        draft_lock_id = mapping.client_draft_id if mapping else f"gmail:{gmail_draft_id}"
+        with client_draft_lock(
+            database_url,
+            user_id=user_id,
+            client_draft_id=draft_lock_id,
+            gmail_draft_id=gmail_draft_id,
+        ):
+            # The mapping may have been committed while delete waited on the
+            # provider lock. Re-read it inside the lock so the durable row is
+            # finalized as deleted rather than left as a stale saved draft.
+            mapping = get_client_draft(
+                database_url,
+                user_id=user_id,
+                gmail_draft_id=gmail_draft_id,
+            )
+            if mapping is not None and mapping.state in {"sending", "sent"}:
+                raise MailDraftIdentityConflict(
+                    "This draft is being sent or was already sent and cannot be deleted."
+                )
+            return _delete_draft_by_id_locked(
+                settings,
+                user_id=user_id,
+                gmail_draft_id=gmail_draft_id,
+                mapping=mapping,
+            )
+
+
+def _delete_draft_by_id_locked(
+    settings: Settings,
+    *,
+    user_id: str,
+    gmail_draft_id: str,
+    mapping: ClientDraftRecord | None,
+) -> bool:
+    database_url = str(settings.database_path)
     message_id = mapping.gmail_message_id if mapping else None
     if not message_id:
         try:
@@ -366,7 +664,15 @@ def delete_draft_by_id(settings: Settings, *, user_id: str, gmail_draft_id: str)
     if message_id:
         _remove_local_messages(settings, user_id=user_id, message_ids=[message_id])
     if mapping:
-        mark_client_draft_deleted(database_url, user_id=user_id, client_draft_id=mapping.client_draft_id)
+        deleted = mark_client_draft_deleted(
+            database_url,
+            user_id=user_id,
+            client_draft_id=mapping.client_draft_id,
+        )
+        if deleted is None:
+            raise MailDraftIdentityConflict(
+                "This draft is being sent or was already sent and cannot be deleted."
+            )
     _after_draft_change(settings, user_id=user_id, source="draft_deleted")
     return True
 
@@ -381,9 +687,20 @@ def send_saved_draft(
     if not _can_manage_drafts(settings, user_id=user_id):
         return _send_reauth_required(settings, request.client_send_id)
     database_url = str(settings.database_path)
-    with client_draft_lock(database_url, user_id=user_id, client_draft_id=request.client_draft_id):
+    with shared_user_mail_lock(database_url, user_id=user_id), client_draft_lock(
+        database_url,
+        user_id=user_id,
+        client_draft_id=request.client_draft_id,
+        gmail_draft_id=gmail_draft_id,
+    ):
         mapping = get_client_draft(database_url, user_id=user_id, client_draft_id=request.client_draft_id)
-        if mapping and mapping.state == "sent" and mapping.last_client_send_id == request.client_send_id:
+        if mapping is None or not mapping.gmail_draft_id:
+            raise MailDraftIdentityConflict("Save this draft before sending it.")
+        if mapping.gmail_draft_id != gmail_draft_id:
+            raise MailDraftIdentityConflict("This client draft is bound to a different Gmail draft.")
+        if mapping.state == "sent":
+            if mapping.last_client_send_id != request.client_send_id:
+                raise MailDraftIdentityConflict("This draft was already sent with a different send identity.")
             return MailSendResponse(
                 client_send_id=request.client_send_id,
                 gmail_thread_id=mapping.gmail_thread_id,
@@ -391,73 +708,224 @@ def send_saved_draft(
                 state="sent",
                 sent_at=mapping.updated_at,
             )
-        effective_draft_id = mapping.gmail_draft_id if mapping and mapping.gmail_draft_id else gmail_draft_id
-        try:
-            result = send_gmail_draft(settings, user_id=user_id, gmail_draft_id=effective_draft_id)
-        except GoogleCredentialsUnavailable:
-            return _send_reauth_required(settings, request.client_send_id)
-        except HttpError as exc:
-            if getattr(exc.resp, "status", None) in {401, 403}:
-                return _send_reauth_required(settings, request.client_send_id)
-            if getattr(exc.resp, "status", None) == 404:
-                try:
-                    recovered = find_gmail_message_by_rfc822_message_id(
-                        settings,
-                        user_id=user_id,
-                        rfc822_message_id=_draft_rfc822_message_id(request.client_draft_id),
-                    )
-                except GoogleCredentialsUnavailable:
-                    return _send_reauth_required(settings, request.client_send_id)
-                except HttpError as recovery_exc:
-                    if getattr(recovery_exc.resp, "status", None) in {401, 403}:
-                        return _send_reauth_required(settings, request.client_send_id)
-                    raise
-                if not recovered:
-                    return MailSendResponse(client_send_id=request.client_send_id, state="failed", error="Draft not found.")
-                result = recovered
-            else:
-                raise
-        gmail_message_id = str(result.get("id") or "") or None
-        gmail_thread_id = str(result.get("threadId") or "") or None
-        try:
-            imported = _import_gmail_message(settings, user_id=user_id, message_id=gmail_message_id)
-        except GoogleCredentialsUnavailable:
-            # Gmail accepted the send. Its stable draft Message-ID keeps the
-            # operation recoverable after reauthentication without resending.
-            return _send_reauth_required(settings, request.client_send_id)
-        except HttpError as exc:
-            if getattr(exc.resp, "status", None) in {401, 403}:
-                return _send_reauth_required(settings, request.client_send_id)
-            raise
-        if mapping and mapping.gmail_message_id and mapping.gmail_message_id != gmail_message_id:
-            _remove_local_messages(settings, user_id=user_id, message_ids=[mapping.gmail_message_id])
-        if mapping is None:
-            mapping = upsert_client_draft(
-                database_url,
-                user_id=user_id,
-                client_draft_id=request.client_draft_id,
-                gmail_draft_id=effective_draft_id,
-                gmail_message_id=None,
-                gmail_thread_id=gmail_thread_id,
-                content_hash="",
-                state="saved",
-                created_at=imported.created_at if imported else "1970-01-01T00:00:00+00:00",
-            )
-        mark_client_draft_sent(
+        if mapping.state == "sending":
+            if mapping.last_client_send_id != request.client_send_id:
+                raise MailDraftIdentityConflict("A different send attempt is already being confirmed.")
+            return _reconcile_sending_draft(settings, user_id=user_id, mapping=mapping)
+        if mapping.state != "saved":
+            raise MailDraftIdentityConflict("This draft is not ready to send.")
+
+        sending = mark_client_draft_sending(
             database_url,
             user_id=user_id,
             client_draft_id=request.client_draft_id,
             client_send_id=request.client_send_id,
+        )
+        if sending is None:
+            raise MailDraftIdentityConflict("This draft changed before it could be sent.")
+        try:
+            result = send_gmail_draft(settings, user_id=user_id, gmail_draft_id=mapping.gmail_draft_id)
+        except GoogleCredentialsUnavailable:
+            restore_client_draft_after_definite_send_failure(
+                database_url,
+                user_id=user_id,
+                client_draft_id=request.client_draft_id,
+                client_send_id=request.client_send_id,
+                error="Google credentials are not connected.",
+            )
+            return _send_reauth_required(settings, request.client_send_id)
+        except HttpError as exc:
+            status = _google_http_status(exc)
+            if status in _GOOGLE_AUTH_HTTP_STATUSES:
+                restore_client_draft_after_definite_send_failure(
+                    database_url,
+                    user_id=user_id,
+                    client_draft_id=request.client_draft_id,
+                    client_send_id=request.client_send_id,
+                    error="Google needs full mail permission.",
+                )
+                return _send_reauth_required(settings, request.client_send_id)
+            if status == 404:
+                return _reconcile_sending_draft(settings, user_id=user_id, mapping=sending)
+            if _is_definite_google_client_rejection(exc):
+                error = "Google rejected the send. Check the draft and try again."
+                restored = restore_client_draft_after_definite_send_failure(
+                    database_url,
+                    user_id=user_id,
+                    client_draft_id=request.client_draft_id,
+                    client_send_id=request.client_send_id,
+                    error=error,
+                )
+                if restored is None:
+                    raise RuntimeError("Definite draft send failure could not be persisted") from exc
+                return MailSendResponse(
+                    client_send_id=request.client_send_id,
+                    gmail_thread_id=restored.gmail_thread_id,
+                    state="failed",
+                    error=error,
+                )
+            _log_post_checkpoint_failure("draft_send_ambiguous", user_id=user_id, exc=exc)
+            return _pending_draft_send_response(sending)
+        except Exception as exc:
+            _log_post_checkpoint_failure("draft_send_ambiguous", user_id=user_id, exc=exc)
+            return _pending_draft_send_response(sending)
+        gmail_message_id = str(result.get("id") or "") or None
+        gmail_thread_id = str(result.get("threadId") or "") or None
+        if not gmail_message_id:
+            return _reconcile_sending_draft(settings, user_id=user_id, mapping=sending)
+        return _finalize_draft_send(
+            settings,
+            user_id=user_id,
+            mapping=sending,
             gmail_message_id=gmail_message_id,
             gmail_thread_id=gmail_thread_id,
         )
+
+
+def _reconcile_sending_draft(
+    settings: Settings,
+    *,
+    user_id: str,
+    mapping: ClientDraftRecord,
+) -> MailSendResponse:
+    try:
+        recovered = find_sent_gmail_message_by_rfc822_message_id(
+            settings,
+            user_id=user_id,
+            rfc822_message_id=_draft_rfc822_message_id(mapping.client_draft_id),
+        )
+    except MultipleSentGmailMessagesFound:
+        return _pending_draft_send_response(
+            mapping,
+            error="Multiple Sent copies matched this delivery. Delivery is ambiguous and will not be retried automatically.",
+        )
+    except GoogleCredentialsUnavailable:
+        return _send_reauth_required(settings, mapping.last_client_send_id or "")
+    except HttpError as exc:
+        if getattr(exc.resp, "status", None) in {401, 403}:
+            return _send_reauth_required(settings, mapping.last_client_send_id or "")
+        _log_post_checkpoint_failure("draft_send_reconcile", user_id=user_id, exc=exc)
+        return _pending_draft_send_response(mapping)
+    except Exception as exc:
+        _log_post_checkpoint_failure("draft_send_reconcile", user_id=user_id, exc=exc)
+        return _pending_draft_send_response(mapping)
+    if not recovered:
+        return _pending_draft_send_response(mapping)
+    gmail_message_id = str(recovered.get("id") or "") or None
+    if not gmail_message_id:
+        return _pending_draft_send_response(mapping)
+    return _finalize_draft_send(
+        settings,
+        user_id=user_id,
+        mapping=mapping,
+        gmail_message_id=gmail_message_id,
+        gmail_thread_id=str(recovered.get("threadId") or "") or mapping.gmail_thread_id,
+    )
+
+
+def _finalize_draft_send(
+    settings: Settings,
+    *,
+    user_id: str,
+    mapping: ClientDraftRecord,
+    gmail_message_id: str,
+    gmail_thread_id: str | None,
+) -> MailSendResponse:
+    sent = mark_client_draft_sent(
+        str(settings.database_path),
+        user_id=user_id,
+        client_draft_id=mapping.client_draft_id,
+        client_send_id=mapping.last_client_send_id or "",
+        gmail_message_id=gmail_message_id,
+        gmail_thread_id=gmail_thread_id,
+    )
+    if sent is None:
+        raise RuntimeError("Draft send completion could not be persisted")
+
+    # Gmail delivery and the durable mapping now agree. Projection work is
+    # best-effort and must never turn a delivered message into a retryable send.
+    try:
+        _import_gmail_message(settings, user_id=user_id, message_id=gmail_message_id)
+        if mapping.gmail_message_id and mapping.gmail_message_id != gmail_message_id:
+            _remove_local_messages(settings, user_id=user_id, message_ids=[mapping.gmail_message_id])
+    except Exception as exc:
+        _log_post_checkpoint_failure("draft_sent_projection", user_id=user_id, exc=exc)
+    try:
         _after_draft_change(settings, user_id=user_id, source="draft_sent")
-        return MailSendResponse(
-            client_send_id=request.client_send_id,
-            gmail_thread_id=gmail_thread_id,
-            gmail_message_id=gmail_message_id,
-            state="sent",
-        )
+    except Exception as exc:
+        _log_post_checkpoint_failure("draft_sent_notification", user_id=user_id, exc=exc)
+    return MailSendResponse(
+        client_send_id=sent.last_client_send_id or "",
+        gmail_thread_id=sent.gmail_thread_id,
+        gmail_message_id=sent.sent_message_id,
+        state="sent",
+        sent_at=sent.updated_at,
+    )
+
+
+def _pending_draft_send_response(
+    mapping: ClientDraftRecord,
+    *,
+    error: str = "Delivery is still being confirmed. Retry safely.",
+) -> MailSendResponse:
+    return MailSendResponse(
+        client_send_id=mapping.last_client_send_id or "",
+        gmail_thread_id=mapping.gmail_thread_id,
+        state="sending",
+        error=error,
+    )
+
+
+def _mark_definite_create_failure(
+    settings: Settings,
+    *,
+    user_id: str,
+    record: ClientDraftRecord,
+    error: str,
+) -> None:
+    upsert_client_draft(
+        str(settings.database_path),
+        user_id=user_id,
+        client_draft_id=record.client_draft_id,
+        gmail_draft_id=record.gmail_draft_id,
+        gmail_message_id=record.gmail_message_id,
+        gmail_thread_id=record.gmail_thread_id,
+        content_hash=record.content_hash,
+        state="failed",
+        created_at=record.created_at,
+        error=error,
+    )
+
+
+def _google_http_status(exc: HttpError) -> int | None:
+    try:
+        return int(getattr(exc.resp, "status", None))
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_definite_google_client_rejection(exc: HttpError) -> bool:
+    status = _google_http_status(exc)
+    return (
+        status is not None
+        and 400 <= status < 500
+        and status not in _GOOGLE_AUTH_HTTP_STATUSES
+        and status not in _AMBIGUOUS_GOOGLE_HTTP_STATUSES
+    )
+
+
+def _log_post_checkpoint_failure(stage: str, *, user_id: str, exc: Exception) -> None:
+    logger.warning(
+        "Gmail draft post-checkpoint work failed",
+        extra={
+            "event_fields": {
+                "event": "gmail_draft.post_checkpoint_failed",
+                "stage": stage,
+                "user_id": user_id,
+                "exception_type": type(exc).__name__,
+            }
+        },
+    )
 
 
 def _can_manage_drafts(settings: Settings, *, user_id: str) -> bool:
@@ -708,6 +1176,21 @@ def _draft_response(
         saved_at=record.saved_at,
         error=record.error,
     )
+
+
+def _noneditable_draft_response(record: ClientDraftRecord) -> MailDraftResponse:
+    """Represent a finalized/in-flight mapping without exposing it as editable."""
+    if record.state == "sending":
+        return MailDraftResponse(
+            client_draft_id=record.client_draft_id,
+            gmail_draft_id=record.gmail_draft_id,
+            gmail_message_id=record.gmail_message_id,
+            gmail_thread_id=record.gmail_thread_id,
+            state="failed",
+            saved_at=record.saved_at,
+            error="This draft is being sent and cannot be edited.",
+        )
+    return _draft_response(record, None)
 
 
 def _reauth_required(settings: Settings, client_draft_id: str) -> MailDraftResponse:

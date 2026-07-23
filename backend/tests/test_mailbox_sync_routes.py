@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from base64 import urlsafe_b64encode
+from contextlib import nullcontext
 import json
 from types import SimpleNamespace
 import unittest
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 from google.auth.exceptions import RefreshError
 
 from app.api.routes import mailbox as mailbox_routes
+from app.db.user_mail_guard import UserMailWorkBlocked
 from app.main import app
 from app.schemas.domain import MailboxRealtimeStateResponse, MailboxSyncStateResponse
 from app.services import auth as auth_service
@@ -53,6 +55,7 @@ class MailboxSyncRouteTests(unittest.TestCase):
         token_row = SimpleNamespace(token_json_encrypted="encrypted")
 
         with (
+            patch.object(google_integration, "shared_user_mail_lock", return_value=nullcontext()),
             patch.object(google_integration, "get_google_oauth_token", return_value=token_row),
             patch.object(
                 google_integration,
@@ -79,6 +82,7 @@ class MailboxSyncRouteTests(unittest.TestCase):
         token_row = SimpleNamespace(token_json_encrypted="encrypted")
 
         with (
+            patch.object(google_integration, "shared_user_mail_lock", return_value=nullcontext()),
             patch.object(google_integration, "get_google_oauth_token", return_value=token_row),
             patch.object(google_integration, "decrypt_json", return_value={"token": "legacy-access-token", "refresh_token": "legacy-refresh-token"}),
             patch.object(google_integration.Credentials, "from_authorized_user_info") as credentials_from_info,
@@ -101,6 +105,7 @@ class MailboxSyncRouteTests(unittest.TestCase):
         token_row = SimpleNamespace(token_json_encrypted="encrypted")
 
         with (
+            patch.object(google_integration, "shared_user_mail_lock", return_value=nullcontext()),
             patch.object(google_integration, "get_google_oauth_token", return_value=token_row),
             patch.object(
                 google_integration,
@@ -181,6 +186,30 @@ class MailboxSyncRouteTests(unittest.TestCase):
         self.assertTrue(state.reauth_required)
         self.assertEqual(state.error, GOOGLE_REAUTH_REQUIRED_MESSAGE)
         self.assertEqual(state.connect_url, "http://127.0.0.1:3001/auth/google")
+        missing_scopes.assert_not_called()
+
+    def test_verified_auth_state_reports_guarded_retained_token_as_disconnected(self) -> None:
+        settings = _FakeSettings(database_path="postgresql://example/db", backend_origin="http://127.0.0.1:3001")
+        request = SimpleNamespace(cookies={}, headers={})
+
+        with (
+            patch.object(auth_service, "get_current_user", return_value=SimpleNamespace(id="user-1", legacy_local=False)),
+            patch.object(auth_service, "get_google_oauth_token", return_value=SimpleNamespace(token_json_encrypted="encrypted")),
+            patch.object(
+                auth_service,
+                "check_user_google_credentials",
+                side_effect=UserMailWorkBlocked("Google credentials are no longer connected for this user"),
+            ) as check_credentials,
+            patch.object(auth_service, "missing_google_scopes") as missing_scopes,
+        ):
+            state = auth_service.auth_state_for_request(settings, request, verify_google_credentials=True)
+
+        self.assertFalse(state.connected)
+        self.assertFalse(state.can_send_mail)
+        self.assertTrue(state.reauth_required)
+        self.assertEqual(state.error, "Google is disconnected. Please sign in with Google again.")
+        self.assertEqual(state.connect_url, "http://127.0.0.1:3001/auth/google")
+        check_credentials.assert_called_once_with(settings, user_id="user-1", refresh_expired=True)
         missing_scopes.assert_not_called()
 
     def test_auth_state_requires_full_mail_scope_for_legacy_tokens(self) -> None:

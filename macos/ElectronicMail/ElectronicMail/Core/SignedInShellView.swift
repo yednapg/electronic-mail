@@ -1435,11 +1435,13 @@ private struct MailComposerSheet: View {
     @State private var preserveExistingDraftAttachments = true
     @State private var sourceAttachmentCount = 0
     @State private var includeOriginalAttachments = false
+    @State private var draftForkWarning: String?
     @State private var autosaveTask: Task<Void, Never>?
     @State private var attachmentLoadTask: Task<Void, Never>?
     @State private var sendTask: Task<Void, Never>?
     @State private var loadingAttachments = false
     @State private var autosaveRevision: UInt64 = 0
+    @State private var draftChangeTracker = MailComposerDraftChangeTracker()
     @State private var confirmSendWithoutSubject = false
     @State private var confirmDeleteDraft = false
     @State private var initialResponseFingerprint: String?
@@ -1823,6 +1825,7 @@ private struct MailComposerSheet: View {
         if let recovery = recoverySnapshot,
            recovery.matches(presentation, accountUserID: store.session?.user.id) {
             apply(recovery)
+            draftChangeTracker.synchronize(fingerprint: draftFingerprint)
             didLoadInitialValues = true
             restoredFromRecovery = true
             statusText = "Recovered your unsent message."
@@ -1830,6 +1833,7 @@ private struct MailComposerSheet: View {
         }
         switch presentation.mode {
         case .compose:
+            draftChangeTracker.synchronize(fingerprint: draftFingerprint)
             didLoadInitialValues = true
             return
         case .draft:
@@ -1853,6 +1857,7 @@ private struct MailComposerSheet: View {
                 bodyText = draft.bodyText
                 existingDraftAttachments = draft.attachments
                 statusText = "Draft loaded."
+                draftChangeTracker.synchronize(fingerprint: draftFingerprint)
                 didLoadInitialValues = true
             } catch {
                 draftLoadError = error.localizedDescription
@@ -1861,8 +1866,9 @@ private struct MailComposerSheet: View {
             }
         case .reply, .replyAll, .forward:
             prefillResponse()
-            didLoadInitialValues = true
             initialResponseFingerprint = draftFingerprint
+            draftChangeTracker.synchronize(fingerprint: draftFingerprint)
+            didLoadInitialValues = true
         }
     }
 
@@ -1979,11 +1985,34 @@ private struct MailComposerSheet: View {
         guard didLoadInitialValues, !sending else {
             return
         }
-        if unresolvedSendAttempt {
+        guard draftChangeTracker.shouldHandleChange(fingerprint: draftFingerprint) else {
+            return
+        }
+        let contentChangeDecision = MailComposerPolicy.contentChangeDecision(
+            hasUnresolvedSendAttempt: unresolvedSendAttempt,
+            existingDraftAttachmentCount: existingDraftAttachments.count
+        )
+        if case .forkDraftForNewSendAttempt(let discardExistingDraftAttachments) = contentChangeDecision {
+            let discardedAttachmentCount = existingDraftAttachments.count
             unresolvedSendAttempt = false
             serverSendID = nil
+            clientDraftID = UUID().uuidString
             clientSendID = UUID().uuidString
-            statusText = "Message changed. Send will create a new delivery attempt."
+            gmailDraftID = nil
+            // Keep gmailThreadID so the replacement reply/draft stays in the
+            // same conversation without reusing the ambiguous provider draft.
+            existingDraftAttachments = []
+            preserveExistingDraftAttachments = false
+            if discardExistingDraftAttachments {
+                let noun = discardedAttachmentCount == 1 ? "attachment" : "attachments"
+                draftForkWarning = "Message changed. A new draft was created; \(discardedAttachmentCount) saved \(noun) could not be copied and must be attached again."
+                statusText = draftForkWarning
+            } else {
+                statusText = "Message changed. A new draft and delivery attempt were created."
+            }
+            // The fork mutates attachment-backed fingerprint fields internally;
+            // keep those changes from being mistaken for another user edit.
+            draftChangeTracker.synchronize(fingerprint: draftFingerprint)
         }
         autosaveRevision &+= 1
         let revision = autosaveRevision
@@ -2047,7 +2076,7 @@ private struct MailComposerSheet: View {
             } else {
                 await ComposerRecoveryWriter.shared.clear()
             }
-            if !sending { statusText = "Draft saved." }
+            if !sending { statusText = draftForkWarning ?? "Draft saved." }
             return response
         } catch {
             statusText = "Draft was not saved: \(error.localizedDescription)"
@@ -2101,6 +2130,22 @@ private struct MailComposerSheet: View {
                 statusText = "Email thread not found."
                 return
             }
+
+            let draftSendPreparation = MailComposerPolicy.draftSendPreparation(
+                hasUnchangedUnresolvedSendAttempt: wasUnresolved,
+                gmailDraftID: gmailDraftID,
+                clientSendID: clientSendID
+            )
+            if case .retryExistingDraft(let draftID, let retryClientSendID) = draftSendPreparation {
+                let response = try await store.sendDraft(
+                    gmailDraftID: draftID,
+                    clientDraftID: clientDraftID,
+                    clientSendID: retryClientSendID
+                )
+                await handle(response)
+                return
+            }
+
             guard let draft = await saveDraftIfNeeded(force: true),
                   draft.state == .saved,
                   let draftID = draft.gmailDraftID ?? gmailDraftID else {
@@ -2312,6 +2357,15 @@ private struct MailComposerSheet: View {
                 return
             }
             await pollForSendConfirmation(serverSendID: serverSendID)
+        case .definiteFailure(let message):
+            // The backend only emits `failed` once Gmail conclusively rejected
+            // the send. The saved provider draft is still valid, so keep its
+            // IDs and attachments and stop treating edits as an ambiguous-send
+            // fork. A retry may safely use the same draft.
+            unresolvedSendAttempt = false
+            serverSendID = nil
+            statusText = message
+            _ = await persistRecoverySnapshotIfNeeded(force: true)
         case .preserveForRetry(let message):
             if let responseServerSendID = response.serverSendID, !responseServerSendID.isEmpty {
                 serverSendID = responseServerSendID
@@ -2357,6 +2411,12 @@ private struct MailComposerSheet: View {
                     statusText = response.state == .sending
                         ? "Sending. Confirming delivery..."
                         : "Queued to send. Confirming delivery..."
+                case .definiteFailure(let message):
+                    unresolvedSendAttempt = false
+                    self.serverSendID = nil
+                    statusText = message
+                    _ = await persistRecoverySnapshotIfNeeded(force: true)
+                    return
                 case .preserveForRetry(let message):
                     await preserveUnconfirmedSend(message: message)
                     return
