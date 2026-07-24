@@ -2877,7 +2877,7 @@ final class InboxStoreTests: XCTestCase {
 
         await requestGate.releaseRequest()
         await openTask.value
-        for _ in 0..<40 where client.threadCallCount < 2 {
+        for _ in 0..<40 where store.readerThread?.messages.first?.bodyComplete != true {
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
 
