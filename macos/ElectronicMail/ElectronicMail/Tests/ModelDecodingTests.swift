@@ -883,6 +883,18 @@ final class ModelDecodingTests: XCTestCase {
         )
     }
 
+    func testComposerPlaceholderSharesNativeEditorInsertionOrigin() {
+        XCTAssertEqual(
+            ElectronicMailComposerEditorLayout.placeholderHorizontalInset,
+            ElectronicMailComposerEditorLayout.textEditorHorizontalInset
+                + ElectronicMailComposerEditorLayout.nativeLineFragmentPadding
+        )
+        XCTAssertEqual(
+            ElectronicMailComposerEditorLayout.placeholderVerticalInset,
+            ElectronicMailComposerEditorLayout.textEditorVerticalInset
+        )
+    }
+
     func testResponseFieldProvenancePreservesClearedReplyAllCcAcrossRoundTrip() {
         var provenance = MailComposerResponseFieldProvenance()
         provenance.markUserEdited(.cc)

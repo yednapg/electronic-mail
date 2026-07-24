@@ -1906,9 +1906,7 @@ private struct MailComposerSheet: View {
     @State private var autosaveTask: Task<Void, Never>?
     @State private var attachmentLoadTask: Task<Void, Never>?
     @State private var sendTask: Task<Void, Never>?
-    @State private var responseModeTask: Task<Void, Never>?
     @State private var loadingAttachments = false
-    @State private var switchingResponseMode = false
     @State private var responseFieldProvenance = MailComposerResponseFieldProvenance()
     @State private var autosaveRevision: UInt64 = 0
     @State private var draftChangeTracker = MailComposerDraftChangeTracker()
@@ -2050,7 +2048,7 @@ private struct MailComposerSheet: View {
                         .buttonStyle(.plain)
                         .font(ElectronicMailComposerType.status())
                         .foregroundStyle(Color.red)
-                        .disabled(savingDraft || sending || switchingResponseMode)
+                        .disabled(savingDraft || sending)
                     }
                 }
                 .padding(.vertical, 6)
@@ -2092,9 +2090,7 @@ private struct MailComposerSheet: View {
             autosaveTask?.cancel()
             attachmentLoadTask?.cancel()
             sendTask?.cancel()
-            responseModeTask?.cancel()
             sendTask = nil
-            responseModeTask = nil
             ElectronicMailComposerShutdownCoordinator.shared.unregister(id: shutdownRegistrationID)
             guard !composerResolved else { return }
             Task {
@@ -2141,6 +2137,9 @@ private struct MailComposerSheet: View {
                 .font(ElectronicMailComposerType.mode())
                 .frame(minWidth: 0, idealWidth: 264, maxWidth: 264, minHeight: 31, maxHeight: 31)
                 .disabled(responseModeControlsDisabled)
+                .transaction { transaction in
+                    transaction.animation = nil
+                }
                 .accessibilityLabel("Response type")
                 .help(
                     unresolvedSendAttempt
@@ -2155,12 +2154,6 @@ private struct MailComposerSheet: View {
             }
 
             Spacer(minLength: 8)
-
-            if switchingResponseMode {
-                ProgressView()
-                    .controlSize(.small)
-                    .accessibilityLabel("Changing response type")
-            }
 
             if gmailDraftID != nil {
                 Menu {
@@ -2188,8 +2181,12 @@ private struct MailComposerSheet: View {
                 Text(editorPlaceholder)
                     .font(ElectronicMailComposerType.body())
                     .foregroundStyle(ElectronicMailDesign.tertiaryText(for: colorScheme))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
+                    // TextEditor adds five points of native line-fragment
+                    // padding inside our seven-point horizontal inset. Match
+                    // that insertion origin so the placeholder and caret share
+                    // the same first baseline.
+                    .padding(.horizontal, ElectronicMailComposerEditorLayout.placeholderHorizontalInset)
+                    .padding(.vertical, ElectronicMailComposerEditorLayout.placeholderVerticalInset)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
@@ -2199,8 +2196,8 @@ private struct MailComposerSheet: View {
                 .font(ElectronicMailComposerType.body())
                 .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                 .scrollContentBackground(.hidden)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 6)
+                .padding(.horizontal, ElectronicMailComposerEditorLayout.textEditorHorizontalInset)
+                .padding(.vertical, ElectronicMailComposerEditorLayout.textEditorVerticalInset)
                 .accessibilityLabel("Message body")
         }
         .frame(minHeight: 150, maxHeight: .infinity)
@@ -2279,7 +2276,7 @@ private struct MailComposerSheet: View {
             .foregroundStyle(ElectronicMailDesign.appleBlue)
             .frame(minWidth: 54, minHeight: 36)
             .contentShape(Rectangle())
-            .disabled(switchingResponseMode || sending)
+            .disabled(sending)
 
             Button {
                 startSend(allowEmptySubject: false)
@@ -2309,21 +2306,15 @@ private struct MailComposerSheet: View {
     }
 
     private var composerControlsDisabled: Bool {
-        !editorReady || sending || switchingResponseMode
+        !editorReady || sending
     }
 
     private var responseModeControlsDisabled: Bool {
         composerControlsDisabled
-            || savingDraft
-            || loadingDraft
-            || loadingAttachments
             || unresolvedSendAttempt
     }
 
     private var footerStatusText: String? {
-        if switchingResponseMode {
-            return "Changing response type…"
-        }
         if savingDraft {
             return "Saving…"
         }
@@ -2370,7 +2361,6 @@ private struct MailComposerSheet: View {
         !sending
             && !savingDraft
             && !loadingDraft
-            && !switchingResponseMode
             && editorReady
             && !parsedAddresses(toText).isEmpty
     }
@@ -2565,7 +2555,7 @@ private struct MailComposerSheet: View {
                 }
                 .buttonStyle(.plain)
                 .help("Remove \(name)")
-                .disabled(savingDraft || sending || switchingResponseMode)
+                .disabled(savingDraft || sending)
             }
         }
         .font(ElectronicMailComposerType.control())
@@ -2590,18 +2580,14 @@ private struct MailComposerSheet: View {
         guard isResponseComposer,
               MailComposerResponseTransitionPolicy.isResponseMode(mode),
               mode != effectiveMode,
-              responseModeTask == nil,
               !responseModeControlsDisabled else {
             return
         }
-        responseModeTask = Task { @MainActor in
-            await changeResponseMode(to: mode)
-            responseModeTask = nil
-        }
+        changeResponseMode(to: mode)
     }
 
     @MainActor
-    private func changeResponseMode(to nextMode: MailComposerMode) async {
+    private func changeResponseMode(to nextMode: MailComposerMode) {
         let previousMode = effectiveMode
         guard previousMode != nextMode,
               !unresolvedSendAttempt,
@@ -2609,94 +2595,50 @@ private struct MailComposerSheet: View {
             return
         }
 
-        let crossesForwardBoundary = MailComposerResponseTransitionPolicy.crossesForwardBoundary(
-            from: previousMode,
-            to: nextMode
-        )
-        if crossesForwardBoundary, !existingDraftAttachments.isEmpty {
-            statusText = "Remove saved attachments before changing the response type."
-            return
-        }
-
-        var focusAfterTransition: ComposerFocusField?
-        switchingResponseMode = true
+        // A response-mode selection is a local presentation change. Provider
+        // draft reconciliation is deliberately left to the debounced autosave
+        // path so Keychain, disk, and network latency never block this control.
         autosaveTask?.cancel()
         autosaveTask = nil
-        autosaveRevision &+= 1
-        defer {
-            switchingResponseMode = false
-            scheduleAutosave(rearm: true)
-            if let focusAfterTransition {
-                Task { @MainActor in
-                    await Task.yield()
-                    guard !composerResolved else { return }
-                    focusedField = focusAfterTransition
-                }
-            }
+
+        withTransaction(Transaction(animation: nil)) {
+            activeMode = nextMode
+            gmailThreadID = nextPrefill.gmailThreadID
+            sourceAttachmentCount = nextPrefill.sourceAttachmentCount
+            toText = responseFieldProvenance.transitionedValue(
+                for: .to,
+                current: toText,
+                nextDefault: nextPrefill.toText
+            )
+            ccText = responseFieldProvenance.transitionedValue(
+                for: .cc,
+                current: ccText,
+                nextDefault: nextPrefill.ccText
+            )
+            subject = responseFieldProvenance.transitionedValue(
+                for: .subject,
+                current: subject,
+                nextDefault: nextPrefill.subject
+            )
+            subject = MailComposerPolicy.sanitizedSubject(subject)
         }
 
-        if crossesForwardBoundary {
-            guard await persistRecoverySnapshotIfNeeded(force: true) else {
-                statusText = "Your current message could not be preserved, so the response type was not changed."
-                return
-            }
-            guard !Task.isCancelled else { return }
-        }
-
-        if crossesForwardBoundary, let gmailDraftID {
-            do {
-                try await store.deleteDraft(gmailDraftID: gmailDraftID)
-            } catch {
-                statusText = "Could not change the response type: \(error.localizedDescription)"
-                return
-            }
-        }
-
-        if crossesForwardBoundary {
-            // Once the old provider draft has been removed, immediately sever
-            // its identity before any cancellation point can reuse it.
-            clientDraftID = UUID().uuidString
-            clientSendID = UUID().uuidString
-            gmailDraftID = nil
-            serverSendID = nil
-            unresolvedSendAttempt = false
-            existingDraftAttachments = []
-            preserveExistingDraftAttachments = true
-            draftForkWarning = nil
-        }
-
-        activeMode = nextMode
-        gmailThreadID = nextPrefill.gmailThreadID
-        sourceAttachmentCount = nextPrefill.sourceAttachmentCount
-        toText = responseFieldProvenance.transitionedValue(
-            for: .to,
-            current: toText,
-            nextDefault: nextPrefill.toText
-        )
-        ccText = responseFieldProvenance.transitionedValue(
-            for: .cc,
-            current: ccText,
-            nextDefault: nextPrefill.ccText
-        )
-        subject = responseFieldProvenance.transitionedValue(
-            for: .subject,
-            current: subject,
-            nextDefault: nextPrefill.subject
-        )
-        subject = MailComposerPolicy.sanitizedSubject(subject)
-        focusAfterTransition = nextMode == .forward && parsedAddresses(toText).isEmpty ? .to : .body
-        if await persistRecoverySnapshotIfNeeded(force: true) {
-            statusText = "Changed to \(nextMode.title)."
-        } else {
-            statusText = "Changed to \(nextMode.title), but recovery could not be updated. Keep this window open."
+        statusText = "Changed to \(nextMode.title)."
+        scheduleAutosave()
+        let focusAfterTransition: ComposerFocusField =
+            nextMode == .forward && parsedAddresses(toText).isEmpty ? .to : .body
+        Task { @MainActor in
+            await Task.yield()
+            guard !composerResolved, effectiveMode == nextMode else { return }
+            focusedField = focusAfterTransition
         }
     }
 
     @MainActor
     private func responsePrefill(for mode: MailComposerMode) -> ResponsePrefill? {
-        let orderedMessages = store.readerThread?.messages.sorted(by: { $0.receivedAt < $1.receivedAt }) ?? []
-        guard let message = orderedMessages.first(where: { $0.id == presentation.sourceMessageID })
-            ?? orderedMessages.last else {
+        let messages = store.readerThread?.messages ?? []
+        guard let message = messages.first(where: { $0.id == presentation.sourceMessageID })
+            ?? messages.max(by: { $0.receivedAt < $1.receivedAt }) else {
             return nil
         }
         let recipients = MailReplyPrefillPolicy.recipients(
@@ -2925,6 +2867,14 @@ private struct MailComposerSheet: View {
             guard !Task.isCancelled, revision == autosaveRevision else { return }
             _ = await persistRecoverySnapshotIfNeeded()
             guard !Task.isCancelled, revision == autosaveRevision else { return }
+
+            // Mode changes remain interactive while an older provider save is
+            // winding down. Serialize the next save here and coalesce rapid
+            // selections to the newest revision instead of blocking the UI.
+            while savingDraft {
+                try? await Task.sleep(nanoseconds: 25_000_000)
+                guard !Task.isCancelled, revision == autosaveRevision else { return }
+            }
             _ = await saveDraftIfNeeded(force: false, expectedRevision: revision)
         }
     }
@@ -2981,7 +2931,10 @@ private struct MailComposerSheet: View {
             }
             if !sending { statusText = draftForkWarning ?? "Draft saved." }
             return response
+        } catch is CancellationError {
+            return nil
         } catch {
+            guard !Task.isCancelled else { return nil }
             statusText = "Draft was not saved: \(error.localizedDescription)"
             return nil
         }
@@ -3074,7 +3027,6 @@ private struct MailComposerSheet: View {
         guard !savingDraft,
               !loadingDraft,
               !sending,
-              !switchingResponseMode,
               let gmailDraftID else {
             return
         }
@@ -3144,10 +3096,6 @@ private struct MailComposerSheet: View {
     @MainActor
     private func requestClose() async {
         autosaveTask?.cancel()
-        guard !switchingResponseMode else {
-            statusText = "Finishing the response-type change…"
-            return
-        }
         guard !sending else {
             statusText = "Waiting for delivery confirmation..."
             return
@@ -3194,10 +3142,6 @@ private struct MailComposerSheet: View {
     @MainActor
     private func prepareForShutdown() async -> Bool {
         autosaveTask?.cancel()
-        guard !switchingResponseMode else {
-            statusText = "Finishing the response-type change before closing…"
-            return false
-        }
         let recoveryPersisted = await persistRecoverySnapshotIfNeeded(force: unresolvedSendAttempt)
         guard recoveryPersisted else {
             statusText = "Your unsent message could not be preserved. Keep the app open and try again."
