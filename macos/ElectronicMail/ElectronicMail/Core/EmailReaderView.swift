@@ -484,15 +484,7 @@ private struct EmailBodyContent: View, Equatable {
                     guard !Task.isCancelled else { return nil }
                     return .html(
                         EmailHTMLPreparedDocument(
-                            hasRemoteContent: EmailRemoteImagePrivacy.hasRemoteContent(in: sourceHTML),
-                            blockedImagesDocument: EmailRemoteImagePrivacy.applyingPolicy(
-                                to: renderable,
-                                allowsRemoteImages: false
-                            ),
-                            remoteImagesDocument: EmailRemoteImagePrivacy.applyingPolicy(
-                                to: renderable,
-                                allowsRemoteImages: true
-                            )
+                            remoteImagesDocument: EmailRemoteImagePolicy.renderDocument(from: renderable)
                         ),
                         fallbackText: fallbackText
                     )
@@ -1185,25 +1177,9 @@ private struct EmailHTMLBodyView: View {
 
     @State private var contentHeight: CGFloat = EmailReaderMetrics.htmlBodyMinHeight
     @State private var runtimeFallbackReason: String?
-    @State private var allowsRemoteImages = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if preparedDocument.hasRemoteContent, !allowsRemoteImages {
-                HStack(spacing: 10) {
-                    Image(systemName: "eye.slash")
-                    Text("Remote images are blocked for privacy.")
-                    Button("Load Images") {
-                        allowsRemoteImages = true
-                        runtimeFallbackReason = nil
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(ElectronicMailDesign.appleBlue)
-                }
-                .font(EmailReaderTypography.metadata())
-                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-            }
-
             Group {
                 if runtimeFallbackReason != nil {
                     EmailTextBodyView(
@@ -1214,9 +1190,7 @@ private struct EmailHTMLBodyView: View {
                     )
                 } else {
                     EmailHTMLWebView(
-                        html: allowsRemoteImages
-                            ? preparedDocument.remoteImagesDocument
-                            : preparedDocument.blockedImagesDocument,
+                        html: preparedDocument.remoteImagesDocument,
                         contentHeight: $contentHeight
                     ) { result in
                         if result.fallbackReason != nil {
@@ -1241,22 +1215,12 @@ private struct EmailHTMLBodyView: View {
 }
 
 private struct EmailHTMLPreparedDocument: @unchecked Sendable {
-    let hasRemoteContent: Bool
-    let blockedImagesDocument: String
     let remoteImagesDocument: String
 }
 
-enum EmailRemoteImagePrivacy {
-    static func hasRemoteContent(in html: String) -> Bool {
-        html.range(
-            of: #"(?is)(?:src|srcset)\s*=\s*[\"'][^\"']*https?://|url\(\s*[\"']?https?://"#,
-            options: .regularExpression
-        ) != nil
-    }
-
-    static func applyingPolicy(to html: String, allowsRemoteImages: Bool) -> String {
-        let imageSources = allowsRemoteImages ? "img-src http: https: data: cid:;" : "img-src data: cid:;"
-        let policy = "default-src 'none'; \(imageSources) style-src 'unsafe-inline'; font-src data:; media-src data:; frame-src 'none'; script-src 'none'"
+enum EmailRemoteImagePolicy {
+    static func renderDocument(from html: String) -> String {
+        let policy = "default-src 'none'; img-src https: data: cid:; style-src 'unsafe-inline'; font-src data:; media-src data:; frame-src 'none'; script-src 'none'"
         let meta = #"<meta http-equiv="Content-Security-Policy" content="\#(policy)">"#
         if let headRange = html.range(of: #"(?i)<head(?:\s[^>]*)?>"#, options: .regularExpression) {
             var result = html
@@ -1278,7 +1242,12 @@ private struct EmailHTMLWebView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
-        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
+        EmailHTMLWebViewPolicy.configure(configuration)
+        configuration.userContentController.add(
+            context.coordinator,
+            name: Coordinator.contentSizeMessageName
+        )
+        configuration.userContentController.addUserScript(Coordinator.contentSizeUserScript)
 
         let webView = EmailScrollPassthroughWebView(frame: .zero, configuration: configuration)
         webView.appearance = NSAppearance(named: .aqua)
@@ -1296,7 +1265,36 @@ private struct EmailHTMLWebView: NSViewRepresentable {
         webView.loadHTMLString(html, baseURL: nil)
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+        static let contentSizeMessageName = "emailContentSizeDidChange"
+        static var contentSizeUserScript: WKUserScript {
+            WKUserScript(
+                source: """
+                (() => {
+                  var notificationScheduled = false;
+                  const notify = () => {
+                    if (notificationScheduled) return;
+                    notificationScheduled = true;
+                    requestAnimationFrame(() => {
+                      notificationScheduled = false;
+                      window.webkit.messageHandlers.\(contentSizeMessageName).postMessage(null);
+                    });
+                  };
+                  if (window.ResizeObserver) {
+                    new ResizeObserver(notify).observe(document.documentElement);
+                  }
+                  Array.from(document.images || []).forEach((image) => {
+                    image.addEventListener('load', notify, { once: true });
+                    image.addEventListener('error', notify, { once: true });
+                  });
+                  notify();
+                })();
+                """,
+                injectionTime: .atDocumentEnd,
+                forMainFrameOnly: true
+            )
+        }
+
         var currentHTML: String?
         var onRenderResult: (EmailHTMLRenderResult) -> Void
         private var contentHeight: Binding<CGFloat>
@@ -1308,6 +1306,17 @@ private struct EmailHTMLWebView: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             updateRenderResult(from: webView)
+        }
+
+        func userContentController(
+            _ userContentController: WKUserContentController,
+            didReceive message: WKScriptMessage
+        ) {
+            guard message.name == Self.contentSizeMessageName,
+                  let webView = message.webView else {
+                return
+            }
+            updateContentHeight(from: webView)
         }
 
         func webView(
@@ -1370,18 +1379,56 @@ private struct EmailHTMLWebView: NSViewRepresentable {
                 }
                 let renderResult = EmailHTMLRenderResult(values: values)
                 if let nextHeight = renderResult.height, nextHeight.isFinite, nextHeight > 0 {
-                    let currentHeight = self.contentHeight.wrappedValue
-                    if abs(nextHeight - currentHeight) > 1 {
-                        var transaction = Transaction(animation: nil)
-                        transaction.disablesAnimations = true
-                        withTransaction(transaction) {
-                            self.contentHeight.wrappedValue = nextHeight
-                        }
-                    }
+                    self.applyContentHeight(nextHeight)
                 }
                 self.onRenderResult(renderResult)
             }
         }
+
+        private func updateContentHeight(from webView: WKWebView) {
+            let script = """
+            (() => {
+              const body = document.body;
+              const doc = document.documentElement;
+              return Math.max(
+                body ? body.scrollHeight : 0,
+                body ? body.offsetHeight : 0,
+                doc ? doc.scrollHeight : 0,
+                doc ? doc.offsetHeight : 0
+              );
+            })()
+            """
+            webView.evaluateJavaScript(script) { [weak self] result, _ in
+                guard let self,
+                      let number = result as? NSNumber else {
+                    return
+                }
+                let nextHeight = CGFloat(truncating: number)
+                guard nextHeight.isFinite, nextHeight > 0 else {
+                    return
+                }
+                self.applyContentHeight(nextHeight)
+            }
+        }
+
+        private func applyContentHeight(_ nextHeight: CGFloat) {
+            let currentHeight = contentHeight.wrappedValue
+            guard abs(nextHeight - currentHeight) > 1 else {
+                return
+            }
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                contentHeight.wrappedValue = nextHeight
+            }
+        }
+    }
+}
+
+enum EmailHTMLWebViewPolicy {
+    static func configure(_ configuration: WKWebViewConfiguration) {
+        configuration.websiteDataStore = .nonPersistent()
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
     }
 }
 

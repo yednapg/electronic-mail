@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import WebKit
 import XCTest
 import Security
 @testable import ElectronicMailCore
@@ -256,24 +257,32 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(cachedMailbox.nextCursor, "generation-cursor-2")
     }
 
-    func testRemoteImagesAreBlockedByDefault() {
+    func testRemoteImagesLoadAutomatically() {
         let html = #"<html><head></head><body><img src="https://tracker.example/pixel.png"><img src="data:image/png;base64,AA=="></body></html>"#
 
-        XCTAssertTrue(EmailRemoteImagePrivacy.hasRemoteContent(in: html))
-        let protected = EmailRemoteImagePrivacy.applyingPolicy(to: html, allowsRemoteImages: false)
+        let rendered = EmailRemoteImagePolicy.renderDocument(from: html)
 
-        XCTAssertTrue(protected.contains("Content-Security-Policy"))
-        XCTAssertTrue(protected.contains("img-src data: cid:"))
-        XCTAssertFalse(protected.contains("img-src http: https:"))
+        XCTAssertTrue(rendered.contains("Content-Security-Policy"))
+        XCTAssertTrue(rendered.contains("img-src https: data: cid:"))
+        XCTAssertTrue(rendered.contains("script-src 'none'"))
     }
 
-    func testRemoteImagesRequireExplicitOptIn() {
+    func testRemoteImagePolicyKeepsScriptsAndFramesDisabled() {
         let html = #"<html><body style="background-image:url('https://images.example/background.png')"></body></html>"#
 
-        XCTAssertTrue(EmailRemoteImagePrivacy.hasRemoteContent(in: html))
-        let allowed = EmailRemoteImagePrivacy.applyingPolicy(to: html, allowsRemoteImages: true)
-        XCTAssertTrue(allowed.contains("img-src http: https: data: cid:"))
+        let allowed = EmailRemoteImagePolicy.renderDocument(from: html)
+        XCTAssertTrue(allowed.contains("img-src https: data: cid:"))
         XCTAssertTrue(allowed.contains("script-src 'none'"))
+        XCTAssertTrue(allowed.contains("frame-src 'none'"))
+    }
+
+    func testEmailHTMLWebViewUsesEphemeralStorageAndDisablesPageScripts() {
+        let configuration = WKWebViewConfiguration()
+
+        EmailHTMLWebViewPolicy.configure(configuration)
+
+        XCTAssertFalse(configuration.websiteDataStore.isPersistent)
+        XCTAssertFalse(configuration.defaultWebpagePreferences.allowsContentJavaScript)
     }
 
     func testExternalLinkPolicyAllowsOnlySafeSchemes() {
@@ -810,7 +819,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(labels.map(SignedInDestination.init(mailboxLabel:)), SignedInDestination.allCases)
     }
 
-    func testFullScreenNavigationExposesEveryMailboxBeforeFunctionalSupplementalDestinations() {
+    func testFullScreenNavigationKeepsTodosInThePrimaryNavigationList() {
         let destinations = ShellPrimaryNavigationDestination.allCases
 
         XCTAssertEqual(
@@ -822,7 +831,6 @@ final class ModelDecodingTests: XCTestCase {
             ["Inbox", "Starred", "Drafts", "Sent", "Spam", "Trash", "Archive", "All Mail", "To-dos"]
         )
         XCTAssertFalse(destinations.map(\.title).contains("Calendar"))
-        XCTAssertEqual(destinations.filter(\.isSupplemental), [.todos])
     }
 
     func testMailboxSearchFieldFocusesOnAttachmentAndRoutesEscape() {
