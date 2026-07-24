@@ -20,6 +20,9 @@ SHA256_REFERENCE = re.compile(r"@sha256:[0-9a-f]{64}(?:\s|$)")
 ACTION_SHA = re.compile(r"^[^\s@]+@[0-9a-f]{40}$")
 NODE_SHA512_SRI = re.compile(r"^sha512-(?P<digest>[A-Za-z0-9+/]+={0,2})$")
 PINNED_NPM_VERSION = "10.9.4"
+CANONICAL_PYTHON_VERSION = "3.12.13"
+MACOS_AUTOMATION_PYTHON_VERSION = "3.12.10"
+SUPPORTED_MACOS_RUNNER = "macos-15-intel"
 DOCKER_FROM_INSTRUCTION = re.compile(
     r"^\s*FROM\s+"
     r"(?:(?:--platform(?:\s*=\s*|\s+))\S+\s+)?"
@@ -58,7 +61,10 @@ WORKFLOW_PLAIN_MAPPING = re.compile(r"^(?P<key>[A-Za-z0-9_.-]+)\s*:\s*(?P<value>
 WORKFLOW_BLOCK_SCALAR = re.compile(
     r":\s*[|>](?P<indicators>(?:[1-9][+-]?|[+-][1-9]?))?\s*$"
 )
-PYTHON_PIN = re.compile(r"^[A-Za-z0-9_.-]+==[^\s;]+(?:\s*;.*)?$")
+PYTHON_PIN = re.compile(
+    r"^(?P<name>[A-Za-z0-9_.-]+)==(?P<version>[0-9][0-9A-Za-z.!+_-]*)$"
+)
+PYTHON_SHA256 = re.compile(r"^--hash=sha256:(?P<digest>[0-9a-f]{64})$")
 PYTHON_DIRECT_REQUIREMENT = re.compile(
     r"^(?P<name>[A-Za-z0-9_.-]+)(?:\[[A-Za-z0-9_,.-]+\])?"
     r"(?P<constraints>(?:(?:>=|<=|==|>|<)[0-9]+\.[0-9]+\.[0-9]+)"
@@ -68,6 +74,7 @@ PYTHON_EXTRA_LOCK_PACKAGES: dict[tuple[str, str], tuple[str, bool]] = {
     ("psycopg", "binary"): ("psycopg-binary", True),
 }
 REQUIRED_PYTHON_TRANSITIVE_PINS = {"greenlet"}
+REQUIRED_AUDIT_TOOL_PINS = {"pip", "pip-audit"}
 
 
 class ReproducibilityError(RuntimeError):
@@ -107,6 +114,10 @@ def _runtime_pins() -> tuple[str, str]:
     require(
         EXACT_VERSION.fullmatch(python_version) is not None,
         ".python-version must be an exact three-component version",
+    )
+    require(
+        python_version == CANONICAL_PYTHON_VERSION,
+        f".python-version must pin canonical Python {CANONICAL_PYTHON_VERSION}",
     )
     return node_version, python_version
 
@@ -280,20 +291,100 @@ def verify_node_manifests() -> None:
     require("engine-strict=true" in npm_configuration, ".npmrc must enforce engine-strict=true")
 
 
+def _hashed_python_pins(path: Path) -> dict[str, str]:
+    logical_requirements: list[tuple[int, str]] = []
+    continuation: list[str] = []
+    continuation_line = 0
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            require(not continuation, f"{path.relative_to(ROOT)}:{line_number} interrupts a continued requirement")
+            continue
+        if not continuation:
+            continuation_line = line_number
+        continued = line.endswith("\\")
+        continuation.append(line[:-1].rstrip() if continued else line)
+        if not continued:
+            logical_requirements.append((continuation_line, " ".join(continuation)))
+            continuation = []
+    require(not continuation, f"{path.relative_to(ROOT)} ends with an unfinished requirement")
+
+    pins: dict[str, str] = {}
+    for line_number, requirement in logical_requirements:
+        tokens = requirement.split()
+        pin_match = PYTHON_PIN.fullmatch(tokens[0]) if tokens else None
+        require(pin_match is not None, f"{path.relative_to(ROOT)}:{line_number} is not an exact package pin")
+        hashes: set[str] = set()
+        for token in tokens[1:]:
+            hash_match = PYTHON_SHA256.fullmatch(token)
+            require(
+                hash_match is not None,
+                f"{path.relative_to(ROOT)}:{line_number} contains an unsupported lock option or hash",
+            )
+            digest = hash_match.group("digest")
+            require(
+                digest not in hashes,
+                f"{path.relative_to(ROOT)}:{line_number} contains a duplicate SHA-256 hash",
+            )
+            hashes.add(digest)
+        require(hashes, f"{path.relative_to(ROOT)}:{line_number} is missing a SHA-256 artifact hash")
+
+        name = re.sub(r"[-_.]+", "-", pin_match.group("name").lower())
+        require(name not in pins, f"{path.relative_to(ROOT)} contains duplicate package {name}")
+        pins[name] = pin_match.group("version")
+    require(pins, f"{path.relative_to(ROOT)} contains no package pins")
+    return pins
+
+
+def _pip_install_commands(path: Path) -> list[list[str]]:
+    policy_text = "\n".join(
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    ).replace("\\\n", " ")
+    commands: list[list[str]] = []
+    for line in policy_text.splitlines():
+        for segment in re.split(r"\s*(?:&&|;)\s*", line):
+            if "pip" not in segment or "install" not in segment:
+                continue
+            try:
+                tokens = shlex.split(segment)
+            except ValueError as error:
+                raise ReproducibilityError(f"could not parse a pip command in {path.relative_to(ROOT)}: {error}") from error
+            for index, token in enumerate(tokens):
+                executable = Path(token).name
+                if executable == "pip" and index + 1 < len(tokens) and tokens[index + 1] == "install":
+                    commands.append(tokens[index + 2 :])
+                    break
+                if (
+                    executable.startswith("python")
+                    and tokens[index + 1 : index + 4] == ["-m", "pip", "install"]
+                ):
+                    commands.append(tokens[index + 4 :])
+                    break
+    return commands
+
+
+def _requirement_targets(arguments: list[str]) -> list[str]:
+    targets: list[str] = []
+    for index, argument in enumerate(arguments):
+        if argument in {"-r", "--requirement"} and index + 1 < len(arguments):
+            targets.append(Path(arguments[index + 1]).name)
+        elif argument.startswith("--requirement="):
+            targets.append(Path(argument.partition("=")[2]).name)
+    return targets
+
+
 def verify_python_lock() -> None:
     version = (ROOT / ".python-version").read_text(encoding="utf-8").strip()
     require(EXACT_VERSION.fullmatch(version) is not None, ".python-version must be an exact three-component version")
-    pins: dict[str, str] = {}
-    for line_number, raw_line in enumerate((ROOT / "backend/requirements.lock").read_text(encoding="utf-8").splitlines(), 1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        require(PYTHON_PIN.fullmatch(line) is not None, f"backend/requirements.lock:{line_number} is not an exact pin")
-        name, locked_version = line.split("==", 1)
-        name = re.sub(r"[-_.]+", "-", name.lower())
-        locked_version = locked_version.split(";", 1)[0].strip()
-        require(name not in pins, f"backend/requirements.lock contains duplicate package {name}")
-        pins[name] = locked_version
+    pins = _hashed_python_pins(ROOT / "backend/requirements.lock")
+    audit_pins = _hashed_python_pins(ROOT / "backend/audit-requirements.lock")
+    for required_pin in REQUIRED_AUDIT_TOOL_PINS:
+        require(
+            required_pin in audit_pins,
+            f"backend/audit-requirements.lock is missing required tool {required_pin}",
+        )
 
     direct_names: set[str] = set()
     for line_number, raw_line in enumerate((ROOT / "backend/requirements.txt").read_text(encoding="utf-8").splitlines(), 1):
@@ -344,49 +435,107 @@ def verify_python_lock() -> None:
             f"backend/requirements.lock is missing required transitive package {required_pin}",
         )
 
-    install_policy = ("backend/Dockerfile", "scripts/bootstrap.sh", ".github/workflows/quality.yml")
-    no_deps_install = re.compile(r"pip[\"']?\s+install\s+--no-deps\s+(?:--requirement|-r)\s+")
+    install_policy = {
+        "backend/Dockerfile": {"requirements.lock": 1},
+        "scripts/bootstrap.sh": {"requirements.lock": 1},
+        ".github/workflows/quality.yml": {
+            "requirements.lock": 2,
+            "audit-requirements.lock": 1,
+        },
+    }
     pip_check = re.compile(r"(?:[^\s]*pip[\"']?|python\s+-m\s+pip)\s+check(?:\s|$)")
-    for relative in install_policy:
+    required_install_flags = {"--no-deps", "--require-hashes", "--only-binary=:all:"}
+    for relative, minimum_counts in install_policy.items():
+        path = ROOT / relative
         policy_text = "\n".join(
             line
-            for line in (ROOT / relative).read_text(encoding="utf-8").splitlines()
+            for line in path.read_text(encoding="utf-8").splitlines()
             if not line.lstrip().startswith("#")
         )
         normalized = " ".join(policy_text.replace("\\\n", " ").split())
-        locked_install_count = len(no_deps_install.findall(normalized))
+        install_commands = _pip_install_commands(path)
+        observed_counts = {name: 0 for name in minimum_counts}
+        for arguments in install_commands:
+            targets = _requirement_targets(arguments)
+            require(
+                len(targets) == 1 and targets[0] in observed_counts,
+                f"{relative} contains a pip install outside an approved hash lock",
+            )
+            missing_flags = sorted(required_install_flags.difference(arguments))
+            require(
+                not missing_flags,
+                f"{relative} {targets[0]} install is missing {' '.join(missing_flags)}",
+            )
+            observed_counts[targets[0]] += 1
+        for lock_name, minimum_count in minimum_counts.items():
+            require(
+                observed_counts[lock_name] >= minimum_count,
+                f"{relative} must install {lock_name} with hash and binary enforcement",
+            )
         require(
-            locked_install_count >= 1,
-            f"{relative} must install requirements.lock with --no-deps",
-        )
-        require(
-            len(pip_check.findall(normalized)) >= locked_install_count,
-            f"{relative} must run pip check for every requirements.lock install",
+            len(pip_check.findall(normalized)) >= len(install_commands),
+            f"{relative} must run pip check for every Python lock install",
         )
 
     workflow_text = (ROOT / ".github/workflows/quality.yml").read_text(encoding="utf-8")
+    wheel_proof_command = (
+        ".audit-venv/bin/python scripts/verify_python_wheels.py "
+        "backend/requirements.lock backend/audit-requirements.lock"
+    )
+    require(
+        sum(line.strip() == wheel_proof_command for line in workflow_text.splitlines()) == 1,
+        "Python CI must prove each lock has a hash-approved CPython 3.12 macOS Intel wheel",
+    )
+    wheel_policy_path = ROOT / "scripts/verify_python_wheels.py"
+    require(wheel_policy_path.is_file(), "scripts/verify_python_wheels.py is required")
+    wheel_policy_text = wheel_policy_path.read_text(encoding="utf-8")
+    for required_policy in (
+        'platform="macosx_15_0_x86_64"',
+        'python_version="3.12"',
+        'implementation="cp"',
+        '"--require-hashes"',
+        '"--only-binary=:all:"',
+    ):
+        require(
+            required_policy in wheel_policy_text,
+            f"macOS Intel wheel verifier is missing required policy {required_policy}",
+        )
     audit_commands = [
         line.strip()
         for line in workflow_text.splitlines()
         if line.strip().startswith(".audit-venv/bin/python -m pip_audit ")
     ]
-    require(len(audit_commands) == 1, ".github/workflows/quality.yml must define exactly one Python lock audit")
-    audit_arguments = shlex.split(audit_commands[0])
-    for required_argument in ("--strict", "--no-deps", "--disable-pip"):
+    audited_locks: dict[str, int] = {
+        "backend/requirements.lock": 0,
+        "backend/audit-requirements.lock": 0,
+    }
+    for audit_command in audit_commands:
+        audit_arguments = shlex.split(audit_command)
+        for required_argument in ("--strict", "--no-deps", "--disable-pip"):
+            require(
+                required_argument in audit_arguments,
+                f"Python lock audit must include {required_argument}",
+            )
+        lock_argument_indexes = [
+            index
+            for index, argument in enumerate(audit_arguments)
+            if argument in ("-r", "--requirement")
+        ]
         require(
-            required_argument in audit_arguments,
-            f"Python lock audit must include {required_argument}",
+            len(lock_argument_indexes) == 1 and lock_argument_indexes[0] + 1 < len(audit_arguments),
+            "every Python lock audit must inspect exactly one requirements file",
         )
-    lock_argument_indexes = [
-        index
-        for index, argument in enumerate(audit_arguments)
-        if argument in ("-r", "--requirement")
-    ]
+        audited_lock = audit_arguments[lock_argument_indexes[0] + 1]
+        require(audited_lock in audited_locks, f"Python audit uses unapproved lock {audited_lock}")
+        audited_locks[audited_lock] += 1
     require(
-        len(lock_argument_indexes) == 1
-        and lock_argument_indexes[0] + 1 < len(audit_arguments)
-        and audit_arguments[lock_argument_indexes[0] + 1] == "backend/requirements.lock",
-        "Python lock audit must inspect backend/requirements.lock exactly once",
+        all(count == 1 for count in audited_locks.values()),
+        "Python audits must inspect each runtime and audit-tool lock exactly once",
+    )
+    require(
+        "cache-dependency-path: |" in workflow_text
+        and "backend/audit-requirements.lock" in workflow_text,
+        "Python CI cache key must include the audit-tool lock",
     )
 
 
@@ -632,6 +781,67 @@ def _workflow_direct_child_lines(
     return children
 
 
+def _workflow_enclosing_job_runner(
+    workflow: Path,
+    lines: list[str],
+    uses_index: int,
+    structural_lines: set[int],
+) -> str:
+    contexts: list[int] = []
+    for jobs_index in sorted(structural_lines):
+        jobs_line = _strip_yaml_inline_comment(lines[jobs_index])
+        if re.fullmatch(r"jobs\s*:\s*", jobs_line) is None:
+            continue
+        if len(jobs_line) - len(jobs_line.lstrip()) != 0:
+            continue
+
+        job_indexes = _workflow_direct_child_lines(lines, jobs_index, structural_lines)
+        for position, job_index in enumerate(job_indexes):
+            job_line = _strip_yaml_inline_comment(lines[job_index]).lstrip()
+            job_mapping = WORKFLOW_PLAIN_MAPPING.fullmatch(job_line)
+            if job_mapping is None or job_mapping.group("value").strip():
+                continue
+            job_stop = job_indexes[position + 1] if position + 1 < len(job_indexes) else len(lines)
+            for candidate_index in range(job_index + 1, len(lines)):
+                if candidate_index not in structural_lines:
+                    continue
+                candidate = lines[candidate_index]
+                if len(candidate) - len(candidate.lstrip()) <= len(lines[job_index]) - len(lines[job_index].lstrip()):
+                    job_stop = min(job_stop, candidate_index)
+                    break
+            if job_index < uses_index < job_stop:
+                contexts.append(job_index)
+
+    line_number = uses_index + 1
+    require(
+        len(contexts) == 1,
+        f"{workflow.relative_to(ROOT)}:{line_number} setup-python must be nested under "
+        "exactly one literal jobs.<job> runner context",
+    )
+    job_index = contexts[0]
+    runner_matches: list[re.Match[str]] = []
+    for child_index in _workflow_direct_child_lines(lines, job_index, structural_lines):
+        logical_line = _strip_yaml_inline_comment(lines[child_index])
+        if re.match(r"^\s*runs-on\s*:", logical_line) is None:
+            continue
+        match = WORKFLOW_RUNS_ON.fullmatch(logical_line)
+        require(
+            match is not None,
+            f"{workflow.relative_to(ROOT)}:{line_number} setup-python job must use one literal runs-on label",
+        )
+        runner_matches.append(match)
+    require(
+        len(runner_matches) == 1,
+        f"{workflow.relative_to(ROOT)}:{line_number} setup-python job must define exactly one literal runs-on label",
+    )
+    runner_label = _workflow_scalar(runner_matches[0])
+    require(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", runner_label) is not None,
+        f"{workflow.relative_to(ROOT)}:{line_number} setup-python job runs-on must be a static literal label",
+    )
+    return runner_label
+
+
 def _workflow_structural_lines(workflow: Path, lines: list[str]) -> set[int]:
     structural_lines: set[int] = set()
     block_scalar_parent_indent: int | None = None
@@ -734,6 +944,10 @@ def verify_actions() -> None:
         EXACT_VERSION.fullmatch(python_version) is not None,
         ".python-version must be an exact three-component version",
     )
+    require(
+        python_version == CANONICAL_PYTHON_VERSION,
+        f".python-version must pin canonical Python {CANONICAL_PYTHON_VERSION}",
+    )
     for workflow in workflows:
         workflow_text = workflow.read_text(encoding="utf-8")
         workflow_lines = workflow_text.splitlines()
@@ -760,6 +974,17 @@ def verify_actions() -> None:
                     require(ACTION_SHA.fullmatch(reference) is not None, f"{workflow.relative_to(ROOT)}:{line_number} action is not commit-pinned: {reference}")
                 action_name = reference.split("@", 1)[0].casefold()
                 if action_name == "actions/setup-python":
+                    runner_label = _workflow_enclosing_job_runner(
+                        workflow,
+                        workflow_lines,
+                        line_index,
+                        structural_lines,
+                    )
+                    expected_python_version = (
+                        MACOS_AUTOMATION_PYTHON_VERSION
+                        if runner_label == SUPPORTED_MACOS_RUNNER
+                        else python_version
+                    )
                     pinned_versions = _workflow_step_versions(
                         workflow_lines,
                         line_index,
@@ -773,8 +998,9 @@ def verify_actions() -> None:
                     )
                     for pinned_version in pinned_versions:
                         require(
-                            pinned_version == python_version,
-                            f"{workflow.relative_to(ROOT)}:{line_number} setup-python must pin Python {python_version}",
+                            pinned_version == expected_python_version,
+                            f"{workflow.relative_to(ROOT)}:{line_number} setup-python on {runner_label} "
+                            f"must pin Python {expected_python_version}",
                         )
                 if action_name == "actions/setup-node":
                     pinned_versions = _workflow_step_versions(
@@ -839,9 +1065,10 @@ def verify_actions() -> None:
                 runner_label = _workflow_scalar(runs_on_match)
                 if runner_label.startswith("macos-"):
                     require(
-                        runner_label == "macos-15-intel",
+                        runner_label == SUPPORTED_MACOS_RUNNER,
                         f"{workflow.relative_to(ROOT)}:{line_number} macOS jobs must use "
-                        "macos-15-intel so exact Python and Xcode pins are available",
+                        f"{SUPPORTED_MACOS_RUNNER} so Python {MACOS_AUTOMATION_PYTHON_VERSION} "
+                        "and the approved Xcode pin are available",
                     )
 
 

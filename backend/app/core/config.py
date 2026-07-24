@@ -8,7 +8,7 @@ import ipaddress
 from pathlib import Path
 import re
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from dotenv import load_dotenv
 import os
@@ -225,6 +225,8 @@ class Settings:
                 errors.append("APP_SESSION_SECRET and APP_ENCRYPTION_KEY must use different key material")
             if _looks_like_placeholder(self.database_url):
                 errors.append("DATABASE_URL still contains placeholder connection details")
+            if self.app_env == "production":
+                errors.extend(_production_database_transport_errors(self.database_url))
             if _looks_like_placeholder(self.google_client_id) or _looks_like_placeholder(self.google_client_secret):
                 errors.append("Google OAuth credentials still contain placeholder values")
             if _looks_like_placeholder(self.gmail_pubsub_topic) or not re.fullmatch(
@@ -415,6 +417,100 @@ def _looks_like_placeholder(value: str) -> bool:
             "placeholder",
         )
     )
+
+
+def _production_database_transport_errors(database_url: str) -> list[str]:
+    """Require hostname-authenticated PostgreSQL TLS for production traffic."""
+    if _contains_control_character(database_url) or database_url != database_url.strip():
+        return ["DATABASE_URL must be a valid PostgreSQL URL in production"]
+
+    try:
+        parsed = urlparse(database_url)
+        hostname = parsed.hostname
+        # Accessing port is intentionally part of validation because urlparse
+        # otherwise leaves malformed ports latent until the first DB request.
+        port = parsed.port
+        query_pairs = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=16,
+        )
+    except ValueError:
+        return ["DATABASE_URL must be a valid PostgreSQL URL in production"]
+
+    errors: list[str] = []
+    if (
+        parsed.scheme not in {"postgres", "postgresql"}
+        or not hostname
+        or not _is_canonical_database_hostname(hostname)
+        or port == 0
+    ):
+        errors.append("DATABASE_URL must include a database host for production TLS verification")
+    if parsed.params or parsed.fragment:
+        errors.append("DATABASE_URL must not contain URL parameters or a fragment in production")
+
+    required_query_keys = {"sslmode", "sslrootcert", "gssencmode"}
+    if len(query_pairs) != len(required_query_keys) or {key for key, _ in query_pairs} != required_query_keys:
+        errors.append(
+            "DATABASE_URL query must contain only exact lowercase sslmode, sslrootcert, and gssencmode parameters once in production"
+        )
+
+    security_parameters: dict[str, list[tuple[str, str]]] = {
+        "sslmode": [],
+        "sslrootcert": [],
+        "gssencmode": [],
+    }
+    for key, value in query_pairs:
+        canonical_key = key.casefold()
+        if canonical_key in security_parameters:
+            security_parameters[canonical_key].append((key, value))
+
+    sslmode_values = security_parameters["sslmode"]
+    if len(sslmode_values) != 1 or sslmode_values[0][0] != "sslmode" or sslmode_values[0][1] != "verify-full":
+        errors.append("DATABASE_URL must set sslmode=verify-full exactly once in production")
+
+    gssencmode_values = security_parameters["gssencmode"]
+    if (
+        len(gssencmode_values) != 1
+        or gssencmode_values[0][0] != "gssencmode"
+        or gssencmode_values[0][1] != "disable"
+    ):
+        errors.append("DATABASE_URL must set gssencmode=disable exactly once in production")
+
+    sslrootcert_values = security_parameters["sslrootcert"]
+    if len(sslrootcert_values) != 1 or sslrootcert_values[0][0] != "sslrootcert":
+        errors.append(
+            "DATABASE_URL must set sslrootcert=system or one readable absolute CA-bundle path exactly once in production"
+        )
+    else:
+        sslrootcert = sslrootcert_values[0][1]
+        trusted_ca_path = Path(sslrootcert)
+        if sslrootcert != "system" and not (
+            trusted_ca_path.is_absolute()
+            and trusted_ca_path.is_file()
+            and os.access(trusted_ca_path, os.R_OK)
+        ):
+            errors.append(
+                "DATABASE_URL sslrootcert must be system or a readable existing absolute CA-bundle path in production"
+            )
+
+    return errors
+
+
+def _is_canonical_database_hostname(hostname: str) -> bool:
+    """Reject libpq multi-host and non-canonical authority ambiguities."""
+    if not hostname.isascii() or hostname.endswith("."):
+        return False
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        # Numeric-looking invalid IPv4 values must not fall through as DNS.
+        return (
+            re.fullmatch(r"[0-9.]+", hostname) is None
+            and CANONICAL_DNS_HOSTNAME.fullmatch(hostname) is not None
+        )
+    return hostname == address.compressed
 
 
 def _is_https_url(value: str) -> bool:
