@@ -25,15 +25,21 @@ struct ElectronicMailApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        Window("Electronic Mail", id: "main") {
             ElectronicMailRootView(store: store)
                 .frame(minWidth: 1100, minHeight: 680)
                 .tint(ElectronicMailDesign.appleBlue)
+                .background(ElectronicMailWindowSurface())
         }
-        .windowToolbarStyle(.unifiedCompact(showsTitle: true))
+        .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1440, height: 900)
         .commands {
-            SidebarCommands()
+            CommandGroup(replacing: .sidebar) {
+                Button("Toggle Navigation") {
+                    NotificationCenter.default.post(name: .electronicMailToggleNavigation, object: nil)
+                }
+                .keyboardShortcut("s", modifiers: [.command, .control])
+            }
 
             CommandGroup(after: .newItem) {
                 Button("New Message") {
@@ -43,6 +49,13 @@ struct ElectronicMailApp: App {
             }
 
             CommandMenu("Mailbox") {
+                Button("Search Mail…") {
+                    NotificationCenter.default.post(name: .electronicMailOpenMailboxSearch, object: nil)
+                }
+                .keyboardShortcut("f", modifiers: [.command])
+
+                Divider()
+
                 Button("Get New Mail") {
                     NotificationCenter.default.post(name: .electronicMailSyncMailbox, object: nil)
                 }
@@ -55,7 +68,74 @@ struct ElectronicMailApp: App {
                 }
                 .keyboardShortcut("k", modifiers: [.command])
             }
+
+            CommandMenu("Account") {
+                Button("Sign Out") {
+                    NotificationCenter.default.post(name: .electronicMailSignOut, object: nil)
+                }
+                .disabled(!store.hasSessionToken)
+
+                Divider()
+
+                Button("Disconnect Google…") {
+                    NotificationCenter.default.post(name: .electronicMailDisconnectGoogle, object: nil)
+                }
+                .disabled(!store.hasSessionToken)
+
+                Button("Delete Account…") {
+                    NotificationCenter.default.post(name: .electronicMailDeleteAccount, object: nil)
+                }
+                .disabled(!store.hasSessionToken)
+            }
         }
+    }
+}
+
+private struct ElectronicMailWindowSurface: NSViewRepresentable {
+    @Environment(\.colorScheme) private var colorScheme
+
+    func makeNSView(context _: Context) -> ElectronicMailWindowSurfaceView {
+        let view = ElectronicMailWindowSurfaceView()
+        view.surfaceColor = surfaceColor
+        return view
+    }
+
+    func updateNSView(_ view: ElectronicMailWindowSurfaceView, context _: Context) {
+        view.surfaceColor = surfaceColor
+    }
+
+    private var surfaceColor: NSColor {
+        colorScheme == .dark ? .black : .white
+    }
+}
+
+private final class ElectronicMailWindowSurfaceView: NSView {
+    var surfaceColor = NSColor.black {
+        didSet {
+            guard surfaceColor != oldValue else {
+                return
+            }
+            window?.backgroundColor = surfaceColor
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyWindowSurface()
+        DispatchQueue.main.async { [weak self] in
+            self?.applyWindowSurface()
+        }
+    }
+
+    private func applyWindowSurface() {
+        guard let window else {
+            return
+        }
+        window.styleMask.insert(.fullSizeContentView)
+        window.titleVisibility = .visible
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.backgroundColor = surfaceColor
     }
 }
 

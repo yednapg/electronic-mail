@@ -46,6 +46,354 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(store.sections.map(\.title), ["Today", "Past 7 days", "Earlier this month"])
     }
 
+    func testInboxChronologyIncludesExactSeventhCalendarDayAndPreservesParentChildOrder() {
+        InboxChronologyPresenter.resetCacheForTesting()
+        let calendar = chronologyCalendar(timeZoneIdentifier: "Asia/Kolkata")
+        let source = InboxSectionViewModel(
+            id: "source-a",
+            title: "Legacy source",
+            rows: [
+                makeChronologyTestRow(
+                    id: "today-parent",
+                    receivedAt: "2026-07-24T09:10:11.123+05:30",
+                    isExpandable: true,
+                    isExpanded: true
+                ),
+                makeChronologyTestRow(
+                    id: "today-parent::message::child",
+                    receivedAt: "2025-01-01T00:00:00Z",
+                    threadID: "today-parent",
+                    isChild: true
+                ),
+                makeChronologyTestRow(
+                    id: "recent",
+                    receivedAt: "2026-07-23T08:00:00+05:30"
+                ),
+                makeChronologyTestRow(
+                    id: "exactly-seven-days-old",
+                    receivedAt: "2026-07-17T00:00:00+05:30"
+                ),
+                makeChronologyTestRow(
+                    id: "one-second-too-old",
+                    receivedAt: "2026-07-16T23:59:59+05:30"
+                ),
+                makeChronologyTestRow(
+                    id: "prior-month",
+                    receivedAt: "2026-06-30T23:59:59+05:30"
+                ),
+                makeChronologyTestRow(
+                    id: "malformed",
+                    receivedAt: "not-an-iso-date"
+                )
+            ]
+        )
+
+        let sections = InboxChronologyPresenter.sections(
+            from: [source],
+            cacheOwner: self,
+            revision: 1,
+            now: chronologyDate("2026-07-24T14:00:00+05:30"),
+            calendar: calendar,
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+
+        XCTAssertEqual(
+            sections.map(\.id),
+            [
+                "chronology::today",
+                "chronology::past-seven-days",
+                "chronology::earlier-this-month",
+                "chronology::month::gregorian::1-2026-6",
+                "chronology::fallback::source-a"
+            ]
+        )
+        XCTAssertEqual(
+            sections.map(\.title),
+            ["Today", "Past 7 days", "Earlier this month", "June 2026", "Legacy source"]
+        )
+        XCTAssertEqual(sections[0].rows.map(\.id), ["today-parent", "today-parent::message::child"])
+        XCTAssertEqual(
+            sections.flatMap(\.rows).map(\.id),
+            [
+                "today-parent",
+                "today-parent::message::child",
+                "recent",
+                "exactly-seven-days-old",
+                "one-second-too-old",
+                "prior-month",
+                "malformed"
+            ]
+        )
+    }
+
+    func testInboxChronologyHandlesSevenDayBoundaryAcrossMonthAndYear() {
+        InboxChronologyPresenter.resetCacheForTesting()
+        let calendar = chronologyCalendar(timeZoneIdentifier: "UTC")
+        let source = InboxSectionViewModel(
+            id: "new-year",
+            title: "Server bucket",
+            rows: [
+                makeChronologyTestRow(id: "today", receivedAt: "2027-01-03T10:00:00Z"),
+                makeChronologyTestRow(id: "seven-days", receivedAt: "2026-12-27T00:00:00Z"),
+                makeChronologyTestRow(id: "older", receivedAt: "2026-12-26T23:59:59Z")
+            ]
+        )
+
+        let sections = InboxChronologyPresenter.sections(
+            from: [source],
+            cacheOwner: self,
+            revision: 1,
+            now: chronologyDate("2027-01-03T12:00:00Z"),
+            calendar: calendar,
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+
+        XCTAssertEqual(sections.map(\.title), ["Today", "Past 7 days", "December 2026"])
+        XCTAssertEqual(
+            sections.map(\.id),
+            [
+                "chronology::today",
+                "chronology::past-seven-days",
+                "chronology::month::gregorian::1-2026-12"
+            ]
+        )
+        XCTAssertEqual(sections.flatMap(\.rows).map(\.id), ["today", "seven-days", "older"])
+    }
+
+    func testInboxChronologyUsesClientTimeZoneForBucketAndRowLabel() {
+        InboxChronologyPresenter.resetCacheForTesting()
+        let calendar = chronologyCalendar(timeZoneIdentifier: "Asia/Kolkata")
+        let source = InboxSectionViewModel(
+            id: "server-yesterday",
+            title: "Yesterday",
+            rows: [
+                makeChronologyTestRow(
+                    id: "local-today",
+                    receivedAt: "2026-07-23T19:00:00Z",
+                    timeLabel: "Jul 23"
+                ),
+                makeChronologyTestRow(
+                    id: "local-yesterday",
+                    receivedAt: "2026-07-23T17:30:00Z",
+                    timeLabel: "11:00 PM"
+                ),
+                makeChronologyTestRow(
+                    id: "malformed",
+                    receivedAt: "not-an-iso-date",
+                    timeLabel: "server fallback"
+                )
+            ]
+        )
+
+        let sections = InboxChronologyPresenter.sections(
+            from: [source],
+            cacheOwner: self,
+            revision: 1,
+            now: chronologyDate("2026-07-23T19:30:00Z"),
+            calendar: calendar,
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+
+        XCTAssertEqual(sections.map(\.title), ["Today", "Past 7 days", "Yesterday"])
+        let localTodayLabel = sections[0].rows[0].timeLabel
+        XCTAssertTrue(localTodayLabel.contains(":"))
+        XCTAssertFalse(localTodayLabel.contains("Jul"))
+        let localYesterdayLabel = sections[1].rows[0].timeLabel
+        XCTAssertFalse(localYesterdayLabel.contains(":"))
+        XCTAssertTrue(localYesterdayLabel.contains("23"))
+        XCTAssertEqual(sections[2].rows[0].timeLabel, "server fallback")
+    }
+
+    func testInboxChronologySectionIDsStayStableWhenLeadingMessagesChange() {
+        InboxChronologyPresenter.resetCacheForTesting()
+        let calendar = chronologyCalendar(timeZoneIdentifier: "UTC")
+        let original = InboxSectionViewModel(
+            id: "ranked",
+            title: "Server bucket",
+            rows: [
+                makeChronologyTestRow(id: "original-today", receivedAt: "2026-07-24T08:00:00Z"),
+                makeChronologyTestRow(id: "june", receivedAt: "2026-06-15T08:00:00Z"),
+                makeChronologyTestRow(id: "second-today-run", receivedAt: "2026-07-24T07:00:00Z")
+            ]
+        )
+        let changed = InboxSectionViewModel(
+            id: "ranked",
+            title: "Server bucket",
+            rows: [
+                makeChronologyTestRow(id: "new-leading-today", receivedAt: "2026-07-24T09:00:00Z"),
+                makeChronologyTestRow(id: "original-today", receivedAt: "2026-07-24T08:00:00Z"),
+                makeChronologyTestRow(id: "june", receivedAt: "2026-06-15T08:00:00Z"),
+                makeChronologyTestRow(id: "second-today-run", receivedAt: "2026-07-24T07:00:00Z")
+            ]
+        )
+        let now = chronologyDate("2026-07-24T12:00:00Z")
+        let first = InboxChronologyPresenter.sections(
+            from: [original],
+            cacheOwner: self,
+            revision: 10,
+            now: now,
+            calendar: calendar,
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        let second = InboxChronologyPresenter.sections(
+            from: [changed],
+            cacheOwner: self,
+            revision: 11,
+            now: now,
+            calendar: calendar,
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+
+        XCTAssertEqual(
+            first.map(\.id),
+            [
+                "chronology::today",
+                "chronology::month::gregorian::1-2026-6",
+                "chronology::today::run-2"
+            ]
+        )
+        XCTAssertEqual(second.map(\.id), first.map(\.id))
+        XCTAssertEqual(
+            second.flatMap(\.rows).map(\.id),
+            ["new-leading-today", "original-today", "june", "second-today-run"]
+        )
+    }
+
+    func testInboxChronologyCacheInvalidatesOnlyForPresentationContextChanges() {
+        InboxChronologyPresenter.resetCacheForTesting()
+        let source = InboxSectionViewModel(
+            id: "cached",
+            title: "Server bucket",
+            rows: [makeChronologyTestRow(id: "today", receivedAt: "2026-07-24T08:00:00Z")]
+        )
+        let now = chronologyDate("2026-07-24T12:00:00Z")
+        let utcCalendar = chronologyCalendar(timeZoneIdentifier: "UTC")
+        let locale = Locale(identifier: "en_US_POSIX")
+
+        let first = InboxChronologyPresenter.sections(
+            from: [source],
+            cacheOwner: self,
+            revision: 20,
+            now: now,
+            calendar: utcCalendar,
+            locale: locale
+        )
+        let broadInvalidation = InboxChronologyPresenter.sections(
+            from: [source],
+            cacheOwner: self,
+            revision: 20,
+            now: now,
+            calendar: utcCalendar,
+            locale: locale
+        )
+
+        XCTAssertEqual(first, broadInvalidation)
+        XCTAssertEqual(InboxChronologyPresenter.cacheMissCount, 1)
+        XCTAssertEqual(InboxChronologyPresenter.cacheEntryCount, 1)
+
+        _ = InboxChronologyPresenter.sections(
+            from: [source],
+            cacheOwner: self,
+            revision: 21,
+            now: now,
+            calendar: utcCalendar,
+            locale: locale
+        )
+        XCTAssertEqual(InboxChronologyPresenter.cacheMissCount, 2)
+        XCTAssertEqual(InboxChronologyPresenter.cacheEntryCount, 1)
+
+        _ = InboxChronologyPresenter.sections(
+            from: [source],
+            cacheOwner: self,
+            revision: 21,
+            now: chronologyDate("2026-07-25T12:00:00Z"),
+            calendar: utcCalendar,
+            locale: locale
+        )
+        XCTAssertEqual(InboxChronologyPresenter.cacheMissCount, 3)
+        XCTAssertEqual(InboxChronologyPresenter.cacheEntryCount, 1)
+
+        _ = InboxChronologyPresenter.sections(
+            from: [source],
+            cacheOwner: self,
+            revision: 21,
+            now: now,
+            calendar: chronologyCalendar(timeZoneIdentifier: "America/Los_Angeles"),
+            locale: locale
+        )
+        XCTAssertEqual(InboxChronologyPresenter.cacheMissCount, 4)
+        XCTAssertEqual(InboxChronologyPresenter.cacheEntryCount, 1)
+
+        _ = InboxChronologyPresenter.sections(
+            from: [source],
+            cacheOwner: self,
+            revision: 21,
+            now: now,
+            calendar: utcCalendar,
+            locale: Locale(identifier: "fr_FR")
+        )
+        XCTAssertEqual(InboxChronologyPresenter.cacheMissCount, 5)
+        XCTAssertEqual(InboxChronologyPresenter.cacheEntryCount, 1)
+
+        let otherStoreIdentity = NSObject()
+        _ = InboxChronologyPresenter.sections(
+            from: [source],
+            cacheOwner: otherStoreIdentity,
+            revision: 21,
+            now: now,
+            calendar: utcCalendar,
+            locale: locale
+        )
+        XCTAssertEqual(InboxChronologyPresenter.cacheMissCount, 6)
+        XCTAssertEqual(InboxChronologyPresenter.cacheEntryCount, 2)
+    }
+
+    private func chronologyCalendar(timeZoneIdentifier: String) -> Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = Locale(identifier: "en_US_POSIX")
+        calendar.timeZone = TimeZone(identifier: timeZoneIdentifier)!
+        return calendar
+    }
+
+    private func chronologyDate(_ value: String) -> Date {
+        let formatter = ISO8601DateFormatter()
+        guard let date = formatter.date(from: value) else {
+            XCTFail("Invalid test date: \(value)")
+            return Date(timeIntervalSince1970: 0)
+        }
+        return date
+    }
+
+    private func makeChronologyTestRow(
+        id: String,
+        receivedAt: String,
+        threadID: String? = nil,
+        isChild: Bool = false,
+        isExpandable: Bool = false,
+        isExpanded: Bool = false,
+        timeLabel: String = ""
+    ) -> InboxRowViewModel {
+        InboxRowViewModel(
+            id: id,
+            sender: "Sender \(id)",
+            title: "Subject \(id)",
+            summary: nil,
+            receivedAt: receivedAt,
+            section: "Server bucket",
+            isUnread: true,
+            isGrouped: false,
+            threadID: threadID ?? id,
+            focusedMessageID: isChild ? id : nil,
+            messageCount: 1,
+            timeLabel: timeLabel,
+            hasAttachments: false,
+            presentationStatus: nil,
+            isChild: isChild,
+            isExpandable: isExpandable,
+            isExpanded: isExpanded
+        )
+    }
+
     func testInboxMappingPreservesAuthoritativeOrderAcrossDateRuns() async {
         let demoRows = DemoAppFixtures.sections[0].rows
         let mailbox = MailboxResponse(
