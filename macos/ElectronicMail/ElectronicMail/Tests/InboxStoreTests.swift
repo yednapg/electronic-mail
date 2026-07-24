@@ -1265,6 +1265,26 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(store.selectedThreadID, "demo-google-today")
     }
 
+    func testUnchangedRefreshDoesNotPublishVisibleState() async {
+        let store = InboxStore(
+            client: DemoAppClient(),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        await store.load()
+
+        var changeCount = 0
+        let observation = store.objectWillChange.sink {
+            changeCount += 1
+        }
+
+        await store.refresh()
+
+        XCTAssertEqual(changeCount, 0)
+        observation.cancel()
+    }
+
     func testClearSelectionClearsSelectedAndActiveIdentifiers() async {
         let store = InboxStore(client: DemoAppClient(), sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
 
@@ -1580,6 +1600,26 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(client.threadCallCounts["paged-thread"], 2)
         XCTAssertEqual(store.openedThreads["paged-thread"]?.messages.map(\.id), ["paged-0", "paged-1", "paged-2"])
         XCTAssertEqual(store.openedThreads["paged-thread"]?.hasMore, false)
+    }
+
+    func testThreadPrefetchAggregatesDuplicatePagesInLinearOrder() async {
+        let client = SlowThreadAppClient()
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        await store.prefetchThread(threadID: "duplicate-paged-thread", force: true, silent: false)
+
+        XCTAssertEqual(client.threadCallCounts["duplicate-paged-thread"], 3)
+        XCTAssertEqual(
+            store.openedThreads["duplicate-paged-thread"]?.messages.map(\.id),
+            ["duplicate-0", "duplicate-1", "duplicate-2", "duplicate-3"]
+        )
+        XCTAssertEqual(store.openedThreads["duplicate-paged-thread"]?.hasMore, false)
     }
 
     func testLateThreadFetchCannotRestoreEmailDataAfterSessionIsCleared() async {
@@ -4730,6 +4770,54 @@ private final class SlowThreadAppClient: AppClient {
             }
         } else {
             try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if threadID == "duplicate-paged-thread" {
+            let messageIDs: [String]
+            let hasMore: Bool
+            switch offset {
+            case 0:
+                messageIDs = ["duplicate-0", "duplicate-1"]
+                hasMore = true
+            case 2:
+                messageIDs = ["duplicate-1", "duplicate-2"]
+                hasMore = true
+            case 4:
+                messageIDs = ["duplicate-2", "duplicate-3"]
+                hasMore = false
+            default:
+                messageIDs = []
+                hasMore = false
+            }
+            let pageMessages = messageIDs.enumerated().map { index, messageID in
+                ThreadMessage(
+                    id: messageID,
+                    source: .gmail,
+                    threadID: "gmail-duplicate-paged",
+                    fromAddress: "sender@example.com",
+                    to: "me@example.com",
+                    cc: nil,
+                    bcc: nil,
+                    subject: "Long thread with duplicates",
+                    body: "Message \(index)",
+                    htmlBody: nil,
+                    htmlRenderDocument: nil,
+                    snippet: nil,
+                    labelIDs: ["INBOX"],
+                    receivedAt: "2026-05-29T10:00:00+00:00"
+                )
+            }
+            return ThreadReaderResponse(
+                entityID: "duplicate-paged-thread",
+                userID: DemoAppFixtures.userID,
+                source: .gmail,
+                gmailThreadID: "gmail-duplicate-paged",
+                subject: "Long thread with duplicates",
+                totalMessages: 4,
+                limit: 2,
+                offset: offset,
+                hasMore: hasMore,
+                messages: pageMessages
+            )
         }
         if threadID == "paged-thread" {
             let allMessages = (0..<3).map { index in
