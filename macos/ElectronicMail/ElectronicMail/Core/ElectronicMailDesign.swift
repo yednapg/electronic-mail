@@ -202,6 +202,16 @@ public enum ElectronicMailComposerType {
     }
 }
 
+/// Shared editor geometry keeps the empty-state copy on the exact insertion
+/// origin used by SwiftUI's macOS TextEditor.
+enum ElectronicMailComposerEditorLayout {
+    static let textEditorHorizontalInset: CGFloat = 7
+    static let textEditorVerticalInset: CGFloat = 6
+    static let nativeLineFragmentPadding: CGFloat = 5
+    static let placeholderHorizontalInset = textEditorHorizontalInset + nativeLineFragmentPadding
+    static let placeholderVerticalInset = textEditorVerticalInset
+}
+
 public struct ElectronicMailHamburgerIcon: View {
     private let sourceWidth: CGFloat = 60
     private let sourceHeight: CGFloat = 54
