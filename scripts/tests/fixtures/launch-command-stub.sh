@@ -75,18 +75,43 @@ case "$command_name" in
       fi
     }
 
+    emit_public_readiness_headers() {
+      if [ -n "$header_path" ]; then
+        printf '%s\r\n' \
+          'HTTP/2 200' \
+          'cache-control: no-store' \
+          'content-type: application/json' \
+          > "$header_path"
+      fi
+    }
+
     case "$url" in
+      */healthz)
+        emit_public_readiness_headers
+        if [ "${LAUNCH_TEST_WEB_READY:-true}" = "true" ]; then
+          emit_body '{"status":"ready","checks":{"backend":true,"download":true,"legal":true}}'
+          [ -n "$write_out" ] && printf '200'
+        else
+          emit_body '{"status":"not_ready","checks":{"backend":true,"download":false,"legal":true}}'
+          [ -n "$write_out" ] && printf '503'
+        fi
+        ;;
       */v1/ops/health)
         default_queue_depth_json='{"critical":1,"default":2}'
+        worker_release="${LAUNCH_TEST_WORKER_RELEASE:-${LAUNCH_TEST_RELEASE_SHA:?}}"
+        default_workers_json="$(printf \
+          '[{"worker_id":"fast","queues":["critical","default"],"release_sha":"%s","age_seconds":5,"fresh":true,"release_matches_expected":true},{"worker_id":"reader","queues":["reader"],"release_sha":"%s","age_seconds":5,"fresh":true,"release_matches_expected":true},{"worker_id":"slow","queues":["slow"],"release_sha":"%s","age_seconds":5,"fresh":true,"release_matches_expected":true},{"worker_id":"poller","queues":["gmail_poll"],"release_sha":"%s","age_seconds":5,"fresh":true,"release_matches_expected":true}]' \
+          "$worker_release" "$worker_release" "$worker_release" "$worker_release")"
         emit_backend_headers
         emit_body "$(printf \
-          '{\"environment\":\"%s\",\"release\":\"%s\",\"queue_depth\":%s,\"dead_jobs\":%s,\"stale_running_jobs\":%s,\"oldest_queued_age_seconds\":%s,\"workers\":[],\"worker_online\":true,\"required_queues_ready\":true,\"worker_releases_match\":%s}' \
+          '{\"environment\":\"%s\",\"release\":\"%s\",\"queue_depth\":%s,\"dead_jobs\":%s,\"stale_running_jobs\":%s,\"oldest_queued_age_seconds\":%s,\"workers\":%s,\"worker_online\":true,\"required_queues_ready\":true,\"worker_releases_match\":%s}' \
           "${LAUNCH_TEST_OPS_ENVIRONMENT:-production}" \
           "${LAUNCH_TEST_OPS_RELEASE:-${LAUNCH_TEST_RELEASE_SHA:?}}" \
           "${LAUNCH_TEST_QUEUE_DEPTH_JSON:-$default_queue_depth_json}" \
           "${LAUNCH_TEST_DEAD_JOBS:-0}" \
           "${LAUNCH_TEST_STALE_JOBS:-0}" \
           "${LAUNCH_TEST_OLDEST_QUEUED_AGE:-10}" \
+          "${LAUNCH_TEST_OPS_WORKERS_JSON:-$default_workers_json}" \
           "${LAUNCH_TEST_WORKER_RELEASES_MATCH:-true}")"
         ;;
       */health)

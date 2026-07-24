@@ -23,6 +23,11 @@ SECURITY_HEADERS = {
 
 def valid_pages() -> dict[str, tuple[int, dict[str, str], str]]:
     return {
+        "/healthz": (
+            200,
+            {"Cache-Control": "no-store"},
+            '{"status":"ready","checks":{"backend":true,"download":true,"legal":true}}',
+        ),
         "/": (
             200,
             SECURITY_HEADERS.copy(),
@@ -94,6 +99,22 @@ class WebRuntimeVerificationTests(unittest.TestCase):
 
     def test_complete_native_only_runtime_passes(self) -> None:
         self.validate(valid_pages())
+
+    def test_public_launch_readiness_must_be_complete(self) -> None:
+        pages = valid_pages()
+        pages["/healthz"] = (
+            503,
+            {"Cache-Control": "no-store"},
+            '{"status":"not_ready","checks":{"backend":true,"download":false,"legal":true}}',
+        )
+        with self.assertRaisesRegex(WebRuntimeError, "/healthz returned HTTP 503"):
+            self.validate(pages)
+
+    def test_public_launch_readiness_must_not_be_cached(self) -> None:
+        pages = valid_pages()
+        pages["/healthz"] = (200, {}, pages["/healthz"][2])
+        with self.assertRaisesRegex(WebRuntimeError, "/healthz is missing Cache-Control: no-store"):
+            self.validate(pages)
 
     def test_retention_copy_failure_is_named(self) -> None:
         pages = valid_pages()

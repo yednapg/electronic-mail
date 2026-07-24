@@ -156,7 +156,7 @@ def _verify_docker_boundary(root: Path) -> None:
         "COPY --from=build --chown=electronicmail:electronicmail /app/web/.next/static ./web/.next/static",
         "USER electronicmail",
         "EXPOSE 5173",
-        "HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD node -e \"fetch('http://127.0.0.1:' + process.env.PORT + '/support').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))\"",
+        "HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD node -e \"fetch('http://127.0.0.1:' + process.env.PORT + '/healthz').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))\"",
         'CMD ["node", "web/server.js"]',
     )
     _require(
@@ -180,7 +180,7 @@ def _verify_docker_boundary(root: Path) -> None:
         "COPY --from=build --chown=electronicmail:electronicmail /app/web/.next/static ./web/.next/static",
         "USER electronicmail",
         "EXPOSE 5173",
-        "HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD node -e \"fetch('http://127.0.0.1:' + process.env.PORT + '/support').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))\"",
+        "HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD node -e \"fetch('http://127.0.0.1:' + process.env.PORT + '/healthz').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))\"",
         'CMD ["node", "web/server.js"]',
     )
     _require(tuple(runtime_lines) == expected, "Dockerfile.web runtime stage differs from the audited fail-closed instruction allowlist")

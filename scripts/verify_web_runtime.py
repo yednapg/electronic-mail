@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from html.parser import HTMLParser
+import json
 import re
 import sys
 from typing import Mapping
@@ -124,6 +125,21 @@ def validate_runtime(
     backup_retention_days: int,
 ) -> None:
     base_url = _validate_base_url(web_url)
+    health_status, health_headers, health_markup = _fetch(base_url, "/healthz")
+    _require_status(health_status, 200, "/healthz")
+    try:
+        health_payload = json.loads(health_markup)
+    except json.JSONDecodeError as error:
+        raise WebRuntimeError(f"/healthz did not return valid JSON: {error}") from error
+    _require(
+        health_payload == {
+            "status": "ready",
+            "checks": {"backend": True, "download": True, "legal": True},
+        },
+        "/healthz did not prove all public launch configuration categories ready",
+    )
+    _require("no-store" in health_headers.get("Cache-Control", "").lower(), "/healthz is missing Cache-Control: no-store")
+
     pages: dict[str, tuple[Mapping[str, str], str]] = {}
     for path in ("/", "/privacy", "/terms", "/support", "/post-login"):
         status, headers, markup = _fetch(base_url, path)
