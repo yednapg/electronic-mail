@@ -12,12 +12,14 @@ from httplib2 import Response
 from app.core.error_safety import GoogleCredentialsUnavailable
 from app.db.jobs import renew_heartbeat
 from app.db.mail_groups import AppSessionSnapshotRecord, GmailMessageRecord, MailboxCursorError, MailboxThreadPage, MailGroupRecord, VisibleMailGroupRecord, decode_mailbox_cursor, encode_mailbox_cursor
+from app.schemas.domain import GoogleAuthState
 from app.services.auth import CurrentUser
-from app.services.gmail_importer import _encode_full_mailbox_cursor, run_gmail_backfill, run_gmail_delta_sync, run_gmail_import_batch
+from app.services.gmail_importer import GmailHistoryTraversalLimit, _encode_full_mailbox_cursor, _list_history_delta, run_gmail_backfill, run_gmail_delta_sync, run_gmail_import_batch
 from app.services.gmail_watch import ensure_gmail_watch
 from app.services.mail_groups import (
     APP_SESSION_PROJECTION_VERSION,
     _candidate_groups,
+    _full_import_status,
     _gmail_row_from_canonical_thread,
     _message_title_map,
     _refresh_ai_lifecycle_groups,
@@ -143,6 +145,7 @@ class SpeedPipelineTests(unittest.TestCase):
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
     @patch("app.services.gmail_importer.enqueue_job")
     @patch("app.services.gmail_importer.mark_import_completed")
+    @patch("app.services.gmail_importer.get_import_state", return_value=SimpleNamespace(last_history_id="9", history_cursor_authoritative=True))
     @patch("app.services.gmail_importer.rebuild_touched_mail_groups", return_value=1)
     @patch("app.services.gmail_importer.upsert_gmail_messages", return_value=1)
     @patch("app.services.gmail_importer._hydrate_messages")
@@ -159,6 +162,7 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_hydrate: Mock,
         _mock_upsert: Mock,
         mock_rebuild_touched: Mock,
+        _mock_state: Mock,
         _mock_completed: Mock,
         _mock_enqueue: Mock,
         mock_projection: Mock,
@@ -185,6 +189,8 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_projection.assert_not_called()
 
     @patch("app.services.gmail_importer._hydrate_thread_metadata_for_messages")
+    @patch("app.services.gmail_importer._ensure_gmail_reconciliation_started")
+    @patch("app.services.gmail_importer.enqueue_gmail_full_reconciliation")
     @patch("app.services.gmail_importer.enqueue_job")
     @patch("app.services.gmail_importer.mark_import_completed")
     @patch("app.services.gmail_importer.upsert_gmail_messages")
@@ -203,6 +209,8 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_upsert: Mock,
         mock_completed: Mock,
         mock_enqueue: Mock,
+        mock_reconcile_enqueue: Mock,
+        mock_reconcile_start: Mock,
         mock_thread_history: Mock,
     ) -> None:
         self.settings.ai_grouping_enabled = True
@@ -238,11 +246,14 @@ class SpeedPipelineTests(unittest.TestCase):
         self.mock_importer_order.assert_not_called()
         self.assertTrue(any(call.kwargs.get("kind") == "gmail_backfill" for call in mock_enqueue.call_args_list))
         self.assertFalse(any(call.kwargs.get("kind") == "first_run_ai_grouping" for call in mock_enqueue.call_args_list))
+        mock_reconcile_start.assert_called_once_with(self.settings, user_id="user-1")
+        mock_reconcile_enqueue.assert_called_once_with(self.settings, user_id="user-1")
+        self.assertNotIn("last_history_id", mock_completed.call_args.kwargs)
 
     @patch("app.services.gmail_importer._list_messages")
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
     @patch("app.services.gmail_importer.enqueue_job")
-    @patch("app.services.gmail_importer.mark_import_completed")
+    @patch("app.services.gmail_importer.mark_history_delta_completed")
     @patch("app.services.gmail_importer.rebuild_touched_mail_groups")
     @patch("app.services.gmail_importer.upsert_gmail_messages")
     @patch("app.services.gmail_importer._hydrate_message_ids")
@@ -270,7 +281,7 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_projection: Mock,
         mock_list_messages: Mock,
     ) -> None:
-        mock_state.return_value = SimpleNamespace(last_history_id="10")
+        mock_state.return_value = SimpleNamespace(last_history_id="10", history_cursor_authoritative=True)
         mock_history.return_value = {"message_ids": [], "deleted_message_ids": [], "latest_history_id": "11"}
         mock_hydrate_ids.return_value = ([], None)
 
@@ -299,7 +310,7 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_history: Mock,
         mock_error: Mock,
     ) -> None:
-        mock_state.return_value = SimpleNamespace(last_history_id="10")
+        mock_state.return_value = SimpleNamespace(last_history_id="10", history_cursor_authoritative=True)
         mock_history.side_effect = GoogleCredentialsUnavailable(
             "Google credentials are not connected"
         )
@@ -313,10 +324,34 @@ class SpeedPipelineTests(unittest.TestCase):
             error="Google authorization expired or was revoked. Please sign in again.",
         )
 
+    @patch("app.services.gmail_importer.enqueue_gmail_full_reconciliation", return_value="reconcile-job-1")
+    @patch("app.services.gmail_importer._run_recent_metadata_sync", return_value=2)
+    @patch("app.services.gmail_importer._ensure_gmail_reconciliation_started")
+    @patch("app.services.gmail_importer.get_import_state")
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_cursorless_sync_starts_reconciliation_before_recent_hydration(
+        self,
+        _mock_can_write: Mock,
+        mock_state: Mock,
+        mock_reconcile_start: Mock,
+        mock_recent: Mock,
+        mock_reconcile_enqueue: Mock,
+    ) -> None:
+        mock_state.return_value = SimpleNamespace(last_history_id=None)
+        calls = Mock()
+        calls.attach_mock(mock_reconcile_start, "baseline")
+        calls.attach_mock(mock_recent, "recent")
+
+        touched = run_gmail_delta_sync(self.settings, user_id="user-1", batch_size=100)
+
+        self.assertEqual(touched, 2)
+        self.assertEqual([call[0] for call in calls.mock_calls], ["baseline", "recent"])
+        mock_reconcile_enqueue.assert_called_once_with(self.settings, user_id="user-1")
+
     @patch("app.services.gmail_importer._list_messages")
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
     @patch("app.services.gmail_importer.enqueue_job")
-    @patch("app.services.gmail_importer.mark_import_completed")
+    @patch("app.services.gmail_importer.mark_history_delta_completed")
     @patch("app.services.gmail_importer.rebuild_touched_mail_groups", return_value=1)
     @patch("app.services.gmail_importer.upsert_gmail_messages", return_value=1)
     @patch("app.services.gmail_importer._hydrate_message_ids")
@@ -345,11 +380,13 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_list_messages: Mock,
     ) -> None:
         message = sample_message("msg-2")
-        mock_state.return_value = SimpleNamespace(last_history_id="10")
-        mock_history.return_value = {"message_ids": ["msg-2"], "deleted_message_ids": [], "latest_history_id": "12"}
-        mock_hydrate_ids.return_value = ([message], "12")
+        mock_state.return_value = SimpleNamespace(last_history_id="10", history_cursor_authoritative=True)
+        mock_history.return_value = {"message_ids": ["msg-2"], "deleted_message_ids": [], "latest_history_id": "101"}
+        # H102 can be observed during hydration after history.list completed
+        # through H101. Publishing H102 here would permanently skip its delta.
+        mock_hydrate_ids.return_value = ([replace(message, history_id="102")], "102")
 
-        touched = run_gmail_delta_sync(self.settings, user_id="user-1", batch_size=100, target_history_id="13")
+        touched = run_gmail_delta_sync(self.settings, user_id="user-1", batch_size=100, target_history_id="102")
 
         self.assertEqual(touched, 1)
         mock_list_messages.assert_not_called()
@@ -358,11 +395,141 @@ class SpeedPipelineTests(unittest.TestCase):
         self.mock_importer_order.assert_called_once_with(
             self.settings,
             user_id="user-1",
-            target_history_id="13",
+            target_history_id="101",
         )
+        self.assertEqual(_mock_completed.call_args.kwargs["last_history_id"], "101")
         self.assertFalse(any(call.kwargs.get("kind") == "mail_group_enrich" for call in mock_enqueue.call_args_list))
         mock_projection.assert_not_called()
 
+    @patch("app.services.gmail_importer.build_google_service")
+    @patch("app.services.gmail_importer.create_authorized_credentials", return_value=object())
+    def test_history_delta_rejects_repeated_page_token(
+        self,
+        _credentials: Mock,
+        build_service: Mock,
+    ) -> None:
+        service = build_service.return_value
+        request = service.users.return_value.history.return_value.list.return_value
+        request.execute.side_effect = [
+            {"historyId": "101", "history": [], "nextPageToken": "repeat"},
+            {"historyId": "102", "history": [], "nextPageToken": "repeat"},
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "repeated a page token"):
+            _list_history_delta(
+                self.settings,
+                user_id="user-1",
+                start_history_id="100",
+                page_size=100,
+            )
+
+        self.assertEqual(service.users.return_value.history.return_value.list.call_count, 2)
+
+    @patch("app.services.gmail_importer.GMAIL_HISTORY_MAX_PAGES_PER_SYNC", 2)
+    @patch("app.services.gmail_importer.build_google_service")
+    @patch("app.services.gmail_importer.create_authorized_credentials", return_value=object())
+    def test_history_delta_stops_at_page_budget_without_partial_result(
+        self,
+        _credentials: Mock,
+        build_service: Mock,
+    ) -> None:
+        service = build_service.return_value
+        request = service.users.return_value.history.return_value.list.return_value
+        request.execute.side_effect = [
+            {"historyId": "101", "history": [], "nextPageToken": "page-2"},
+            {"historyId": "102", "history": [], "nextPageToken": "page-3"},
+        ]
+
+        with self.assertRaises(GmailHistoryTraversalLimit):
+            _list_history_delta(
+                self.settings,
+                user_id="user-1",
+                start_history_id="100",
+                page_size=100,
+            )
+
+        self.assertEqual(service.users.return_value.history.return_value.list.call_count, 2)
+
+    @patch("app.services.gmail_importer.enqueue_gmail_full_reconciliation")
+    @patch("app.services.gmail_importer._ensure_gmail_reconciliation_started")
+    @patch("app.services.gmail_importer.mark_import_completed")
+    @patch("app.services.gmail_importer.rebuild_touched_mail_groups", return_value=1)
+    @patch("app.services.gmail_importer.upsert_gmail_messages")
+    @patch("app.services.gmail_importer._hydrate_full_mailbox_cursor_page")
+    @patch("app.services.gmail_importer.get_import_state")
+    @patch("app.services.gmail_importer.mark_import_started")
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_repeated_backfill_cursor_retires_listing_and_uses_reconciliation(
+        self,
+        _can_write: Mock,
+        _started: Mock,
+        get_state: Mock,
+        hydrate_page: Mock,
+        _upsert: Mock,
+        _rebuild: Mock,
+        completed: Mock,
+        reconcile_start: Mock,
+        reconcile_enqueue: Mock,
+    ) -> None:
+        cursor = _encode_full_mailbox_cursor(page_token="repeat")
+        get_state.return_value = SimpleNamespace(
+            first_batch_imported_at="ready",
+            full_backfill_cursor=cursor,
+            full_backfill_completed_at=None,
+            last_history_id=None,
+        )
+        hydrate_page.return_value = ([sample_message()], "102", cursor)
+
+        touched = run_gmail_backfill(self.settings, user_id="user-1", batch_size=100)
+
+        self.assertEqual(touched, 1)
+        completed.assert_called_once_with(
+            self.settings.database_path,
+            user_id="user-1",
+            clear_full_backfill_cursor=True,
+            full_backfill_started=True,
+            full_backfill_completed=True,
+        )
+        reconcile_start.assert_called_once_with(self.settings, user_id="user-1")
+        reconcile_enqueue.assert_called_once_with(self.settings, user_id="user-1")
+
+    def test_provider_rejected_backfill_token_retires_listing_and_uses_reconciliation(self) -> None:
+        cursor = _encode_full_mailbox_cursor(page_token="persisted-token")
+        state = SimpleNamespace(
+            first_batch_imported_at="ready",
+            full_backfill_cursor=cursor,
+            full_backfill_completed_at=None,
+            last_history_id="102",
+            history_cursor_authoritative=False,
+        )
+        for status in (400, 404):
+            with self.subTest(status=status), patch(
+                "app.services.gmail_importer.user_can_write_gmail",
+                return_value=True,
+            ), patch(
+                "app.services.gmail_importer.mark_import_started",
+            ), patch(
+                "app.services.gmail_importer.get_import_state",
+                return_value=state,
+            ), patch(
+                "app.services.gmail_importer._list_messages",
+                side_effect=HttpError(
+                    Response({"status": str(status)}),
+                    b"invalid page token",
+                ),
+            ), patch(
+                "app.services.gmail_importer._retire_backfill_for_reconciliation",
+            ) as retire:
+                touched = run_gmail_backfill(
+                    self.settings,
+                    user_id="user-1",
+                    batch_size=100,
+                )
+
+            self.assertEqual(touched, 0)
+            retire.assert_called_once_with(self.settings, user_id="user-1")
+
+    @patch("app.services.gmail_importer._ensure_gmail_reconciliation_started")
     @patch("app.services.gmail_importer.enqueue_gmail_full_reconciliation", return_value="reconcile-job-1")
     @patch("app.services.gmail_importer._run_recent_metadata_sync", return_value=2)
     @patch("app.services.gmail_importer._list_history_delta")
@@ -377,8 +544,9 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_history: Mock,
         mock_fallback: Mock,
         mock_reconcile: Mock,
+        mock_reconcile_start: Mock,
     ) -> None:
-        mock_state.return_value = SimpleNamespace(last_history_id="10")
+        mock_state.return_value = SimpleNamespace(last_history_id="10", history_cursor_authoritative=True)
         mock_history.side_effect = HttpError(Response({"status": "404"}), b"History expired")
 
         touched = run_gmail_delta_sync(self.settings, user_id="user-1", batch_size=100)
@@ -386,10 +554,11 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertEqual(touched, 2)
         mock_fallback.assert_called_once_with(self.settings, user_id="user-1", batch_size=100, can_write_checked=True)
         mock_reconcile.assert_called_once_with(self.settings, user_id="user-1")
+        mock_reconcile_start.assert_called_once_with(self.settings, user_id="user-1")
 
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
     @patch("app.services.gmail_importer.enqueue_job")
-    @patch("app.services.gmail_importer.mark_import_completed")
+    @patch("app.services.gmail_importer.mark_history_delta_completed")
     @patch("app.services.gmail_importer.rebuild_touched_mail_groups", return_value=0)
     @patch("app.services.gmail_importer.upsert_gmail_messages")
     @patch("app.services.gmail_importer._hydrate_message_ids", return_value=([], None))
@@ -416,7 +585,7 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_enqueue: Mock,
         mock_projection: Mock,
     ) -> None:
-        mock_state.return_value = SimpleNamespace(last_history_id="10")
+        mock_state.return_value = SimpleNamespace(last_history_id="10", history_cursor_authoritative=True)
         mock_history.return_value = {"message_ids": [], "deleted_message_ids": ["msg-1"], "latest_history_id": "11"}
 
         touched = run_gmail_delta_sync(self.settings, user_id="user-1", batch_size=100)
@@ -435,7 +604,7 @@ class SpeedPipelineTests(unittest.TestCase):
 
     @patch("app.services.mail_groups.ensure_background_import_work")
     @patch("app.services.mail_groups.enqueue_job")
-    @patch("app.services.mail_groups.get_import_state", return_value=SimpleNamespace(last_history_id="10"))
+    @patch("app.services.mail_groups.get_import_state", return_value=SimpleNamespace(last_history_id="10", history_cursor_authoritative=True))
     def test_manual_sync_enqueues_delta_when_history_cursor_exists(
         self,
         _mock_state: Mock,
@@ -454,6 +623,27 @@ class SpeedPipelineTests(unittest.TestCase):
     @patch("app.services.mail_groups.enqueue_job")
     @patch("app.services.mail_groups.get_import_state", return_value=SimpleNamespace(last_history_id=None))
     def test_manual_sync_falls_back_before_history_cursor_exists(
+        self,
+        _mock_state: Mock,
+        mock_enqueue: Mock,
+        _mock_background: Mock,
+    ) -> None:
+        mock_enqueue.return_value = SimpleNamespace(id="job-1")
+
+        enqueue_mailbox_sync(self.settings, user_id="user-1")
+
+        self.assertEqual(mock_enqueue.call_args.kwargs["kind"], "gmail_import_batch")
+
+    @patch("app.services.mail_groups.ensure_background_import_work")
+    @patch("app.services.mail_groups.enqueue_job")
+    @patch(
+        "app.services.mail_groups.get_import_state",
+        return_value=SimpleNamespace(
+            last_history_id="999",
+            history_cursor_authoritative=False,
+        ),
+    )
+    def test_manual_sync_does_not_trust_legacy_history_cursor(
         self,
         _mock_state: Mock,
         mock_enqueue: Mock,
@@ -511,7 +701,7 @@ class SpeedPipelineTests(unittest.TestCase):
             token_json_encrypted="encrypted-token-payload",
         )
 
-    @patch("app.workers.main.get_import_state", return_value=SimpleNamespace(last_history_id="123"))
+    @patch("app.workers.main.get_import_state", return_value=SimpleNamespace(last_history_id="123", history_cursor_authoritative=True))
     @patch("app.workers.main.refresh_gmail_thread_order")
     @patch("app.workers.main.refresh_app_session_snapshot")
     def test_thread_order_refresh_runs_only_in_slow_worker_job(
@@ -834,8 +1024,9 @@ class SpeedPipelineTests(unittest.TestCase):
         self.mock_importer_order.assert_called_once_with(
             self.settings,
             user_id="user-1",
-            target_history_id="22",
+            target_history_id=None,
         )
+        self.assertNotIn("last_history_id", mock_completed.call_args.kwargs)
 
     @patch("app.services.mail_groups.ensure_background_import_work")
     @patch("app.services.mail_groups.latest_gmail_mailbox_revision", return_value="rev-1")
@@ -1744,9 +1935,149 @@ class SpeedPipelineTests(unittest.TestCase):
         self.assertNotIn("mail_group_enrich", kinds)
         mock_projection.assert_not_called()
 
+    def test_full_import_completion_requires_trusted_cursor_and_no_reconciliation(self) -> None:
+        completed_state = SimpleNamespace(
+            first_batch_imported_at="2026-07-24T00:00:00+00:00",
+            full_backfill_cursor=None,
+            full_backfill_completed_at="2026-07-24T00:01:00+00:00",
+            last_history_id="101",
+            history_cursor_authoritative=True,
+            reconcile_generation=None,
+        )
+
+        self.assertEqual(
+            _full_import_status(
+                completed_state,
+                active_backfill_jobs=0,
+                active_reconciliation_jobs=0,
+            ),
+            (False, True, "2026-07-24T00:01:00+00:00"),
+        )
+        self.assertEqual(
+            _full_import_status(
+                completed_state,
+                active_backfill_jobs=0,
+                active_reconciliation_jobs=1,
+            ),
+            (True, False, None),
+        )
+        self.assertEqual(
+            _full_import_status(
+                SimpleNamespace(
+                    **{
+                        **completed_state.__dict__,
+                        "history_cursor_authoritative": False,
+                    }
+                ),
+                active_backfill_jobs=0,
+                active_reconciliation_jobs=1,
+            ),
+            (True, False, None),
+        )
+        self.assertEqual(
+            _full_import_status(
+                SimpleNamespace(
+                    **{
+                        **completed_state.__dict__,
+                        "reconcile_generation": "generation-1",
+                    }
+                ),
+                active_backfill_jobs=0,
+                active_reconciliation_jobs=0,
+            ),
+            (True, False, None),
+        )
+
+    @patch("app.services.mail_groups.enqueue_projection_refresh")
+    @patch(
+        "app.services.mail_groups.count_mail_groups_by_enrichment_status",
+        return_value={"pending": 0, "ready": 10},
+    )
+    @patch("app.services.mail_groups.count_active_jobs", return_value=0)
+    @patch("app.services.mail_groups.enqueue_job")
+    @patch("app.services.mail_groups.get_import_state")
+    @patch("app.services.mail_groups.user_can_write_gmail", return_value=True)
+    def test_recovery_queues_reconciliation_for_completed_backfill_with_untrusted_cursor(
+        self,
+        _can_write: Mock,
+        get_state: Mock,
+        enqueue: Mock,
+        _active_jobs: Mock,
+        _counts: Mock,
+        projection: Mock,
+    ) -> None:
+        get_state.return_value = SimpleNamespace(
+            first_batch_imported_at="2026-07-24T00:00:00+00:00",
+            first_groups_ready_at=None,
+            full_backfill_cursor=None,
+            full_backfill_completed_at="2026-07-24T00:01:00+00:00",
+            last_history_id="102",
+            history_cursor_authoritative=False,
+            reconcile_generation=None,
+        )
+
+        ensure_background_import_work(self.settings, user_id="user-1")
+
+        self.assertEqual(enqueue.call_count, 1)
+        self.assertEqual(enqueue.call_args.kwargs["kind"], "gmail_full_reconcile")
+        self.assertEqual(enqueue.call_args.kwargs["queue"], "slow")
+        self.assertEqual(
+            enqueue.call_args.kwargs["dedupe_key"],
+            "gmail-full-reconcile:user-1:trigger",
+        )
+        projection.assert_not_called()
+
+    def test_empty_app_snapshot_reports_queued_reconciliation_as_running(self) -> None:
+        state = SimpleNamespace(
+            first_batch_imported_at="2026-07-24T00:00:00+00:00",
+            full_backfill_cursor=None,
+            full_backfill_completed_at="2026-07-24T00:01:00+00:00",
+            last_history_id="102",
+            history_cursor_authoritative=False,
+            reconcile_generation=None,
+        )
+
+        def active_jobs(_database_url: str, **kwargs) -> int:
+            return 1 if kwargs.get("kinds") == ["gmail_full_reconcile"] else 0
+
+        with patch(
+            "app.services.mail_groups._google_auth_state",
+            return_value=GoogleAuthState(
+                available=True,
+                connected=True,
+                reauth_required=False,
+                connect_url=None,
+            ),
+        ), patch(
+            "app.services.mail_groups.ensure_background_import_work",
+        ), patch(
+            "app.services.mail_groups.get_app_session_snapshot",
+            return_value=None,
+        ), patch(
+            "app.services.mail_groups.get_import_state",
+            return_value=state,
+        ), patch(
+            "app.services.mail_groups.count_active_jobs",
+            side_effect=active_jobs,
+        ):
+            session = build_app_session_response(
+                self.settings,
+                user=CurrentUser(
+                    id="user-1",
+                    email="me@example.com",
+                    display_name="Gaurav",
+                ),
+            )
+
+        self.assertTrue(session.mailbox.full_import_running)
+        self.assertFalse(session.mailbox.full_import_completed)
+        self.assertTrue(session.sync.full_import_running)
+        self.assertFalse(session.sync.full_import_completed)
+
     @patch("app.services.mail_groups.get_queue_health", return_value=SimpleNamespace(queue_depth={}, worker_online=False, required_queues_ready=False))
     @patch("app.services.mail_groups.latest_mail_group_ai_error", return_value=None)
     @patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 0, "pending": 0})
+    @patch("app.services.mail_groups.count_active_jobs", return_value=0)
     @patch("app.services.mail_groups.ensure_background_import_work")
     @patch("app.services.mail_groups.get_import_state", return_value=None)
     @patch("app.services.mail_groups.get_app_session_snapshot")
@@ -1761,6 +2092,7 @@ class SpeedPipelineTests(unittest.TestCase):
         mock_snapshot: Mock,
         _mock_state: Mock,
         _mock_recovery: Mock,
+        _mock_active_jobs: Mock,
         _mock_counts: Mock,
         _mock_ai_error: Mock,
         _mock_health: Mock,

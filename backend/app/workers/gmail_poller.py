@@ -13,7 +13,11 @@ from uuid import uuid4
 from app.core.config import load_settings
 from app.core.observability import configure_observability
 from app.db.jobs import count_active_jobs, enqueue_job, renew_heartbeat
-from app.db.mail_groups import get_import_state, list_connected_gmail_user_ids
+from app.db.mail_groups import (
+    get_import_state,
+    gmail_history_cursor_is_authoritative,
+    list_connected_gmail_user_ids,
+)
 from app.db.user_mail_guard import UserMailWorkBlocked
 from app.services.integrations.google import check_user_google_credentials
 
@@ -108,7 +112,7 @@ def poll_once(settings, *, worker_id: str = "gmail-poller") -> int:
                     continue
                 queued += 1
             continue
-        if state is None or not state.last_history_id:
+        if not gmail_history_cursor_is_authoritative(state):
             try:
                 enqueue_job(
                     database_url,
@@ -186,10 +190,11 @@ def _should_poll(settings, state) -> bool:
 
 
 def _completed_recently(state, *, grace: timedelta = RECENT_DELTA_SYNC_GRACE) -> bool:
-    if not state.last_import_completed_at:
+    # Backfill/reconciliation page completion must not suppress recovery deltas.
+    if not getattr(state, "last_delta_sync_at", None):
         return False
     try:
-        completed = datetime.fromisoformat(state.last_import_completed_at.replace("Z", "+00:00"))
+        completed = datetime.fromisoformat(state.last_delta_sync_at.replace("Z", "+00:00"))
     except ValueError:
         return False
     if completed.tzinfo is None:

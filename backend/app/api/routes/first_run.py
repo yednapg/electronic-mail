@@ -5,8 +5,8 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Request
 
 from app.core.config import load_settings
-from app.db.jobs import get_job
-from app.db.mail_groups import get_import_state
+from app.db.jobs import count_active_jobs, get_job
+from app.db.mail_groups import get_import_state, gmail_history_cursor_is_authoritative
 from app.schemas.domain import FirstRunImportJobResponse
 from app.services.auth import require_current_user
 from app.services.mail_groups import enqueue_first_run
@@ -38,8 +38,16 @@ def first_run_import_job(request: Request, job_id: str) -> FirstRunImportJobResp
 
 
 def _first_run_response(user_id: str, *, job_id: str) -> FirstRunImportJobResponse:
-    state = get_import_state(str(settings.database_path), user_id=user_id)
-    job = get_job(str(settings.database_path), job_id)
+    database_url = str(settings.database_path)
+    state = get_import_state(database_url, user_id=user_id)
+    job = get_job(database_url, job_id)
+    reconciliation_active = bool(
+        count_active_jobs(
+            database_url,
+            user_id=user_id,
+            kinds=["gmail_full_reconcile"],
+        )
+    )
     ready = bool(state and state.first_batch_imported_at)
     job_is_active = bool(job and job.status in {"queued", "running"})
     error_message = None if job_is_active else (state.last_sync_error if state else None) or (job.last_error if job else None)
@@ -71,7 +79,14 @@ def _first_run_response(user_id: str, *, job_id: str) -> FirstRunImportJobRespon
         quality_status=quality_status,  # type: ignore[arg-type]
         quality_error=error_message,
         full_import_started_at=getattr(state, "full_backfill_started_at", None) if state else None,
-        full_import_completed_at=getattr(state, "full_backfill_completed_at", None) if state else None,
+        full_import_completed_at=(
+            getattr(state, "full_backfill_completed_at", None)
+            if state
+            and gmail_history_cursor_is_authoritative(state)
+            and not getattr(state, "reconcile_generation", None)
+            and not reconciliation_active
+            else None
+        ),
         error_message=error_message,
         created_at=job.created_at if job else (state.updated_at if state else ""),
         started_at=job.started_at if job else (state.last_import_started_at if state else None),

@@ -75,13 +75,16 @@ public final class OfflineFirstAppClient: AppClient {
         do {
             let response = try await backend.mailbox(label: label, limit: limit, cursor: cursor)
             try validateSessionToken(expectedSessionToken)
-            if let userID {
-                localMailStore.writeMailbox(response, userID: userID, label: label)
-            }
             return response
         } catch {
             try validateSessionToken(expectedSessionToken)
-            if let userID, let cached = localMailStore.readMailbox(userID: userID, label: label) {
+            // A mailbox cache is an accumulated snapshot, not a transport page.
+            // Returning it for a cursor request would make the caller append a
+            // whole snapshot as though it were that page. Only the initial
+            // request may fall back to the last atomically persisted snapshot.
+            if cursor == nil,
+               let userID,
+               let cached = localMailStore.readMailbox(userID: userID, label: label) {
                 return cached
             }
             throw error

@@ -687,11 +687,12 @@ final class APIClientTests: XCTestCase {
         }
     }
 
-    func testOfflineFirstClientWritesMailboxUnderRefreshedBackendUserAfterSessionSwitch() async throws {
+    func testOfflineFirstClientDoesNotPersistTransportPageAfterSessionSwitch() async throws {
         let localStore = MemoryLocalMailStore()
         let userAMailbox = singleRowMailbox(threadID: "user-a-thread", title: "User A row")
         let userBMailbox = singleRowMailbox(threadID: "user-b-thread", title: "User B row")
         localStore.writeSession(appSession(userID: "user-a", email: "user-a@example.com", mailbox: userAMailbox))
+        localStore.writeMailbox(userAMailbox, userID: "user-a", label: .inbox)
         let backend = FixedUserMailboxAppClient(
             session: appSession(userID: "user-b", email: "user-b@example.com", mailbox: userBMailbox),
             mailbox: userBMailbox
@@ -704,7 +705,7 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(mailbox.sections.first?.rows.first?.threadID, "user-b-thread")
         XCTAssertEqual(localStore.readSession()?.user.id, "user-b")
         XCTAssertEqual(localStore.readMailbox(userID: "user-a", label: .inbox)?.sections.first?.rows.first?.threadID, "user-a-thread")
-        XCTAssertEqual(localStore.readMailbox(userID: "user-b", label: .inbox)?.sections.first?.rows.first?.threadID, "user-b-thread")
+        XCTAssertNil(localStore.readMailbox(userID: "user-b", label: .inbox))
         XCTAssertEqual(backend.appSessionCallCount, 1)
     }
 

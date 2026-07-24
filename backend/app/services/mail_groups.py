@@ -28,6 +28,7 @@ from app.db.mail_groups import (
     count_ready_mail_groups_since,
     get_app_session_snapshot,
     get_import_state,
+    gmail_history_cursor_is_authoritative,
     get_latest_entity_outcomes,
     latest_mail_group_ai_error,
     latest_gmail_mailbox_revision,
@@ -117,6 +118,39 @@ MAILBOX_DISPLAY_CLUSTER_WORKFLOW_TYPES = {
     "newsletter",
     "marketing",
 }
+
+
+def _full_import_status(
+    state: Any,
+    *,
+    active_backfill_jobs: int,
+    active_reconciliation_jobs: int,
+) -> tuple[bool, bool, str | None]:
+    """Return truthful full-import running/completed state."""
+    if state is None:
+        return bool(active_backfill_jobs or active_reconciliation_jobs), False, None
+    backfill_completed_at = getattr(state, "full_backfill_completed_at", None)
+    reconciliation_running = bool(
+        getattr(state, "reconcile_generation", None)
+        or active_reconciliation_jobs
+    )
+    backfill_running = bool(
+        getattr(state, "first_batch_imported_at", None)
+        and not backfill_completed_at
+        and (getattr(state, "full_backfill_cursor", None) or active_backfill_jobs)
+    )
+    completed = bool(
+        backfill_completed_at
+        and gmail_history_cursor_is_authoritative(state)
+        and not reconciliation_running
+    )
+    return (
+        reconciliation_running or backfill_running,
+        completed,
+        str(backfill_completed_at) if completed else None,
+    )
+
+
 MAILBOX_DISPLAY_CLUSTER_PREFIX = "mailbox-cluster:"
 TRANSFER_TOPIC_RE = re.compile(r"(?i)\b(remittance|wire|fx|forex|trade)\b")
 TRAVEL_TOPIC_RE = re.compile(r"(?i)\b(ride|trip|reservation|bus|flight)\b")
@@ -240,7 +274,7 @@ def enqueue_first_run(settings: Settings, *, user_id: str) -> str:
 
 def enqueue_mailbox_sync(settings: Settings, *, user_id: str) -> str:
     state = get_import_state(str(settings.database_path), user_id=user_id)
-    if state is not None and state.last_history_id:
+    if gmail_history_cursor_is_authoritative(state):
         job = enqueue_job(
             str(settings.database_path),
             kind="gmail_delta_sync",
@@ -272,12 +306,12 @@ def ensure_background_import_work(settings: Settings, *, user_id: str) -> None:
         return
     state = get_import_state(database_url, user_id=user_id)
     reconcile_generation = str(getattr(state, "reconcile_generation", None) or "")
+    active_reconciliations = count_active_jobs(
+        database_url,
+        user_id=user_id,
+        kinds=["gmail_full_reconcile"],
+    )
     if reconcile_generation:
-        active_reconciliations = count_active_jobs(
-            database_url,
-            user_id=user_id,
-            kinds=["gmail_full_reconcile"],
-        )
         if not active_reconciliations:
             enqueue_job(
                 database_url,
@@ -289,6 +323,21 @@ def ensure_background_import_work(settings: Settings, *, user_id: str) -> None:
                 payload={"user_id": user_id, "batch_size": 250},
             )
         return
+    if (
+        state is not None
+        and state.first_batch_imported_at
+        and not gmail_history_cursor_is_authoritative(state)
+        and not active_reconciliations
+    ):
+        enqueue_job(
+            database_url,
+            kind="gmail_full_reconcile",
+            queue="slow",
+            user_id=user_id,
+            dedupe_key=f"gmail-full-reconcile:{user_id}:trigger",
+            priority=90,
+            payload={"user_id": user_id, "batch_size": 250},
+        )
     if state is None or not state.first_batch_imported_at:
         enqueue_job(
             database_url,
@@ -357,6 +406,26 @@ def build_app_session_response(settings: Settings, *, user) -> AppSessionRespons
         if _mailbox_contains_legacy_ai_content(mailbox):
             mailbox = build_mailbox_response(settings, user_id=user.id, label="inbox", limit=100)
     sync = AppSessionSyncState.model_validate(snapshot.sync)
+    import_state = get_import_state(database_url, user_id=user.id)
+    full_import_running, full_import_completed, full_import_completed_at = _full_import_status(
+        import_state,
+        active_backfill_jobs=count_active_jobs(
+            database_url,
+            user_id=user.id,
+            kinds=["gmail_backfill"],
+        ),
+        active_reconciliation_jobs=count_active_jobs(
+            database_url,
+            user_id=user.id,
+            kinds=["gmail_full_reconcile"],
+        ),
+    )
+    mailbox = mailbox.model_copy(
+        update={
+            "full_import_running": full_import_running,
+            "full_import_completed": full_import_completed,
+        }
+    )
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user.id)
     last_ai_error = latest_mail_group_ai_error(database_url, user_id=user.id) if ai_grouping_enabled else None
     live_runtime = _mail_runtime_status(
@@ -373,6 +442,9 @@ def build_app_session_response(settings: Settings, *, user) -> AppSessionRespons
             "enrichment_pending_count": status_counts.get("pending", 0) if ai_grouping_enabled else 0,
             "ready_group_count": status_counts.get("ready", 0) if ai_grouping_enabled else mailbox.total_threads,
             "last_ai_error": last_ai_error,
+            "full_import_running": full_import_running,
+            "full_import_completed": full_import_completed,
+            "full_import_completed_at": full_import_completed_at,
             "last_error": (
                 None
                 if not ai_grouping_enabled and legacy_ai_error and sync.last_error == legacy_ai_error
@@ -396,16 +468,45 @@ def build_app_session_response(settings: Settings, *, user) -> AppSessionRespons
 
 
 def _empty_app_session_response(settings: Settings, *, user, auth: GoogleAuthState) -> AppSessionResponse:
+    database_url = str(settings.database_path)
+    state = get_import_state(database_url, user_id=user.id) if auth.connected else None
+    full_import_running, full_import_completed, full_import_completed_at = _full_import_status(
+        state,
+        active_backfill_jobs=(
+            count_active_jobs(
+                database_url,
+                user_id=user.id,
+                kinds=["gmail_backfill"],
+            )
+            if auth.connected
+            else 0
+        ),
+        active_reconciliation_jobs=(
+            count_active_jobs(
+                database_url,
+                user_id=user.id,
+                kinds=["gmail_full_reconcile"],
+            )
+            if auth.connected
+            else 0
+        ),
+    )
     dashboard = DashboardResponse(auth=auth, profile=user.profile, feed=FeedResponse())
-    mailbox = MailboxResponse(label="inbox", total_threads=0)
+    mailbox = MailboxResponse(
+        label="inbox",
+        total_threads=0,
+        full_import_running=full_import_running,
+        full_import_completed=full_import_completed,
+    )
     sync = AppSessionSyncState(
         last_sync_at=None,
         last_error=None,
         enrichment_pending_count=0,
         ready_group_count=0,
         oldest_imported_at=None,
-        full_import_running=False,
-        full_import_completed=False,
+        full_import_running=full_import_running,
+        full_import_completed=full_import_completed,
+        full_import_completed_at=full_import_completed_at,
     )
     readiness = _readiness_from_snapshot(settings, user=user, dashboard=dashboard, mailbox=mailbox, sync=sync)
     return AppSessionResponse(
@@ -482,7 +583,6 @@ def refresh_app_session_snapshot(settings: Settings, *, user_id: str) -> AppSess
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user.id)
     last_ai_error = latest_mail_group_ai_error(database_url, user_id=user.id) if ai_grouping_enabled else None
     state = get_import_state(database_url, user_id=user.id)
-    full_backfill_completed_at = getattr(state, "full_backfill_completed_at", None) if state is not None else None
     sync = AppSessionSyncState(
         last_sync_at=state.last_import_completed_at if state else None,
         last_error=(state.last_sync_error if state else None) or (last_ai_error if ai_grouping_enabled and status_counts.get("ready", 0) == 0 else None),
@@ -490,8 +590,12 @@ def refresh_app_session_snapshot(settings: Settings, *, user_id: str) -> AppSess
         ready_group_count=status_counts.get("ready", 0) if ai_grouping_enabled else mailbox.total_threads,
         oldest_imported_at=oldest_imported_message_at(database_url, user_id=user.id),
         full_import_running=mailbox.full_import_running,
-        full_import_completed=bool(full_backfill_completed_at),
-        full_import_completed_at=full_backfill_completed_at,
+        full_import_completed=mailbox.full_import_completed,
+        full_import_completed_at=(
+            getattr(state, "full_backfill_completed_at", None)
+            if mailbox.full_import_completed
+            else None
+        ),
         pending_action_count=count_pending_thread_actions(database_url, user_id=user.id),
         last_ai_error=last_ai_error,
     )
@@ -597,24 +701,21 @@ def build_post_login_readiness_response(
         else count_dashboard_mail_groups(database_url, user_id=user.id, since_iso=dashboard_since)
     )
     active_backfill_jobs = count_active_jobs(database_url, user_id=user.id, kinds=["gmail_backfill"])
+    active_reconciliation_jobs = count_active_jobs(
+        database_url,
+        user_id=user.id,
+        kinds=["gmail_full_reconcile"],
+    )
     active_setup_jobs = count_active_jobs(
         database_url,
         user_id=user.id,
         kinds=["gmail_import_batch", *([] if not _ai_grouping_enabled(settings) else ["first_run_ai_grouping", "mail_group_enrich"])],
     )
-    full_backfill_completed_at = getattr(state, "full_backfill_completed_at", None) if state is not None else None
-    full_import_running = bool(
-        state
-        and (
-            getattr(state, "reconcile_generation", None)
-            or (
-                state.first_batch_imported_at
-                and not full_backfill_completed_at
-                and (active_backfill_jobs or state.full_backfill_cursor)
-            )
-        )
+    full_import_running, full_import_completed, _full_import_completed_at = _full_import_status(
+        state,
+        active_backfill_jobs=active_backfill_jobs,
+        active_reconciliation_jobs=active_reconciliation_jobs,
     )
-    full_import_completed = bool(full_backfill_completed_at)
     has_prior_product = bool((state and state.first_batch_imported_at) or mailbox_thread_count > 0)
     mode = "returning" if has_prior_product else "first_time"
     auth = _google_auth_state(settings, user_id=user.id)
@@ -1128,17 +1229,15 @@ def build_mailbox_response(
     ensure_background_import_work(settings, user_id=user_id)
     state = get_import_state(database_url, user_id=user_id)
     active_backfill_jobs = count_active_jobs(database_url, user_id=user_id, kinds=["gmail_backfill"])
-    full_backfill_completed_at = getattr(state, "full_backfill_completed_at", None) if state is not None else None
-    full_import_running = bool(
-        state
-        and (
-            getattr(state, "reconcile_generation", None)
-            or (
-                state.first_batch_imported_at
-                and not full_backfill_completed_at
-                and (state.full_backfill_cursor or active_backfill_jobs)
-            )
-        )
+    active_reconciliation_jobs = count_active_jobs(
+        database_url,
+        user_id=user_id,
+        kinds=["gmail_full_reconcile"],
+    )
+    full_import_running, full_import_completed, _full_import_completed_at = _full_import_status(
+        state,
+        active_backfill_jobs=active_backfill_jobs,
+        active_reconciliation_jobs=active_reconciliation_jobs,
     )
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user_id)
     mailbox_label = _mailbox_label(label)
@@ -1240,7 +1339,7 @@ def build_mailbox_response(
         generated_at=datetime.now(timezone.utc).isoformat(),
         oldest_imported_at=oldest_imported_message_at(database_url, user_id=user_id),
         full_import_running=full_import_running,
-        full_import_completed=bool(full_backfill_completed_at),
+        full_import_completed=full_import_completed,
     )
 
 
@@ -1309,36 +1408,42 @@ def build_mailbox_sync_state(settings: Settings, *, user_id: str) -> MailboxSync
         credential_error
         or ((state.last_sync_error or getattr(state, "gmail_watch_error", None)) if state else None)
     )
+    active_backfill_jobs = count_active_jobs(
+        database_url,
+        user_id=user_id,
+        kinds=["gmail_backfill"],
+    )
+    active_reconciliation_jobs = count_active_jobs(
+        database_url,
+        user_id=user_id,
+        kinds=["gmail_full_reconcile"],
+    )
+    full_import_running, full_import_completed, full_import_completed_at = _full_import_status(
+        state,
+        active_backfill_jobs=active_backfill_jobs,
+        active_reconciliation_jobs=active_reconciliation_jobs,
+    )
     return MailboxSyncStateResponse(
         connected=connected,
-        last_history_id=state.last_history_id if state else None,
+        last_history_id=(
+            state.last_history_id
+            if gmail_history_cursor_is_authoritative(state)
+            else None
+        ),
         last_full_sync_at=state.last_import_completed_at if state else None,
         watch_expiration_at=watch_expiration,
         last_sync_started_at=state.last_import_started_at if state else None,
         last_sync_completed_at=state.last_import_completed_at if state else None,
         watch_status=watch_status,
-        last_delta_sync_at=state.last_import_completed_at if state else None,
+        last_delta_sync_at=getattr(state, "last_delta_sync_at", None) if state else None,
         last_poll_at=str(poller_workers[0].get("last_seen_at")) if poller_workers else None,
         poller_online=bool(poller_workers),
         mailbox_revision=latest_gmail_mailbox_revision(database_url, user_id=user_id),
         last_sync_error=last_sync_error,
         total_threads=count_mailbox_threads(database_url, user_id=user_id, label="all"),
-        full_import_running=bool(
-            state
-            and (
-                getattr(state, "reconcile_generation", None)
-                or (
-                    state.first_batch_imported_at
-                    and not getattr(state, "full_backfill_completed_at", None)
-                    and (
-                        state.full_backfill_cursor
-                        or count_active_jobs(database_url, user_id=user_id, kinds=["gmail_backfill"])
-                    )
-                )
-            )
-        ),
-        full_import_completed=bool(getattr(state, "full_backfill_completed_at", None)) if state else False,
-        full_import_completed_at=getattr(state, "full_backfill_completed_at", None) if state else None,
+        full_import_running=full_import_running,
+        full_import_completed=full_import_completed,
+        full_import_completed_at=full_import_completed_at,
         pending_action_count=count_pending_thread_actions(database_url, user_id=user_id),
         last_ai_error=None,
     )

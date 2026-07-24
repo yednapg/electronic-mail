@@ -166,6 +166,11 @@ final class ModelDecodingTests: XCTestCase {
         let userID = DemoAppFixtures.appSession.user.id
 
         store.writeSession(DemoAppFixtures.appSession)
+        store.writeMailbox(
+            DemoAppFixtures.appSession.mailbox,
+            userID: userID,
+            label: DemoAppFixtures.appSession.mailbox.label
+        )
         store.writeThread(thread, userID: userID, threadID: thread.entityID)
         store.writePendingThreadAction(
             LocalPendingThreadAction(
@@ -240,6 +245,7 @@ final class ModelDecodingTests: XCTestCase {
         )
 
         store.writeSession(session)
+        store.writeMailbox(mailbox, userID: base.user.id, label: .inbox)
 
         let cachedSession = try XCTUnwrap(store.readSession())
         let cachedMailbox = try XCTUnwrap(store.readMailbox(userID: base.user.id, label: .inbox))

@@ -24,6 +24,7 @@ from app.db.jobs import (
     renew_heartbeat,
 )
 from app.db.repository import get_user_by_email
+from app.db.mail_groups import gmail_history_cursor_is_authoritative
 from app.db.user_mail_guard import UserMailWorkBlocked
 from app.services.gmail_importer import (
     GMAIL_SEARCH_MAX_PAGES,
@@ -311,7 +312,11 @@ def _run_job(settings, job) -> None:
             raise RuntimeError("gmail_thread_order_refresh missing user_id")
         target_history_id = str(payload.get("target_history_id") or "") or None
         state = get_import_state(str(settings.database_path), user_id=user_id)
-        current_history_id = str(state.last_history_id or "") if state is not None else ""
+        current_history_id = (
+            str(state.last_history_id or "")
+            if gmail_history_cursor_is_authoritative(state)
+            else ""
+        )
         if (
             target_history_id
             and target_history_id.isdigit()

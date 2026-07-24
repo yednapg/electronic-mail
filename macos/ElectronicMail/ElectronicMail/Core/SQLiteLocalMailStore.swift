@@ -66,7 +66,6 @@ public final class SQLiteLocalMailStore: LocalMailStore {
                 bindings: [session.user.id]
             )
         }
-        writeMailbox(session.mailbox, userID: session.user.id, label: session.mailbox.label)
     }
 
     public func readMailbox(userID: String, label: MailboxLabel) -> MailboxResponse? {
