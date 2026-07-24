@@ -1105,6 +1105,56 @@ final class InboxStoreTests: XCTestCase {
         )
     }
 
+    func testSuccessfulReaderTrashClosesReaderWhenEmailLeavesMailbox() async {
+        let threadID = "reader-trash-thread"
+        let messageID = "reader-trash-message"
+        let mailbox = makeSingleRowMailbox(threadID: threadID, title: "Reader trash")
+        let thread = makeReaderActionThread(threadID: threadID, messageID: messageID, labelIDs: ["INBOX"])
+        let client = ActionMailboxAppClient(mailbox: mailbox, threadResponse: thread)
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+        await store.openReader(threadID: threadID, focusedMessageID: messageID).value
+
+        await store.performReaderThreadAction(.moveTrash, threadID: threadID, messageID: messageID)
+
+        XCTAssertNil(store.readerThreadID)
+        XCTAssertNil(store.readerFocusedMessageID)
+        XCTAssertEqual(client.enqueuedActions.last?.action, .moveTrash)
+    }
+
+    func testFailedReaderTrashKeepsReaderOpen() async {
+        let threadID = "failed-reader-trash-thread"
+        let messageID = "failed-reader-trash-message"
+        let mailbox = makeSingleRowMailbox(threadID: threadID, title: "Failed reader trash")
+        let thread = makeReaderActionThread(threadID: threadID, messageID: messageID, labelIDs: ["INBOX"])
+        let client = ActionMailboxAppClient(
+            mailbox: mailbox,
+            threadResponse: thread,
+            shouldFailActions: true
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+        await store.openReader(threadID: threadID, focusedMessageID: messageID).value
+
+        await store.performReaderThreadAction(.moveTrash, threadID: threadID, messageID: messageID)
+
+        XCTAssertEqual(store.readerThreadID, threadID)
+        XCTAssertEqual(store.readerFocusedMessageID, messageID)
+        XCTAssertTrue(store.refreshFailed)
+    }
+
     func testReaderLabelActionsImmediatelyUpdateTheLoadedMessage() async {
         let threadID = "reader-action-thread"
         let messageID = "reader-action-message"
