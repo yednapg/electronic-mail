@@ -1514,18 +1514,29 @@ enum EmailThreadPresentation {
     }
 
     static func orderedMessages(_ messages: [ThreadMessage]) -> [ThreadMessage] {
-        messages.enumerated().sorted { lhs, rhs in
-            let lhsDate = EmailReaderText.date(from: lhs.element.receivedAt)
-            let rhsDate = EmailReaderText.date(from: rhs.element.receivedAt)
-            switch (lhsDate, rhsDate) {
+        orderedMessages(messages, dateParser: EmailReaderText.date(from:))
+    }
+
+    static func orderedMessages(
+        _ messages: [ThreadMessage],
+        dateParser: (String) -> Date?
+    ) -> [ThreadMessage] {
+        messages.enumerated().map { offset, message in
+            DatedMessage(
+                offset: offset,
+                message: message,
+                receivedDate: dateParser(message.receivedAt)
+            )
+        }.sorted { lhs, rhs in
+            switch (lhs.receivedDate, rhs.receivedDate) {
             case let (lhsDate?, rhsDate?) where lhsDate != rhsDate:
                 return lhsDate < rhsDate
-            case (nil, nil) where lhs.element.receivedAt != rhs.element.receivedAt:
-                return lhs.element.receivedAt < rhs.element.receivedAt
+            case (nil, nil) where lhs.message.receivedAt != rhs.message.receivedAt:
+                return lhs.message.receivedAt < rhs.message.receivedAt
             default:
                 return lhs.offset < rhs.offset
             }
-        }.map(\.element)
+        }.map(\.message)
     }
 
     static func latestMessageID(in orderedMessages: [ThreadMessage]) -> String? {
@@ -1579,6 +1590,12 @@ enum EmailThreadPresentation {
         let value = message.subject?.trimmingCharacters(in: .whitespacesAndNewlines)
         return EmailReaderText.decodingHTML(value?.isEmpty == false ? value! : "No subject")
     }
+}
+
+private struct DatedMessage {
+    let offset: Int
+    let message: ThreadMessage
+    let receivedDate: Date?
 }
 
 private struct EmailThreadPresentationDuplicateKey: Hashable {
