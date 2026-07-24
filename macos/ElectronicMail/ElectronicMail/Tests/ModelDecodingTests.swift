@@ -454,6 +454,11 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertTrue(MailComposerPolicy.hasDraftContent(textFields: [""], attachmentCount: 1))
         XCTAssertTrue(MailComposerPolicy.requiresEmptySubjectConfirmation("  "))
         XCTAssertFalse(MailComposerPolicy.requiresEmptySubjectConfirmation("Hello"))
+        XCTAssertEqual(
+            MailComposerPolicy.sanitizedSubject("Quarterly\r\n Update\u{2028}Now"),
+            "Quarterly Update Now"
+        )
+        XCTAssertEqual(MailComposerPolicy.sanitizedSubject("Keep  deliberate spacing"), "Keep  deliberate spacing")
     }
 
     func testComposerPolicyEnforcesAttachmentLimits() {
@@ -864,6 +869,79 @@ final class ModelDecodingTests: XCTestCase {
 
         XCTAssertEqual(recipients.to, ["sender@example.com"])
         XCTAssertEqual(recipients.cc, ["other@example.com", "copy@example.com"])
+    }
+
+    func testResponseModeTransitionIdentifiesForwardDraftBoundary() {
+        XCTAssertFalse(
+            MailComposerResponseTransitionPolicy.crossesForwardBoundary(from: .reply, to: .replyAll)
+        )
+        XCTAssertTrue(
+            MailComposerResponseTransitionPolicy.crossesForwardBoundary(from: .replyAll, to: .forward)
+        )
+        XCTAssertTrue(
+            MailComposerResponseTransitionPolicy.crossesForwardBoundary(from: .forward, to: .reply)
+        )
+    }
+
+    func testResponseFieldProvenancePreservesClearedReplyAllCcAcrossRoundTrip() {
+        var provenance = MailComposerResponseFieldProvenance()
+        provenance.markUserEdited(.cc)
+
+        var cc = ""
+        cc = provenance.transitionedValue(for: .cc, current: cc, nextDefault: "")
+        cc = provenance.transitionedValue(for: .cc, current: cc, nextDefault: "copy@example.com")
+
+        XCTAssertEqual(cc, "")
+        XCTAssertTrue(provenance.isUserEdited(.cc))
+    }
+
+    func testResponseFieldProvenanceUpdatesUntouchedDefaultsAcrossModes() {
+        let provenance = MailComposerResponseFieldProvenance()
+
+        var to = "sender@example.com"
+        var cc = "copy@example.com"
+        var subject = "Re: Launch"
+
+        to = provenance.transitionedValue(for: .to, current: to, nextDefault: "")
+        cc = provenance.transitionedValue(for: .cc, current: cc, nextDefault: "")
+        subject = provenance.transitionedValue(for: .subject, current: subject, nextDefault: "Fwd: Launch")
+        XCTAssertEqual(to, "")
+        XCTAssertEqual(cc, "")
+        XCTAssertEqual(subject, "Fwd: Launch")
+
+        to = provenance.transitionedValue(for: .to, current: to, nextDefault: "sender@example.com")
+        cc = provenance.transitionedValue(for: .cc, current: cc, nextDefault: "copy@example.com")
+        subject = provenance.transitionedValue(for: .subject, current: subject, nextDefault: "Re: Launch")
+        XCTAssertEqual(to, "sender@example.com")
+        XCTAssertEqual(cc, "copy@example.com")
+        XCTAssertEqual(subject, "Re: Launch")
+    }
+
+    func testResponseFieldProvenancePreservesEditedToAndSubjectWhileCleanCcUpdates() throws {
+        var provenance = MailComposerResponseFieldProvenance()
+        provenance.markUserEdited(.to)
+        provenance.markUserEdited(.subject)
+
+        var to = "alternate@example.com"
+        var cc = "copy@example.com"
+        var subject = "Custom subject"
+
+        to = provenance.transitionedValue(for: .to, current: to, nextDefault: "")
+        cc = provenance.transitionedValue(for: .cc, current: cc, nextDefault: "")
+        subject = provenance.transitionedValue(for: .subject, current: subject, nextDefault: "Fwd: Launch")
+
+        let restored = try JSONDecoder().decode(
+            MailComposerResponseFieldProvenance.self,
+            from: JSONEncoder().encode(provenance)
+        )
+        to = restored.transitionedValue(for: .to, current: to, nextDefault: "sender@example.com")
+        cc = restored.transitionedValue(for: .cc, current: cc, nextDefault: "copy@example.com")
+        subject = restored.transitionedValue(for: .subject, current: subject, nextDefault: "Re: Launch")
+
+        XCTAssertEqual(to, "alternate@example.com")
+        XCTAssertEqual(cc, "copy@example.com")
+        XCTAssertEqual(subject, "Custom subject")
+        XCTAssertEqual(restored.userEditedFields, [.to, .subject])
     }
 
     func testMailAddressParserPreservesQuotedNamesEscapesAndPlainSeparators() {

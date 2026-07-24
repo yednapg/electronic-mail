@@ -60,6 +60,24 @@ public enum ElectronicMailDesign {
         }
         return Color(nsColor: .controlBackgroundColor)
     }
+
+    public static func composerSurface(for colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark
+            ? Color(red: 18.0 / 255.0, green: 19.0 / 255.0, blue: 21.0 / 255.0)
+            : Color(nsColor: .windowBackgroundColor)
+    }
+
+    public static func composerEditorSurface(for colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark
+            ? Color(red: 13.0 / 255.0, green: 14.0 / 255.0, blue: 16.0 / 255.0)
+            : Color(nsColor: .textBackgroundColor)
+    }
+
+    public static func composerTokenFill(for colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.08)
+            : Color.black.opacity(0.06)
+    }
 }
 
 public enum ElectronicMailType {
@@ -145,6 +163,42 @@ public enum ElectronicMailMailboxType {
 
     public static func metadata(unread _: Bool = false) -> Font {
         .system(size: metadataSize, weight: .regular, design: .rounded)
+    }
+}
+
+/// Compact semantic roles used by the macOS message composer. These remain
+/// separate from the larger mailbox and reader scales so form density can be
+/// tuned without weakening the product hierarchy elsewhere.
+public enum ElectronicMailComposerType {
+    public static let modeSize: CGFloat = 13
+    public static let labelSize: CGFloat = 14
+    public static let valueSize: CGFloat = 14
+    public static let bodySize: CGFloat = 15
+    public static let controlSize: CGFloat = 13
+    public static let statusSize: CGFloat = 12
+
+    public static func mode(weight: Font.Weight = .medium) -> Font {
+        .system(size: modeSize, weight: weight, design: .rounded)
+    }
+
+    public static func label() -> Font {
+        .system(size: labelSize, weight: .medium, design: .rounded)
+    }
+
+    public static func value() -> Font {
+        .system(size: valueSize, weight: .regular, design: .rounded)
+    }
+
+    public static func body() -> Font {
+        .system(size: bodySize, weight: .regular, design: .rounded)
+    }
+
+    public static func control(weight: Font.Weight = .medium) -> Font {
+        .system(size: controlSize, weight: weight, design: .rounded)
+    }
+
+    public static func status() -> Font {
+        .system(size: statusSize, weight: .regular, design: .rounded)
     }
 }
 

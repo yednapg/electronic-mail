@@ -1337,6 +1337,15 @@ enum MailComposerPolicy {
         subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    static func sanitizedSubject(_ subject: String) -> String {
+        let lines = subject.components(separatedBy: .newlines)
+        guard lines.count > 1 else { return subject }
+        return lines
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
     static func acceptsAttachment(byteCount: Int, currentTotalBytes: Int) -> Bool {
         byteCount <= maximumAttachmentBytes
             && currentTotalBytes + byteCount <= maximumTotalAttachmentBytes
@@ -1509,6 +1518,60 @@ enum MailComposerExitDecision: Equatable {
     case block
     case finishAndClearRecovery
     case finishPreservingRecovery
+}
+
+enum MailComposerResponseTransitionPolicy {
+    static let modes: [MailComposerMode] = [.reply, .replyAll, .forward]
+
+    static func isResponseMode(_ mode: MailComposerMode) -> Bool {
+        modes.contains(mode)
+    }
+
+    static func crossesForwardBoundary(from current: MailComposerMode, to next: MailComposerMode) -> Bool {
+        (current == .forward) != (next == .forward)
+    }
+
+}
+
+enum MailComposerResponseField: String, Codable, CaseIterable, Sendable {
+    case to
+    case cc
+    case subject
+}
+
+/// Sticky provenance for response fields whose generated defaults change when
+/// the composer moves between Reply, Reply All, and Forward.
+///
+/// A user edit remains authoritative across subsequent mode transitions even
+/// when its value happens to equal another mode's generated default. Callers
+/// should mark edits from user-facing bindings, not from programmatic prefill
+/// or transition assignments.
+struct MailComposerResponseFieldProvenance: Codable, Equatable, Sendable {
+    private(set) var userEditedFields: Set<MailComposerResponseField>
+
+    init(userEditedFields: Set<MailComposerResponseField> = []) {
+        self.userEditedFields = userEditedFields
+    }
+
+    mutating func markUserEdited(_ field: MailComposerResponseField) {
+        userEditedFields.insert(field)
+    }
+
+    mutating func resetToGenerated(_ field: MailComposerResponseField) {
+        userEditedFields.remove(field)
+    }
+
+    func isUserEdited(_ field: MailComposerResponseField) -> Bool {
+        userEditedFields.contains(field)
+    }
+
+    func transitionedValue(
+        for field: MailComposerResponseField,
+        current: String,
+        nextDefault: String
+    ) -> String {
+        isUserEdited(field) ? current : nextDefault
+    }
 }
 
 enum MailComposerDraftSendPreparation: Equatable {
