@@ -252,7 +252,7 @@ public struct SignedInShellView: View {
     private var headerTitle: String {
         switch supplementalDestination {
         case .todos:
-            return "To-dos"
+            return "To-do's"
         case nil:
             return store.mailboxTitle
         }
@@ -526,6 +526,7 @@ enum ShellSupplementalDestination: Equatable {
 }
 
 enum ShellPrimaryNavigationDestination: String, CaseIterable, Identifiable {
+    case todos = "To-do's"
     case inbox = "Inbox"
     case starred = "Starred"
     case drafts = "Drafts"
@@ -534,7 +535,6 @@ enum ShellPrimaryNavigationDestination: String, CaseIterable, Identifiable {
     case trash = "Trash"
     case archive = "Archive"
     case all = "All Mail"
-    case todos = "To-dos"
 
     var id: Self {
         self
