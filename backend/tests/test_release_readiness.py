@@ -203,6 +203,37 @@ class ReleaseReadinessTests(unittest.TestCase):
                     errors,
                 )
 
+    def test_railway_git_revision_is_the_runtime_release_identity(self) -> None:
+        railway_sha = "1" * 40
+        with patch.dict(
+            os.environ,
+            production_environment(RELEASE_SHA="", RAILWAY_GIT_COMMIT_SHA=railway_sha),
+            clear=True,
+        ):
+            settings = load_settings()
+            deploy_result = deploy_check.main()
+
+        self.assertEqual(settings.release_sha, railway_sha)
+        self.assertEqual(settings.readiness_errors(), [])
+        self.assertEqual(deploy_result, 0)
+
+    def test_railway_rejects_a_manually_configured_release_that_drifted(self) -> None:
+        with patch.dict(
+            os.environ,
+            production_environment(
+                RELEASE_SHA="1" * 40,
+                RAILWAY_GIT_COMMIT_SHA="2" * 40,
+            ),
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertEqual(settings.release_sha, "2" * 40)
+        self.assertIn(
+            "RELEASE_SHA must match Railway's RAILWAY_GIT_COMMIT_SHA when both are set",
+            settings.readiness_errors(),
+        )
+
     def test_production_rejects_template_placeholders_and_reused_key_material(self) -> None:
         placeholder_environment = production_environment(
             DATABASE_URL=(

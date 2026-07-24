@@ -30,7 +30,9 @@ RUN python -m compileall -q app \
 USER electronicmail
 EXPOSE 3001
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('PORT', '3001') + '/health', timeout=3)" || exit 1
+# Process liveness only; scripts/verify_backend_release.py is the production
+# API/database/worker readiness and exact-release promotion gate.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=150s --retries=3 \
+  CMD python -m app.container_health
 
 CMD ["sh", "-c", "python -m app.deploy_check && python -m app.schema_check --wait-seconds 120 && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --no-access-log"]

@@ -4,7 +4,7 @@ import React from 'react';
 
 import { AppMark } from '../components/AppMark';
 import {
-  downloadConfigIssues,
+  downloadAvailability,
   loadDownloadConfig,
   type DownloadConfig,
 } from '../lib/download-config';
@@ -16,7 +16,7 @@ export default function HomePage() {
 }
 
 export function HomePageContent({ downloadConfig }: { downloadConfig: DownloadConfig }) {
-  const downloadReady = downloadConfigIssues(downloadConfig).length === 0;
+  const downloadState = downloadAvailability(downloadConfig);
 
   return (
     <main className="login-page">
@@ -33,13 +33,17 @@ export function HomePageContent({ downloadConfig }: { downloadConfig: DownloadCo
           </p>
         </div>
 
-        {downloadReady ? (
+        {downloadState === 'available' ? (
           <a className="login-primary-link" href={downloadConfig.url}>
             Download for macOS
           </a>
-        ) : (
+        ) : downloadState === 'paused' ? (
           <Link className="login-primary-link" href="/support">
             Downloads paused — get support
+          </Link>
+        ) : (
+          <Link className="login-primary-link" href="/support">
+            Download unavailable — get support
           </Link>
         )}
         <nav className="login-legal-links" aria-label="Legal and support">

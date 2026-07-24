@@ -368,6 +368,47 @@ if payload.get("required_queues_ready") is not True:
 if payload.get("worker_releases_match") is not True:
     raise SystemExit("ops health reports fresh worker releases do not all match the API release")
 
+expected_roles = {
+    "fast": frozenset(("critical", "default")),
+    "reader": frozenset(("reader",)),
+    "slow": frozenset(("slow",)),
+    "poller": frozenset(("gmail_poll",)),
+}
+workers = payload.get("workers")
+if not isinstance(workers, list):
+    raise SystemExit("ops workers must be an array")
+role_counts = {role: 0 for role in expected_roles}
+for worker in workers:
+    if not isinstance(worker, dict):
+        raise SystemExit("ops workers contains a non-object entry")
+    if worker.get("fresh") is not True:
+        continue
+    worker_id = worker.get("worker_id")
+    queues = worker.get("queues")
+    age_seconds = worker.get("age_seconds")
+    if not isinstance(worker_id, str) or not worker_id:
+        raise SystemExit("fresh worker is missing worker_id")
+    if type(age_seconds) is not int or not 0 <= age_seconds <= 120:
+        raise SystemExit(f"fresh worker {worker_id!r} has invalid heartbeat age {age_seconds!r}")
+    if worker.get("release_sha") != expected_release:
+        raise SystemExit(f"fresh worker {worker_id!r} does not run the expected release")
+    if worker.get("release_matches_expected") is not True:
+        raise SystemExit(f"fresh worker {worker_id!r} does not confirm the expected release")
+    if (
+        not isinstance(queues, list)
+        or not all(isinstance(queue, str) and queue for queue in queues)
+        or len(queues) != len(set(queues))
+    ):
+        raise SystemExit(f"fresh worker {worker_id!r} has invalid queue declarations")
+    queue_set = frozenset(queues)
+    role = next((name for name, expected in expected_roles.items() if queue_set == expected), None)
+    if role is None:
+        raise SystemExit(f"fresh worker {worker_id!r} has an unreviewed queue role")
+    role_counts[role] += 1
+missing_roles = [role for role, count in role_counts.items() if count < 1]
+if missing_roles:
+    raise SystemExit(f"ops health is missing fresh worker roles: {', '.join(missing_roles)}")
+
 for field in ("dead_jobs", "stale_running_jobs"):
     value = payload.get(field)
     if type(value) is not int or value != 0:

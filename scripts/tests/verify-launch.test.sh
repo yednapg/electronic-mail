@@ -225,6 +225,7 @@ run_verify() {
   LAUNCH_TEST_DMG_EXTRA_FILE="${LAUNCH_TEST_DMG_EXTRA_FILE_OVERRIDE-0}" \
   LAUNCH_TEST_CODESIGN_TIMESTAMP="${LAUNCH_TEST_CODESIGN_TIMESTAMP_OVERRIDE-1}" \
   LAUNCH_TEST_STATUS_PAGE_FAIL="${LAUNCH_TEST_STATUS_PAGE_FAIL_OVERRIDE-0}" \
+  LAUNCH_TEST_WEB_READY="${LAUNCH_TEST_WEB_READY_OVERRIDE-true}" \
   LAUNCH_TEST_HEALTH_RELEASE="${LAUNCH_TEST_HEALTH_RELEASE_OVERRIDE-$RELEASE_SHA}" \
   LAUNCH_TEST_READY_RELEASE="${LAUNCH_TEST_READY_RELEASE_OVERRIDE-$RELEASE_SHA}" \
   LAUNCH_TEST_READY_ENVIRONMENT="${LAUNCH_TEST_READY_ENVIRONMENT_OVERRIDE-production}" \
@@ -235,6 +236,7 @@ run_verify() {
   LAUNCH_TEST_STALE_JOBS="${LAUNCH_TEST_STALE_JOBS_OVERRIDE-0}" \
   LAUNCH_TEST_OLDEST_QUEUED_AGE="${LAUNCH_TEST_OLDEST_QUEUED_AGE_OVERRIDE-10}" \
   LAUNCH_TEST_WORKER_RELEASES_MATCH="${LAUNCH_TEST_WORKER_RELEASES_MATCH_OVERRIDE-true}" \
+  LAUNCH_TEST_OPS_WORKERS_JSON="${LAUNCH_TEST_OPS_WORKERS_JSON_OVERRIDE-}" \
   LAUNCH_TEST_DOWNLOAD_BODY="${LAUNCH_TEST_DOWNLOAD_BODY_OVERRIDE-deterministic fake DMG}" \
   bash "$SCRIPT"
 }
@@ -355,6 +357,9 @@ LAUNCH_TEST_READY_ENVIRONMENT_OVERRIDE=staging \
 LAUNCH_TEST_WORKER_RELEASES_MATCH_OVERRIDE=false \
   expect_failure worker-release-mismatch 'fresh worker releases do not all match the API release' run_verify
 
+LAUNCH_TEST_OPS_WORKERS_JSON_OVERRIDE='[]' \
+  expect_failure missing-worker-roles 'ops health is missing fresh worker roles' run_verify
+
 LAUNCH_TEST_QUEUE_DEPTH_OVERRIDE='{"critical":6}' \
   expect_failure queue-depth 'exceeds MAX_QUEUE_DEPTH_PER_QUEUE=5' run_verify
 
@@ -398,6 +403,9 @@ LAUNCH_TEST_DOWNLOAD_BODY_OVERRIDE='stale public DMG' \
 
 LAUNCH_TEST_STATUS_PAGE_FAIL_OVERRIDE=1 \
   expect_failure public-status-unavailable 'public status page is unavailable over HTTPS' run_verify
+
+LAUNCH_TEST_WEB_READY_OVERRIDE=false \
+  expect_failure public-web-not-ready 'public web readiness returned HTTP 503 instead of 200' run_verify
 
 run_verify > "$TEST_DIR/production-success.stdout"
 grep -Fq 'Production launch verification passed' "$TEST_DIR/production-success.stdout" \
