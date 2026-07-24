@@ -7,7 +7,12 @@ import logging
 from fastapi import APIRouter, HTTPException, Request, status
 
 from app.core.config import load_settings
-from app.db.repository import ALEMBIC_HEAD_REVISION, get_engine
+from app.db.repository import ALEMBIC_HEAD_REVISION
+from app.schema_check import (
+    ALEMBIC_REVISION_PROBE,
+    REQUIRED_SCHEMA_PROBES,
+    schema_probe_connection,
+)
 
 
 router = APIRouter()
@@ -31,27 +36,14 @@ def ready() -> dict[str, object]:
         errors.append("Runtime database must be Postgres")
     else:
         try:
-            with get_engine(str(settings.database_path)).connect() as connection:
-                revision = connection.exec_driver_sql("SELECT version_num FROM alembic_version LIMIT 1").scalar()
+            with schema_probe_connection(settings) as connection:
+                revision = connection.exec_driver_sql(ALEMBIC_REVISION_PROBE).scalar()
                 if revision != ALEMBIC_HEAD_REVISION:
                     errors.append(
                         f"Database migration revision is {revision or 'missing'}, expected {ALEMBIC_HEAD_REVISION}"
                     )
-                connection.exec_driver_sql("SELECT 1 FROM gmail_messages LIMIT 1")
-                connection.exec_driver_sql("SELECT 1 FROM mail_groups LIMIT 1")
-                connection.exec_driver_sql("SELECT 1 FROM app_session_snapshots LIMIT 1")
-                connection.exec_driver_sql("SELECT body_fetch_status, render_doc_bytes FROM gmail_messages LIMIT 1")
-                connection.exec_driver_sql("SELECT 1 FROM gmail_pending_thread_actions LIMIT 1")
-                connection.exec_driver_sql("SELECT attachments_json FROM gmail_pending_sends LIMIT 1")
-                connection.exec_driver_sql("SELECT 1 FROM gmail_client_drafts LIMIT 1")
-                connection.exec_driver_sql(
-                    "SELECT login_code_hash, exchange_code_challenge FROM mobile_oauth_handoffs LIMIT 1"
-                )
-                connection.exec_driver_sql("SELECT started_epoch FROM oauth_login_sessions LIMIT 1")
-                connection.exec_driver_sql(
-                    "SELECT subject_hash, deleted_epoch FROM google_subject_deletion_tombstones LIMIT 1"
-                )
-                connection.exec_driver_sql("SELECT release_sha FROM worker_heartbeats LIMIT 1")
+                for query in REQUIRED_SCHEMA_PROBES:
+                    connection.exec_driver_sql(query)
         except Exception as exc:
             logger.error(
                 "postgres.readiness_check_failed",

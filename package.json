@@ -1,9 +1,10 @@
 {
   "name": "electronic-mail-system",
   "private": true,
+  "packageManager": "npm@10.9.4",
   "engines": {
-    "node": ">=22 <23",
-    "npm": ">=10 <12"
+    "node": "22.22.0",
+    "npm": "10.9.4"
   },
   "workspaces": [
     "web",
@@ -53,7 +54,7 @@
     "reproducibility:verify:test": "python3 -m unittest scripts/tests/test_verify_reproducibility.py",
     "deploy:check": "PYTHONPATH=backend .venv/bin/python -m app.deploy_check",
     "launch:verify": "bash scripts/verify-launch.sh",
-    "launch:verify:test": "python3 -m unittest scripts/tests/test_verify_launch_acceptance.py && bash scripts/tests/verify-launch.test.sh",
+    "launch:verify:test": "python3 -m unittest scripts/tests/test_verify_launch_acceptance.py scripts/tests/test_verify_web_runtime.py scripts/tests/test_public_url_policy.py && bash scripts/tests/verify-launch.test.sh",
     "database:scripts:test": "bash scripts/tests/backup-postgres.test.sh && bash scripts/tests/restore-postgres.test.sh",
     "release:macos:preflight": "bash scripts/preflight-macos-release.sh",
     "release:macos:validate": "bash scripts/release-macos.sh --validate-inputs",
@@ -63,12 +64,11 @@
     "verify:all": "npm run reproducibility:verify && npm run reproducibility:verify:test && npm run verify:macos && npm run backend:test && npm run backend:compile && npm run database:scripts:test && npm run web:typecheck && npm run web:test && npm run web:build && npm run web:verify:assets:test && npm run web:verify:assets && npm run launch:verify:test && npm run security:audit"
   },
   "overrides": {
-    "next": {
-      "postcss": "8.5.10"
-    }
+    "postcss": "8.5.12",
+    "sharp": "0.35.3"
   },
   "devDependencies": {
-    "sharp": "0.34.5",
+    "sharp": "0.35.3",
     "typescript": "5.9.3"
   }
 }

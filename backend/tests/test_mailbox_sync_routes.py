@@ -5,7 +5,7 @@ from contextlib import nullcontext
 import json
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 from google.auth.exceptions import RefreshError
@@ -259,6 +259,99 @@ class MailboxSyncRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 401)
 
+    def test_pubsub_route_rejects_malformed_token_without_certificate_fetch(self) -> None:
+        production_settings = SimpleNamespace(
+            is_production_like=True,
+            resolved_gmail_pubsub_push_audience="https://backend.example.com/v1/mailbox/pubsub",
+            gmail_pubsub_push_service_account_email="pubsub@example.iam.gserviceaccount.com",
+            database_path="postgresql://example/db",
+        )
+        with (
+            patch.object(mailbox_routes, "settings", production_settings),
+            patch.object(mailbox_routes.id_token, "verify_oauth2_token") as verify,
+            patch.object(mailbox_routes, "_VERIFIED_PUBSUB_RATE_LIMITER") as limiter,
+        ):
+            response = self.client.post(
+                "/v1/mailbox/pubsub",
+                headers={"Authorization": "Bearer not-a-jwt"},
+                json={"message": {"data": _pubsub_data()}},
+            )
+
+        self.assertEqual(response.status_code, 401)
+        verify.assert_not_called()
+        limiter.consume.assert_not_called()
+
+    def test_pubsub_certificate_fetch_uses_bounded_timeout(self) -> None:
+        delegate = Mock(return_value=object())
+        with patch.object(mailbox_routes.google_requests, "Request", return_value=delegate):
+            request = mailbox_routes._BoundedGoogleAuthRequest()
+            request("https://www.googleapis.com/oauth2/v1/certs", timeout=120)
+
+        delegate.assert_called_once_with(
+            "https://www.googleapis.com/oauth2/v1/certs",
+            method="GET",
+            body=None,
+            headers=None,
+            timeout=mailbox_routes.PUBSUB_CERTIFICATE_TIMEOUT_SECONDS,
+        )
+
+    def test_pubsub_verifier_saturation_retries_without_consuming_delivery_quota(self) -> None:
+        production_settings = SimpleNamespace(
+            is_production_like=True,
+            resolved_gmail_pubsub_push_audience="https://backend.example.com/v1/mailbox/pubsub",
+            gmail_pubsub_push_service_account_email="pubsub@example.iam.gserviceaccount.com",
+            database_path="postgresql://example/db",
+        )
+        slots = Mock()
+        slots.acquire.return_value = False
+        with (
+            patch.object(mailbox_routes, "settings", production_settings),
+            patch.object(mailbox_routes, "_PUBSUB_VERIFICATION_SLOTS", slots),
+            patch.object(mailbox_routes.id_token, "verify_oauth2_token") as verify,
+            patch.object(mailbox_routes, "_VERIFIED_PUBSUB_RATE_LIMITER") as limiter,
+        ):
+            response = self.client.post(
+                "/v1/mailbox/pubsub",
+                headers={"Authorization": "Bearer signed.token.value"},
+                json={"message": {"data": _pubsub_data()}},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers["retry-after"], "1")
+        slots.acquire.assert_called_once_with(blocking=False)
+        verify.assert_not_called()
+        limiter.consume.assert_not_called()
+
+    def test_pubsub_rate_limit_is_consumed_only_after_authentication_and_payload_validation(self) -> None:
+        production_settings = SimpleNamespace(
+            is_production_like=True,
+            resolved_gmail_pubsub_push_audience="https://backend.example.com/v1/mailbox/pubsub",
+            gmail_pubsub_push_service_account_email="pubsub@example.iam.gserviceaccount.com",
+            database_path="postgresql://example/db",
+        )
+        claims = {
+            "email": "pubsub@example.iam.gserviceaccount.com",
+            "email_verified": True,
+        }
+        limiter = Mock()
+        limiter.consume.return_value = (False, 17)
+        with (
+            patch.object(mailbox_routes, "settings", production_settings),
+            patch.object(mailbox_routes.id_token, "verify_oauth2_token", return_value=claims),
+            patch.object(mailbox_routes, "_VERIFIED_PUBSUB_RATE_LIMITER", limiter),
+            patch.object(mailbox_routes, "get_user_by_email") as get_user,
+        ):
+            response = self.client.post(
+                "/v1/mailbox/pubsub",
+                headers={"Authorization": "Bearer signed.token.value"},
+                json={"message": {"data": _pubsub_data()}},
+            )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["retry-after"], "17")
+        limiter.consume.assert_called_once_with()
+        get_user.assert_not_called()
+
     def test_pubsub_route_requires_explicitly_verified_service_account_email(self) -> None:
         production_settings = SimpleNamespace(
             is_production_like=True,
@@ -273,7 +366,7 @@ class MailboxSyncRouteTests(unittest.TestCase):
         ):
             response = self.client.post(
                 "/v1/mailbox/pubsub",
-                headers={"Authorization": "Bearer signed-token"},
+                headers={"Authorization": "Bearer signed.token.value"},
                 json={"message": {"data": _pubsub_data()}},
             )
 
@@ -415,6 +508,42 @@ class MailboxSyncRouteTests(unittest.TestCase):
 
 
 class MailboxSSEConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pubsub_token_verification_is_offloaded_from_event_loop(self) -> None:
+        request = SimpleNamespace(
+            headers={"authorization": "Bearer signed.token.value"},
+            body=AsyncMock(
+                return_value=json.dumps(
+                    {"message": {"data": _pubsub_data()}}
+                ).encode()
+            ),
+        )
+        production_settings = SimpleNamespace(
+            is_production_like=True,
+            resolved_gmail_pubsub_push_audience="https://backend.example.com/v1/mailbox/pubsub",
+            gmail_pubsub_push_service_account_email="pubsub@example.iam.gserviceaccount.com",
+            database_path="postgresql://example/db",
+        )
+        claims = {
+            "email": "pubsub@example.iam.gserviceaccount.com",
+            "email_verified": True,
+        }
+        offload = AsyncMock(side_effect=lambda function, *args: function(*args))
+
+        with (
+            patch.object(mailbox_routes, "settings", production_settings),
+            patch.object(mailbox_routes.asyncio, "to_thread", new=offload),
+            patch.object(
+                mailbox_routes.id_token,
+                "verify_oauth2_token",
+                return_value=claims,
+            ),
+            patch.object(mailbox_routes, "get_user_by_email", return_value=None),
+        ):
+            response = await mailbox_routes.mailbox_pubsub(request)
+
+        self.assertEqual(response, {"status": "ignored", "reason": "unknown_user"})
+        offload.assert_awaited_once_with(mailbox_routes._verify_pubsub_push, request)
+
     async def test_event_stream_offloads_blocking_database_poll(self) -> None:
         request = SimpleNamespace(
             headers={"last-event-id": "41"},

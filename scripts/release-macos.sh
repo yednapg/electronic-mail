@@ -48,24 +48,30 @@ esac
 [ -n "$BACKEND_URL" ] || fail "BACKEND_URL is required"
 python3 - "$BACKEND_URL" <<'PY'
 import ipaddress
+import re
 import sys
 from urllib.parse import urlsplit
 
 value = sys.argv[1]
 if value != value.strip() or any(ord(character) < 33 for character in value):
     raise SystemExit("BACKEND_URL cannot contain whitespace or control characters")
-url = urlsplit(value)
+try:
+    url = urlsplit(value)
+except ValueError as error:
+    raise SystemExit(f"BACKEND_URL is invalid: {error}")
 if url.scheme != "https" or not url.hostname:
     raise SystemExit("BACKEND_URL must be the production HTTPS API origin")
 if url.username or url.password or url.query or url.fragment:
     raise SystemExit("BACKEND_URL cannot include credentials, a query, or a fragment")
-if url.path not in ("", "/"):
+if url.path:
     raise SystemExit("BACKEND_URL must be an origin without a path")
 try:
-    url.port
+    port = url.port
 except ValueError as error:
     raise SystemExit(f"BACKEND_URL has an invalid port: {error}")
-host = url.hostname.lower().rstrip(".")
+host = url.hostname
+if not host.isascii() or host != host.lower() or host.endswith("."):
+    raise SystemExit("BACKEND_URL hostname must be lowercase canonical ASCII without a trailing dot")
 reserved_suffixes = (".invalid", ".test", ".example", ".localhost", ".local")
 reserved_hosts = {"example.com", "example.net", "example.org"}
 if host == "localhost" or host in reserved_hosts or host.endswith(reserved_suffixes) or any(host.endswith(f".{value}") for value in reserved_hosts):
@@ -74,12 +80,30 @@ try:
     address = ipaddress.ip_address(host)
 except ValueError:
     address = None
-if address is not None and not address.is_global:
-    raise SystemExit("BACKEND_URL cannot use a private, loopback, or link-local IP address")
-if address is None and "." not in host:
-    raise SystemExit("BACKEND_URL must use a fully qualified public hostname")
+if address is not None:
+    if not address.is_global:
+        raise SystemExit("BACKEND_URL cannot use a private, loopback, or link-local IP address")
+    canonical_address = address.compressed
+    if host != canonical_address:
+        raise SystemExit("BACKEND_URL IP address must use its canonical compressed representation")
+    canonical_host = f"[{canonical_address}]" if address.version == 6 else canonical_address
+else:
+    labels = host.split(".")
+    valid_label = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+    if (
+        "." not in host
+        or len(host) > 253
+        or re.fullmatch(r"[0-9.]+", host)
+        or any(not valid_label.fullmatch(label) for label in labels)
+    ):
+        raise SystemExit("BACKEND_URL must use valid lowercase ASCII DNS labels or a canonical public IP address")
+    canonical_host = host
+if port == 443:
+    raise SystemExit("BACKEND_URL must omit the default HTTPS port")
+canonical_netloc = canonical_host if port is None else f"{canonical_host}:{port}"
+if url.netloc != canonical_netloc or value != f"https://{canonical_netloc}":
+    raise SystemExit("BACKEND_URL must be a canonical HTTPS origin")
 PY
-BACKEND_URL="${BACKEND_URL%/}"
 
 if [ "$VALIDATE_INPUTS_ONLY" = "1" ]; then
   echo "macOS production release inputs are valid: version $VERSION ($BUILD_NUMBER), backend $BACKEND_URL"
@@ -350,9 +374,10 @@ rm -rf "$DMG_MOUNT_POINT"
 mkdir -p "$DMG_MOUNT_POINT"
 hdiutil attach -readonly -nobrowse -mountpoint "$DMG_MOUNT_POINT" "$DMG_PATH" >/dev/null
 DMG_IS_MOUNTED=1
-[ -L "$DMG_MOUNT_POINT/Applications" ] || fail "DMG is missing the Applications shortcut"
+python3 "$ROOT_DIR/scripts/verify_macos_dmg_layout.py" \
+  --mount "$DMG_MOUNT_POINT" \
+  --app-name ElectronicMail.app
 DMG_APP_PATH="$DMG_MOUNT_POINT/ElectronicMail.app"
-[ -d "$DMG_APP_PATH" ] || fail "DMG does not contain ElectronicMail.app"
 APP_PATH="$DMG_APP_PATH" \
 EXPECTED_BACKEND_URL="$BACKEND_URL" \
 EXPECTED_VERSION="$VERSION" \

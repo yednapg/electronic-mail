@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 from types import SimpleNamespace
 import unittest
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from app import schema_check
 from app.api.routes import system as system_routes
 from app.main import app
 
@@ -47,7 +49,11 @@ class SystemRouteTests(unittest.TestCase):
 
         with (
             patch.object(system_routes, "settings", settings),
-            patch.object(system_routes, "get_engine", return_value=FakeEngine()),
+            patch.object(
+                system_routes,
+                "schema_probe_connection",
+                return_value=nullcontext(FakeConnection()),
+            ),
         ):
             response = self.client.get("/ready")
 
@@ -69,13 +75,45 @@ class SystemRouteTests(unittest.TestCase):
 
         with (
             patch.object(system_routes, "settings", settings),
-            patch.object(system_routes, "get_engine", return_value=FakeEngine()),
+            patch.object(
+                system_routes,
+                "schema_probe_connection",
+                return_value=nullcontext(FakeConnection()),
+            ),
         ):
             response = self.client.get("/ready")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["database"], "postgres")
         self.assertEqual(response.json()["schema_head"], system_routes.ALEMBIC_HEAD_REVISION)
+
+    def test_ready_probes_latest_release_columns_with_bounded_lock_waits(self) -> None:
+        settings = SimpleNamespace(
+            app_env="production",
+            database_path="postgresql://example/db",
+            database_backend="postgres",
+            google_configured=True,
+            readiness_errors=lambda: [],
+        )
+        connection = FakeConnection()
+
+        with (
+            patch.object(system_routes, "settings", settings),
+            patch.object(
+                schema_check,
+                "connect_bounded_schema_probe",
+                return_value=nullcontext(connection),
+            ),
+        ):
+            response = self.client.get("/ready")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(any("previous_labels_json" in query for query in connection.queries))
+        self.assertTrue(any("request_hash" in query for query in connection.queries))
+        self.assertTrue(any("reconcile_generation" in query for query in connection.queries))
+        self.assertTrue(any("gmail_reconcile_seen" in query for query in connection.queries))
+        self.assertTrue(any("SET LOCAL lock_timeout" in query for query in connection.queries))
+        self.assertTrue(any("SET LOCAL statement_timeout" in query for query in connection.queries))
 
     def test_ready_rejects_old_migration_revision(self) -> None:
         settings = SimpleNamespace(
@@ -91,7 +129,11 @@ class SystemRouteTests(unittest.TestCase):
 
         with (
             patch.object(system_routes, "settings", settings),
-            patch.object(system_routes, "get_engine", return_value=FakeEngine(revision="20260519_0009")),
+            patch.object(
+                system_routes,
+                "schema_probe_connection",
+                return_value=nullcontext(FakeConnection(revision="20260519_0009")),
+            ),
         ):
             response = self.client.get("/ready")
 
@@ -110,7 +152,11 @@ class SystemRouteTests(unittest.TestCase):
 
         with (
             patch.object(system_routes, "settings", settings),
-            patch.object(system_routes, "get_engine", return_value=FailingEngine(secret_detail)),
+            patch.object(
+                system_routes,
+                "schema_probe_connection",
+                return_value=FailingProbe(secret_detail),
+            ),
             self.assertLogs(system_routes.logger, level="ERROR") as captured_logs,
         ):
             response = self.client.get("/ready", headers={"X-Request-ID": "readiness-safe-1"})
@@ -135,6 +181,7 @@ class FakeResult:
 class FakeConnection:
     def __init__(self, revision: str | None = None) -> None:
         self.revision = revision or system_routes.ALEMBIC_HEAD_REVISION
+        self.queries: list[str] = []
 
     def __enter__(self) -> "FakeConnection":
         return self
@@ -143,25 +190,21 @@ class FakeConnection:
         return None
 
     def exec_driver_sql(self, sql: str) -> FakeResult:
+        self.queries.append(sql)
         if "alembic_version" in sql:
             return FakeResult(self.revision)
         return FakeResult()
 
 
-class FakeEngine:
-    def __init__(self, revision: str | None = None) -> None:
-        self.revision = revision
-
-    def connect(self) -> FakeConnection:
-        return FakeConnection(self.revision)
-
-
-class FailingEngine:
+class FailingProbe:
     def __init__(self, detail: str) -> None:
         self.detail = detail
 
-    def connect(self) -> FakeConnection:
+    def __enter__(self) -> FakeConnection:
         raise RuntimeError(self.detail)
+
+    def __exit__(self, *_args) -> None:
+        return None
 
 
 if __name__ == "__main__":

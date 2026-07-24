@@ -44,6 +44,11 @@ case "$INFO_POLICY" in
   production | local-beta) ;;
   *) fail "INFO_POLICY must be production or local-beta" ;;
 esac
+if [ "$INFO_POLICY" = "production" ]; then
+  EXPECTED_BUNDLE_ID=app.electronicmail.mac
+else
+  EXPECTED_BUNDLE_ID=app.electronicmail.mac.beta
+fi
 case "$REQUIRE_NOTARIZATION" in
   0 | 1) ;;
   *) fail "REQUIRE_NOTARIZATION must be 0 or 1" ;;
@@ -76,6 +81,7 @@ PRIVACY_MANIFEST="$APP_PATH/Contents/Resources/PrivacyInfo.xcprivacy"
 APP_ICON="$APP_PATH/Contents/Resources/AppIcon.icns"
 FRAMEWORK="$APP_PATH/Contents/Frameworks/ElectronicMailCore.framework"
 FRAMEWORK_EXECUTABLE="$FRAMEWORK/ElectronicMailCore"
+FRAMEWORK_INFO_PLIST="$FRAMEWORK/Resources/Info.plist"
 FRAMEWORK_PRIVACY_MANIFEST="$FRAMEWORK/Resources/PrivacyInfo.xcprivacy"
 
 [ -s "$INFO_PLIST" ] || fail "Info.plist is missing"
@@ -84,6 +90,7 @@ FRAMEWORK_PRIVACY_MANIFEST="$FRAMEWORK/Resources/PrivacyInfo.xcprivacy"
 [ -s "$APP_ICON" ] || fail "AppIcon.icns is missing"
 [ -d "$FRAMEWORK" ] || fail "ElectronicMailCore.framework is missing"
 [ -x "$FRAMEWORK_EXECUTABLE" ] || fail "ElectronicMailCore framework executable is missing"
+[ -s "$FRAMEWORK_INFO_PLIST" ] || fail "ElectronicMailCore framework Info.plist is missing"
 [ -s "$FRAMEWORK_PRIVACY_MANIFEST" ] || fail "ElectronicMailCore privacy manifest is missing"
 
 for marker in demo-session-token demo@example.com demo-google-today DemoAppFixtures; do
@@ -101,6 +108,7 @@ plutil -lint "$SOURCE_RELEASE_INFO" >/dev/null
 plutil -lint "$SOURCE_BETA_INFO" >/dev/null
 plutil -lint "$INFO_PLIST" >/dev/null
 plutil -lint "$PRIVACY_MANIFEST" >/dev/null
+plutil -lint "$FRAMEWORK_INFO_PLIST" >/dev/null
 plutil -lint "$FRAMEWORK_PRIVACY_MANIFEST" >/dev/null
 
 ACTUAL_BACKEND_URL="$(plutil -extract BackendBaseURL raw "$INFO_PLIST")"
@@ -108,13 +116,17 @@ ACTUAL_VERSION="$(plutil -extract CFBundleShortVersionString raw "$INFO_PLIST")"
 ACTUAL_BUILD_NUMBER="$(plutil -extract CFBundleVersion raw "$INFO_PLIST")"
 ACTUAL_SOURCE_COMMIT="$(plutil -extract ElectronicMailSourceCommit raw "$INFO_PLIST")"
 ACTUAL_BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw "$INFO_PLIST")"
+FRAMEWORK_BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw "$FRAMEWORK_INFO_PLIST")"
 ACTUAL_MINIMUM_SYSTEM="$(plutil -extract LSMinimumSystemVersion raw "$INFO_PLIST")"
 
 [ "$ACTUAL_BACKEND_URL" = "$EXPECTED_BACKEND_URL" ] || fail "backend URL mismatch: expected $EXPECTED_BACKEND_URL, found $ACTUAL_BACKEND_URL"
 [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ] || fail "version mismatch: expected $EXPECTED_VERSION, found $ACTUAL_VERSION"
 [ "$ACTUAL_BUILD_NUMBER" = "$EXPECTED_BUILD_NUMBER" ] || fail "build-number mismatch: expected $EXPECTED_BUILD_NUMBER, found $ACTUAL_BUILD_NUMBER"
 [ "$ACTUAL_SOURCE_COMMIT" = "$EXPECTED_SOURCE_COMMIT" ] || fail "source-commit mismatch: expected $EXPECTED_SOURCE_COMMIT, found $ACTUAL_SOURCE_COMMIT"
-[ "$ACTUAL_BUNDLE_ID" = "app.electronicmail.mac" ] || fail "unexpected bundle identifier: $ACTUAL_BUNDLE_ID"
+[ "$ACTUAL_BUNDLE_ID" = "$EXPECTED_BUNDLE_ID" ] || \
+  fail "unexpected $INFO_POLICY bundle identifier: expected $EXPECTED_BUNDLE_ID, found $ACTUAL_BUNDLE_ID"
+[ "$FRAMEWORK_BUNDLE_ID" = "app.electronicmail.core" ] || \
+  fail "unexpected ElectronicMailCore framework bundle identifier: $FRAMEWORK_BUNDLE_ID"
 [ "$ACTUAL_MINIMUM_SYSTEM" = "14.0" ] || fail "unexpected minimum macOS version: $ACTUAL_MINIMUM_SYSTEM"
 
 ARCHITECTURES="$(lipo -archs "$EXECUTABLE")"
@@ -275,6 +287,18 @@ expected_beta_ats = {
 require(source_beta_info.get("NSAppTransportSecurity") == expected_beta_ats, "Beta Info.plist must contain only the exact localhost HTTP exception")
 require(source_beta_info.get("ElectronicMailDistributionChannel") == "local-testing-beta", "Beta Info.plist must identify the local-testing distribution channel")
 require(source_beta_info.get("ElectronicMailNotarized") is False, "Beta Info.plist must explicitly mark the app as unnotarized")
+beta_url_types = source_beta_info.get("CFBundleURLTypes")
+require(
+    isinstance(beta_url_types, list)
+    and len(beta_url_types) == 1
+    and isinstance(beta_url_types[0], dict)
+    and beta_url_types[0].get("CFBundleURLName") == "app.electronicmail.mac.beta",
+    "Beta Info.plist must use the distinct beta URL registration label",
+)
+require(
+    beta_url_types[0].get("CFBundleURLSchemes") == ["electronicmail"],
+    "Beta Info.plist must register the backend-compatible OAuth callback scheme",
+)
 
 if info_policy == "production":
     require("NSAppTransportSecurity" not in packaged_info, "packaged Release app contains an ATS exception")

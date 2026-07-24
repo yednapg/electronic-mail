@@ -29,7 +29,14 @@ class ReproducibilityVerifierTests(unittest.TestCase):
         (self.root / "packages/types").mkdir(parents=True)
         (self.root / "backend").mkdir()
         (self.root / ".github/workflows").mkdir(parents=True)
-        self.write_json("package.json", {"devDependencies": {"typescript": "5.9.3"}})
+        self.write_json(
+            "package.json",
+            {
+                "packageManager": "npm@10.9.4",
+                "engines": {"node": "22.22.0", "npm": "10.9.4"},
+                "devDependencies": {"typescript": "5.9.3"},
+            },
+        )
         self.write_json("web/package.json", {"dependencies": {"react": "19.2.7"}})
         self.write_json("packages/types/package.json", {"name": "types"})
         self.write_json(
@@ -37,7 +44,10 @@ class ReproducibilityVerifierTests(unittest.TestCase):
             {
                 "lockfileVersion": 3,
                 "packages": {
-                    "": {"devDependencies": {"typescript": "5.9.3"}},
+                    "": {
+                        "devDependencies": {"typescript": "5.9.3"},
+                        "engines": {"node": "22.22.0", "npm": "10.9.4"},
+                    },
                     "web": {"dependencies": {"react": "19.2.7"}},
                     "packages/types": {"name": "types"},
                     "node_modules/react": {"version": "19.2.7", "integrity": VALID_SHA512_SRI},
@@ -52,7 +62,10 @@ class ReproducibilityVerifierTests(unittest.TestCase):
             "fastapi>=0.115.0,<1.0.0\n",
             encoding="utf-8",
         )
-        (self.root / "backend/requirements.lock").write_text("fastapi==0.139.0\n", encoding="utf-8")
+        (self.root / "backend/requirements.lock").write_text(
+            "fastapi==0.139.0\ngreenlet==3.5.3\n",
+            encoding="utf-8",
+        )
         pinned = "sha256:" + "a" * 64
         dockerfile = f"# syntax=docker/dockerfile:1.7@{pinned}\nFROM example.invalid/runtime:1@{pinned}\nRUN pip install --no-deps -r requirements.lock && python -m pip check\n"
         (self.root / "Dockerfile.web").write_text(dockerfile, encoding="utf-8")
@@ -65,7 +78,13 @@ class ReproducibilityVerifierTests(unittest.TestCase):
         )
         action = "a" * 40
         (self.root / ".github/workflows/quality.yml").write_text(
-            f"steps:\n  - uses: actions/checkout@{action}\n  - node-version: 22.22.0\n  - run: pip install --no-deps -r backend/requirements.lock\n  - run: pip install --no-deps -r backend/requirements.lock\n  - run: .venv/bin/pip check\n",
+            f"steps:\n  - uses: actions/checkout@{action}\n  - node-version: 22.22.0\n"
+            "  - run: pip install --no-deps -r backend/requirements.lock\n"
+            "  - run: .venv/bin/pip check\n"
+            "  - run: pip install --no-deps -r backend/requirements.lock\n"
+            "  - run: .venv/bin/pip check\n"
+            "  - run: |\n"
+            "      .audit-venv/bin/python -m pip_audit --strict --no-deps --disable-pip -r backend/requirements.lock\n",
             encoding="utf-8",
         )
 
@@ -101,6 +120,21 @@ class ReproducibilityVerifierTests(unittest.TestCase):
         ):
             verifier.verify_runtime_environment()
 
+    def test_executing_npm_must_match_package_manager_pin(self) -> None:
+        with (
+            patch.object(verifier.platform, "python_version", return_value="3.12.13"),
+            patch.object(
+                verifier.subprocess,
+                "run",
+                side_effect=(
+                    SimpleNamespace(returncode=0, stdout="v22.22.0\n"),
+                    SimpleNamespace(returncode=0, stdout="11.17.0\n"),
+                ),
+            ),
+            self.assertRaisesRegex(verifier.ReproducibilityError, "executing npm must match"),
+        ):
+            verifier.verify_runtime_environment()
+
     def test_local_venv_provenance_must_match_python_pin(self) -> None:
         (self.root / ".venv").mkdir()
         (self.root / ".venv/pyvenv.cfg").write_text(
@@ -115,7 +149,10 @@ class ReproducibilityVerifierTests(unittest.TestCase):
             patch.object(
                 verifier.subprocess,
                 "run",
-                return_value=SimpleNamespace(returncode=0, stdout="v22.22.0\n"),
+                side_effect=(
+                    SimpleNamespace(returncode=0, stdout="v22.22.0\n"),
+                    SimpleNamespace(returncode=0, stdout="10.9.4\n"),
+                ),
             ),
             self.assertRaisesRegex(verifier.ReproducibilityError, "pyvenv.cfg version must match"),
         ):
@@ -128,7 +165,10 @@ class ReproducibilityVerifierTests(unittest.TestCase):
             patch.object(
                 verifier.subprocess,
                 "run",
-                return_value=SimpleNamespace(returncode=0, stdout="v22.22.0\n"),
+                side_effect=(
+                    SimpleNamespace(returncode=0, stdout="v22.22.0\n"),
+                    SimpleNamespace(returncode=0, stdout="10.9.4\n"),
+                ),
             ),
             self.assertRaisesRegex(verifier.ReproducibilityError, "without pyvenv.cfg provenance"),
         ):
@@ -151,6 +191,7 @@ class ReproducibilityVerifierTests(unittest.TestCase):
                 "run",
                 side_effect=(
                     SimpleNamespace(returncode=0, stdout="v22.22.0\n", stderr=""),
+                    SimpleNamespace(returncode=0, stdout="10.9.4\n", stderr=""),
                     SimpleNamespace(returncode=0, stdout="Python 3.14.6\n", stderr=""),
                 ),
             ),
@@ -169,6 +210,20 @@ class ReproducibilityVerifierTests(unittest.TestCase):
     def test_manifest_lock_drift_is_rejected(self) -> None:
         self.write_json("web/package.json", {"dependencies": {"react": "19.2.6"}})
         with self.assertRaisesRegex(verifier.ReproducibilityError, "does not exactly match"):
+            verifier.verify_node_manifests()
+
+    def test_package_manager_must_be_exactly_pinned(self) -> None:
+        manifest = json.loads((self.root / "package.json").read_text(encoding="utf-8"))
+        manifest["packageManager"] = "npm@latest"
+        self.write_json("package.json", manifest)
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "packageManager must pin npm@10.9.4"):
+            verifier.verify_node_manifests()
+
+    def test_node_and_npm_engine_pins_must_match_the_lock(self) -> None:
+        manifest = json.loads((self.root / "package.json").read_text(encoding="utf-8"))
+        manifest["engines"]["npm"] = ">=10 <12"
+        self.write_json("package.json", manifest)
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "engines must exactly pin"):
             verifier.verify_node_manifests()
 
     def test_malformed_node_integrity_digest_is_rejected(self) -> None:
@@ -209,10 +264,20 @@ class ReproducibilityVerifierTests(unittest.TestCase):
         with self.assertRaisesRegex(verifier.ReproducibilityError, "missing extra provider psycopg-binary"):
             verifier.verify_python_lock()
 
+    def test_python_lock_must_include_required_sqlalchemy_runtime_dependency(self) -> None:
+        (self.root / "backend/requirements.lock").write_text("fastapi==0.139.0\n", encoding="utf-8")
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "required transitive package greenlet"):
+            verifier.verify_python_lock()
+
     def test_mutable_override_is_rejected(self) -> None:
         self.write_json(
             "package.json",
-            {"devDependencies": {"typescript": "5.9.3"}, "overrides": {"postcss": "^8.5.10"}},
+            {
+                "packageManager": "npm@10.9.4",
+                "engines": {"node": "22.22.0", "npm": "10.9.4"},
+                "devDependencies": {"typescript": "5.9.3"},
+                "overrides": {"postcss": "^8.5.10"},
+            },
         )
         with self.assertRaisesRegex(verifier.ReproducibilityError, "overrides.postcss must use an exact version"):
             verifier.verify_node_manifests()
@@ -223,6 +288,24 @@ class ReproducibilityVerifierTests(unittest.TestCase):
             encoding="utf-8",
         )
         with self.assertRaisesRegex(verifier.ReproducibilityError, "must install requirements.lock with --no-deps"):
+            verifier.verify_python_lock()
+
+    def test_every_python_lock_install_must_be_followed_by_graph_validation(self) -> None:
+        workflow = self.root / ".github/workflows/quality.yml"
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace("  - run: .venv/bin/pip check\n", "", 1),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "pip check for every"):
+            verifier.verify_python_lock()
+
+    def test_python_audit_must_not_resolve_a_second_dependency_graph(self) -> None:
+        workflow = self.root / ".github/workflows/quality.yml"
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(" --no-deps --disable-pip", ""),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "audit must include --no-deps"):
             verifier.verify_python_lock()
 
     def test_mutable_container_base_is_rejected(self) -> None:
@@ -601,6 +684,21 @@ class ReproducibilityVerifierTests(unittest.TestCase):
             f"  - uses: actions/setup-python@{action}\n"
             "    with:\n"
             "      python-version : \"3.12.13\" # repository Python pin\n",
+            encoding="utf-8",
+        )
+        verifier.verify_actions()
+
+    def test_arm_macos_runner_is_rejected_for_the_exact_python_pin(self) -> None:
+        (self.root / ".github/workflows/quality.yml").write_text(
+            "jobs:\n  macos:\n    runs-on: macos-15\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "must use macos-15-intel"):
+            verifier.verify_actions()
+
+    def test_intel_macos_runner_is_supported_for_the_exact_python_pin(self) -> None:
+        (self.root / ".github/workflows/quality.yml").write_text(
+            "jobs:\n  macos:\n    runs-on: macos-15-intel\n",
             encoding="utf-8",
         )
         verifier.verify_actions()

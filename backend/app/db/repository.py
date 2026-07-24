@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import NullPool
 
 from app.db.models import (
     StoredAppSession,
@@ -30,6 +31,7 @@ POSTGRES_URL_PREFIXES = ("postgres://", "postgresql://")
 ADVISORY_LOCK_POOL_SIZE = 10
 ADVISORY_LOCK_POOL_TIMEOUT_SECONDS = 30
 ADVISORY_LOCK_WAIT_TIMEOUT_SECONDS = 30
+POSTGRES_CONNECT_TIMEOUT_SECONDS = 10
 _ENGINES: dict[str, Engine] = {}
 _ADVISORY_LOCK_ENGINES: dict[str, Engine] = {}
 _ENGINES_LOCK = Lock()
@@ -141,6 +143,7 @@ def get_engine(database_path: str) -> Engine:
         if engine is None:
             engine = create_engine(
                 url,
+                connect_args={"connect_timeout": POSTGRES_CONNECT_TIMEOUT_SECONDS},
                 pool_pre_ping=True,
                 pool_size=5,
                 max_overflow=10,
@@ -164,6 +167,7 @@ def get_advisory_lock_engine(database_path: str) -> Engine:
         if engine is None:
             engine = create_engine(
                 url,
+                connect_args={"connect_timeout": POSTGRES_CONNECT_TIMEOUT_SECONDS},
                 pool_pre_ping=True,
                 pool_size=ADVISORY_LOCK_POOL_SIZE,
                 max_overflow=0,
@@ -172,6 +176,42 @@ def get_advisory_lock_engine(database_path: str) -> Engine:
             )
             _ADVISORY_LOCK_ENGINES[url] = engine
         return engine
+
+
+@contextmanager
+def connect_bounded_schema_probe(
+    database_path: str,
+    *,
+    connect_timeout_seconds: int,
+    lock_timeout_ms: int,
+    statement_timeout_ms: int,
+    transaction_timeout_ms: int,
+) -> Iterator[Any]:
+    """Open an uncached probe session with timeouts active before its first query.
+
+    Readiness must not queue behind the application pool or run a pool pre-ping
+    before its statement budget exists. NullPool gives every probe a fresh,
+    bounded connection and the PostgreSQL 17 startup options cover even the
+    first statement while transaction_timeout caps the complete probe batch.
+    """
+    engine = create_engine(
+        _sqlalchemy_url(database_path),
+        connect_args={
+            "connect_timeout": connect_timeout_seconds,
+            "options": (
+                f"-c lock_timeout={lock_timeout_ms} "
+                f"-c statement_timeout={statement_timeout_ms} "
+                f"-c transaction_timeout={transaction_timeout_ms}"
+            ),
+        },
+        poolclass=NullPool,
+        pool_pre_ping=False,
+    )
+    try:
+        with engine.connect() as connection:
+            yield connection
+    finally:
+        engine.dispose()
 
 
 def dispose_cached_engines() -> None:

@@ -174,32 +174,38 @@ if grep -R "cd backend && \.venv/bin" "$ROOT_DIR/package.json" "$ROOT_DIR/script
 fi
 PYTHONPATH="$ROOT_DIR/backend" "$ROOT_DIR/.venv/bin/python" -c "import app.core.config, app.main"
 
-BACKEND_URL="${BACKEND_URL%/}"
-WEB_URL="${WEB_URL%/}"
 if [ "$ALLOW_INSECURE_LAUNCH_VERIFY" != "1" ]; then
   [[ "$BACKEND_URL" == https://* ]] || fail "BACKEND_URL must use HTTPS"
 fi
 if [ "$LAUNCH_VERIFY_MODE" = "production" ]; then
   python3 - "$BACKEND_URL" "$WEB_URL" <<'PY'
 import ipaddress
+import re
 import sys
 from urllib.parse import urlsplit
 
 def validate_origin(label, value):
     if value != value.strip() or any(ord(character) < 33 for character in value):
         raise SystemExit(f"launch verification failed: {label} cannot contain whitespace or control characters")
-    url = urlsplit(value)
+    try:
+        url = urlsplit(value)
+    except ValueError as error:
+        raise SystemExit(f"launch verification failed: {label} is invalid: {error}")
     if url.scheme != "https" or not url.hostname:
         raise SystemExit(f"launch verification failed: {label} must be a production HTTPS origin")
-    if url.username or url.password or url.query or url.fragment or url.path not in ("", "/"):
+    if url.username or url.password or url.query or url.fragment or url.path:
         raise SystemExit(
             f"launch verification failed: {label} must be an origin without credentials, path, query, or fragment"
         )
     try:
-        url.port
+        port = url.port
     except ValueError as error:
         raise SystemExit(f"launch verification failed: {label} has an invalid port: {error}")
-    host = url.hostname.lower().rstrip(".")
+    host = url.hostname
+    if not host.isascii() or host != host.lower() or host.endswith("."):
+        raise SystemExit(
+            f"launch verification failed: {label} hostname must be lowercase canonical ASCII without a trailing dot"
+        )
     reserved_suffixes = (".invalid", ".test", ".example", ".localhost", ".local")
     reserved_hosts = {"example.com", "example.net", "example.org"}
     if (
@@ -213,15 +219,40 @@ def validate_origin(label, value):
         address = ipaddress.ip_address(host)
     except ValueError:
         address = None
-    if address is not None and not address.is_global:
-        raise SystemExit(f"launch verification failed: {label} cannot use a private, loopback, or link-local IP address")
-    if address is None and "." not in host:
-        raise SystemExit(f"launch verification failed: {label} must use a fully qualified public hostname")
+    if address is not None:
+        if not address.is_global:
+            raise SystemExit(f"launch verification failed: {label} cannot use a private, loopback, or link-local IP address")
+        canonical_address = address.compressed
+        if host != canonical_address:
+            raise SystemExit(
+                f"launch verification failed: {label} IP address must use its canonical compressed representation"
+            )
+        canonical_host = f"[{canonical_address}]" if address.version == 6 else canonical_address
+    else:
+        labels = host.split(".")
+        valid_label = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+        if (
+            "." not in host
+            or len(host) > 253
+            or re.fullmatch(r"[0-9.]+", host)
+            or any(not valid_label.fullmatch(item) for item in labels)
+        ):
+            raise SystemExit(
+                f"launch verification failed: {label} must use valid lowercase ASCII DNS labels or a canonical public IP address"
+            )
+        canonical_host = host
+    if port == 443:
+        raise SystemExit(f"launch verification failed: {label} must omit the default HTTPS port")
+    canonical_netloc = canonical_host if port is None else f"{canonical_host}:{port}"
+    if url.netloc != canonical_netloc or value != f"https://{canonical_netloc}":
+        raise SystemExit(f"launch verification failed: {label} must be a canonical HTTPS origin")
 
 validate_origin("BACKEND_URL", sys.argv[1])
 validate_origin("WEB_URL", sys.argv[2])
 PY
 fi
+BACKEND_URL="${BACKEND_URL%/}"
+WEB_URL="${WEB_URL%/}"
 
 TMP_DIR="$(mktemp -d)"
 trap cleanup EXIT
@@ -386,12 +417,18 @@ verify_checksum_manifest() {
   checksum_name="$(basename "$SHA256SUMS_PATH")"
   [[ "$checksum_name" != -* ]] || fail "SHA256SUMS_PATH filename cannot begin with a hyphen"
 
-  python3 - "$checksum_dir/$checksum_name" "$DMG_PATH" "$RELEASE_METADATA_PATH" <<'PY'
+  python3 - \
+    "$checksum_dir/$checksum_name" \
+    "$DMG_PATH" \
+    "$RELEASE_METADATA_PATH" \
+    "$EXPECTED_VERSION" \
+    "$EXPECTED_BUILD_NUMBER" <<'PY'
 import os
 import re
 import sys
 
-checksum_path, dmg_path, metadata_path = map(os.path.realpath, sys.argv[1:])
+checksum_path, dmg_path, metadata_path = map(os.path.realpath, sys.argv[1:4])
+version, build_number = sys.argv[4:]
 checksum_dir = os.path.dirname(checksum_path)
 
 def require(condition, message):
@@ -400,6 +437,34 @@ def require(condition, message):
 
 require(os.path.dirname(dmg_path) == checksum_dir, "DMG_PATH must be in the SHA256SUMS directory")
 require(os.path.dirname(metadata_path) == checksum_dir, "RELEASE_METADATA_PATH must be in the SHA256SUMS directory")
+
+stem = f"{version}-{build_number}"
+expected_checksum_name = f"SHA256SUMS-{stem}.txt"
+expected_dmg_name = f"ElectronicMail-{stem}.dmg"
+expected_metadata_name = f"RELEASE-METADATA-{stem}.json"
+require(
+    os.path.basename(checksum_path) == expected_checksum_name,
+    f"SHA256SUMS_PATH must be named {expected_checksum_name}",
+)
+require(
+    os.path.basename(dmg_path) == expected_dmg_name,
+    f"DMG_PATH must be named {expected_dmg_name}",
+)
+require(
+    os.path.basename(metadata_path) == expected_metadata_name,
+    f"RELEASE_METADATA_PATH must be named {expected_metadata_name}",
+)
+expected_entries = {
+    f"ElectronicMail-{stem}.zip",
+    expected_dmg_name,
+    f"ElectronicMail-{stem}-dSYMs.zip",
+    f"ElectronicMail-{stem}.xcarchive.zip",
+    expected_metadata_name,
+    f"NOTARY-APP-{stem}.json",
+    f"NOTARY-DMG-{stem}.json",
+    f"NOTARY-APP-LOG-{stem}.json",
+    f"NOTARY-DMG-LOG-{stem}.json",
+}
 
 with open(checksum_path, encoding="utf-8") as handle:
     lines = handle.read().splitlines()
@@ -420,6 +485,13 @@ for line_number, line in enumerate(lines, 1):
 for required_path, label in ((dmg_path, "DMG_PATH"), (metadata_path, "RELEASE_METADATA_PATH")):
     filename = os.path.basename(required_path)
     require(filename in entries, f"SHA256SUMS does not cover {label}: {filename}")
+missing = sorted(expected_entries - entries)
+unexpected = sorted(entries - expected_entries)
+require(
+    not missing and not unexpected,
+    "SHA256SUMS release artifact set mismatch: "
+    f"missing={missing or 'none'}, unexpected={unexpected or 'none'}",
+)
 PY
 
   (
@@ -529,6 +601,8 @@ if [ "$SKIP_ARTIFACT_VERIFY" = "0" ]; then
   DMG_SIGNATURE_DETAILS="$(codesign -dvvv "$DMG_PATH" 2>&1)"
   printf '%s\n' "$DMG_SIGNATURE_DETAILS" | grep -q '^Authority=Developer ID Application:' || \
     fail "DMG is not signed with a Developer ID Application certificate"
+  printf '%s\n' "$DMG_SIGNATURE_DETAILS" | grep -q '^Timestamp=' || \
+    fail "DMG secure signing timestamp is missing"
   DMG_TEAM_ID="$(printf '%s\n' "$DMG_SIGNATURE_DETAILS" | sed -n 's/^TeamIdentifier=//p' | head -1)"
   [ "$DMG_TEAM_ID" = "$APPLE_DEVELOPMENT_TEAM" ] || \
     fail "DMG signature team mismatch: expected $APPLE_DEVELOPMENT_TEAM, found ${DMG_TEAM_ID:-none}"
@@ -540,11 +614,10 @@ if [ "$SKIP_ARTIFACT_VERIFY" = "0" ]; then
   mkdir -p "$DMG_MOUNT_POINT"
   hdiutil attach -readonly -nobrowse -mountpoint "$DMG_MOUNT_POINT" "$DMG_PATH" >/dev/null
   DMG_IS_MOUNTED=1
-  [ -L "$DMG_MOUNT_POINT/Applications" ] || fail "DMG is missing the Applications shortcut"
-  [ "$(readlink "$DMG_MOUNT_POINT/Applications")" = "/Applications" ] || \
-    fail "DMG Applications shortcut does not target /Applications"
+  python3 "$ROOT_DIR/scripts/verify_macos_dmg_layout.py" \
+    --mount "$DMG_MOUNT_POINT" \
+    --app-name ElectronicMail.app
   DMG_APP_PATH="$DMG_MOUNT_POINT/ElectronicMail.app"
-  [ ! -L "$DMG_APP_PATH" ] || fail "DMG ElectronicMail.app must not be a symbolic link"
   verify_app_bundle "$DMG_APP_PATH" "ElectronicMail.app mounted from DMG_PATH"
   hdiutil detach "$DMG_MOUNT_POINT" >/dev/null || fail "could not detach the verified DMG"
   DMG_IS_MOUNTED=0
