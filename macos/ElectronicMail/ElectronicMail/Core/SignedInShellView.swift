@@ -1155,11 +1155,9 @@ private struct CommandPaletteView: View {
     @State private var selectedIndex = 0
     @FocusState private var searchFocused: Bool
 
-    private var results: [CommandPaletteItem] {
-        CommandPaletteBuilder.results(for: query, store: store)
-    }
-
     var body: some View {
+        let results = CommandPaletteBuilder.results(for: query, store: store)
+
         ZStack {
             Button(action: onClose) {
                 Rectangle()
@@ -1225,7 +1223,7 @@ private struct CommandPaletteView: View {
                 CommandPaletteNavigationCapture(
                     selectedIndex: $selectedIndex,
                     resultsCount: results.count,
-                    onRun: { runSelectedResult() },
+                    onRun: { runSelectedResult(in: results) },
                     onClose: onClose
                 )
             )
@@ -1247,7 +1245,7 @@ private struct CommandPaletteView: View {
         ElectronicMailDesign.background(for: colorScheme).opacity(colorScheme == .dark ? 0.82 : 0.62)
     }
 
-    private func runSelectedResult() {
+    private func runSelectedResult(in results: [CommandPaletteItem]) {
         guard results.indices.contains(selectedIndex) else {
             return
         }

@@ -1530,6 +1530,24 @@ final class ModelDecodingTests: XCTestCase {
         )
     }
 
+    func testThreadPresentationParsesEachTimestampOnceWhileOrdering() {
+        let messages = [
+            makeThreadMessage(id: "newest", receivedAt: "2026-05-19T19:33:06+00:00"),
+            makeThreadMessage(id: "oldest", receivedAt: "2026-05-19T19:31:42+00:00"),
+            makeThreadMessage(id: "middle", receivedAt: "2026-05-19T19:32:18+00:00"),
+        ]
+        var parseCount = 0
+        let formatter = ISO8601DateFormatter()
+
+        let ordered = EmailThreadPresentation.orderedMessages(messages) { value in
+            parseCount += 1
+            return formatter.date(from: value)
+        }
+
+        XCTAssertEqual(ordered.map(\.id), ["oldest", "middle", "newest"])
+        XCTAssertEqual(parseCount, messages.count)
+    }
+
     func testThreadPresentationUsesUniqueKeysWhenMessageIDsRepeat() {
         let older = makeThreadMessage(id: "duplicate", receivedAt: "2026-05-19T19:31:42+00:00")
         let newer = makeThreadMessage(id: "duplicate", receivedAt: "2026-05-19T19:33:06+00:00")

@@ -120,7 +120,6 @@ public struct TodoHomeView: View {
                     .padding(.bottom, 70)
                     .padding(.horizontal, ElectronicMailShellMetrics.navLeading)
                     .frame(maxWidth: .infinity)
-                    .animation(TodoExpansionMotion.layout(for: expandedItemID), value: expandedItemID)
                 }
             }
         }
@@ -727,10 +726,6 @@ private enum TodoExpansionMotion {
     static let closeDuration: TimeInterval = 0.22
     static let open = Animation.timingCurve(0.18, 0.0, 0.12, 1.0, duration: openDuration)
     static let close = Animation.timingCurve(0.32, 0.0, 0.22, 1.0, duration: closeDuration)
-
-    static func layout(for expandedItemID: String?) -> Animation {
-        expandedItemID == nil ? close : open
-    }
 }
 
 private struct TodoSectionHeader: View {
