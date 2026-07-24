@@ -25,7 +25,7 @@ from app.db.models import (
 )
 
 DEFAULT_USER_ID = os.getenv("APP_USER_ID", "local-user").strip() or "local-user"
-ALEMBIC_HEAD_REVISION = "20260723_0025"
+ALEMBIC_HEAD_REVISION = "20260724_0027"
 ALEMBIC_BASELINE_REVISION = ALEMBIC_HEAD_REVISION
 POSTGRES_URL_PREFIXES = ("postgres://", "postgresql://")
 ADVISORY_LOCK_POOL_SIZE = 10

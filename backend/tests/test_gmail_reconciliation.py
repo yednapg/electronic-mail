@@ -7,6 +7,8 @@ from unittest.mock import Mock, patch
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from googleapiclient.errors import HttpError
+from httplib2 import Response
 from sqlalchemy import text
 
 from app.db import repository
@@ -22,8 +24,10 @@ from app.db.mail_groups import (
     upsert_pending_send,
 )
 from app.services.gmail_importer import (
+    GmailDurablePageTokenRejected,
     _encode_full_mailbox_cursor,
     _finalize_gmail_full_reconciliation,
+    _hydrate_reconciliation_cursor_page,
     run_gmail_full_reconciliation,
 )
 
@@ -132,6 +136,167 @@ class GmailFullReconciliationTests(unittest.TestCase):
             baseline_history_id="100",
         )
 
+    @patch("app.services.gmail_importer.enqueue_job")
+    @patch("app.services.gmail_importer.reset_gmail_reconciliation", return_value=True)
+    @patch("app.services.gmail_importer.get_import_state")
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_invalid_durable_cursor_resets_generation_and_queues_clean_restart(
+        self,
+        _can_write: Mock,
+        get_state: Mock,
+        reset: Mock,
+        enqueue: Mock,
+    ) -> None:
+        get_state.return_value = SimpleNamespace(
+            reconcile_generation="generation-corrupt",
+            reconcile_baseline_history_id="100",
+            reconcile_cursor="not-valid-base64-json",
+        )
+
+        touched = run_gmail_full_reconciliation(
+            self.settings,
+            user_id="user-1",
+            max_pages=1,
+        )
+
+        self.assertEqual(touched, 0)
+        reset.assert_called_once_with(
+            self.settings.database_path,
+            user_id="user-1",
+            generation_id="generation-corrupt",
+        )
+        self.assertEqual(enqueue.call_args.kwargs["kind"], "gmail_full_reconcile")
+        self.assertIn(":restart:", enqueue.call_args.kwargs["dedupe_key"])
+
+    @patch("app.services.gmail_importer.enqueue_job")
+    @patch("app.services.gmail_importer.reset_gmail_reconciliation", return_value=True)
+    @patch("app.services.gmail_importer.get_import_state")
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_incomplete_reconciliation_tuple_resets_and_queues_clean_restart(
+        self,
+        _can_write: Mock,
+        get_state: Mock,
+        reset: Mock,
+        enqueue: Mock,
+    ) -> None:
+        get_state.return_value = SimpleNamespace(
+            reconcile_generation="generation-incomplete",
+            reconcile_baseline_history_id=None,
+            reconcile_cursor=self.initial_cursor,
+        )
+
+        touched = run_gmail_full_reconciliation(
+            self.settings,
+            user_id="user-1",
+            max_pages=1,
+        )
+
+        self.assertEqual(touched, 0)
+        reset.assert_called_once_with(
+            self.settings.database_path,
+            user_id="user-1",
+            generation_id="generation-incomplete",
+        )
+        self.assertEqual(enqueue.call_args.kwargs["kind"], "gmail_full_reconcile")
+
+    @patch("app.services.gmail_importer.enqueue_job")
+    @patch("app.services.gmail_importer.reset_gmail_reconciliation", return_value=True)
+    @patch("app.services.gmail_importer.record_gmail_reconciliation_page")
+    @patch("app.services.gmail_importer.upsert_gmail_messages")
+    @patch("app.services.gmail_importer._hydrate_reconciliation_cursor_page")
+    @patch("app.services.gmail_importer.get_import_state")
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_repeated_reconciliation_cursor_resets_instead_of_poisoning_successors(
+        self,
+        _can_write: Mock,
+        get_state: Mock,
+        hydrate_page: Mock,
+        upsert: Mock,
+        checkpoint: Mock,
+        reset: Mock,
+        enqueue: Mock,
+    ) -> None:
+        get_state.return_value = self.state
+        hydrate_page.return_value = ([_message()], self.initial_cursor)
+
+        touched = run_gmail_full_reconciliation(
+            self.settings,
+            user_id="user-1",
+            max_pages=1,
+        )
+
+        self.assertEqual(touched, 0)
+        reset.assert_called_once_with(
+            self.settings.database_path,
+            user_id="user-1",
+            generation_id="generation-1",
+        )
+        self.assertEqual(enqueue.call_args.kwargs["kind"], "gmail_full_reconcile")
+        upsert.assert_not_called()
+        checkpoint.assert_not_called()
+
+    @patch("app.services.gmail_importer.enqueue_job")
+    @patch("app.services.gmail_importer.reset_gmail_reconciliation", return_value=True)
+    @patch("app.services.gmail_importer.record_gmail_reconciliation_page")
+    @patch("app.services.gmail_importer.upsert_gmail_messages")
+    @patch(
+        "app.services.gmail_importer._hydrate_reconciliation_cursor_page",
+        side_effect=GmailDurablePageTokenRejected("expired token"),
+    )
+    @patch("app.services.gmail_importer.get_import_state")
+    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
+    def test_provider_rejected_reconciliation_token_resets_and_restarts(
+        self,
+        _can_write: Mock,
+        get_state: Mock,
+        _hydrate_page: Mock,
+        upsert: Mock,
+        checkpoint: Mock,
+        reset: Mock,
+        enqueue: Mock,
+    ) -> None:
+        get_state.return_value = self.state
+
+        touched = run_gmail_full_reconciliation(
+            self.settings,
+            user_id="user-1",
+            max_pages=1,
+        )
+
+        self.assertEqual(touched, 0)
+        reset.assert_called_once_with(
+            self.settings.database_path,
+            user_id="user-1",
+            generation_id="generation-1",
+        )
+        self.assertEqual(enqueue.call_args.kwargs["kind"], "gmail_full_reconcile")
+        upsert.assert_not_called()
+        checkpoint.assert_not_called()
+
+    @patch("app.services.gmail_importer._list_messages")
+    def test_reconciliation_wraps_provider_rejection_for_persisted_page_token(
+        self,
+        list_messages: Mock,
+    ) -> None:
+        for status in (400, 404):
+            with self.subTest(status=status):
+                list_messages.side_effect = HttpError(
+                    Response({"status": str(status)}),
+                    b"invalid page token",
+                )
+                with self.assertRaises(GmailDurablePageTokenRejected):
+                    _hydrate_reconciliation_cursor_page(
+                        self.settings,
+                        user_id="user-1",
+                        batch_size=100,
+                        cursor={
+                            "page_token": "persisted-token",
+                            "all_mail_completed": False,
+                            "draft_page_token": None,
+                            "drafts_completed": True,
+                        },
+                    )
+
     @patch("app.services.gmail_importer.emit_mailbox_event")
     @patch("app.services.gmail_importer._refresh_gmail_thread_order_best_effort")
     @patch("app.services.gmail_importer.prune_empty_mail_groups")
@@ -158,7 +323,9 @@ class GmailFullReconciliationTests(unittest.TestCase):
             "deleted_message_ids": ["msg-deleted"],
             "latest_history_id": "105",
         }
-        hydrate.return_value = ([_message("msg-new")], "105")
+        # Hydration may observe a newer H106 message version, but only the
+        # fully consumed history response through H105 is publishable.
+        hydrate.return_value = ([_message("msg-new")], "106")
         finalize.return_value = GmailReconcileFinalizeResult(
             deleted_message_count=2,
             affected_group_ids=["group-sweep"],
@@ -302,7 +469,8 @@ class GmailReconciliationPostgresTests(unittest.TestCase):
             persisted = connection.execute(
                 text(
                     """
-                    SELECT last_history_id, reconcile_generation
+                    SELECT last_history_id, history_cursor_authoritative,
+                           reconcile_generation
                     FROM gmail_import_state
                     WHERE user_id = :user_id
                     """
@@ -310,7 +478,63 @@ class GmailReconciliationPostgresTests(unittest.TestCase):
                 {"user_id": self.user_id},
             ).mappings().one()
         self.assertEqual(str(persisted["last_history_id"]), "105")
+        self.assertTrue(persisted["history_cursor_authoritative"])
         self.assertIsNone(persisted["reconcile_generation"])
+
+    def test_trusted_reconciliation_cursor_replaces_higher_untrusted_cursor(self) -> None:
+        with repository.get_engine(self.database_url).begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO gmail_import_state (
+                      user_id, last_history_id, history_cursor_authoritative,
+                      full_backfill_completed_at, updated_at
+                    ) VALUES (:user_id, '102', FALSE, now(), now())
+                    """
+                ),
+                {"user_id": self.user_id},
+            )
+
+        state = start_gmail_reconciliation(
+            self.database_url,
+            user_id=self.user_id,
+            generation_id="generation-lower-cursor",
+            baseline_history_id="100",
+            initial_cursor="page-1",
+        )
+        self.assertFalse(state.history_cursor_authoritative)
+        self.assertTrue(
+            record_gmail_reconciliation_page(
+                self.database_url,
+                user_id=self.user_id,
+                generation_id="generation-lower-cursor",
+                expected_cursor="page-1",
+                next_cursor=None,
+                message_ids=[],
+            )
+        )
+
+        result = finalize_gmail_reconciliation(
+            self.database_url,
+            user_id=self.user_id,
+            generation_id="generation-lower-cursor",
+            final_history_id="101",
+        )
+
+        self.assertIsNotNone(result)
+        with repository.get_engine(self.database_url).connect() as connection:
+            persisted = connection.execute(
+                text(
+                    """
+                    SELECT last_history_id, history_cursor_authoritative
+                    FROM gmail_import_state
+                    WHERE user_id = :user_id
+                    """
+                ),
+                {"user_id": self.user_id},
+            ).mappings().one()
+        self.assertEqual(str(persisted["last_history_id"]), "101")
+        self.assertTrue(persisted["history_cursor_authoritative"])
 
     def test_pending_send_identity_accepts_exact_replay_and_rejects_mutation(self) -> None:
         kwargs = {

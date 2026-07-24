@@ -101,6 +101,7 @@ class NoAIResponsePurityTests(unittest.TestCase):
     @patch("app.services.mail_groups.get_queue_health", return_value=queue_health())
     @patch("app.services.mail_groups.latest_mail_group_ai_error")
     @patch("app.services.mail_groups.count_mail_groups_by_enrichment_status", return_value={"ready": 3, "pending": 2})
+    @patch("app.services.mail_groups.count_active_jobs", return_value=0)
     @patch("app.services.mail_groups.get_import_state")
     @patch("app.services.mail_groups.build_mailbox_response")
     @patch("app.services.mail_groups.get_app_session_snapshot")
@@ -113,6 +114,7 @@ class NoAIResponsePurityTests(unittest.TestCase):
         get_snapshot: Mock,
         build_mailbox: Mock,
         get_import_state: Mock,
+        _active_jobs: Mock,
         _counts: Mock,
         latest_ai_error: Mock,
         _health: Mock,

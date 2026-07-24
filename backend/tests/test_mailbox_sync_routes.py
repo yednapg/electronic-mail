@@ -148,6 +148,7 @@ class MailboxSyncRouteTests(unittest.TestCase):
             patch.object(mail_group_service, "count_mail_groups_by_enrichment_status") as legacy_ai_counts,
             patch.object(mail_group_service, "latest_mail_group_ai_error") as legacy_ai_error,
             patch.object(mail_group_service, "get_queue_health", return_value=SimpleNamespace(workers=[])),
+            patch.object(mail_group_service, "count_active_jobs", return_value=0),
             patch.object(mail_group_service, "latest_gmail_mailbox_revision", return_value="rev-1"),
             patch.object(mail_group_service, "count_mailbox_threads", return_value=12),
             patch.object(mail_group_service, "count_pending_thread_actions", return_value=0),

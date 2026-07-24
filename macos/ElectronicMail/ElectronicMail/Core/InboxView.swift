@@ -66,18 +66,19 @@ public struct InboxView: View {
                     inboxList(snapshot: snapshot, metrics: metrics)
                 }
 
-                if store.refreshFailed {
+                if store.refreshFailed && store.mailboxPresentationReady {
                     ElectronicMailRefreshFailureToast(message: "Inbox could not refresh. Showing last saved state.")
                 }
             }
         }
         .task {
+            await Task.yield()
+            if searchText != store.searchQuery {
+                searchText = store.searchQuery
+            }
             if store.session == nil {
                 await store.load()
             }
-        }
-        .onAppear {
-            searchText = store.searchQuery
         }
         .onChange(of: store.activeMailboxLabel) { _, _ in
             searchText = ""
@@ -150,11 +151,6 @@ public struct InboxView: View {
             onActivate: activate(row:),
             onSelect: select(row:),
             onToggleExpansion: { store.toggleExpansion(threadID: $0) },
-            onLoadMore: {
-                Task {
-                    await store.loadMoreMailbox()
-                }
-            },
             onOpenSelection: openActiveSelection,
             onMoveToTrash: moveSelectedThreadToTrash,
             onPermanentDelete: requestPermanentDelete
@@ -238,8 +234,8 @@ private struct InboxRenderSnapshot: Equatable {
     let flatRows: [InboxRowViewModel]
     let selectedRowID: String?
     let hasRows: Bool
-    let footer: InboxMailboxFooterViewModel?
-    let mailboxPageLoading: Bool
+    let mailboxPresentationReady: Bool
+    let mailboxLoadingMessage: String?
     let mailboxLabel: MailboxLabel
     let mailboxTitle: String
     let isSearchActive: Bool
@@ -260,15 +256,21 @@ private struct InboxRenderSnapshot: Equatable {
         self.chronologyCalendarIdentifier = String(describing: calendar.identifier)
         self.chronologyTimeZoneIdentifier = calendar.timeZone.identifier
         self.chronologyLocaleIdentifier = locale.identifier
-        self.sections = InboxChronologyPresenter.sections(
-            from: store.sections,
-            cacheOwner: store,
-            revision: self.revision,
-            now: now,
-            calendar: calendar,
-            locale: locale
-        )
-        self.flatRows = store.flatRows
+        self.mailboxPresentationReady = store.mailboxPresentationReady
+        if mailboxPresentationReady {
+            self.sections = InboxChronologyPresenter.sections(
+                from: store.sections,
+                cacheOwner: store,
+                revision: self.revision,
+                now: now,
+                calendar: calendar,
+                locale: locale
+            )
+            self.flatRows = store.flatRows
+        } else {
+            self.sections = []
+            self.flatRows = []
+        }
         if let selectedThreadID = store.selectedThreadID {
             if let selectedMessageID = store.selectedMessageID {
                 self.selectedRowID = "\(selectedThreadID)::message::\(selectedMessageID)"
@@ -279,14 +281,15 @@ private struct InboxRenderSnapshot: Equatable {
             self.selectedRowID = nil
         }
         self.hasRows = !self.flatRows.isEmpty
-        self.footer = store.mailboxFooter
-        self.mailboxPageLoading = store.mailboxPageLoading
+        self.mailboxLoadingMessage = store.mailboxLoadingProgressText
         self.mailboxLabel = store.activeMailboxLabel
         self.mailboxTitle = store.mailboxTitle
         self.isSearchActive = store.isSearchActive
         self.searchQuery = store.searchQuery
         self.searchError = store.searchError
-        self.emptyStateIsLoading = store.searchInProgress || store.phase == .loading
+        self.emptyStateIsLoading = store.searchInProgress
+            || store.phase == .loading
+            || (!mailboxPresentationReady && store.searchError == nil && !store.refreshFailed)
         if case .failed(let message) = store.phase {
             self.mailboxError = message
         } else {
@@ -296,6 +299,9 @@ private struct InboxRenderSnapshot: Equatable {
     }
 
     var emptyStateTitle: String {
+        if emptyStateIsLoading {
+            return isSearchActive ? "Searching" : "Loading \(mailboxTitle)"
+        }
         if isSearchActive {
             return searchError == nil ? "No matching email" : "Search unavailable"
         }
@@ -306,6 +312,9 @@ private struct InboxRenderSnapshot: Equatable {
     }
 
     var emptyStateMessage: String {
+        if emptyStateIsLoading {
+            return mailboxLoadingMessage ?? (isSearchActive ? "Searching your mailbox..." : "Loading your mailbox...")
+        }
         if let searchError {
             return searchError
         }
@@ -333,8 +342,8 @@ private struct InboxRenderSnapshot: Equatable {
             && lhs.chronologyTimeZoneIdentifier == rhs.chronologyTimeZoneIdentifier
             && lhs.chronologyLocaleIdentifier == rhs.chronologyLocaleIdentifier
             && lhs.selectedRowID == rhs.selectedRowID
-            && lhs.footer == rhs.footer
-            && lhs.mailboxPageLoading == rhs.mailboxPageLoading
+            && lhs.mailboxPresentationReady == rhs.mailboxPresentationReady
+            && lhs.mailboxLoadingMessage == rhs.mailboxLoadingMessage
             && lhs.mailboxLabel == rhs.mailboxLabel
             && lhs.mailboxTitle == rhs.mailboxTitle
             && lhs.isSearchActive == rhs.isSearchActive
@@ -354,7 +363,6 @@ private struct InboxMailboxList: View, Equatable {
     let onActivate: (InboxRowViewModel) -> Void
     let onSelect: (InboxRowViewModel) -> Void
     let onToggleExpansion: (String) -> Void
-    let onLoadMore: () -> Void
     let onOpenSelection: () -> Void
     let onMoveToTrash: () -> Void
     let onPermanentDelete: () -> Void
@@ -411,16 +419,6 @@ private struct InboxMailboxList: View, Equatable {
                             }
                         }
 
-                        if let footer = snapshot.footer {
-                            InboxFooterView(
-                                text: footer.text,
-                                canLoadMore: footer.canLoadMore,
-                                isLoading: snapshot.mailboxPageLoading,
-                                metrics: metrics,
-                                colorScheme: colorScheme,
-                                onLoadMore: onLoadMore
-                            )
-                        }
                     }
                     .frame(width: metrics.windowWidth, alignment: .topLeading)
                 }
@@ -428,9 +426,7 @@ private struct InboxMailboxList: View, Equatable {
                 .focusable()
                 .focusEffectDisabled()
                 .focused($isFocused)
-                .onAppear {
-                    isFocused = true
-                }
+                .defaultFocus($isFocused, true)
                 .onKeyPress(.upArrow) {
                     moveSelection(by: -1, scrollProxy: scrollProxy)
                     return .handled
@@ -870,43 +866,6 @@ private struct InboxEmptyState: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 48)
-    }
-}
-
-private struct InboxFooterView: View {
-    let text: String
-    let canLoadMore: Bool
-    let isLoading: Bool
-    let metrics: InboxLayoutMetrics
-    let colorScheme: ColorScheme
-    let onLoadMore: () -> Void
-
-    var body: some View {
-        HStack(spacing: 10) {
-            if isLoading {
-                ProgressView()
-                    .controlSize(.small)
-                    .frame(width: 18, height: 18)
-            }
-
-            Button(action: onLoadMore) {
-                Text(text)
-                    .font(.system(size: 13, weight: canLoadMore ? .semibold : .regular, design: .rounded))
-                    .tracking(ElectronicMailTypography.bodyTracking)
-                    .foregroundStyle(canLoadMore ? ElectronicMailDesign.appleBlue : ElectronicMailDesign.secondaryText(for: colorScheme))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-            .buttonStyle(.plain)
-            .disabled(!canLoadMore || isLoading)
-            .help(canLoadMore ? "Load more emails" : text)
-        }
-        .frame(
-            width: max(0, metrics.windowWidth - metrics.senderLeading - metrics.dividerTrailing),
-            height: ElectronicMailTypography.bodyLineHeight * 2,
-            alignment: .leading
-        )
-        .padding(.leading, metrics.senderLeading)
     }
 }
 

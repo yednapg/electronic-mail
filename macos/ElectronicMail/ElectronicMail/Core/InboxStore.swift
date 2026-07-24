@@ -231,12 +231,6 @@ public struct InboxSectionViewModel: Identifiable, Equatable {
     let rows: [InboxRowViewModel]
 }
 
-public struct InboxMailboxFooterViewModel: Equatable {
-    let text: String
-    let progress: Double?
-    let canLoadMore: Bool
-}
-
 public struct MailboxFolderCount: Equatable {
     let total: Int
     let unread: Int
@@ -329,6 +323,27 @@ private struct MailboxRefreshContext: Equatable {
     let allowCachedFallback: Bool
     let force: Bool
     let startedAt: Date
+}
+
+private enum MailboxPaginationError: LocalizedError {
+    case repeatedCursor
+    case pageLimitExceeded
+    case mismatchedLabel
+    case mismatchedRevision
+    case incompleteSnapshot
+
+    var errorDescription: String? {
+        switch self {
+        case .repeatedCursor:
+            return "The mailbox server repeated a page. Try refreshing again."
+        case .pageLimitExceeded:
+            return "The mailbox is too large to load safely in one pass. Try refreshing again."
+        case .mismatchedLabel, .mismatchedRevision:
+            return "The mailbox changed while it was loading. Try refreshing again."
+        case .incompleteSnapshot:
+            return "The mailbox server returned an incomplete result. Try refreshing again."
+        }
+    }
 }
 
 private struct InboxTimestampLabelCacheKey: Hashable {
@@ -479,8 +494,8 @@ public final class InboxStore: ObservableObject {
     private var lastMailboxRefreshAt: [MailboxLabel: Date] = [:]
     private var mailboxPageGeneration: UInt = 0
     private var mailboxPageRequestID: UUID?
-    private var requestedMailboxPageCursors: Set<String> = []
     private var searchRequestID: UUID?
+    private var pendingSearchCompletionRefresh = false
     private var searchHydrationRefreshTask: Task<Void, Never>?
     private var bodyRefreshAttempts: [String: Int] = [:]
     private var bodyRefreshTasks: [String: Task<Void, Never>] = [:]
@@ -514,6 +529,9 @@ public final class InboxStore: ObservableObject {
     private let eventRefreshDebounce: TimeInterval = 1
     private let threadFetchLimit = 50
     private let mailboxPageLimit = 100
+    private let maximumAutomaticMailboxPages = 1_000
+    private let maximumMailboxReconciliationRestarts = 3
+    private let mailboxReconciliationRestartDelayNanoseconds: UInt64 = 25_000_000
     private let timestampLabelCacheLimit = 2_048
     private static let folderCountLabels: [MailboxLabel] = [
         .inbox,
@@ -628,6 +646,7 @@ public final class InboxStore: ObservableObject {
             searchResults = nil
             searchInProgress = false
             searchError = nil
+            pendingSearchCompletionRefresh = false
             searchHydrationRefreshTask?.cancel()
             searchHydrationRefreshTask = nil
             lastSSEConnectedAt = nil
@@ -707,6 +726,9 @@ public final class InboxStore: ObservableObject {
     }
 
     public var sections: [InboxSectionViewModel] {
+        guard mailboxPresentationReady else {
+            return []
+        }
         if let inboxSectionsCache, inboxSectionsCache.revision == inboxSectionsRevision {
             return inboxSectionsCache.sections
         }
@@ -860,22 +882,31 @@ public final class InboxStore: ObservableObject {
         return readiness.mailboxReady
     }
 
-    public var canLoadMoreMailbox: Bool {
-        guard let cursor = visibleMailbox?.nextCursor, !cursor.isEmpty else {
+    public var mailboxPresentationReady: Bool {
+        guard let mailbox = visibleMailbox else {
             return false
         }
-        return !requestedMailboxPageCursors.contains(cursor)
+        return Self.isCompleteMailboxSnapshot(mailbox)
     }
 
-    public var mailboxPageCursor: String? {
-        guard let cursor = visibleMailbox?.nextCursor, !cursor.isEmpty else {
+    public var mailboxLoadingProgressText: String? {
+        guard !mailboxPresentationReady else {
             return nil
         }
-        return cursor
-    }
-
-    public var mailboxFooterText: String? {
-        mailboxFooter?.text
+        guard let mailbox = visibleMailbox else {
+            return isSearchActive ? "Searching your mailbox..." : "Loading your mailbox..."
+        }
+        let visibleRows = mailbox.sections.reduce(0) { $0 + $1.rows.count }
+        let loadedThreads = min(mailbox.totalThreads, visibleRows)
+        guard mailbox.totalThreads > 0 else {
+            return isSearchActive ? "Searching your mailbox..." : "Syncing your mailbox..."
+        }
+        if mailbox.fullImportRunning == true || mailbox.fullImportCompleted == false,
+           loadedThreads >= mailbox.totalThreads,
+           mailbox.nextCursor?.isEmpty != false {
+            return "Finishing mailbox sync..."
+        }
+        return "Loading \(loadedThreads) of \(mailbox.totalThreads) emails..."
     }
 
     public var mailboxTitle: String {
@@ -902,50 +933,6 @@ public final class InboxStore: ObservableObject {
         }
     }
 
-    public var mailboxFooter: InboxMailboxFooterViewModel? {
-        guard let mailbox = visibleMailbox else {
-            return nil
-        }
-
-        let visibleRows = mailbox.sections.reduce(0) { $0 + $1.rows.count }
-        let loadedThreads = max(mailbox.loadedThreads ?? visibleRows, visibleRows)
-        let totalThreads = max(mailbox.totalThreads, loadedThreads)
-        let progress = totalThreads > 0 ? min(1, Double(loadedThreads) / Double(totalThreads)) : nil
-
-        if let cursor = mailbox.nextCursor, !cursor.isEmpty {
-            let cursorAlreadyRequested = requestedMailboxPageCursors.contains(cursor)
-            return InboxMailboxFooterViewModel(
-                text: cursorAlreadyRequested && !mailboxPageLoading
-                    ? "Limit reached"
-                    : "Showing \(loadedThreads) of \(totalThreads). Load more...",
-                progress: progress,
-                canLoadMore: !cursorAlreadyRequested
-            )
-        }
-
-        if totalThreads == 0 {
-            return nil
-        }
-
-        if mailbox.fullImportRunning == true {
-            return InboxMailboxFooterViewModel(
-                text: "Syncing more emails...",
-                progress: progress,
-                canLoadMore: false
-            )
-        }
-
-        if mailbox.fullImportCompleted == true {
-            return nil
-        }
-
-        return InboxMailboxFooterViewModel(
-            text: "Limit reached",
-            progress: progress,
-            canLoadMore: false
-        )
-    }
-
     public func load() async {
         guard client.mode != .localBackend || client.sessionToken?.isEmpty == false else {
             phase = .failed("Sign in with Google to load your mailbox.")
@@ -956,7 +943,7 @@ public final class InboxStore: ObservableObject {
         if let cached = memoryCachedSession ?? diskCachedSession {
             session = cached
             activeMailbox = await localMailStoreWorker.readMailbox(userID: cached.user.id, label: activeMailboxLabel)
-            phase = activeMailbox == nil ? .loading : .loaded
+            phase = activeMailbox.map(Self.isCompleteMailboxSnapshot) == true ? .loaded : .loading
             await refreshPendingLocalActionCount()
         } else {
             phase = .loading
@@ -1177,21 +1164,27 @@ public final class InboxStore: ObservableObject {
             clearSearch()
             return
         }
+        guard let userID = session?.user.id else {
+            return
+        }
         searchHydrationRefreshTask?.cancel()
         searchHydrationRefreshTask = nil
+        pendingSearchCompletionRefresh = false
+        cancelActiveMailboxRefresh()
         resetMailboxPagination()
         let requestID = UUID()
+        let pageContext = MailboxPageContext(
+            generation: mailboxPageGeneration,
+            label: activeMailboxLabel,
+            searchQuery: normalized,
+            userID: userID
+        )
         searchRequestID = requestID
         searchQuery = normalized
         searchResults = nil
         searchInProgress = true
         searchError = nil
-        defer {
-            if searchRequestID == requestID {
-                searchRequestID = nil
-                searchInProgress = false
-            }
-        }
+        defer { finishSearchRequest(id: requestID) }
         do {
             let response = try await client.searchMailbox(
                 query: normalized,
@@ -1201,7 +1194,11 @@ public final class InboxStore: ObservableObject {
                 hydrateInBackground: true
             )
             guard searchRequestID == requestID, searchQuery == normalized else { return }
-            searchResults = response
+            let completed = try await completeMailboxSnapshot(startingWith: response, context: pageContext)
+            guard searchRequestID == requestID,
+                  searchQuery == normalized,
+                  matchesMailboxPageContext(pageContext) else { return }
+            searchResults = completed
             selectedThreadID = nil
             selectedMessageID = nil
             activeThreadID = nil
@@ -1217,6 +1214,7 @@ public final class InboxStore: ObservableObject {
     public func clearSearch() {
         searchHydrationRefreshTask?.cancel()
         searchHydrationRefreshTask = nil
+        pendingSearchCompletionRefresh = false
         resetMailboxPagination()
         searchRequestID = nil
         searchQuery = ""
@@ -1299,7 +1297,9 @@ public final class InboxStore: ObservableObject {
                         activeMailbox = cached.mailbox
                     }
                 }
-                let nextPhase: LoadPhase = activeMailbox == nil ? .failed(error.localizedDescription) : .loaded
+                let nextPhase: LoadPhase = activeMailbox.map(Self.isCompleteMailboxSnapshot) == true
+                    ? .loaded
+                    : .failed(error.localizedDescription)
                 if phase != nextPhase {
                     phase = nextPhase
                 }
@@ -1309,11 +1309,21 @@ public final class InboxStore: ObservableObject {
                 if activeMailbox != cachedInbox {
                     activeMailbox = cachedInbox
                 }
-                if phase != .loaded {
-                    phase = .loaded
+                let nextPhase: LoadPhase = Self.isCompleteMailboxSnapshot(cachedInbox)
+                    ? .loaded
+                    : .failed(error.localizedDescription)
+                if phase != nextPhase {
+                    phase = nextPhase
                 }
-                seedActiveSelectionIfNeeded()
+                if Self.isCompleteMailboxSnapshot(cachedInbox) {
+                    seedActiveSelectionIfNeeded()
+                }
             } else if session == nil {
+                let nextPhase = LoadPhase.failed(error.localizedDescription)
+                if phase != nextPhase {
+                    phase = nextPhase
+                }
+            } else if activeMailbox.map(Self.isCompleteMailboxSnapshot) != true {
                 let nextPhase = LoadPhase.failed(error.localizedDescription)
                 if phase != nextPhase {
                     phase = nextPhase
@@ -1348,6 +1358,12 @@ public final class InboxStore: ObservableObject {
         guard let userID = session?.user.id else {
             return
         }
+        // The visible search owns the shared page-generation slot. Background
+        // mailbox refreshes wait until search is cleared instead of cancelling
+        // an in-progress search cursor chain.
+        guard !isSearchActive else {
+            return
+        }
         let label = activeMailboxLabel
         let now = Date()
         if !force,
@@ -1357,65 +1373,95 @@ public final class InboxStore: ObservableObject {
             return
         }
 
-        let context: MailboxRefreshContext
-        let task: Task<MailboxResponse, Error>
-        if let existingTask = inFlightMailboxRefresh,
+        if inFlightMailboxRefresh != nil,
            let existingContext = inFlightMailboxRefreshContext,
            existingContext.accountGeneration == accountOperationGeneration,
            existingContext.userID == userID,
            existingContext.label == label,
            !force || existingContext.force {
-            context = existingContext
-            task = existingTask
-        } else {
-            cancelActiveMailboxRefresh()
-            context = MailboxRefreshContext(
-                requestID: UUID(),
-                accountGeneration: accountOperationGeneration,
-                userID: userID,
-                label: label,
-                allowCachedFallback: allowCachedFallback,
-                force: force,
-                startedAt: now
-            )
-            task = Task { [client, mailboxPageLimit] in
-                try Task.checkCancellation()
-                return try await client.mailbox(label: label, limit: mailboxPageLimit, cursor: nil)
-            }
-            inFlightMailboxRefreshContext = context
-            inFlightMailboxRefresh = task
+            // The caller that created this refresh owns the complete cursor
+            // chain. A second consumer of only its first-page task could race
+            // the owner and clear presentation state while later pages load.
+            return
         }
+        cancelActiveMailboxRefresh()
+        resetMailboxPagination()
+        let context = MailboxRefreshContext(
+            requestID: UUID(),
+            accountGeneration: accountOperationGeneration,
+            userID: userID,
+            label: label,
+            allowCachedFallback: allowCachedFallback,
+            force: force,
+            startedAt: now
+        )
+        let task = Task { [client, mailboxPageLimit] in
+            try Task.checkCancellation()
+            return try await client.mailbox(label: label, limit: mailboxPageLimit, cursor: nil)
+        }
+        inFlightMailboxRefreshContext = context
+        inFlightMailboxRefresh = task
 
         do {
-            let mailbox = try await task.value
+            let firstPage = try await task.value
             guard ownsActiveMailboxRefresh(context),
                   context.accountGeneration == accountOperationGeneration,
                   session?.user.id == context.userID,
                   activeMailboxLabel == context.label else {
                 return
             }
-            clearActiveMailboxRefresh(context)
-            lastMailboxRefreshAt[context.label] = context.startedAt
-
-            let shouldResetPagination = context.force
-                || discardLoadedMailboxPagesOnNextRefresh
-                || Self.mailboxRevisionChanged(from: activeMailbox, to: mailbox)
-            let merged = activeMailbox?.preservingLoadedPages(
-                afterRefreshingFirstPage: mailbox,
-                discardStalePages: context.force || discardLoadedMailboxPagesOnNextRefresh
-            ) ?? mailbox
-            if shouldResetPagination {
-                resetMailboxPagination()
-            }
+            let hadCompleteSnapshot = activeMailbox.map(Self.isCompleteMailboxSnapshot) == true
+            let serverReportsIncompleteImport = firstPage.fullImportRunning == true
+                || firstPage.fullImportCompleted == false
+            let canRetainCompleteSnapshot = hadCompleteSnapshot && !serverReportsIncompleteImport
+            let discardLoadedPages = context.force || discardLoadedMailboxPagesOnNextRefresh
+            let initialSnapshot = activeMailbox?.preservingLoadedPages(
+                afterRefreshingFirstPage: firstPage,
+                discardStalePages: discardLoadedPages
+            ) ?? firstPage
             discardLoadedMailboxPagesOnNextRefresh = false
-            let mailboxChanged = activeMailbox != merged
-            if mailboxChanged {
-                activeMailbox = merged
+
+            // Keep a previously proven-complete mailbox visible while a fresh
+            // cursor generation is accumulated. With no complete fallback,
+            // retain the partial payload only as progress/cache state; the view
+            // deliberately does not expose its rows.
+            if !canRetainCompleteSnapshot, activeMailbox != initialSnapshot {
+                activeMailbox = initialSnapshot
             }
-            updateFolderCount(from: merged)
-            if let revision = merged.mailboxRevision, !revision.isEmpty {
+
+            let pageContext = MailboxPageContext(
+                generation: mailboxPageGeneration,
+                label: context.label,
+                searchQuery: nil,
+                userID: context.userID
+            )
+            let completedSnapshot = try await completeMailboxSnapshot(
+                startingWith: initialSnapshot,
+                context: pageContext
+            )
+            guard ownsActiveMailboxRefresh(context),
+                  context.accountGeneration == accountOperationGeneration,
+                  session?.user.id == context.userID,
+                  activeMailboxLabel == context.label else {
+                return
+            }
+
+            let snapshotIsComplete = Self.isCompleteMailboxSnapshot(completedSnapshot)
+            let completedReportsIncompleteImport = completedSnapshot.fullImportRunning == true
+                || completedSnapshot.fullImportCompleted == false
+            let hasPresentableFallback = canRetainCompleteSnapshot && !completedReportsIncompleteImport
+            if snapshotIsComplete || !hasPresentableFallback {
+                if activeMailbox != completedSnapshot {
+                    activeMailbox = completedSnapshot
+                }
+            }
+            updateFolderCount(from: completedSnapshot)
+            if snapshotIsComplete,
+               let revision = completedSnapshot.mailboxRevision,
+               !revision.isEmpty {
                 lastSeenMailboxRevision = revision
             }
+            lastMailboxRefreshAt[context.label] = context.startedAt
             if context.force {
                 lastForcedMailboxRefreshAt = Date()
                 lastForcedMailboxRefreshError = nil
@@ -1423,19 +1469,26 @@ public final class InboxStore: ObservableObject {
             if refreshFailed {
                 refreshFailed = false
             }
-            if phase != .loaded {
-                phase = .loaded
+            let nextPhase: LoadPhase = snapshotIsComplete || hasPresentableFallback ? .loaded : .loading
+            if phase != nextPhase {
+                phase = nextPhase
             }
-            seedActiveSelectionIfNeeded()
-            refreshReaderRow()
-            if automaticallyPrefetchThreads {
-                prefetchPriorityThreads()
+            if mailboxPresentationReady {
+                seedActiveSelectionIfNeeded()
+                refreshReaderRow()
+                if automaticallyPrefetchThreads {
+                    prefetchPriorityThreads()
+                }
             }
-            await localMailStoreWorker.writeMailbox(
-                merged,
-                userID: context.userID,
-                label: context.label
-            )
+            let snapshotToPersist = snapshotIsComplete ? completedSnapshot : nil
+            clearActiveMailboxRefresh(context)
+            if let snapshotToPersist {
+                await localMailStoreWorker.writeMailbox(
+                    snapshotToPersist,
+                    userID: context.userID,
+                    label: context.label
+                )
+            }
         } catch is CancellationError {
             clearActiveMailboxRefresh(context)
         } catch {
@@ -1462,24 +1515,33 @@ public final class InboxStore: ObservableObject {
             if !refreshFailed {
                 refreshFailed = true
             }
-            if let cached {
+            if let cached,
+               Self.isCompleteMailboxSnapshot(cached) || activeMailbox.map(Self.isCompleteMailboxSnapshot) != true {
                 if activeMailbox != cached {
                     activeMailbox = cached
                 }
-                if phase != .loaded {
-                    phase = .loaded
+                let nextPhase: LoadPhase = Self.isCompleteMailboxSnapshot(cached) ? .loaded : .failed(error.localizedDescription)
+                if phase != nextPhase {
+                    phase = nextPhase
                 }
-                seedActiveSelectionIfNeeded()
+                if Self.isCompleteMailboxSnapshot(cached) {
+                    seedActiveSelectionIfNeeded()
+                }
             } else if context.allowCachedFallback,
                       context.label == .inbox,
-                      let sessionInbox = session?.mailbox {
+                      let sessionInbox = session?.mailbox,
+                      Self.isCompleteMailboxSnapshot(sessionInbox)
+                        || activeMailbox.map(Self.isCompleteMailboxSnapshot) != true {
                 if activeMailbox != sessionInbox {
                     activeMailbox = sessionInbox
                 }
-                if phase != .loaded {
-                    phase = .loaded
+                let nextPhase: LoadPhase = Self.isCompleteMailboxSnapshot(sessionInbox) ? .loaded : .failed(error.localizedDescription)
+                if phase != nextPhase {
+                    phase = nextPhase
                 }
-                seedActiveSelectionIfNeeded()
+                if Self.isCompleteMailboxSnapshot(sessionInbox) {
+                    seedActiveSelectionIfNeeded()
+                }
             } else if activeMailbox == nil {
                 let nextPhase = LoadPhase.failed(error.localizedDescription)
                 if phase != nextPhase {
@@ -1509,10 +1571,10 @@ public final class InboxStore: ObservableObject {
 
     public func loadMoreMailbox(automatic _: Bool = false) async {
         guard !mailboxPageLoading,
-              let cursor = visibleMailbox?.nextCursor,
+              let mailbox = visibleMailbox,
+              let cursor = mailbox.nextCursor,
               !cursor.isEmpty,
-              let userID = session?.user.id,
-              requestedMailboxPageCursors.insert(cursor).inserted else {
+              let userID = session?.user.id else {
             return
         }
 
@@ -1522,25 +1584,155 @@ public final class InboxStore: ObservableObject {
             searchQuery: isSearchActive ? searchQuery : nil,
             userID: userID
         )
+        do {
+            let completed = try await completeMailboxSnapshot(startingWith: mailbox, context: context)
+            guard matchesMailboxPageContext(context),
+                  visibleMailbox?.nextCursor == cursor else {
+                return
+            }
+            if context.searchQuery != nil {
+                if searchResults != completed {
+                    searchResults = completed
+                }
+            } else {
+                if activeMailbox != completed {
+                    activeMailbox = completed
+                }
+                updateFolderCount(from: completed)
+                if Self.isCompleteMailboxSnapshot(completed) {
+                    await localMailStoreWorker.writeMailbox(completed, userID: userID, label: context.label)
+                }
+            }
+            if refreshFailed {
+                refreshFailed = false
+            }
+            seedActiveSelectionIfNeeded()
+            refreshReaderRow()
+        } catch is CancellationError {
+            // A new account, mailbox, search, or revision owns presentation.
+        } catch {
+            if matchesMailboxPageContext(context) {
+                if context.searchQuery != nil {
+                    searchError = error.localizedDescription
+                } else {
+                    refreshFailed = true
+                }
+            }
+        }
+    }
+
+    private func completeMailboxSnapshot(
+        startingWith initialSnapshot: MailboxResponse,
+        context: MailboxPageContext
+    ) async throws -> MailboxResponse {
+        // Cursor pages are not stable while the backend is still importing.
+        // Keep showing sync progress and let the next poll/event start from a
+        // new first page rather than mixing two changing revisions.
+        guard initialSnapshot.fullImportRunning != true,
+              initialSnapshot.fullImportCompleted != false else {
+            return initialSnapshot
+        }
+        guard let firstCursor = initialSnapshot.nextCursor, !firstCursor.isEmpty else {
+            try Self.validateCompletedMailboxSnapshot(initialSnapshot)
+            return initialSnapshot
+        }
+        guard !mailboxPageLoading else {
+            throw CancellationError()
+        }
+
         let requestID = UUID()
         mailboxPageRequestID = requestID
         mailboxPageLoading = true
-        let task = Task { [client, mailboxPageLimit] in
-            try Task.checkCancellation()
-            let page: MailboxResponse
-            if let query = context.searchQuery {
-                page = try await client.searchMailbox(
-                    query: query,
-                    label: context.label,
-                    limit: mailboxPageLimit,
-                    cursor: cursor,
-                    hydrateInBackground: true
-                )
-            } else {
-                page = try await client.mailbox(label: context.label, limit: mailboxPageLimit, cursor: cursor)
+        let task = Task {
+            [
+                client,
+                mailboxPageLimit,
+                maximumAutomaticMailboxPages,
+                maximumMailboxReconciliationRestarts,
+                mailboxReconciliationRestartDelayNanoseconds,
+            ] in
+            var accumulated = initialSnapshot
+            var seenCursors: Set<String> = []
+            var requestedPageCount = 0
+            var reconciliationRestartCount = 0
+
+            while let cursor = accumulated.nextCursor, !cursor.isEmpty {
+                try Task.checkCancellation()
+                guard seenCursors.insert(cursor).inserted else {
+                    throw MailboxPaginationError.repeatedCursor
+                }
+                requestedPageCount += 1
+                guard requestedPageCount <= maximumAutomaticMailboxPages else {
+                    throw MailboxPaginationError.pageLimitExceeded
+                }
+
+                let page: MailboxResponse
+                if let query = context.searchQuery {
+                    page = try await client.searchMailbox(
+                        query: query,
+                        label: context.label,
+                        limit: mailboxPageLimit,
+                        cursor: cursor,
+                        hydrateInBackground: true
+                    )
+                } else {
+                    page = try await client.mailbox(
+                        label: context.label,
+                        limit: mailboxPageLimit,
+                        cursor: cursor
+                    )
+                }
+                try Task.checkCancellation()
+                guard page.label == context.label else {
+                    throw MailboxPaginationError.mismatchedLabel
+                }
+                guard page.totalThreads == accumulated.totalThreads,
+                      Self.mailboxRevisionsMatch(accumulated, page) else {
+                    reconciliationRestartCount += 1
+                    guard reconciliationRestartCount <= maximumMailboxReconciliationRestarts else {
+                        // The backend is actively reconciling. Return the last
+                        // internally consistent prefix as loading progress; it
+                        // is never presentation-ready or persisted, and a
+                        // later event/poll will start another bounded pass.
+                        return accumulated
+                    }
+                    let delay = mailboxReconciliationRestartDelayNanoseconds
+                        * UInt64(reconciliationRestartCount)
+                    try await Task.sleep(nanoseconds: delay)
+                    try Task.checkCancellation()
+                    let restarted: MailboxResponse
+                    if let query = context.searchQuery {
+                        restarted = try await client.searchMailbox(
+                            query: query,
+                            label: context.label,
+                            limit: mailboxPageLimit,
+                            cursor: nil,
+                            hydrateInBackground: true
+                        )
+                    } else {
+                        restarted = try await client.mailbox(
+                            label: context.label,
+                            limit: mailboxPageLimit,
+                            cursor: nil
+                        )
+                    }
+                    try Task.checkCancellation()
+                    guard restarted.label == context.label else {
+                        throw MailboxPaginationError.mismatchedLabel
+                    }
+                    accumulated = restarted
+                    seenCursors.removeAll(keepingCapacity: true)
+                    if restarted.fullImportRunning == true
+                        || restarted.fullImportCompleted == false {
+                        return restarted
+                    }
+                    continue
+                }
+                accumulated = accumulated.appendingPage(page)
             }
-            try Task.checkCancellation()
-            return page
+
+            try Self.validateCompletedMailboxSnapshot(accumulated)
+            return accumulated
         }
         inFlightMailboxPage = task
         defer {
@@ -1550,45 +1742,13 @@ public final class InboxStore: ObservableObject {
                 mailboxPageLoading = false
             }
         }
-        do {
-            let page = try await task.value
-            guard mailboxPageRequestID == requestID,
-                  matchesMailboxPageContext(context),
-                  visibleMailbox?.nextCursor == cursor,
-                  page.label == context.label else {
-                if matchesMailboxPageContext(context) {
-                    requestedMailboxPageCursors.remove(cursor)
-                }
-                return
-            }
-            let current = visibleMailbox
-            let merged = current?.appendingPage(page) ?? page
-            if context.searchQuery != nil {
-                if searchResults != merged {
-                    searchResults = merged
-                }
-            } else {
-                if activeMailbox != merged {
-                    activeMailbox = merged
-                }
-                updateFolderCount(from: merged)
-                await localMailStoreWorker.writeMailbox(merged, userID: userID, label: context.label)
-            }
-            if refreshFailed {
-                refreshFailed = false
-            }
-            seedActiveSelectionIfNeeded()
-            refreshReaderRow()
-        } catch is CancellationError {
-            if matchesMailboxPageContext(context) {
-                requestedMailboxPageCursors.remove(cursor)
-            }
-        } catch {
-            if matchesMailboxPageContext(context) {
-                requestedMailboxPageCursors.remove(cursor)
-                refreshFailed = true
-            }
+
+        let completed = try await task.value
+        guard mailboxPageRequestID == requestID,
+              matchesMailboxPageContext(context) else {
+            throw CancellationError()
         }
+        return completed
     }
 
     public func select(threadID: String, prefetch: Bool = true) {
@@ -2452,13 +2612,15 @@ public final class InboxStore: ObservableObject {
                 transitionToReauthentication()
                 return
             }
+            if await refreshVisibleSearchIfAwaitingCompletion() {
+                return
+            }
             guard let revision = state.mailboxRevision, !revision.isEmpty else {
                 return
             }
             guard lastSeenMailboxRevision != revision else {
                 return
             }
-            lastSeenMailboxRevision = revision
             await refreshActiveMailbox(allowCachedFallback: true, force: true)
         } catch {
             if transitionToReauthenticationIfNeeded(for: error) {
@@ -2601,7 +2763,8 @@ public final class InboxStore: ObservableObject {
             guard eventAffectsActiveMailbox(envelope) else {
                 return
             }
-            if shouldRefreshForRevision(envelope.mailboxRevision) {
+            if visibleSearchAwaitsCompletion
+                || shouldRefreshForRevision(envelope.mailboxRevision) {
                 scheduleEventRefresh(needsSession: false)
             }
         case "dashboard-changed":
@@ -2617,7 +2780,8 @@ public final class InboxStore: ObservableObject {
                 transitionToReauthentication()
                 return
             }
-            if shouldRefreshForRevision(state.mailboxRevision) {
+            if visibleSearchAwaitsCompletion
+                || shouldRefreshForRevision(state.mailboxRevision) {
                 scheduleEventRefresh(needsSession: false)
             }
         default:
@@ -2644,14 +2808,23 @@ public final class InboxStore: ObservableObject {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let label = activeMailboxLabel
         guard !query.isEmpty,
-              eventSearchKey == Self.searchKey(label: label, query: query) else {
+              eventSearchKey == Self.searchKey(label: label, query: query),
+              let userID = session?.user.id else {
             return
         }
 
         searchHydrationRefreshTask?.cancel()
+        cancelActiveMailboxRefresh()
         resetMailboxPagination()
         let requestID = UUID()
+        let pageContext = MailboxPageContext(
+            generation: mailboxPageGeneration,
+            label: label,
+            searchQuery: query,
+            userID: userID
+        )
         searchRequestID = requestID
+        searchInProgress = true
         searchHydrationRefreshTask = Task { [weak self] in
             guard let self else {
                 return
@@ -2671,7 +2844,17 @@ public final class InboxStore: ObservableObject {
                       Self.searchKey(label: self.activeMailboxLabel, query: self.searchQuery) == eventSearchKey else {
                     return
                 }
-                self.searchResults = response
+                let completed = try await self.completeMailboxSnapshot(
+                    startingWith: response,
+                    context: pageContext
+                )
+                guard self.searchRequestID == requestID,
+                      self.activeMailboxLabel == label,
+                      self.searchQuery == query,
+                      self.matchesMailboxPageContext(pageContext) else {
+                    return
+                }
+                self.searchResults = completed
                 self.searchError = nil
                 self.seedActiveSelectionIfNeeded()
             } catch is CancellationError {
@@ -2690,8 +2873,7 @@ public final class InboxStore: ObservableObject {
             guard self.searchRequestID == requestID else {
                 return
             }
-            self.searchRequestID = nil
-            self.searchInProgress = false
+            self.finishSearchRequest(id: requestID)
             self.searchHydrationRefreshTask = nil
         }
     }
@@ -2703,9 +2885,67 @@ public final class InboxStore: ObservableObject {
         lastMailboxRefreshAt[activeMailboxLabel] = nil
         if needsSession {
             await refresh(allowEmptyDashboard: true, forceMailbox: true)
-        } else {
-            await refreshActiveMailbox(allowCachedFallback: true, force: true)
         }
+        if await refreshVisibleSearchIfAwaitingCompletion() {
+            return
+        }
+        guard !needsSession else {
+            return
+        }
+        await refreshActiveMailbox(allowCachedFallback: true, force: true)
+    }
+
+    private var visibleSearchAwaitsCompletion: Bool {
+        guard isSearchActive else {
+            return false
+        }
+        if searchInProgress {
+            return true
+        }
+        guard let searchResults, searchError == nil else {
+            return false
+        }
+        return !Self.isCompleteMailboxSnapshot(searchResults)
+    }
+
+    @discardableResult
+    private func refreshVisibleSearchIfAwaitingCompletion() async -> Bool {
+        guard isSearchActive else {
+            return false
+        }
+        if searchInProgress {
+            pendingSearchCompletionRefresh = true
+            return true
+        }
+        guard let searchResults,
+              searchError == nil,
+              !Self.isCompleteMailboxSnapshot(searchResults) else {
+            pendingSearchCompletionRefresh = false
+            return false
+        }
+        pendingSearchCompletionRefresh = false
+        let query = searchQuery
+        await searchMailbox(query)
+        return true
+    }
+
+    private func finishSearchRequest(id requestID: UUID) {
+        guard searchRequestID == requestID else {
+            return
+        }
+        searchRequestID = nil
+        searchInProgress = false
+        guard pendingSearchCompletionRefresh else {
+            return
+        }
+        pendingSearchCompletionRefresh = false
+        guard isSearchActive,
+              let searchResults,
+              searchError == nil,
+              !Self.isCompleteMailboxSnapshot(searchResults) else {
+            return
+        }
+        scheduleEventRefresh(needsSession: false)
     }
 
     private func sanitizedAttachmentFilename(_ filename: String) -> String {
@@ -2724,7 +2964,6 @@ public final class InboxStore: ObservableObject {
         if lastSeenMailboxRevision == revision {
             return false
         }
-        lastSeenMailboxRevision = revision
         return true
     }
 
@@ -3328,6 +3567,7 @@ public final class InboxStore: ObservableObject {
         searchHydrationRefreshTask?.cancel()
         searchHydrationRefreshTask = nil
         searchRequestID = nil
+        pendingSearchCompletionRefresh = false
         cancelFolderCountRefresh()
         lastCompletedFolderCountsRefreshAt = nil
         resetMailboxPagination()
@@ -3338,25 +3578,49 @@ public final class InboxStore: ObservableObject {
         inFlightMailboxPage?.cancel()
         inFlightMailboxPage = nil
         mailboxPageRequestID = nil
-        requestedMailboxPageCursors = []
         mailboxPageLoading = false
     }
 
     private func matchesMailboxPageContext(_ context: MailboxPageContext) -> Bool {
-        context.generation == mailboxPageGeneration
+        let searchMatches = context.searchQuery.map { isSearchActive && searchQuery == $0 } ?? !isSearchActive
+        return context.generation == mailboxPageGeneration
             && context.label == activeMailboxLabel
-            && context.searchQuery == (isSearchActive ? searchQuery : nil)
+            && searchMatches
             && context.userID == session?.user.id
     }
 
-    private static func mailboxRevisionChanged(from current: MailboxResponse?, to next: MailboxResponse) -> Bool {
-        guard let currentRevision = current?.mailboxRevision,
-              !currentRevision.isEmpty,
-              let nextRevision = next.mailboxRevision,
-              !nextRevision.isEmpty else {
+    private static func isCompleteMailboxSnapshot(_ mailbox: MailboxResponse) -> Bool {
+        guard mailbox.fullImportRunning != true,
+              mailbox.fullImportCompleted != false,
+              mailbox.nextCursor?.isEmpty != false else {
             return false
         }
-        return currentRevision != nextRevision
+        let visibleRows = mailbox.sections.reduce(0) { $0 + $1.rows.count }
+        let loadedThreads = max(mailbox.loadedThreads ?? visibleRows, visibleRows)
+        return loadedThreads >= mailbox.totalThreads && visibleRows >= mailbox.totalThreads
+    }
+
+    private static func validateCompletedMailboxSnapshot(_ mailbox: MailboxResponse) throws {
+        guard mailbox.fullImportRunning != true,
+              mailbox.fullImportCompleted != false else {
+            return
+        }
+        guard isCompleteMailboxSnapshot(mailbox) else {
+            throw MailboxPaginationError.incompleteSnapshot
+        }
+    }
+
+    private static func mailboxRevisionsMatch(_ current: MailboxResponse, _ page: MailboxResponse) -> Bool {
+        let currentRevision = current.mailboxRevision?.isEmpty == false ? current.mailboxRevision : nil
+        let pageRevision = page.mailboxRevision?.isEmpty == false ? page.mailboxRevision : nil
+        switch (currentRevision, pageRevision) {
+        case (nil, nil):
+            return true
+        case let (.some(currentRevision), .some(pageRevision)):
+            return currentRevision == pageRevision
+        default:
+            return false
+        }
     }
 
     private func mailboxRow(threadID: String) -> GmailThreadRow? {

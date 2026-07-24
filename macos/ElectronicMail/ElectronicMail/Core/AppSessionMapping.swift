@@ -160,7 +160,18 @@ extension MailboxResponse {
         let loaded = nextSections.reduce(0) { $0 + $1.rows.count }
         let firstPageLoaded = firstPage.loadedThreads ?? firstPage.sections.reduce(0) { $0 + $1.rows.count }
         let nextCursor = loaded > firstPageLoaded ? self.nextCursor : firstPage.nextCursor
-        let isStillComplete = self.fullImportCompleted == true && loaded >= firstPage.totalThreads
+        let isStillComplete = firstPage.fullImportRunning != true
+            && firstPage.fullImportCompleted != false
+            && self.fullImportCompleted == true
+            && loaded >= firstPage.totalThreads
+        let mergedImportCompleted: Bool?
+        if let firstPageImportCompleted = firstPage.fullImportCompleted {
+            mergedImportCompleted = firstPageImportCompleted
+        } else if firstPage.fullImportRunning == true {
+            mergedImportCompleted = false
+        } else {
+            mergedImportCompleted = isStillComplete ? true : fullImportCompleted
+        }
 
         return MailboxResponse(
             label: firstPage.label,
@@ -176,7 +187,7 @@ extension MailboxResponse {
             generatedAt: firstPage.generatedAt ?? generatedAt,
             oldestImportedAt: firstPage.oldestImportedAt ?? oldestImportedAt,
             fullImportRunning: firstPage.fullImportRunning ?? fullImportRunning,
-            fullImportCompleted: isStillComplete ? true : (firstPage.fullImportCompleted ?? fullImportCompleted)
+            fullImportCompleted: mergedImportCompleted
         )
     }
 

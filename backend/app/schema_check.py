@@ -33,7 +33,8 @@ REQUIRED_SCHEMA_PROBES = (
     "SELECT generation_id, gmail_thread_id, position FROM gmail_thread_order_entries LIMIT 1",
     (
         "SELECT reconcile_generation, reconcile_cursor, "
-        "reconcile_baseline_history_id, reconcile_started_at "
+        "reconcile_baseline_history_id, reconcile_started_at, last_delta_sync_at, "
+        "history_cursor_authoritative "
         "FROM gmail_import_state LIMIT 1"
     ),
     "SELECT generation_id, message_id FROM gmail_reconcile_seen LIMIT 1",

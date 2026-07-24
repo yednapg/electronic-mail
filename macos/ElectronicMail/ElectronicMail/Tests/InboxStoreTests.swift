@@ -2336,21 +2336,557 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(localStore.pendingThreadActions().count, 1)
     }
 
-    func testMailboxPaginationFooterAndLoadMoreAppendRows() async {
+    func testMailboxAutomaticallyAccumulatesEveryPageBeforePresentation() async {
         let client = PaginatedMailboxAppClient()
         let store = InboxStore(client: client, sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
         store.setSessionToken("live-session-token")
 
         await store.load()
 
-        XCTAssertEqual(store.flatRows.map(\.threadID), ["demo-google-today"])
-        XCTAssertEqual(store.mailboxFooterText, "Showing 1 of 2. Load more...")
-
-        await store.loadMoreMailbox()
-
         XCTAssertEqual(store.flatRows.map(\.threadID), ["demo-google-today", "demo-github-today"])
-        XCTAssertNil(store.mailboxFooterText)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertFalse(store.mailboxPageLoading)
         XCTAssertEqual(client.mailboxCursors, [nil, "cursor-2"])
+    }
+
+    func testCompletedMailboxLoadsAll357ThreadsAcrossFourPagesAndCachesOnlyFinalSnapshot() async {
+        let client = BulkPaginatedMailboxAppClient()
+        let localStore = MemoryLocalMailStore()
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(store.flatRows.first?.threadID, "bulk-0")
+        XCTAssertEqual(store.flatRows.last?.threadID, "bulk-356")
+        XCTAssertEqual(client.mailboxCursors, [nil, "bulk-cursor-100", "bulk-cursor-200", "bulk-cursor-300"])
+
+        let cached = localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)
+        XCTAssertEqual(cached?.sections.flatMap(\.rows).count, 357)
+        XCTAssertEqual(cached?.loadedThreads, 357)
+        XCTAssertNil(cached?.nextCursor)
+        XCTAssertEqual(cached?.fullImportCompleted, true)
+    }
+
+    func testOfflineFirstSQLiteCacheStaysAt357AcrossSessionThrottleAndFinalTransportPage() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailAtomicMailboxTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let localStore = try XCTUnwrap(
+            SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3"))
+        )
+        let backend = BulkPaginatedMailboxAppClient()
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertEqual(
+            localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)?.sections.flatMap(\.rows).count,
+            357
+        )
+        XCTAssertEqual(backend.mailboxCursors, [nil, "bulk-cursor-100", "bulk-cursor-200", "bulk-cursor-300"])
+
+        // This refresh updates the app session but is inside the mailbox
+        // throttle window. Its embedded 100-row first page must not replace
+        // the independently persisted complete snapshot.
+        await store.refresh()
+
+        XCTAssertEqual(
+            localStore.readSession()?.mailbox.sections.flatMap(\.rows).count,
+            100
+        )
+        XCTAssertEqual(
+            localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)?.sections.flatMap(\.rows).count,
+            357
+        )
+        XCTAssertEqual(backend.mailboxCursors, [nil, "bulk-cursor-100", "bulk-cursor-200", "bulk-cursor-300"])
+
+        let finalTransportPage = try await client.mailbox(
+            label: .inbox,
+            limit: 100,
+            cursor: "bulk-cursor-300"
+        )
+
+        XCTAssertEqual(finalTransportPage.sections.flatMap(\.rows).count, 57)
+        XCTAssertEqual(
+            localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)?.sections.flatMap(\.rows).count,
+            357
+        )
+    }
+
+    func testOfflineFirstSQLitePageFailureCannotDegradeComplete357Cache() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailFailedMailboxTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let localStore = try XCTUnwrap(
+            SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3"))
+        )
+        do {
+            let primingClient = OfflineFirstAppClient(
+                backend: BulkPaginatedMailboxAppClient(),
+                localMailStore: localStore
+            )
+            let primingStore = InboxStore(
+                client: primingClient,
+                sessionCache: AppSessionCache(defaults: .ephemeral()),
+                threadCache: ThreadCache(defaults: .ephemeral()),
+                localMailStore: localStore,
+                automaticallyPrefetchThreads: false
+            )
+            primingStore.setSessionToken("live-session-token")
+            await primingStore.load()
+            XCTAssertEqual(primingStore.flatRows.count, 357)
+        }
+
+        let backend = BulkPaginatedMailboxAppClient(failOnceAtCursor: "bulk-cursor-200")
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertTrue(store.refreshFailed)
+        XCTAssertEqual(backend.mailboxCursors, [nil, "bulk-cursor-100", "bulk-cursor-200"])
+        let cached = try XCTUnwrap(localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox))
+        XCTAssertEqual(cached.sections.flatMap(\.rows).count, 357)
+        XCTAssertEqual(cached.loadedThreads, 357)
+        XCTAssertNil(cached.nextCursor)
+    }
+
+    func testOfflineFirstSQLiteCancelledPageCannotDegradeComplete357Cache() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailCancelledMailboxTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let localStore = try XCTUnwrap(
+            SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3"))
+        )
+        do {
+            let primingClient = OfflineFirstAppClient(
+                backend: BulkPaginatedMailboxAppClient(),
+                localMailStore: localStore
+            )
+            let primingStore = InboxStore(
+                client: primingClient,
+                sessionCache: AppSessionCache(defaults: .ephemeral()),
+                threadCache: ThreadCache(defaults: .ephemeral()),
+                localMailStore: localStore,
+                automaticallyPrefetchThreads: false
+            )
+            primingStore.setSessionToken("live-session-token")
+            await primingStore.load()
+            XCTAssertEqual(primingStore.flatRows.count, 357)
+        }
+
+        let backend = BulkPaginatedMailboxAppClient()
+        backend.delayedCursor = "bulk-cursor-100"
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        let loadingInbox = Task { await store.load() }
+        for _ in 0..<200 where !backend.mailboxCursors.contains("bulk-cursor-100") {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertTrue(backend.mailboxCursors.contains("bulk-cursor-100"))
+
+        await store.setMailboxLabel(.sent)
+        await loadingInbox.value
+
+        let cached = try XCTUnwrap(localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox))
+        XCTAssertEqual(cached.sections.flatMap(\.rows).count, 357)
+        XCTAssertEqual(cached.loadedThreads, 357)
+        XCTAssertNil(cached.nextCursor)
+    }
+
+    func testFailedAutomaticPageNeverExposesPartialRowsAndRetryCompletesAll357Threads() async {
+        let client = BulkPaginatedMailboxAppClient(failOnceAtCursor: "bulk-cursor-200")
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertFalse(store.mailboxPresentationReady)
+        XCTAssertTrue(store.flatRows.isEmpty)
+        XCTAssertTrue(store.refreshFailed)
+        XCTAssertEqual(client.mailboxCursors, [nil, "bulk-cursor-100", "bulk-cursor-200"])
+
+        await store.syncNow()
+
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertFalse(store.refreshFailed)
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(
+            client.mailboxCursors,
+            [
+                nil,
+                "bulk-cursor-100",
+                "bulk-cursor-200",
+                nil,
+                "bulk-cursor-100",
+                "bulk-cursor-200",
+                "bulk-cursor-300"
+            ]
+        )
+    }
+
+    func testCompleteCached357ThreadSnapshotSurvivesOfflineRefresh() async {
+        let localStore = MemoryLocalMailStore()
+        let primingStore = InboxStore(
+            client: BulkPaginatedMailboxAppClient(),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        primingStore.setSessionToken("live-session-token")
+        await primingStore.load()
+        XCTAssertEqual(primingStore.flatRows.count, 357)
+
+        let restoredStore = InboxStore(
+            client: FailingAppClient(statusCode: 503),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        restoredStore.setSessionToken("live-session-token")
+
+        await restoredStore.load()
+
+        XCTAssertTrue(restoredStore.mailboxPresentationReady)
+        XCTAssertEqual(restoredStore.flatRows.count, 357)
+        XCTAssertEqual(restoredStore.flatRows.first?.threadID, "bulk-0")
+        XCTAssertEqual(restoredStore.flatRows.last?.threadID, "bulk-356")
+        XCTAssertTrue(restoredStore.refreshFailed)
+    }
+
+    func testForcedRefreshRetainsCompleteSnapshotAndSelectionUntilAtomicReplacement() async {
+        let client = BulkPaginatedMailboxAppClient()
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+        store.select(threadID: "bulk-150", prefetch: false)
+        client.delayedCursor = "bulk-cursor-100"
+
+        let refresh = Task { await store.syncNow() }
+        for _ in 0..<200 where client.mailboxCursors.count < 6 {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        XCTAssertTrue(store.mailboxPageLoading)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(store.selectedThreadID, "bulk-150")
+
+        await refresh.value
+
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(store.selectedThreadID, "bulk-150")
+    }
+
+    func testOverlappingRefreshCannotConsumeOrClearOwnedPaginationChain() async {
+        let client = BulkPaginatedMailboxAppClient()
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+        client.delayedCursor = "bulk-cursor-100"
+
+        let ownerRefresh = Task { await store.syncNow() }
+        for _ in 0..<200 where client.mailboxCursors.count < 6 {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertTrue(store.mailboxPageLoading)
+
+        await store.refresh()
+
+        XCTAssertTrue(store.mailboxPageLoading)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.count, 357)
+
+        await ownerRefresh.value
+
+        XCTAssertFalse(store.mailboxPageLoading)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(
+            client.mailboxCursors,
+            [
+                nil,
+                "bulk-cursor-100",
+                "bulk-cursor-200",
+                "bulk-cursor-300",
+                nil,
+                "bulk-cursor-100",
+                "bulk-cursor-200",
+                "bulk-cursor-300"
+            ]
+        )
+    }
+
+    func testRevisionMismatchDuringPaginationRestartsFromPageOneAndPublishesOneGeneration() async {
+        let client = BulkPaginatedMailboxAppClient(revisionMismatchOnceAtCursor: "bulk-cursor-200")
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertFalse(store.refreshFailed)
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(Set(store.flatRows.map(\.threadID)).count, 357)
+        XCTAssertEqual(
+            client.mailboxCursors,
+            [
+                nil,
+                "bulk-cursor-100",
+                "bulk-cursor-200",
+                nil,
+                "bulk-cursor-100",
+                "bulk-cursor-200",
+                "bulk-cursor-300",
+            ]
+        )
+    }
+
+    func testMultipleRevisionChurnsRestartFromPageOneThenCompleteWithoutPartialCache() async {
+        let client = BulkPaginatedMailboxAppClient(
+            revisionMismatchOnceAtCursor: "bulk-cursor-100",
+            revisionChurnCount: 2
+        )
+        let localStore = MemoryLocalMailStore()
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertFalse(store.refreshFailed)
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(Set(store.flatRows.map(\.threadID)).count, 357)
+        XCTAssertEqual(
+            client.mailboxCursors,
+            [
+                nil,
+                "bulk-cursor-100",
+                nil,
+                "bulk-cursor-100",
+                nil,
+                "bulk-cursor-100",
+                "bulk-cursor-200",
+                "bulk-cursor-300",
+            ]
+        )
+        let cached = localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)
+        XCTAssertEqual(cached?.sections.flatMap(\.rows).count, 357)
+        XCTAssertNil(cached?.nextCursor)
+    }
+
+    func testRevisionChurnRetryExhaustionStaysLoadingWithoutRowsFailureOrPartialCache() async {
+        let client = BulkPaginatedMailboxAppClient(
+            revisionMismatchOnceAtCursor: "bulk-cursor-100",
+            revisionChurnCount: 10
+        )
+        let localStore = MemoryLocalMailStore()
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertEqual(store.phase, .loading)
+        XCTAssertFalse(store.mailboxPresentationReady)
+        XCTAssertFalse(store.refreshFailed)
+        XCTAssertTrue(store.flatRows.isEmpty)
+        XCTAssertEqual(client.mailboxCursors.filter { $0 == nil }.count, 4)
+        XCTAssertEqual(client.mailboxCursors.filter { $0 == "bulk-cursor-100" }.count, 4)
+        XCTAssertNil(localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox))
+    }
+
+    func testRevisionChurnRetryExhaustionPreservesPriorCompleteSnapshotAndCache() async {
+        let localStore = MemoryLocalMailStore()
+        do {
+            let primingStore = InboxStore(
+                client: BulkPaginatedMailboxAppClient(),
+                sessionCache: AppSessionCache(defaults: .ephemeral()),
+                threadCache: ThreadCache(defaults: .ephemeral()),
+                localMailStore: localStore,
+                automaticallyPrefetchThreads: false
+            )
+            primingStore.setSessionToken("live-session-token")
+            await primingStore.load()
+            XCTAssertEqual(primingStore.flatRows.count, 357)
+        }
+
+        let client = BulkPaginatedMailboxAppClient(
+            revisionMismatchOnceAtCursor: "bulk-cursor-100",
+            revisionChurnCount: 10
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertEqual(store.phase, .loaded)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertFalse(store.refreshFailed)
+        XCTAssertEqual(store.flatRows.count, 357)
+        let cached = localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)
+        XCTAssertEqual(cached?.sections.flatMap(\.rows).count, 357)
+        XCTAssertNil(cached?.nextCursor)
+    }
+
+    func testRepeatedCursorNeverPublishesPartialSnapshotAndCanRetry() async {
+        let client = BulkPaginatedMailboxAppClient(repeatCursorOnceAtCursor: "bulk-cursor-200")
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertFalse(store.mailboxPresentationReady)
+        XCTAssertTrue(store.flatRows.isEmpty)
+        XCTAssertTrue(store.refreshFailed)
+
+        await store.syncNow()
+
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.count, 357)
+    }
+
+    func testImportInProgressDoesNotPaginateAcrossChangingRevisionsOrShowFailure() async {
+        let client = BulkPaginatedMailboxAppClient(
+            revisionMismatchOnceAtCursor: "bulk-cursor-100",
+            importInProgress: true
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertEqual(client.mailboxCursors, [nil])
+        XCTAssertFalse(store.mailboxPresentationReady)
+        XCTAssertTrue(store.flatRows.isEmpty)
+        XCTAssertFalse(store.refreshFailed)
+        XCTAssertEqual(store.mailboxLoadingProgressText, "Loading 100 of 357 emails...")
+    }
+
+    func testFreshIncompleteImportHidesPriorCompleteSnapshotWithoutDegradingCache() async {
+        let localStore = MemoryLocalMailStore()
+        do {
+            let primingStore = InboxStore(
+                client: BulkPaginatedMailboxAppClient(),
+                sessionCache: AppSessionCache(defaults: .ephemeral()),
+                threadCache: ThreadCache(defaults: .ephemeral()),
+                localMailStore: localStore,
+                automaticallyPrefetchThreads: false
+            )
+            primingStore.setSessionToken("live-session-token")
+            await primingStore.load()
+            XCTAssertEqual(primingStore.flatRows.count, 357)
+        }
+
+        let client = BulkPaginatedMailboxAppClient(importInProgress: true)
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertFalse(store.mailboxPresentationReady)
+        XCTAssertTrue(store.flatRows.isEmpty)
+        XCTAssertFalse(store.refreshFailed)
+        XCTAssertEqual(
+            localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)?.sections.flatMap(\.rows).count,
+            357
+        )
     }
 
     func testMailboxPageMergePreservesServerRankAndOrderedDateRuns() {
@@ -2480,18 +3016,17 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(merged.nextCursor, "cursor-3")
     }
 
-    func testRefreshAfterPaginationPreservesLoadedRowsAndDoesNotAutoReloadSameCursor() async {
+    func testRefreshAfterAutomaticPaginationPreservesLoadedRowsAndDoesNotReloadSameCursor() async {
         let client = PaginatedMailboxAppClient()
         let store = InboxStore(client: client, sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
         store.setSessionToken("live-session-token")
 
         await store.load()
-        await store.loadMoreMailbox(automatic: true)
         await store.refresh()
         await store.loadMoreMailbox(automatic: true)
 
         XCTAssertEqual(store.flatRows.map(\.threadID), ["demo-google-today", "demo-github-today"])
-        XCTAssertNil(store.mailboxFooterText)
+        XCTAssertTrue(store.mailboxPresentationReady)
         XCTAssertEqual(client.mailboxCursors, [nil, "cursor-2"])
     }
 
@@ -2506,16 +3041,10 @@ final class InboxStoreTests: XCTestCase {
         store.setSessionToken("live-session-token")
 
         await store.load()
-
-        let firstTrigger = Task { await store.loadMoreMailbox(automatic: true) }
-        let duplicateTrigger = Task { await store.loadMoreMailbox() }
-        await firstTrigger.value
-        await duplicateTrigger.value
-
-        let secondTrigger = Task { await store.loadMoreMailbox(automatic: true) }
-        let secondDuplicateTrigger = Task { await store.loadMoreMailbox(automatic: true) }
-        await secondTrigger.value
-        await secondDuplicateTrigger.value
+        let redundantAutomaticTrigger = Task { await store.loadMoreMailbox(automatic: true) }
+        let redundantManualTrigger = Task { await store.loadMoreMailbox() }
+        await redundantAutomaticTrigger.value
+        await redundantManualTrigger.value
         await store.loadMoreMailbox()
 
         XCTAssertEqual(store.flatRows.map(\.threadID), ["inbox-1", "inbox-2", "inbox-3"])
@@ -2528,7 +3057,34 @@ final class InboxStoreTests: XCTestCase {
             ]
         )
         XCTAssertFalse(store.mailboxPageLoading)
-        XCTAssertNil(store.mailboxFooterText)
+        XCTAssertTrue(store.mailboxPresentationReady)
+    }
+
+    func testSearchCancelsActiveMailboxPageChainAndPublishesCompleteSearch() async {
+        let client = BulkPaginatedMailboxAppClient()
+        client.delayedCursor = "bulk-cursor-100"
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        let loadingMailbox = Task { await store.load() }
+        for _ in 0..<200 where !client.mailboxCursors.contains("bulk-cursor-100") {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertTrue(client.mailboxCursors.contains("bulk-cursor-100"))
+
+        await store.searchMailbox("invoice")
+        await loadingMailbox.value
+
+        XCTAssertEqual(store.searchQuery, "invoice")
+        XCTAssertEqual(store.flatRows.map(\.threadID), ["search-invoice"])
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertFalse(store.mailboxPageLoading)
+        XCTAssertEqual(client.searchQueries, ["invoice"])
     }
 
     func testSwitchingMailboxesCancelsAndIsolatesOldPagination() async {
@@ -2541,8 +3097,7 @@ final class InboxStoreTests: XCTestCase {
         )
         store.setSessionToken("live-session-token")
 
-        await store.load()
-        let staleInboxPage = Task { await store.loadMoreMailbox() }
+        let staleInboxPage = Task { await store.load() }
         for _ in 0..<100 {
             if client.mailboxCalls.contains(MailboxPageCall(label: .inbox, cursor: "inbox-cursor-2")) {
                 break
@@ -2551,9 +3106,10 @@ final class InboxStoreTests: XCTestCase {
         }
         XCTAssertTrue(client.mailboxCalls.contains(MailboxPageCall(label: .inbox, cursor: "inbox-cursor-2")))
         XCTAssertTrue(store.mailboxPageLoading)
+        XCTAssertFalse(store.mailboxPresentationReady)
+        XCTAssertTrue(store.flatRows.isEmpty, "A known partial first page must not be exposed")
 
-        await store.setMailboxLabel(.sent)
-        let currentSentPage = Task { await store.loadMoreMailbox() }
+        let currentSentPage = Task { await store.setMailboxLabel(.sent) }
         for _ in 0..<100 {
             if client.mailboxCalls.contains(MailboxPageCall(label: .sent, cursor: "sent-cursor-2")) {
                 break
@@ -2564,13 +3120,15 @@ final class InboxStoreTests: XCTestCase {
 
         await staleInboxPage.value
         XCTAssertEqual(store.activeMailboxLabel, .sent)
-        XCTAssertEqual(store.flatRows.map(\.threadID), ["sent-1"])
+        XCTAssertTrue(store.flatRows.isEmpty)
         XCTAssertTrue(store.mailboxPageLoading, "A late Inbox completion must not clear the active Sent loading state")
+        XCTAssertFalse(store.mailboxPresentationReady)
 
         await currentSentPage.value
         XCTAssertEqual(store.flatRows.map(\.threadID), ["sent-1", "sent-2"])
         XCTAssertFalse(store.flatRows.map(\.threadID).contains("inbox-2"))
         XCTAssertFalse(store.mailboxPageLoading)
+        XCTAssertTrue(store.mailboxPresentationReady)
         XCTAssertEqual(
             client.mailboxCalls,
             [
@@ -2582,7 +3140,7 @@ final class InboxStoreTests: XCTestCase {
         )
     }
 
-    func testEmptyMailboxNeverShowsPaginationOrSyncingFooter() async {
+    func testIncompleteEmptyMailboxShowsLoadingInsteadOfAnEmptyCompleteState() async {
         let emptyMailbox = MailboxResponse(
             label: .inbox,
             totalThreads: 0,
@@ -2603,8 +3161,71 @@ final class InboxStoreTests: XCTestCase {
         await store.load()
 
         XCTAssertEqual(store.mailboxVisibleRowCount, 0)
-        XCTAssertNil(store.mailboxFooter)
-        XCTAssertFalse(store.canLoadMoreMailbox)
+        XCTAssertFalse(store.mailboxPresentationReady)
+        XCTAssertEqual(store.mailboxLoadingProgressText, "Syncing your mailbox...")
+        XCTAssertTrue(store.flatRows.isEmpty)
+    }
+
+    func testIncompleteImportFlagHidesRowsEvenWhenEveryReportedThreadIsLoaded() async {
+        let row = makeMailboxRow(
+            threadID: "not-yet-proven-complete",
+            latestSourceRecordID: "not-yet-proven-complete-message",
+            receivedAt: "2026-07-24T12:00:00Z",
+            title: "Do not reveal yet"
+        )
+        let incompleteMailbox = MailboxResponse(
+            label: .inbox,
+            totalThreads: 1,
+            nextCursor: nil,
+            loadedThreads: 1,
+            sections: [GmailThreadSection(id: "today", title: "Today", rows: [row])],
+            fullImportRunning: false,
+            fullImportCompleted: false
+        )
+        let store = InboxStore(
+            client: FixedMailboxAppClient(mailbox: incompleteMailbox),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertFalse(store.mailboxPresentationReady)
+        XCTAssertTrue(store.flatRows.isEmpty)
+        XCTAssertEqual(store.mailboxLoadingProgressText, "Finishing mailbox sync...")
+    }
+
+    func testServerClaimedCompletionCannotExposeFewerRowsThanTotal() async {
+        let row = makeMailboxRow(
+            threadID: "only-visible-row",
+            latestSourceRecordID: "only-visible-message",
+            receivedAt: "2026-07-24T12:00:00Z",
+            title: "Only one of two"
+        )
+        let inconsistentMailbox = MailboxResponse(
+            label: .inbox,
+            totalThreads: 2,
+            nextCursor: nil,
+            loadedThreads: 2,
+            sections: [GmailThreadSection(id: "today", title: "Today", rows: [row])],
+            fullImportRunning: false,
+            fullImportCompleted: true
+        )
+        let store = InboxStore(
+            client: FixedMailboxAppClient(mailbox: inconsistentMailbox),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertFalse(store.mailboxPresentationReady)
+        XCTAssertTrue(store.flatRows.isEmpty)
+        XCTAssertTrue(store.refreshFailed)
     }
 
     func testMailboxRefreshDropsRawRowsReplacedByEnrichedGroups() {
@@ -3015,6 +3636,7 @@ final class InboxStoreTests: XCTestCase {
             threadCache: ThreadCache(defaults: .ephemeral()),
             automaticallyPrefetchThreads: false
         )
+        store.setSessionToken("live-session-token")
 
         await store.load()
         await store.searchMailbox("  invoice  ")
@@ -3040,6 +3662,258 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(store.lastSSEEventType, "mailbox-search-hydrated")
     }
 
+    func testServerClaimedCompleteSearchWithMissingRowsBecomesErrorInsteadOfLoadingForever() async {
+        let row = makeMailboxRow(
+            threadID: "only-search-row",
+            latestSourceRecordID: "only-search-message",
+            receivedAt: "2026-07-24T12:00:00Z",
+            title: "Only one search result"
+        )
+        let inconsistent = MailboxResponse(
+            label: .inbox,
+            totalThreads: 2,
+            nextCursor: nil,
+            loadedThreads: 2,
+            sections: [GmailThreadSection(id: "search", title: "Search", rows: [row])],
+            fullImportRunning: false,
+            fullImportCompleted: true
+        )
+        let store = InboxStore(
+            client: SearchHydrationAppClient(searchResponses: [inconsistent]),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+        await store.searchMailbox("invoice")
+
+        XCTAssertFalse(store.searchInProgress)
+        XCTAssertNotNil(store.searchError)
+        XCTAssertNil(store.searchResults)
+        XCTAssertFalse(store.mailboxPresentationReady)
+        XCTAssertTrue(store.flatRows.isEmpty)
+    }
+
+    func testMailboxImportCompletionEventRerunsExactIncompleteVisibleSearch() async {
+        let row = makeMailboxRow(
+            threadID: "import-search-result",
+            latestSourceRecordID: "import-search-message",
+            receivedAt: "2026-07-24T12:00:00Z",
+            title: "Imported search result"
+        )
+        let incomplete = MailboxResponse(
+            label: .inbox,
+            totalThreads: 1,
+            nextCursor: nil,
+            loadedThreads: 1,
+            sections: [GmailThreadSection(id: "search", title: "Search", rows: [row])],
+            mailboxRevision: "import-revision-1",
+            fullImportRunning: true,
+            fullImportCompleted: false
+        )
+        let complete = MailboxResponse(
+            label: .inbox,
+            totalThreads: 1,
+            nextCursor: nil,
+            loadedThreads: 1,
+            sections: [GmailThreadSection(id: "search", title: "Search", rows: [row])],
+            mailboxRevision: "import-revision-2",
+            fullImportRunning: false,
+            fullImportCompleted: true
+        )
+        let client = SearchHydrationAppClient(searchResponses: [incomplete, complete])
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+        await store.searchMailbox("  exact invoice  ")
+
+        XCTAssertEqual(store.searchQuery, "exact invoice")
+        XCTAssertFalse(store.mailboxPresentationReady)
+        XCTAssertTrue(store.flatRows.isEmpty)
+        XCTAssertNil(store.searchError)
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: "import-complete-search",
+                event: "mailbox-changed",
+                data: #"{"mailbox_label":"inbox","payload":{"mailbox_revision":"import-revision-2"}}"#
+            )
+        )
+        try? await Task.sleep(nanoseconds: 1_250_000_000)
+
+        XCTAssertEqual(store.searchQuery, "exact invoice")
+        XCTAssertEqual(store.flatRows.map(\.threadID), ["import-search-result"])
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertNil(store.searchError)
+        XCTAssertEqual(client.searchCalls.map(\.query), ["exact invoice", "exact invoice"])
+        XCTAssertEqual(client.searchCalls.map(\.cursor), [nil, nil])
+    }
+
+    func testSearchPaginationRevisionChurnRestartsFromPageOneThenPublishesCompleteResults() async {
+        let firstRevision = makeSearchPaginationPage(
+            threadID: "search-result-1",
+            title: "First result",
+            nextCursor: "search-cursor-2",
+            revision: "search-revision-1"
+        )
+        let firstMismatch = makeSearchPaginationPage(
+            threadID: "search-result-2",
+            title: "Second result",
+            nextCursor: nil,
+            revision: "search-revision-2"
+        )
+        let secondRevision = makeSearchPaginationPage(
+            threadID: "search-result-1",
+            title: "First result",
+            nextCursor: "search-cursor-2",
+            revision: "search-revision-3"
+        )
+        let secondMismatch = makeSearchPaginationPage(
+            threadID: "search-result-2",
+            title: "Second result",
+            nextCursor: nil,
+            revision: "search-revision-4"
+        )
+        let stableFirstPage = makeSearchPaginationPage(
+            threadID: "search-result-1",
+            title: "First result",
+            nextCursor: "search-cursor-2",
+            revision: "search-revision-5"
+        )
+        let stableFinalPage = makeSearchPaginationPage(
+            threadID: "search-result-2",
+            title: "Second result",
+            nextCursor: nil,
+            revision: "search-revision-5"
+        )
+        let client = SearchHydrationAppClient(
+            searchResponses: [
+                firstRevision,
+                firstMismatch,
+                secondRevision,
+                secondMismatch,
+                stableFirstPage,
+                stableFinalPage,
+            ]
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+        await store.searchMailbox("  exact invoice  ")
+
+        XCTAssertFalse(store.searchInProgress)
+        XCTAssertNil(store.searchError)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.map(\.threadID), ["search-result-1", "search-result-2"])
+        XCTAssertEqual(Set(store.flatRows.map(\.threadID)).count, 2)
+        XCTAssertEqual(client.searchCalls.map(\.query), Array(repeating: "exact invoice", count: 6))
+        XCTAssertEqual(
+            client.searchCalls.map(\.cursor),
+            [nil, "search-cursor-2", nil, "search-cursor-2", nil, "search-cursor-2"]
+        )
+    }
+
+    func testSearchPaginationRevisionChurnExhaustionStaysLoadingWithoutPartialPresentation() async {
+        var responses: [MailboxResponse] = []
+        for attempt in 0..<4 {
+            responses.append(
+                makeSearchPaginationPage(
+                    threadID: "search-result-1",
+                    title: "First result",
+                    nextCursor: "search-cursor-2",
+                    revision: "search-first-revision-\(attempt)"
+                )
+            )
+            responses.append(
+                makeSearchPaginationPage(
+                    threadID: "search-result-2",
+                    title: "Second result",
+                    nextCursor: nil,
+                    revision: "search-mismatch-revision-\(attempt)"
+                )
+            )
+        }
+        let client = SearchHydrationAppClient(searchResponses: responses)
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+        await store.searchMailbox("invoice")
+
+        XCTAssertFalse(store.searchInProgress)
+        XCTAssertNil(store.searchError)
+        XCTAssertNotNil(store.searchResults)
+        XCTAssertFalse(store.mailboxPresentationReady)
+        XCTAssertTrue(store.flatRows.isEmpty)
+        XCTAssertEqual(client.searchCalls.filter { $0.cursor == nil }.count, 4)
+        XCTAssertEqual(client.searchCalls.filter { $0.cursor == "search-cursor-2" }.count, 4)
+    }
+
+    func testImportCompletionWhileSearchIsRunningQueuesOneFollowUpWithoutCancellingOwner() async {
+        let gate = ReaderActionRequestGate()
+        let incomplete = MailboxResponse(
+            label: .inbox,
+            totalThreads: 1,
+            nextCursor: nil,
+            loadedThreads: 1,
+            sections: [],
+            mailboxRevision: "search-import-1",
+            fullImportRunning: true,
+            fullImportCompleted: false
+        )
+        let complete = makeSingleRowMailbox(threadID: "completed-search", title: "Completed search")
+        let client = SearchHydrationAppClient(
+            searchResponses: [incomplete, complete],
+            initialSearchRequestGate: gate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+
+        let initialSearch = Task { await store.searchMailbox("invoice") }
+        await gate.waitUntilRequestStarts()
+
+        await store.triggerMailboxSyncIfNeeded()
+
+        XCTAssertTrue(store.searchInProgress)
+        XCTAssertEqual(client.searchCalls.count, 1)
+
+        await gate.releaseRequest()
+        await initialSearch.value
+        try? await Task.sleep(nanoseconds: 1_250_000_000)
+
+        XCTAssertFalse(store.searchInProgress)
+        XCTAssertNil(store.searchError)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.map(\.threadID), ["completed-search"])
+        XCTAssertEqual(client.searchCalls.map(\.query), ["invoice", "invoice"])
+        XCTAssertEqual(client.searchCalls.map(\.cursor), [nil, nil])
+    }
+
     func testSearchHydratedSSEIgnoresStaleSearchKeyAfterQueryChanges() async {
         let invoice = makeSingleRowMailbox(threadID: "invoice", title: "Invoice")
         let receipt = makeSingleRowMailbox(threadID: "receipt", title: "Receipt")
@@ -3050,6 +3924,7 @@ final class InboxStoreTests: XCTestCase {
             threadCache: ThreadCache(defaults: .ephemeral()),
             automaticallyPrefetchThreads: false
         )
+        store.setSessionToken("live-session-token")
 
         await store.load()
         await store.searchMailbox("invoice")
@@ -3077,6 +3952,7 @@ final class InboxStoreTests: XCTestCase {
             threadCache: ThreadCache(defaults: .ephemeral()),
             automaticallyPrefetchThreads: false
         )
+        store.setSessionToken("live-session-token")
 
         await store.load()
         await store.searchMailbox("invoice")
@@ -3108,6 +3984,7 @@ final class InboxStoreTests: XCTestCase {
             threadCache: ThreadCache(defaults: .ephemeral()),
             automaticallyPrefetchThreads: false
         )
+        store.setSessionToken("live-session-token")
 
         await store.load()
         await store.searchMailbox("invoice")
@@ -3645,17 +4522,51 @@ private func makeSingleRowMailbox(threadID: String, title: String, receivedAt: S
     )
 }
 
+private func makeSearchPaginationPage(
+    threadID: String,
+    title: String,
+    nextCursor: String?,
+    revision: String
+) -> MailboxResponse {
+    let row = makeMailboxRow(
+        threadID: threadID,
+        latestSourceRecordID: "\(threadID)-message",
+        receivedAt: "2026-07-24T12:00:00Z",
+        title: title
+    )
+    return MailboxResponse(
+        label: .inbox,
+        totalThreads: 2,
+        nextCursor: nextCursor,
+        loadedThreads: 1,
+        sections: [GmailThreadSection(id: "search", title: "Search", rows: [row])],
+        mailboxRevision: revision,
+        fullImportRunning: false,
+        fullImportCompleted: true
+    )
+}
+
 private func makeEmptyMailbox(
     label: MailboxLabel,
     totalThreads: Int = 0,
     unreadThreads: Int = 0
 ) -> MailboxResponse {
-    MailboxResponse(
+    let rows = (0..<totalThreads).map { index in
+        makeMailboxRow(
+            threadID: "\(label.rawValue)-complete-\(index)",
+            latestSourceRecordID: "\(label.rawValue)-message-\(index)",
+            receivedAt: "2026-07-24T12:00:00Z",
+            title: "\(label.rawValue) message \(index)",
+            labelIDs: label == .sent ? ["SENT"] : ["INBOX"],
+            labels: label == .sent ? ["SENT"] : ["INBOX"]
+        )
+    }
+    return MailboxResponse(
         label: label,
         totalThreads: totalThreads,
         unreadThreads: unreadThreads,
-        loadedThreads: 0,
-        sections: [],
+        loadedThreads: totalThreads,
+        sections: rows.isEmpty ? [] : [GmailThreadSection(id: "complete", title: "Complete", rows: rows)],
         fullImportRunning: false,
         fullImportCompleted: true
     )
@@ -4299,14 +5210,18 @@ private final class SearchHydrationAppClient: AppClient {
     private let demo = DemoAppClient()
     private var searchResponses: [MailboxResponse]
     private let suppressedResponseDelayNanoseconds: UInt64
+    private let initialSearchRequestGate: ReaderActionRequestGate?
+    private var didSuspendInitialSearchRequest = false
     private(set) var searchCalls: [MailboxSearchCall] = []
 
     init(
         searchResponses: [MailboxResponse],
-        suppressedResponseDelayNanoseconds: UInt64 = 0
+        suppressedResponseDelayNanoseconds: UInt64 = 0,
+        initialSearchRequestGate: ReaderActionRequestGate? = nil
     ) {
         self.searchResponses = searchResponses
         self.suppressedResponseDelayNanoseconds = suppressedResponseDelayNanoseconds
+        self.initialSearchRequestGate = initialSearchRequestGate
     }
 
     func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
@@ -4341,6 +5256,13 @@ private final class SearchHydrationAppClient: AppClient {
             throw APIError.emptyResponse
         }
         let response = searchResponses.removeFirst()
+        if hydrateInBackground,
+           cursor == nil,
+           !didSuspendInitialSearchRequest,
+           let initialSearchRequestGate {
+            didSuspendInitialSearchRequest = true
+            await initialSearchRequestGate.suspendRequest()
+        }
         if !hydrateInBackground, suppressedResponseDelayNanoseconds > 0 {
             await withCheckedContinuation { continuation in
                 DispatchQueue.global().asyncAfter(
@@ -4351,6 +5273,10 @@ private final class SearchHydrationAppClient: AppClient {
             }
         }
         return response
+    }
+
+    func mailboxSyncState() async throws -> MailboxSyncStateResponse {
+        makeMailboxSyncStateResponse(connected: true, mailboxRevision: "search-import-complete")
     }
 
     func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
@@ -4752,7 +5678,7 @@ private final class MailboxPaginationRaceAppClient: AppClient {
             receivedAt: "2026-07-13T10:00:00+00:00",
             totalThreads: 3,
             nextCursor: "inbox-cursor-2",
-            importCompleted: false
+            importCompleted: true
         )
     }
 
@@ -4763,7 +5689,7 @@ private final class MailboxPaginationRaceAppClient: AppClient {
             receivedAt: "2026-07-13T12:00:00+00:00",
             totalThreads: 3,
             nextCursor: "inbox-cursor-3",
-            importCompleted: false
+            importCompleted: true
         )
     }
 
@@ -4785,7 +5711,7 @@ private final class MailboxPaginationRaceAppClient: AppClient {
             receivedAt: "2026-07-13T12:00:00+00:00",
             totalThreads: 2,
             nextCursor: "sent-cursor-2",
-            importCompleted: false
+            importCompleted: true
         )
     }
 
@@ -4843,6 +5769,180 @@ private final class MailboxPaginationRaceAppClient: AppClient {
     }
 }
 
+private final class BulkPaginatedMailboxAppClient: AppClient {
+    var baseURL = AppConfiguration.defaultBackendURL
+    var sessionToken: String?
+    let mode: AppRunMode = .demo
+    var delayedCursor: String?
+    private(set) var mailboxCursors: [String?] = []
+    private(set) var searchQueries: [String] = []
+
+    private let demo = DemoAppClient()
+    private let failOnceAtCursor: String?
+    private let revisionMismatchCursor: String?
+    private let repeatCursorOnceAtCursor: String?
+    private let importInProgress: Bool
+    private var didFailRequestedCursor = false
+    private var remainingRevisionChurns: Int
+    private var didRepeatRequestedCursor = false
+    private let totalThreads = 357
+    private let pageSize = 100
+
+    init(
+        failOnceAtCursor: String? = nil,
+        revisionMismatchOnceAtCursor: String? = nil,
+        repeatCursorOnceAtCursor: String? = nil,
+        importInProgress: Bool = false,
+        revisionChurnCount: Int? = nil
+    ) {
+        self.failOnceAtCursor = failOnceAtCursor
+        self.revisionMismatchCursor = revisionMismatchOnceAtCursor
+        self.repeatCursorOnceAtCursor = repeatCursorOnceAtCursor
+        self.importInProgress = importInProgress
+        self.remainingRevisionChurns = revisionChurnCount
+            ?? (revisionMismatchOnceAtCursor == nil ? 0 : 1)
+    }
+
+    func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
+        try await demo.exchangeMobileSession(loginCode: loginCode)
+    }
+
+    func appSession() async throws -> AppSessionResponse {
+        let current = DemoAppFixtures.appSession
+        return AppSessionResponse(
+            user: current.user,
+            readiness: current.readiness,
+            dashboard: current.dashboard,
+            mailbox: page(offset: 0),
+            sync: current.sync
+        )
+    }
+
+    func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
+        mailboxCursors.append(cursor)
+        guard label == .inbox else {
+            return makeEmptyMailbox(label: label)
+        }
+
+        if let delayedCursor, cursor == delayedCursor {
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+        if let failOnceAtCursor, cursor == failOnceAtCursor, !didFailRequestedCursor {
+            didFailRequestedCursor = true
+            throw APIError.httpStatus(503)
+        }
+
+        let offset = try offset(for: cursor)
+        if let revisionMismatchCursor,
+           cursor == revisionMismatchCursor,
+           remainingRevisionChurns > 0 {
+            remainingRevisionChurns -= 1
+            return page(offset: offset, revision: "bulk-revision-churn-\(remainingRevisionChurns)")
+        }
+        if let repeatCursorOnceAtCursor,
+           cursor == repeatCursorOnceAtCursor,
+           !didRepeatRequestedCursor {
+            didRepeatRequestedCursor = true
+            return page(offset: offset, forcedNextCursor: cursor)
+        }
+        return page(offset: offset)
+    }
+
+    func searchMailbox(
+        query: String,
+        label: MailboxLabel?,
+        limit: Int,
+        cursor: String?,
+        hydrateInBackground: Bool = true
+    ) async throws -> MailboxResponse {
+        searchQueries.append(query)
+        return makeSingleRowMailbox(threadID: "search-\(query)", title: "Search \(query)")
+    }
+
+    func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
+        DemoAppFixtures.threads[threadID] ?? DemoAppFixtures.threads["demo-google-today"]!
+    }
+
+    func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
+        try await demo.triggerMailboxSync()
+    }
+
+    func syncMailboxNow() async throws -> MailboxSyncTriggerResponse {
+        try await demo.syncMailboxNow()
+    }
+
+    func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .archive)
+    }
+
+    func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .unarchive)
+    }
+
+    func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .markRead)
+    }
+
+    func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
+        try await demo.enqueueThreadAction(request)
+    }
+
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        try await demo.createTask(request)
+    }
+
+    func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse {
+        try await demo.updateTask(taskID, request: request)
+    }
+
+    func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
+        try await demo.completeEntity(entityID, request: request)
+    }
+
+    private func offset(for cursor: String?) throws -> Int {
+        guard let cursor else {
+            return 0
+        }
+        guard cursor.hasPrefix("bulk-cursor-"),
+              let offset = Int(cursor.dropFirst("bulk-cursor-".count)),
+              offset >= 0,
+              offset < totalThreads else {
+            throw APIError.httpStatus(400)
+        }
+        return offset
+    }
+
+    private func page(
+        offset: Int,
+        revision: String = "bulk-revision-1",
+        forcedNextCursor: String? = nil
+    ) -> MailboxResponse {
+        let count = min(pageSize, totalThreads - offset)
+        let rows = (offset..<(offset + count)).map { index in
+            makeMailboxRow(
+                threadID: "bulk-\(index)",
+                latestSourceRecordID: "bulk-message-\(index)",
+                receivedAt: "2026-07-24T12:00:00Z",
+                title: "Bulk message \(index)"
+            )
+        }
+        let nextOffset = offset + count
+        return MailboxResponse(
+            label: .inbox,
+            totalThreads: totalThreads,
+            nextCursor: forcedNextCursor ?? (nextOffset < totalThreads ? "bulk-cursor-\(nextOffset)" : nil),
+            loadedThreads: count,
+            windowDays: 90,
+            sections: [GmailThreadSection(id: "bulk", title: "Bulk", rows: rows)],
+            readyCount: totalThreads,
+            pendingCount: 0,
+            mailboxRevision: revision,
+            fullImportRunning: importInProgress,
+            fullImportCompleted: !importInProgress
+        )
+    }
+}
+
 private final class PaginatedMailboxAppClient: AppClient {
     var baseURL = AppConfiguration.defaultBackendURL
     var sessionToken: String?
@@ -4863,7 +5963,7 @@ private final class PaginatedMailboxAppClient: AppClient {
             pendingCount: 0,
             oldestImportedAt: nil,
             fullImportRunning: false,
-            fullImportCompleted: false
+            fullImportCompleted: true
         )
     }
 
