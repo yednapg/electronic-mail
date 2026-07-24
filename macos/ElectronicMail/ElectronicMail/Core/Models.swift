@@ -654,13 +654,7 @@ private enum EmailAddressDisplayFormatter {
             .split { character in
                 character == "." || character == "_" || character == "-" || character == "+"
             }
-            .map { segment in
-                let text = String(segment).lowercased()
-                guard let first = text.first else {
-                    return text
-                }
-                return String(first).uppercased() + String(text.dropFirst())
-            }
+            .map(String.init)
             .joined(separator: " ")
     }
 

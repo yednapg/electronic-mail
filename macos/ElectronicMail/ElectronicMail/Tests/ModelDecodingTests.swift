@@ -1007,13 +1007,13 @@ final class ModelDecodingTests: XCTestCase {
     func testMailboxRowDisplaySenderFormatsEmailOnlySenderWithDomain() {
         let row = makeMailboxPresentationRow(sender: "update@airtel.com")
 
-        XCTAssertEqual(row.displaySender, "Update - airtel.com")
+        XCTAssertEqual(row.displaySender, "update - airtel.com")
     }
 
     func testMailboxRowDisplaySenderFormatsBareAngleAddress() {
         let row = makeMailboxPresentationRow(sender: "<alerts@long-subdomain.example.co.in>")
 
-        XCTAssertEqual(row.displaySender, "Alerts - long-subdomain.example.co.in")
+        XCTAssertEqual(row.displaySender, "alerts - long-subdomain.example.co.in")
     }
 
     func testMailboxRowDisplaySenderPreservesPersonalGmailAddress() {
@@ -1029,7 +1029,15 @@ final class ModelDecodingTests: XCTestCase {
             participants: ["no.reply+statements@mailer.example.com"]
         )
 
-        XCTAssertEqual(row.displaySender, "No Reply Statements - mailer.example.com")
+        XCTAssertEqual(row.displaySender, "no reply statements - mailer.example.com")
+    }
+
+    func testMailboxRowDisplaySenderPreservesEmailLocalPartCapitalization() {
+        let lowercase = makeMailboxPresentationRow(sender: "cbsalerts.sbi@alerts.sbi.bank.in")
+        let mixedCase = makeMailboxPresentationRow(sender: "HDFCFXclearretail@mailer.example.com")
+
+        XCTAssertEqual(lowercase.displaySender, "cbsalerts sbi - alerts.sbi.bank.in")
+        XCTAssertEqual(mixedCase.displaySender, "HDFCFXclearretail - mailer.example.com")
     }
 
     func testMailboxRowPresentationIgnoresPendingAITitleState() throws {
