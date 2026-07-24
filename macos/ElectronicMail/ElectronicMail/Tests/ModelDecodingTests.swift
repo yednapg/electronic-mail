@@ -819,7 +819,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(labels.map(SignedInDestination.init(mailboxLabel:)), SignedInDestination.allCases)
     }
 
-    func testFullScreenNavigationKeepsTodosInThePrimaryNavigationList() {
+    func testFullScreenNavigationShowsTodosFirst() {
         let destinations = ShellPrimaryNavigationDestination.allCases
 
         XCTAssertEqual(
@@ -828,7 +828,7 @@ final class ModelDecodingTests: XCTestCase {
         )
         XCTAssertEqual(
             destinations.map(\.title),
-            ["Inbox", "Starred", "Drafts", "Sent", "Spam", "Trash", "Archive", "All Mail", "To-dos"]
+            ["To-do's", "Inbox", "Starred", "Drafts", "Sent", "Spam", "Trash", "Archive", "All Mail"]
         )
         XCTAssertFalse(destinations.map(\.title).contains("Calendar"))
     }
