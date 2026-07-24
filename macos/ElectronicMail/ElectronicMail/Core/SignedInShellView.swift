@@ -597,9 +597,6 @@ enum ShellPrimaryNavigationDestination: String, CaseIterable, Identifiable {
         }
     }
 
-    var isSupplemental: Bool {
-        self == .todos
-    }
 }
 
 private struct ShellHeaderTitle: View {
@@ -697,7 +694,6 @@ private struct ShellNavigationCanvas: View {
                         colorScheme: colorScheme,
                         action: { onSelect(destination) }
                     )
-                    .padding(.top, destination.isSupplemental ? 12 : 0)
                 }
             }
             .padding(.top, ElectronicMailShellMetrics.navTop)
