@@ -3299,6 +3299,9 @@ public final class InboxStore: ObservableObject {
             activeMessageID = nil
             seedActiveSelectionIfNeeded()
         }
+        if readerThreadID == threadID {
+            closeReader()
+        }
     }
 
     private func applyLocalReadState(threadID: String, targetMessageID: String?, unread: Bool) {
