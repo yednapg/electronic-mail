@@ -13,11 +13,11 @@ const gmailInboxClientSource = readFileSync(new URL('./GmailInboxClient.tsx', im
 
 test('gmail received time stays compact', () => {
   assert.match(
-    formatGmailReceivedAt('2026-05-11T09:30:00+05:30', new Date('2026-05-11T10:00:00+05:30')),
+    formatGmailReceivedAt('2026-05-11T09:30:00', new Date('2026-05-11T10:00:00')),
     /9:30/,
   );
   assert.equal(
-    formatGmailReceivedAt('2026-05-08T11:00:00+05:30', new Date('2026-05-11T10:00:00+05:30')),
+    formatGmailReceivedAt('2026-05-08T11:00:00', new Date('2026-05-11T10:00:00')),
     'May 8',
   );
 });

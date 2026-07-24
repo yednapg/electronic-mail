@@ -155,7 +155,7 @@ fi
 if find "$success_dir" -type f -name 'electronic-mail-*.dump' -print -quit | grep -q .; then
   fail "a plaintext final dump was published"
 fi
-success_mode="$(stat -f '%Lp' "$success_dump" 2>/dev/null || stat -c '%a' "$success_dump")"
+success_mode="$(stat -c '%a' "$success_dump" 2>/dev/null || stat -f '%Lp' "$success_dump")"
 [ "$success_mode" = "600" ] || fail "encrypted backup permissions were not 0600"
 
 test_key_file="$TEST_DIR/test-key"
