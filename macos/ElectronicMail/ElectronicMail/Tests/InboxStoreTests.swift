@@ -1668,7 +1668,7 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertNil(store.session)
     }
 
-    func testTodoMapperSplitsDashboardFeedSections() {
+    func testTodoMapperSplitsDashboardFeedSections() throws {
         let snapshot = TodoHomeMapper.snapshot(from: DemoAppFixtures.appSession, now: Date(timeIntervalSince1970: 0))
 
         XCTAssertEqual(snapshot.now.rows.map(\.entityID), ["demo-apple-today"])
@@ -1687,7 +1687,26 @@ final class InboxStoreTests: XCTestCase {
                 "demo-calendar-update",
             ]
         )
-        XCTAssertEqual(snapshot.agenda.map(\.time), ["10:00", "12:00", "13:30", "14:45", "15:00"])
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withColonSeparatorInTimeZone]
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let expectedAgendaTimes = try [
+            "2026-05-16T10:00:00+05:30",
+            "2026-05-16T12:00:00+05:30",
+            "2026-05-16T13:30:00+05:30",
+            "2026-05-16T14:45:00+05:30",
+            "2026-05-16T15:00:00+05:30",
+        ].map { value in
+            let date = try XCTUnwrap(parser.date(from: value))
+            let components = calendar.dateComponents([.hour, .minute], from: date)
+            return String(
+                format: "%02d:%02d",
+                try XCTUnwrap(components.hour),
+                try XCTUnwrap(components.minute)
+            )
+        }
+        XCTAssertEqual(snapshot.agenda.map(\.time), expectedAgendaTimes)
     }
 
     func testTodoRowsUseInboxDerivedMetadata() async {
@@ -1696,10 +1715,12 @@ final class InboxStoreTests: XCTestCase {
         await store.load()
         let snapshot = TodoHomeMapper.snapshot(from: DemoAppFixtures.appSession, inboxRows: store.flatRows, now: Date(timeIntervalSince1970: 0))
 
+        let sourceInboxRow = store.flatRows.first { $0.threadID == "demo-apple-today" }
         let nowRow = snapshot.now.rows.first
+        XCTAssertNotNil(sourceInboxRow)
         XCTAssertEqual(nowRow?.sender, "Apple Developer")
         XCTAssertEqual(nowRow?.title, "App Review needs one more screenshot for macOS")
-        XCTAssertEqual(nowRow?.timeLabel, "12:46 PM")
+        XCTAssertEqual(nowRow?.timeLabel, sourceInboxRow?.timeLabel)
         XCTAssertEqual(nowRow?.detailText, "Apple Developer needs one more screenshot before review can continue. Confirm the slot or move it out of today's work.")
         XCTAssertEqual(nowRow?.actionLabel, "Open source")
         XCTAssertEqual(nowRow?.gmailThreadID, "demo-apple-today")
