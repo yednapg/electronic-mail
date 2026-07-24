@@ -101,8 +101,8 @@ public struct SignedInShellView: View {
             ZStack(alignment: .topLeading) {
                 content
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .allowsHitTesting(!navigationOpen && !mailboxSearchOpen)
-                    .accessibilityHidden(navigationOpen || mailboxSearchOpen)
+                    .allowsHitTesting(!navigationOpen && !mailboxSearchOpen && composer == nil)
+                    .accessibilityHidden(navigationOpen || mailboxSearchOpen || composer != nil)
 
                 if !navigationOpen,
                    store.readerThreadID == nil,
@@ -113,7 +113,7 @@ public struct SignedInShellView: View {
                         colorScheme: colorScheme
                     )
                     .transition(.opacity)
-                    .accessibilityHidden(mailboxSearchOpen)
+                    .accessibilityHidden(mailboxSearchOpen || composer != nil)
                     .zIndex(4)
                 }
 
@@ -125,12 +125,14 @@ public struct SignedInShellView: View {
                         onSelect: selectPrimaryNavigation
                     )
                     .transition(.opacity)
+                    .allowsHitTesting(composer == nil)
+                    .accessibilityHidden(composer != nil)
                     .zIndex(2)
                 }
 
                 fixedNavigationButton(width: proxy.size.width)
-                    .allowsHitTesting(!mailboxSearchOpen)
-                    .accessibilityHidden(mailboxSearchOpen)
+                    .allowsHitTesting(!mailboxSearchOpen && composer == nil)
+                    .accessibilityHidden(mailboxSearchOpen || composer != nil)
                     .zIndex(6)
 
                 if mailboxSearchOpen {
@@ -218,7 +220,9 @@ public struct SignedInShellView: View {
             await restoreRecoveredComposerIfNeeded()
         }
         .onExitCommand {
-            if commandPaletteOpen {
+            if composer != nil {
+                NotificationCenter.default.post(name: .electronicMailComposerCloseRequested, object: nil)
+            } else if commandPaletteOpen {
                 closeCommandPalette()
             } else if mailboxSearchOpen {
                 closeMailboxSearch()
@@ -1571,6 +1575,7 @@ private struct ComposerRecoverySnapshot: Codable, Equatable, @unchecked Sendable
     let preserveExistingDraftAttachments: Bool
     let sourceAttachmentCount: Int
     let includeOriginalAttachments: Bool
+    let responseFieldProvenance: MailComposerResponseFieldProvenance?
 
     func belongs(to userID: String?) -> Bool {
         guard let userID else { return false }
@@ -1812,6 +1817,9 @@ private struct MailComposerOverlay: View {
 
     var body: some View {
         GeometryReader { proxy in
+            let sheetWidth = min(626, max(0, proxy.size.width - 48))
+            let sheetHeight = min(580, max(0, proxy.size.height - 48))
+
             ZStack {
                 Button {
                     NotificationCenter.default.post(name: .electronicMailComposerCloseRequested, object: nil)
@@ -1831,17 +1839,16 @@ private struct MailComposerOverlay: View {
                     onReauthorizeGoogle: onReauthorizeGoogle,
                     onClose: onClose
                 )
-                .frame(
-                    width: min(max(680, proxy.size.width * 0.60), 900),
-                    height: min(max(520, proxy.size.height * 0.70), 740)
-                )
-                .background(.regularMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .frame(width: sheetWidth, height: sheetHeight)
+                .background(ElectronicMailDesign.composerSurface(for: colorScheme))
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .stroke(ElectronicMailDesign.panelBorder(for: colorScheme), lineWidth: 1)
                 )
-                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.50 : 0.18), radius: 28, x: 0, y: 14)
+                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.52 : 0.18), radius: 26, x: 0, y: 12)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Message composer")
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
             .background(
@@ -1871,6 +1878,7 @@ private struct MailComposerSheet: View {
     let onReauthorizeGoogle: () async throws -> Void
     let onClose: (ComposerRecoverySnapshot?) -> Void
 
+    @State private var activeMode: MailComposerMode
     @State private var toText = ""
     @State private var ccText = ""
     @State private var bccText = ""
@@ -1898,7 +1906,10 @@ private struct MailComposerSheet: View {
     @State private var autosaveTask: Task<Void, Never>?
     @State private var attachmentLoadTask: Task<Void, Never>?
     @State private var sendTask: Task<Void, Never>?
+    @State private var responseModeTask: Task<Void, Never>?
     @State private var loadingAttachments = false
+    @State private var switchingResponseMode = false
+    @State private var responseFieldProvenance = MailComposerResponseFieldProvenance()
     @State private var autosaveRevision: UInt64 = 0
     @State private var draftChangeTracker = MailComposerDraftChangeTracker()
     @State private var confirmSendWithoutSubject = false
@@ -1909,199 +1920,158 @@ private struct MailComposerSheet: View {
     @State private var shutdownRegistrationID = UUID()
     @FocusState private var focusedField: ComposerFocusField?
 
+    init(
+        presentation: MailComposerPresentation,
+        recoverySnapshot: ComposerRecoverySnapshot?,
+        store: InboxStore,
+        colorScheme: ColorScheme,
+        onReauthorizeGoogle: @escaping () async throws -> Void,
+        onClose: @escaping (ComposerRecoverySnapshot?) -> Void
+    ) {
+        self.presentation = presentation
+        self.recoverySnapshot = recoverySnapshot
+        self._store = ObservedObject(wrappedValue: store)
+        self.colorScheme = colorScheme
+        self.onReauthorizeGoogle = onReauthorizeGoogle
+        self.onClose = onClose
+        self._activeMode = State(initialValue: presentation.mode)
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
-                Text(presentation.mode.title)
-                    .font(ElectronicMailType.title())
-                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                if savingDraft {
-                    Text("Saving...")
-                        .font(ElectronicMailType.body())
-                        .foregroundStyle(ElectronicMailDesign.tertiaryText(for: colorScheme))
-                }
-                Spacer()
-                if gmailDraftID != nil {
-                    Button("Delete Draft", role: .destructive) {
-                        confirmDeleteDraft = true
-                    }
-                    .buttonStyle(.borderless)
-                    .disabled(sending || savingDraft || !editorReady)
-                }
-                Button("Cancel") {
-                    Task { await requestClose() }
-                }
-                .buttonStyle(.bordered)
-                Button {
-                    startSend(allowEmptySubject: false)
-                } label: {
-                    if sending {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Text("Send")
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(savingDraft || sending)
-                .disabled(!canSend)
-                .keyboardShortcut(.return, modifiers: [.command])
-            }
+        VStack(alignment: .leading, spacing: 0) {
+            composerHeader
+
+            Rectangle()
+                .fill(ElectronicMailDesign.divider(for: colorScheme))
+                .frame(height: 1)
+                .padding(.top, 12)
 
             if loadingDraft {
-                HStack(spacing: 10) {
+                HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text("Loading draft...")
-                        .font(ElectronicMailType.body())
+                    Text("Loading draft…")
+                        .font(ElectronicMailComposerType.status())
                         .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                 }
+                .padding(.vertical, 8)
             }
 
             if let draftLoadError {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 6) {
                     Text("Draft could not be loaded")
-                        .font(ElectronicMailType.body(weight: .semibold))
+                        .font(ElectronicMailComposerType.value())
                         .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                     Text(draftLoadError)
-                        .font(ElectronicMailType.body())
+                        .font(ElectronicMailComposerType.status())
                         .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                        .lineLimit(2)
                     Button("Retry") {
                         Task {
                             await loadInitialValues()
                             if editorReady {
-                                focusedField = .to
+                                focusedField = initialFocusField
                             }
                         }
                     }
                     .buttonStyle(.plain)
-                    .font(ElectronicMailType.small(weight: .semibold))
+                    .font(ElectronicMailComposerType.control(weight: .semibold))
                     .foregroundStyle(ElectronicMailDesign.appleBlue)
                     .disabled(loadingDraft)
                 }
-                .padding(.vertical, 6)
+                .padding(.vertical, 8)
             }
 
-            composerField("To", placeholder: "name@example.com, another@example.com", text: $toText, focus: .to)
-            composerField("Cc", placeholder: "Optional, comma-separated", text: $ccText, focus: .cc)
-            composerField("Bcc", placeholder: "Optional, hidden recipients", text: $bccText, focus: .bcc)
-            composerField("Subject", placeholder: "Subject", text: $subject, focus: .subject)
+            composerField(
+                "To",
+                placeholder: "Add recipients",
+                text: $toText,
+                focus: .to,
+                usesTokenFill: true,
+                responseField: .to
+            )
+            composerField(
+                "Cc",
+                placeholder: "Add recipients",
+                text: $ccText,
+                focus: .cc,
+                usesTokenFill: true,
+                responseField: .cc
+            )
+            composerField("Bcc", placeholder: "Add hidden recipients", text: $bccText, focus: .bcc, usesTokenFill: true)
+            composerSubjectField
 
-            HStack(spacing: 12) {
-                Button {
-                    chooseAttachments()
-                } label: {
-                    if loadingAttachments {
-                        Label("Preparing Files", systemImage: "paperclip")
-                    } else {
-                        Label("Attach Files", systemImage: "paperclip")
-                    }
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.regular)
-                .font(ElectronicMailType.small(weight: .semibold))
-                .disabled(savingDraft || sending || loadingAttachments || !editorReady)
-
-                if loadingAttachments {
-                    ProgressView().controlSize(.small)
-                }
-
-                if !attachments.isEmpty || !existingDraftAttachments.isEmpty {
-                    Text("\(attachments.count + existingDraftAttachments.count) attachment(s)")
-                        .font(ElectronicMailType.body())
-                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                }
-            }
-
-            if presentation.mode == .forward, sourceAttachmentCount > 0 {
+            if effectiveMode == .forward, sourceAttachmentCount > 0 {
                 Toggle(
                     "Include \(sourceAttachmentCount) original attachment\(sourceAttachmentCount == 1 ? "" : "s")",
                     isOn: $includeOriginalAttachments
                 )
                 .toggleStyle(.checkbox)
-                .font(ElectronicMailType.body())
+                .font(ElectronicMailComposerType.status())
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                .disabled(sending || !editorReady)
+                .padding(.vertical, 7)
+                .disabled(composerControlsDisabled)
             }
 
             if !attachments.isEmpty || !existingDraftAttachments.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(existingDraftAttachments) { attachment in
-                            composerAttachmentChip(
-                                name: attachment.filename,
-                                detail: "Saved attachment",
-                                onRemove: {
-                                    existingDraftAttachments.removeAll { $0.id == attachment.id }
-                                    preserveExistingDraftAttachments = false
-                                    statusText = "Attachment will be removed on the next save."
-                                }
-                            )
-                        }
-                        ForEach(attachments) { attachment in
-                            composerAttachmentChip(
-                                name: attachment.upload.filename,
-                                detail: ByteCountFormatter.string(fromByteCount: Int64(attachment.byteCount), countStyle: .file),
-                                onRemove: { attachments.removeAll { $0.id == attachment.id } }
-                            )
-                        }
-                    }
-                }
-                if !existingDraftAttachments.isEmpty {
-                    Button("Remove All Saved Attachments", role: .destructive) {
-                        existingDraftAttachments = []
-                        preserveExistingDraftAttachments = false
-                        statusText = "Saved attachments will be removed on the next save."
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Color.red)
-                    .disabled(savingDraft || sending)
-                }
-            }
-
-            TextEditor(text: $bodyText)
-                .focused($focusedField, equals: .body)
-                .font(ElectronicMailType.body())
-                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                .scrollContentBackground(.hidden)
-                .frame(minHeight: 220, maxHeight: .infinity)
-                .padding(12)
-                .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(ElectronicMailDesign.panelFill(for: colorScheme))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .stroke(ElectronicMailDesign.panelBorder(for: colorScheme), lineWidth: 1)
-                )
-                .disabled(!editorReady || sending)
-
-            if let statusText {
-                HStack(spacing: 12) {
-                    Text(statusText)
-                        .font(ElectronicMailType.body())
-                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                    if statusText.localizedCaseInsensitiveContains("permission") {
-                        Button {
-                            Task { await reauthorize() }
-                        } label: {
-                            if reauthorizing {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Text("Grant permission")
+                VStack(alignment: .leading, spacing: 5) {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 7) {
+                            ForEach(existingDraftAttachments) { attachment in
+                                composerAttachmentChip(
+                                    name: attachment.filename,
+                                    detail: "Saved attachment",
+                                    onRemove: {
+                                        existingDraftAttachments.removeAll { $0.id == attachment.id }
+                                        preserveExistingDraftAttachments = false
+                                        statusText = "Attachment will be removed on the next save."
+                                    }
+                                )
+                            }
+                            ForEach(attachments) { attachment in
+                                composerAttachmentChip(
+                                    name: attachment.upload.filename,
+                                    detail: ByteCountFormatter.string(
+                                        fromByteCount: Int64(attachment.byteCount),
+                                        countStyle: .file
+                                    ),
+                                    onRemove: { attachments.removeAll { $0.id == attachment.id } }
+                                )
                             }
                         }
+                    }
+                    .frame(height: 38)
+
+                    if !existingDraftAttachments.isEmpty {
+                        Button("Remove saved attachments", role: .destructive) {
+                            existingDraftAttachments = []
+                            preserveExistingDraftAttachments = false
+                            statusText = "Saved attachments will be removed on the next save."
+                        }
                         .buttonStyle(.plain)
-                        .foregroundStyle(ElectronicMailDesign.appleBlue)
-                        .disabled(reauthorizing)
+                        .font(ElectronicMailComposerType.status())
+                        .foregroundStyle(Color.red)
+                        .disabled(savingDraft || sending || switchingResponseMode)
                     }
                 }
+                .padding(.vertical, 6)
             }
+
+            composerEditor
+                .padding(.top, 1)
+
+            composerFooter
+                .padding(.top, 10)
         }
-        .padding(20)
+        .padding(.horizontal, 14)
+        .padding(.top, 16)
+        .padding(.bottom, 10)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(effectiveMode.title) composer")
         .task {
             await loadInitialValues()
             guard editorReady else { return }
-            focusedField = .to
+            focusedField = initialFocusField
         }
         .onAppear {
             ElectronicMailComposerShutdownCoordinator.shared.register(id: shutdownRegistrationID) {
@@ -2117,11 +2087,14 @@ private struct MailComposerSheet: View {
         .onChange(of: existingDraftAttachments.map(\.id)) { _, _ in scheduleAutosave() }
         .onChange(of: preserveExistingDraftAttachments) { _, _ in scheduleAutosave() }
         .onChange(of: includeOriginalAttachments) { _, _ in scheduleAutosave() }
+        .onChange(of: activeMode) { _, _ in scheduleAutosave() }
         .onDisappear {
             autosaveTask?.cancel()
             attachmentLoadTask?.cancel()
             sendTask?.cancel()
+            responseModeTask?.cancel()
             sendTask = nil
+            responseModeTask = nil
             ElectronicMailComposerShutdownCoordinator.shared.unregister(id: shutdownRegistrationID)
             guard !composerResolved else { return }
             Task {
@@ -2155,10 +2128,249 @@ private struct MailComposerSheet: View {
         }
     }
 
+    private var composerHeader: some View {
+        HStack(spacing: 10) {
+            if isResponseComposer {
+                Picker("Response type", selection: responseModeSelection) {
+                    ForEach(MailComposerResponseTransitionPolicy.modes, id: \.rawValue) { mode in
+                        Text(mode.title).tag(mode.rawValue)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .font(ElectronicMailComposerType.mode())
+                .frame(minWidth: 0, idealWidth: 264, maxWidth: 264, minHeight: 31, maxHeight: 31)
+                .disabled(responseModeControlsDisabled)
+                .accessibilityLabel("Response type")
+                .help(
+                    unresolvedSendAttempt
+                        ? "Response type cannot change while delivery is being confirmed."
+                        : "Response type"
+                )
+            } else {
+                Text(effectiveMode.title)
+                    .font(ElectronicMailComposerType.value())
+                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                    .accessibilityAddTraits(.isHeader)
+            }
+
+            Spacer(minLength: 8)
+
+            if switchingResponseMode {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Changing response type")
+            }
+
+            if gmailDraftID != nil {
+                Menu {
+                    Button("Delete Draft", role: .destructive) {
+                        confirmDeleteDraft = true
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .frame(width: 32, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .help("Draft actions")
+                .accessibilityLabel("Draft actions")
+                .disabled(composerControlsDisabled || savingDraft || loadingDraft)
+            }
+        }
+        .frame(height: 31)
+    }
+
+    private var composerEditor: some View {
+        ZStack(alignment: .topLeading) {
+            if bodyText.isEmpty {
+                Text(editorPlaceholder)
+                    .font(ElectronicMailComposerType.body())
+                    .foregroundStyle(ElectronicMailDesign.tertiaryText(for: colorScheme))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+
+            TextEditor(text: $bodyText)
+                .focused($focusedField, equals: .body)
+                .font(ElectronicMailComposerType.body())
+                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .scrollContentBackground(.hidden)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 6)
+                .accessibilityLabel("Message body")
+        }
+        .frame(minHeight: 150, maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(ElectronicMailDesign.composerEditorSurface(for: colorScheme))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .stroke(
+                    focusedField == .body
+                        ? ElectronicMailDesign.appleBlue
+                        : ElectronicMailDesign.panelBorder(for: colorScheme),
+                    lineWidth: focusedField == .body ? 1.25 : 1
+                )
+        }
+        .disabled(composerControlsDisabled)
+    }
+
+    private var composerFooter: some View {
+        HStack(spacing: 12) {
+            Button {
+                chooseAttachments()
+            } label: {
+                HStack(spacing: 5) {
+                    if loadingAttachments {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "paperclip")
+                    }
+                    Text(loadingAttachments ? "Preparing" : "Attach")
+                }
+            }
+            .buttonStyle(.plain)
+            .font(ElectronicMailComposerType.control(weight: .semibold))
+            .foregroundStyle(ElectronicMailDesign.appleBlue)
+            .frame(minWidth: 68, minHeight: 36, alignment: .leading)
+            .contentShape(Rectangle())
+            .disabled(composerControlsDisabled || loadingAttachments)
+            .accessibilityLabel(loadingAttachments ? "Preparing files" : "Attach files")
+
+            if let footerStatusText {
+                Text(footerStatusText)
+                    .font(ElectronicMailComposerType.status())
+                    .foregroundStyle(ElectronicMailDesign.tertiaryText(for: colorScheme))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 180, alignment: .leading)
+                    .help(footerStatusText)
+                    .accessibilityLabel(footerStatusText)
+            }
+
+            if statusText?.localizedCaseInsensitiveContains("permission") == true {
+                Button {
+                    Task { await reauthorize() }
+                } label: {
+                    if reauthorizing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text("Grant permission")
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(ElectronicMailComposerType.control(weight: .semibold))
+                .foregroundStyle(ElectronicMailDesign.appleBlue)
+                .disabled(reauthorizing)
+            }
+
+            Spacer(minLength: 8)
+
+            Button("Cancel") {
+                Task { await requestClose() }
+            }
+            .buttonStyle(.plain)
+            .font(ElectronicMailComposerType.control(weight: .semibold))
+            .foregroundStyle(ElectronicMailDesign.appleBlue)
+            .frame(minWidth: 54, minHeight: 36)
+            .contentShape(Rectangle())
+            .disabled(switchingResponseMode || sending)
+
+            Button {
+                startSend(allowEmptySubject: false)
+            } label: {
+                if sending {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Text("Send")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+            .font(ElectronicMailComposerType.control(weight: .semibold))
+            .frame(minWidth: 60)
+            .disabled(!canSend)
+            .keyboardShortcut(.return, modifiers: [.command])
+        }
+        .frame(height: 40)
+    }
+
+    private var effectiveMode: MailComposerMode {
+        isResponseComposer ? activeMode : presentation.mode
+    }
+
+    private var isResponseComposer: Bool {
+        MailComposerResponseTransitionPolicy.isResponseMode(presentation.mode)
+    }
+
+    private var composerControlsDisabled: Bool {
+        !editorReady || sending || switchingResponseMode
+    }
+
+    private var responseModeControlsDisabled: Bool {
+        composerControlsDisabled
+            || savingDraft
+            || loadingDraft
+            || loadingAttachments
+            || unresolvedSendAttempt
+    }
+
+    private var footerStatusText: String? {
+        if switchingResponseMode {
+            return "Changing response type…"
+        }
+        if savingDraft {
+            return "Saving…"
+        }
+        if let statusText, !statusText.isEmpty {
+            return statusText
+        }
+        if gmailDraftID != nil {
+            return "Draft saved"
+        }
+        return nil
+    }
+
+    private var editorPlaceholder: String {
+        switch effectiveMode {
+        case .reply, .replyAll:
+            return "Write a reply…"
+        case .compose, .draft, .forward:
+            return "Write a message…"
+        }
+    }
+
+    private var initialFocusField: ComposerFocusField {
+        switch effectiveMode {
+        case .reply, .replyAll:
+            return .body
+        case .compose, .forward:
+            return .to
+        case .draft:
+            return parsedAddresses(toText).isEmpty ? .to : .body
+        }
+    }
+
+    private var responseModeSelection: Binding<String> {
+        Binding(
+            get: { effectiveMode.rawValue },
+            set: { rawValue in
+                guard let mode = MailComposerMode(rawValue: rawValue) else { return }
+                requestResponseModeChange(mode)
+            }
+        )
+    }
+
     private var canSend: Bool {
         !sending
             && !savingDraft
             && !loadingDraft
+            && !switchingResponseMode
             && editorReady
             && !parsedAddresses(toText).isEmpty
     }
@@ -2169,6 +2381,8 @@ private struct MailComposerSheet: View {
 
     private var draftFingerprint: String {
         [
+            effectiveMode.rawValue,
+            responseFieldProvenance.userEditedFields.map(\.rawValue).sorted().joined(separator: ","),
             toText,
             ccText,
             bccText,
@@ -2190,7 +2404,7 @@ private struct MailComposerSheet: View {
     }
 
     private var responseDraftChanged: Bool {
-        guard MailComposerPolicy.responseMode(for: presentation.mode) != nil else {
+        guard MailComposerPolicy.responseMode(for: effectiveMode) != nil else {
             return false
         }
         return restoredFromRecovery
@@ -2199,7 +2413,7 @@ private struct MailComposerSheet: View {
 
     private var shouldPersistGmailDraft: Bool {
         MailComposerPolicy.shouldPersistDraft(
-            mode: presentation.mode,
+            mode: effectiveMode,
             hasContent: hasDraftContent,
             responseChanged: responseDraftChanged,
             hasGmailDraft: gmailDraftID?.isEmpty == false
@@ -2210,30 +2424,115 @@ private struct MailComposerSheet: View {
         _ label: String,
         placeholder: String,
         text: Binding<String>,
-        focus: ComposerFocusField
+        focus: ComposerFocusField,
+        usesTokenFill: Bool = false,
+        responseField: MailComposerResponseField? = nil
     ) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
+        HStack(alignment: .center, spacing: 10) {
             Text(label)
-                .font(ElectronicMailType.body())
+                .font(ElectronicMailComposerType.label())
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                 .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-                .frame(width: 56, alignment: .leading)
-            TextField(placeholder, text: text)
+                .frame(width: 60, alignment: .leading)
+            TextField(placeholder, text: composerFieldBinding(text, responseField: responseField))
                 .textFieldStyle(.plain)
-                .font(ElectronicMailType.body())
+                .font(ElectronicMailComposerType.value())
                 .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .padding(.horizontal, usesTokenFill ? 9 : 0)
+                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 28, maxHeight: 28, alignment: .leading)
+                .layoutPriority(1)
+                .background(alignment: .leading) {
+                    if usesTokenFill, !text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        GeometryReader { proxy in
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(ElectronicMailDesign.composerTokenFill(for: colorScheme))
+                                .frame(
+                                    width: min(
+                                        recipientFieldWidth(text: text.wrappedValue, placeholder: placeholder),
+                                        proxy.size.width
+                                    )
+                                )
+                        }
+                    }
+                }
                 .accessibilityLabel(label)
                 .focused($focusedField, equals: focus)
                 .onSubmit { advanceFocus(after: focus) }
         }
-        .padding(.bottom, 6)
+        .frame(height: 44)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(ElectronicMailDesign.divider(for: colorScheme))
                 .frame(height: 1)
         }
-        .disabled(!editorReady || sending)
+        .disabled(composerControlsDisabled)
+    }
+
+    private func composerFieldBinding(
+        _ text: Binding<String>,
+        responseField: MailComposerResponseField?
+    ) -> Binding<String> {
+        Binding(
+            get: { text.wrappedValue },
+            set: { value in
+                let changed = value != text.wrappedValue
+                text.wrappedValue = value
+                if changed,
+                   didLoadInitialValues,
+                   isResponseComposer,
+                   let responseField {
+                    responseFieldProvenance.markUserEdited(responseField)
+                }
+            }
+        )
+    }
+
+    private var composerSubjectField: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text("Subject")
+                .font(ElectronicMailComposerType.label())
+                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                .lineLimit(1)
+                .frame(width: 60, alignment: .leading)
+
+            TextField("Subject", text: responsiveSubjectBinding, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(ElectronicMailComposerType.value())
+                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .lineLimit(1...2)
+                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                .layoutPriority(1)
+                .accessibilityLabel("Subject")
+                .focused($focusedField, equals: .subject)
+                .onSubmit { advanceFocus(after: .subject) }
+        }
+        .padding(.vertical, 8)
+        .frame(minHeight: 44)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(ElectronicMailDesign.divider(for: colorScheme))
+                .frame(height: 1)
+        }
+        .disabled(composerControlsDisabled)
+    }
+
+    private var responsiveSubjectBinding: Binding<String> {
+        Binding(
+            get: { subject },
+            set: { value in
+                let sanitizedValue = MailComposerPolicy.sanitizedSubject(value)
+                let changed = sanitizedValue != subject
+                subject = sanitizedValue
+                if changed, didLoadInitialValues, isResponseComposer {
+                    responseFieldProvenance.markUserEdited(.subject)
+                }
+            }
+        )
+    }
+
+    private func recipientFieldWidth(text: String, placeholder: String) -> CGFloat {
+        let source = text.isEmpty ? placeholder : text
+        return min(max(CGFloat(source.count) * 7.4 + 24, 150), 460)
     }
 
     private func advanceFocus(after field: ComposerFocusField) {
@@ -2252,12 +2551,12 @@ private struct MailComposerSheet: View {
     }
 
     private func composerAttachmentChip(name: String, detail: String, onRemove: (() -> Void)?) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
             Image(systemName: "paperclip")
             VStack(alignment: .leading, spacing: 1) {
                 Text(name).lineLimit(1)
                 Text(detail)
-                    .font(ElectronicMailType.small())
+                    .font(ElectronicMailComposerType.status())
                     .foregroundStyle(ElectronicMailDesign.tertiaryText(for: colorScheme))
             }
             if let onRemove {
@@ -2266,16 +2565,168 @@ private struct MailComposerSheet: View {
                 }
                 .buttonStyle(.plain)
                 .help("Remove \(name)")
-                .disabled(savingDraft || sending)
+                .disabled(savingDraft || sending || switchingResponseMode)
             }
         }
-        .font(ElectronicMailType.body())
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
+        .font(ElectronicMailComposerType.control())
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
         .background(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(ElectronicMailDesign.panelFill(for: colorScheme))
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(ElectronicMailDesign.composerTokenFill(for: colorScheme))
         )
+    }
+
+    private struct ResponsePrefill {
+        let toText: String
+        let ccText: String
+        let subject: String
+        let gmailThreadID: String?
+        let sourceAttachmentCount: Int
+    }
+
+    @MainActor
+    private func requestResponseModeChange(_ mode: MailComposerMode) {
+        guard isResponseComposer,
+              MailComposerResponseTransitionPolicy.isResponseMode(mode),
+              mode != effectiveMode,
+              responseModeTask == nil,
+              !responseModeControlsDisabled else {
+            return
+        }
+        responseModeTask = Task { @MainActor in
+            await changeResponseMode(to: mode)
+            responseModeTask = nil
+        }
+    }
+
+    @MainActor
+    private func changeResponseMode(to nextMode: MailComposerMode) async {
+        let previousMode = effectiveMode
+        guard previousMode != nextMode,
+              !unresolvedSendAttempt,
+              let nextPrefill = responsePrefill(for: nextMode) else {
+            return
+        }
+
+        let crossesForwardBoundary = MailComposerResponseTransitionPolicy.crossesForwardBoundary(
+            from: previousMode,
+            to: nextMode
+        )
+        if crossesForwardBoundary, !existingDraftAttachments.isEmpty {
+            statusText = "Remove saved attachments before changing the response type."
+            return
+        }
+
+        var focusAfterTransition: ComposerFocusField?
+        switchingResponseMode = true
+        autosaveTask?.cancel()
+        autosaveTask = nil
+        autosaveRevision &+= 1
+        defer {
+            switchingResponseMode = false
+            scheduleAutosave(rearm: true)
+            if let focusAfterTransition {
+                Task { @MainActor in
+                    await Task.yield()
+                    guard !composerResolved else { return }
+                    focusedField = focusAfterTransition
+                }
+            }
+        }
+
+        if crossesForwardBoundary {
+            guard await persistRecoverySnapshotIfNeeded(force: true) else {
+                statusText = "Your current message could not be preserved, so the response type was not changed."
+                return
+            }
+            guard !Task.isCancelled else { return }
+        }
+
+        if crossesForwardBoundary, let gmailDraftID {
+            do {
+                try await store.deleteDraft(gmailDraftID: gmailDraftID)
+            } catch {
+                statusText = "Could not change the response type: \(error.localizedDescription)"
+                return
+            }
+        }
+
+        if crossesForwardBoundary {
+            // Once the old provider draft has been removed, immediately sever
+            // its identity before any cancellation point can reuse it.
+            clientDraftID = UUID().uuidString
+            clientSendID = UUID().uuidString
+            gmailDraftID = nil
+            serverSendID = nil
+            unresolvedSendAttempt = false
+            existingDraftAttachments = []
+            preserveExistingDraftAttachments = true
+            draftForkWarning = nil
+        }
+
+        activeMode = nextMode
+        gmailThreadID = nextPrefill.gmailThreadID
+        sourceAttachmentCount = nextPrefill.sourceAttachmentCount
+        toText = responseFieldProvenance.transitionedValue(
+            for: .to,
+            current: toText,
+            nextDefault: nextPrefill.toText
+        )
+        ccText = responseFieldProvenance.transitionedValue(
+            for: .cc,
+            current: ccText,
+            nextDefault: nextPrefill.ccText
+        )
+        subject = responseFieldProvenance.transitionedValue(
+            for: .subject,
+            current: subject,
+            nextDefault: nextPrefill.subject
+        )
+        subject = MailComposerPolicy.sanitizedSubject(subject)
+        focusAfterTransition = nextMode == .forward && parsedAddresses(toText).isEmpty ? .to : .body
+        if await persistRecoverySnapshotIfNeeded(force: true) {
+            statusText = "Changed to \(nextMode.title)."
+        } else {
+            statusText = "Changed to \(nextMode.title), but recovery could not be updated. Keep this window open."
+        }
+    }
+
+    @MainActor
+    private func responsePrefill(for mode: MailComposerMode) -> ResponsePrefill? {
+        let orderedMessages = store.readerThread?.messages.sorted(by: { $0.receivedAt < $1.receivedAt }) ?? []
+        guard let message = orderedMessages.first(where: { $0.id == presentation.sourceMessageID })
+            ?? orderedMessages.last else {
+            return nil
+        }
+        let recipients = MailReplyPrefillPolicy.recipients(
+            mode: mode,
+            currentUser: store.session?.user.email,
+            senderHeader: message.replyTo ?? message.fromAddress,
+            originalToHeader: message.to,
+            originalCCHeader: message.cc
+        )
+        let sourceSubject = MailComposerPolicy.sanitizedSubject(message.subject ?? presentation.title)
+        switch mode {
+        case .reply, .replyAll:
+            return ResponsePrefill(
+                toText: recipients.to.joined(separator: ", "),
+                ccText: recipients.cc.joined(separator: ", "),
+                subject: replySubject(sourceSubject),
+                gmailThreadID: message.threadID ?? store.readerThread?.gmailThreadID,
+                sourceAttachmentCount: message.attachments.count
+            )
+        case .forward:
+            return ResponsePrefill(
+                toText: "",
+                ccText: "",
+                subject: forwardSubject(sourceSubject),
+                gmailThreadID: message.threadID ?? store.readerThread?.gmailThreadID,
+                sourceAttachmentCount: message.attachments.count
+            )
+        case .compose, .draft:
+            return nil
+        }
     }
 
     @MainActor
@@ -2290,7 +2741,7 @@ private struct MailComposerSheet: View {
             statusText = "Recovered your unsent message."
             return
         }
-        switch presentation.mode {
+        switch effectiveMode {
         case .compose:
             draftChangeTracker.synchronize(fingerprint: draftFingerprint)
             didLoadInitialValues = true
@@ -2312,7 +2763,7 @@ private struct MailComposerSheet: View {
                 toText = draft.to.joined(separator: ", ")
                 ccText = draft.cc.joined(separator: ", ")
                 bccText = draft.bcc.joined(separator: ", ")
-                subject = draft.subject
+                subject = MailComposerPolicy.sanitizedSubject(draft.subject)
                 bodyText = draft.bodyText
                 existingDraftAttachments = draft.attachments
                 statusText = "Draft loaded."
@@ -2324,7 +2775,7 @@ private struct MailComposerSheet: View {
                 didLoadInitialValues = false
             }
         case .reply, .replyAll, .forward:
-            prefillResponse()
+            prefillResponse(for: effectiveMode)
             initialResponseFingerprint = draftFingerprint
             draftChangeTracker.synchronize(fingerprint: draftFingerprint)
             didLoadInitialValues = true
@@ -2332,44 +2783,26 @@ private struct MailComposerSheet: View {
     }
 
     @MainActor
-    private func prefillResponse() {
-        let orderedMessages = store.readerThread?.messages.sorted(by: { $0.receivedAt < $1.receivedAt }) ?? []
-        guard let message = orderedMessages.first(where: { $0.id == presentation.sourceMessageID }) ?? orderedMessages.last else {
+    private func prefillResponse(for mode: MailComposerMode) {
+        guard let prefill = responsePrefill(for: mode) else {
             statusText = "Email content is still loading."
             return
         }
-        gmailThreadID = message.threadID ?? store.readerThread?.gmailThreadID
-        sourceAttachmentCount = message.attachments.count
-        let currentUser = store.session?.user.email
-        let recipients = MailReplyPrefillPolicy.recipients(
-            mode: presentation.mode,
-            currentUser: currentUser,
-            senderHeader: message.replyTo ?? message.fromAddress,
-            originalToHeader: message.to,
-            originalCCHeader: message.cc
-        )
-        switch presentation.mode {
-        case .reply:
-            toText = recipients.to.joined(separator: ", ")
-            ccText = recipients.cc.joined(separator: ", ")
-            subject = replySubject(message.subject ?? presentation.title)
-        case .replyAll:
-            toText = recipients.to.joined(separator: ", ")
-            ccText = recipients.cc.joined(separator: ", ")
-            subject = replySubject(message.subject ?? presentation.title)
-        case .forward:
-            subject = forwardSubject(message.subject ?? presentation.title)
-        case .compose, .draft:
-            break
-        }
+        responseFieldProvenance = MailComposerResponseFieldProvenance()
+        gmailThreadID = prefill.gmailThreadID
+        sourceAttachmentCount = prefill.sourceAttachmentCount
+        toText = prefill.toText
+        ccText = prefill.ccText
+        subject = MailComposerPolicy.sanitizedSubject(prefill.subject)
     }
 
     @MainActor
     private func apply(_ recovery: ComposerRecoverySnapshot) {
+        activeMode = recovery.mode
         toText = recovery.toText
         ccText = recovery.ccText
         bccText = recovery.bccText
-        subject = recovery.subject
+        subject = MailComposerPolicy.sanitizedSubject(recovery.subject)
         bodyText = recovery.bodyText
         clientSendID = recovery.clientSendID
         serverSendID = recovery.serverSendID
@@ -2382,6 +2815,12 @@ private struct MailComposerSheet: View {
         preserveExistingDraftAttachments = recovery.preserveExistingDraftAttachments
         sourceAttachmentCount = recovery.sourceAttachmentCount
         includeOriginalAttachments = recovery.includeOriginalAttachments
+        if MailComposerResponseTransitionPolicy.isResponseMode(recovery.mode) {
+            responseFieldProvenance = recovery.responseFieldProvenance
+                ?? MailComposerResponseFieldProvenance(userEditedFields: Set(MailComposerResponseField.allCases))
+        } else {
+            responseFieldProvenance = MailComposerResponseFieldProvenance()
+        }
     }
 
     @MainActor
@@ -2397,7 +2836,7 @@ private struct MailComposerSheet: View {
         if MailComposerPolicy.shouldClearUnchangedResponseRecovery(
             force: force,
             hasUnresolvedSendAttempt: unresolvedSendAttempt,
-            mode: presentation.mode,
+            mode: effectiveMode,
             restoredFromRecovery: restoredFromRecovery,
             responseIsUnchanged: !responseDraftChanged
         ) {
@@ -2417,14 +2856,14 @@ private struct MailComposerSheet: View {
         }
         return ComposerRecoverySnapshot(
             accountUserID: accountUserID,
-            mode: presentation.mode,
+            mode: effectiveMode,
             threadID: presentation.threadID,
             sourceMessageID: presentation.sourceMessageID,
             title: presentation.title,
             toText: toText,
             ccText: ccText,
             bccText: bccText,
-            subject: subject,
+            subject: MailComposerPolicy.sanitizedSubject(subject),
             bodyText: bodyText,
             clientSendID: clientSendID,
             serverSendID: serverSendID,
@@ -2436,16 +2875,21 @@ private struct MailComposerSheet: View {
             existingDraftAttachments: existingDraftAttachments,
             preserveExistingDraftAttachments: preserveExistingDraftAttachments,
             sourceAttachmentCount: sourceAttachmentCount,
-            includeOriginalAttachments: includeOriginalAttachments
+            includeOriginalAttachments: includeOriginalAttachments,
+            responseFieldProvenance: isResponseComposer ? responseFieldProvenance : nil
         )
     }
 
-    private func scheduleAutosave() {
+    private func scheduleAutosave(rearm: Bool = false) {
         guard didLoadInitialValues, !sending else {
             return
         }
-        guard draftChangeTracker.shouldHandleChange(fingerprint: draftFingerprint) else {
-            return
+        if rearm {
+            draftChangeTracker.synchronize(fingerprint: draftFingerprint)
+        } else {
+            guard draftChangeTracker.shouldHandleChange(fingerprint: draftFingerprint) else {
+                return
+            }
         }
         let contentChangeDecision = MailComposerPolicy.contentChangeDecision(
             hasUnresolvedSendAttempt: unresolvedSendAttempt,
@@ -2494,7 +2938,7 @@ private struct MailComposerSheet: View {
         defer { savingDraft = false }
         do {
             let submittedAttachmentIDs = Set(attachments.map(\.id))
-            let responseMode = MailComposerPolicy.responseMode(for: presentation.mode)
+            let responseMode = MailComposerPolicy.responseMode(for: effectiveMode)
             let response = try await store.saveDraft(
                 MailDraftSaveRequest(
                     clientDraftID: clientDraftID,
@@ -2503,7 +2947,7 @@ private struct MailComposerSheet: View {
                     to: parsedAddresses(toText),
                     cc: parsedAddresses(ccText),
                     bcc: parsedAddresses(bccText),
-                    subject: subject,
+                    subject: MailComposerPolicy.sanitizedSubject(subject),
                     bodyText: bodyText,
                     bodyHTML: nil,
                     attachments: draftAttachmentPayload,
@@ -2584,7 +3028,7 @@ private struct MailComposerSheet: View {
                 return
             }
 
-            if MailComposerPolicy.responseMode(for: presentation.mode) != nil,
+            if MailComposerPolicy.responseMode(for: effectiveMode) != nil,
                presentation.threadID == nil {
                 statusText = "Email thread not found."
                 return
@@ -2627,7 +3071,13 @@ private struct MailComposerSheet: View {
 
     @MainActor
     private func deleteDraft() async {
-        guard let gmailDraftID else { return }
+        guard !savingDraft,
+              !loadingDraft,
+              !sending,
+              !switchingResponseMode,
+              let gmailDraftID else {
+            return
+        }
         do {
             try await store.deleteDraft(gmailDraftID: gmailDraftID)
             finishComposer()
@@ -2694,6 +3144,10 @@ private struct MailComposerSheet: View {
     @MainActor
     private func requestClose() async {
         autosaveTask?.cancel()
+        guard !switchingResponseMode else {
+            statusText = "Finishing the response-type change…"
+            return
+        }
         guard !sending else {
             statusText = "Waiting for delivery confirmation..."
             return
@@ -2740,6 +3194,10 @@ private struct MailComposerSheet: View {
     @MainActor
     private func prepareForShutdown() async -> Bool {
         autosaveTask?.cancel()
+        guard !switchingResponseMode else {
+            statusText = "Finishing the response-type change before closing…"
+            return false
+        }
         let recoveryPersisted = await persistRecoverySnapshotIfNeeded(force: unresolvedSendAttempt)
         guard recoveryPersisted else {
             statusText = "Your unsent message could not be preserved. Keep the app open and try again."
