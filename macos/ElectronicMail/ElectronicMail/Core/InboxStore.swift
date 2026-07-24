@@ -339,6 +339,9 @@ private struct InboxTimestampLabelCacheKey: Hashable {
 private struct InboxSectionsCache {
     let revision: UInt
     let sections: [InboxSectionViewModel]
+    let flatRows: [InboxRowViewModel]
+    let rowsByID: [String: InboxRowViewModel]
+    let firstRowByThreadID: [String: InboxRowViewModel]
 }
 
 private struct ReaderLabelMutationKey: Hashable {
@@ -708,12 +711,22 @@ public final class InboxStore: ObservableObject {
             return inboxSectionsCache.sections
         }
         guard let mailbox = visibleMailbox else {
-            inboxSectionsCache = InboxSectionsCache(revision: inboxSectionsRevision, sections: [])
+            inboxSectionsCache = InboxSectionsCache(
+                revision: inboxSectionsRevision,
+                sections: [],
+                flatRows: [],
+                rowsByID: [:],
+                firstRowByThreadID: [:]
+            )
             return []
         }
         let sections: [InboxSectionViewModel] = mailbox.sections.compactMap { section -> InboxSectionViewModel? in
-            let rows = visibleRows(in: section).flatMap { row in
+            let visibleParentRows = visibleRows(in: section)
+            var rows: [InboxRowViewModel] = []
+            rows.reserveCapacity(visibleParentRows.count)
+            for row in visibleParentRows {
                 let childRows = visibleChildren(for: row)
+                let isExpanded = expandedThreadIDs.contains(row.threadID)
                 let parent = InboxRowViewModel(
                     id: row.threadID,
                     sender: row.displaySender,
@@ -731,33 +744,36 @@ public final class InboxStore: ObservableObject {
                     presentationStatus: row.presentationStatus,
                     isChild: false,
                     isExpandable: childRows.count > 1,
-                    isExpanded: expandedThreadIDs.contains(row.threadID)
+                    isExpanded: isExpanded
                 )
-                guard expandedThreadIDs.contains(row.threadID) else {
-                    return [parent]
+                rows.append(parent)
+                guard isExpanded else {
+                    continue
                 }
-                let children = childRows.map { child in
-                    InboxRowViewModel(
-                        id: "\(row.threadID)::message::\(child.messageID)",
-                        sender: child.displaySender,
-                        title: child.displayTitle,
-                        summary: child.snippet,
-                        receivedAt: child.receivedAt,
-                        section: section.title,
-                        isUnread: child.isUnread,
-                        isGrouped: false,
-                        threadID: row.threadID,
-                        focusedMessageID: child.messageID,
-                        messageCount: 1,
-                        timeLabel: timeLabel(for: child.receivedAt, sectionTitle: section.title),
-                        hasAttachments: false,
-                        presentationStatus: row.presentationStatus,
-                        isChild: true,
-                        isExpandable: false,
-                        isExpanded: false
+                rows.reserveCapacity(rows.count + childRows.count)
+                for child in childRows {
+                    rows.append(
+                        InboxRowViewModel(
+                            id: "\(row.threadID)::message::\(child.messageID)",
+                            sender: child.displaySender,
+                            title: child.displayTitle,
+                            summary: child.snippet,
+                            receivedAt: child.receivedAt,
+                            section: section.title,
+                            isUnread: child.isUnread,
+                            isGrouped: false,
+                            threadID: row.threadID,
+                            focusedMessageID: child.messageID,
+                            messageCount: 1,
+                            timeLabel: timeLabel(for: child.receivedAt, sectionTitle: section.title),
+                            hasAttachments: false,
+                            presentationStatus: row.presentationStatus,
+                            isChild: true,
+                            isExpandable: false,
+                            isExpanded: false
+                        )
                     )
                 }
-                return [parent] + children
             }
             guard !rows.isEmpty else {
                 return nil
@@ -768,12 +784,34 @@ public final class InboxStore: ObservableObject {
                 rows: rows
             )
         }
-        inboxSectionsCache = InboxSectionsCache(revision: inboxSectionsRevision, sections: sections)
+        let flatRows = sections.flatMap(\.rows)
+        var rowsByID: [String: InboxRowViewModel] = [:]
+        var firstRowByThreadID: [String: InboxRowViewModel] = [:]
+        rowsByID.reserveCapacity(flatRows.count)
+        firstRowByThreadID.reserveCapacity(flatRows.count)
+        for row in flatRows {
+            rowsByID[row.id] = row
+            if firstRowByThreadID[row.threadID] == nil {
+                firstRowByThreadID[row.threadID] = row
+            }
+        }
+        inboxSectionsCache = InboxSectionsCache(
+            revision: inboxSectionsRevision,
+            sections: sections,
+            flatRows: flatRows,
+            rowsByID: rowsByID,
+            firstRowByThreadID: firstRowByThreadID
+        )
         return sections
     }
 
     public var flatRows: [InboxRowViewModel] {
-        sections.flatMap(\.rows)
+        _ = sections
+        return inboxSectionsCache?.flatRows ?? []
+    }
+
+    var inboxPresentationRevision: UInt {
+        inboxSectionsRevision
     }
 
     public var dashboardFeedCount: Int {
@@ -1211,12 +1249,19 @@ public final class InboxStore: ObservableObject {
             }
             inFlightSessionRefresh = nil
             let merged = sessionCache.merge(current: session ?? sessionCache.read(), next: next, allowEmptyDashboard: allowEmptyDashboard)
-            session = merged
+            let sessionChanged = session != merged
+            if sessionChanged {
+                session = merged
+            }
             sessionCache.write(merged)
             await localMailStoreWorker.writeSession(merged)
             await refreshPendingLocalActionCount()
-            refreshFailed = false
-            phase = .loaded
+            if refreshFailed {
+                refreshFailed = false
+            }
+            if phase != .loaded {
+                phase = .loaded
+            }
             await refreshActiveMailbox(allowCachedFallback: true, force: forceMailbox || activeMailbox == nil)
             seedActiveSelectionIfNeeded()
             refreshReaderRow()
@@ -1236,24 +1281,43 @@ public final class InboxStore: ObservableObject {
             if transitionToReauthenticationIfNeeded(for: error) {
                 return
             }
-            refreshFailed = true
+            if !refreshFailed {
+                refreshFailed = true
+            }
             let memoryCachedSession = sessionCache.read()
             let diskCachedSession = memoryCachedSession == nil ? await localMailStoreWorker.readSession() : nil
             if session == nil, let cached = memoryCachedSession ?? diskCachedSession {
-                session = cached
-                activeMailbox = await localMailStoreWorker.readMailbox(userID: cached.user.id, label: activeMailboxLabel)
-                if activeMailbox == nil, activeMailboxLabel == .inbox {
-                    activeMailbox = cached.mailbox
+                if session != cached {
+                    session = cached
                 }
-                phase = activeMailbox == nil ? .failed(error.localizedDescription) : .loaded
+                let cachedMailbox = await localMailStoreWorker.readMailbox(userID: cached.user.id, label: activeMailboxLabel)
+                if activeMailbox != cachedMailbox {
+                    activeMailbox = cachedMailbox
+                }
+                if activeMailbox == nil, activeMailboxLabel == .inbox {
+                    if activeMailbox != cached.mailbox {
+                        activeMailbox = cached.mailbox
+                    }
+                }
+                let nextPhase: LoadPhase = activeMailbox == nil ? .failed(error.localizedDescription) : .loaded
+                if phase != nextPhase {
+                    phase = nextPhase
+                }
             } else if activeMailbox == nil,
                       activeMailboxLabel == .inbox,
                       let cachedInbox = session?.mailbox {
-                activeMailbox = cachedInbox
-                phase = .loaded
+                if activeMailbox != cachedInbox {
+                    activeMailbox = cachedInbox
+                }
+                if phase != .loaded {
+                    phase = .loaded
+                }
                 seedActiveSelectionIfNeeded()
             } else if session == nil {
-                phase = .failed(error.localizedDescription)
+                let nextPhase = LoadPhase.failed(error.localizedDescription)
+                if phase != nextPhase {
+                    phase = nextPhase
+                }
             }
         }
     }
@@ -1344,7 +1408,10 @@ public final class InboxStore: ObservableObject {
                 resetMailboxPagination()
             }
             discardLoadedMailboxPagesOnNextRefresh = false
-            activeMailbox = merged
+            let mailboxChanged = activeMailbox != merged
+            if mailboxChanged {
+                activeMailbox = merged
+            }
             updateFolderCount(from: merged)
             if let revision = merged.mailboxRevision, !revision.isEmpty {
                 lastSeenMailboxRevision = revision
@@ -1353,8 +1420,12 @@ public final class InboxStore: ObservableObject {
                 lastForcedMailboxRefreshAt = Date()
                 lastForcedMailboxRefreshError = nil
             }
-            refreshFailed = false
-            phase = .loaded
+            if refreshFailed {
+                refreshFailed = false
+            }
+            if phase != .loaded {
+                phase = .loaded
+            }
             seedActiveSelectionIfNeeded()
             refreshReaderRow()
             if automaticallyPrefetchThreads {
@@ -1388,19 +1459,32 @@ public final class InboxStore: ObservableObject {
             if context.force {
                 lastForcedMailboxRefreshError = error.localizedDescription
             }
-            refreshFailed = true
+            if !refreshFailed {
+                refreshFailed = true
+            }
             if let cached {
-                activeMailbox = cached
-                phase = .loaded
+                if activeMailbox != cached {
+                    activeMailbox = cached
+                }
+                if phase != .loaded {
+                    phase = .loaded
+                }
                 seedActiveSelectionIfNeeded()
             } else if context.allowCachedFallback,
                       context.label == .inbox,
                       let sessionInbox = session?.mailbox {
-                activeMailbox = sessionInbox
-                phase = .loaded
+                if activeMailbox != sessionInbox {
+                    activeMailbox = sessionInbox
+                }
+                if phase != .loaded {
+                    phase = .loaded
+                }
                 seedActiveSelectionIfNeeded()
             } else if activeMailbox == nil {
-                phase = .failed(error.localizedDescription)
+                let nextPhase = LoadPhase.failed(error.localizedDescription)
+                if phase != nextPhase {
+                    phase = nextPhase
+                }
             }
         }
     }
@@ -1480,13 +1564,19 @@ public final class InboxStore: ObservableObject {
             let current = visibleMailbox
             let merged = current?.appendingPage(page) ?? page
             if context.searchQuery != nil {
-                searchResults = merged
+                if searchResults != merged {
+                    searchResults = merged
+                }
             } else {
-                activeMailbox = merged
+                if activeMailbox != merged {
+                    activeMailbox = merged
+                }
                 updateFolderCount(from: merged)
                 await localMailStoreWorker.writeMailbox(merged, userID: userID, label: context.label)
             }
-            refreshFailed = false
+            if refreshFailed {
+                refreshFailed = false
+            }
             seedActiveSelectionIfNeeded()
             refreshReaderRow()
         } catch is CancellationError {
@@ -1555,15 +1645,31 @@ public final class InboxStore: ObservableObject {
         }
         selectionPrefetchTask?.cancel()
         selectionPrefetchTask = nil
-        selectedThreadID = threadID
-        selectedMessageID = focusedMessageID
+        if selectedThreadID != threadID {
+            selectedThreadID = threadID
+        }
+        if selectedMessageID != focusedMessageID {
+            selectedMessageID = focusedMessageID
+        }
         activeThreadID = threadID
         activeMessageID = focusedMessageID
-        readerThreadID = threadID
-        readerFocusedMessageID = focusedMessageID
-        readerThread = openedThreads[threadID]
-        readerRow = rowViewModel(threadID: threadID)
-        readerError = nil
+        if readerThreadID != threadID {
+            readerThreadID = threadID
+        }
+        if readerFocusedMessageID != focusedMessageID {
+            readerFocusedMessageID = focusedMessageID
+        }
+        let nextThread = openedThreads[threadID]
+        if readerThread != nextThread {
+            readerThread = nextThread
+        }
+        let nextRow = rowViewModel(threadID: threadID)
+        if readerRow != nextRow {
+            readerRow = nextRow
+        }
+        if readerError != nil {
+            readerError = nil
+        }
         threadErrors[threadID] = nil
         markReadAfterOpening(threadID: threadID, focusedMessageID: focusedMessageID)
 
@@ -1577,8 +1683,12 @@ public final class InboxStore: ObservableObject {
             cancelBodyRefresh(for: readerThreadID)
             pendingHydrationRefreshThreadIDs.remove(readerThreadID)
         }
-        readerThreadID = nil
-        readerFocusedMessageID = nil
+        if readerThreadID != nil {
+            readerThreadID = nil
+        }
+        if readerFocusedMessageID != nil {
+            readerFocusedMessageID = nil
+        }
     }
 
     public func toggleExpansion(threadID: String) {
@@ -2197,24 +2307,73 @@ public final class InboxStore: ObservableObject {
 
         let inFlightLabelMutationGeneration = readerLabelMutationGenerations[threadID] ?? 0
         let task = Task { [client, threadFetchLimit, userID] in
-            var combined = try await client.thread(threadID: threadID, limit: threadFetchLimit, offset: 0)
-            guard combined.userID == userID else {
+            let firstPage = try await client.thread(threadID: threadID, limit: threadFetchLimit, offset: 0)
+            guard firstPage.userID == userID else {
                 throw APIError.emptyResponse
             }
+            var messages = firstPage.messages
+            var seenMessageIDs = Set(messages.map(\.id))
+            messages.reserveCapacity(
+                min(max(firstPage.totalMessages, messages.count), threadFetchLimit * 201)
+            )
+            var source = firstPage.source
+            var gmailThreadID = firstPage.gmailThreadID
+            var subject = firstPage.subject
+            var title = firstPage.title
+            var totalMessages = max(firstPage.totalMessages, messages.count)
+            var limit = firstPage.limit
+            var hasMore = firstPage.hasMore
+            var nextOffset = firstPage.offset + firstPage.messages.count
             var pageCount = 0
-            while combined.hasMore, pageCount < 200 {
-                let nextOffset = combined.offset + combined.messages.count
-                guard nextOffset > combined.offset else {
+            while hasMore, pageCount < 200 {
+                try Task.checkCancellation()
+                let requestedOffset = nextOffset
+                guard requestedOffset > firstPage.offset || pageCount > 0 else {
                     break
                 }
-                let page = try await client.thread(threadID: threadID, limit: threadFetchLimit, offset: nextOffset)
+                let page = try await client.thread(
+                    threadID: threadID,
+                    limit: threadFetchLimit,
+                    offset: requestedOffset
+                )
                 guard page.userID == userID else {
                     throw APIError.emptyResponse
                 }
-                combined = combined.appendingPage(page)
+                for message in page.messages where seenMessageIDs.insert(message.id).inserted {
+                    messages.append(message)
+                }
+                source = source ?? page.source
+                gmailThreadID = gmailThreadID ?? page.gmailThreadID
+                subject = subject ?? page.subject
+                title = title ?? page.title
+                totalMessages = max(totalMessages, page.totalMessages, messages.count)
+                limit = max(limit, page.limit)
+                hasMore = page.hasMore
                 pageCount += 1
+
+                let followingOffset = requestedOffset + page.messages.count
+                guard !hasMore || followingOffset > requestedOffset else {
+                    break
+                }
+                nextOffset = followingOffset
             }
-            return combined
+            guard pageCount > 0 else {
+                return firstPage
+            }
+            return ThreadReaderResponse(
+                entityID: firstPage.entityID,
+                userID: firstPage.userID,
+                source: source,
+                gmailThreadID: gmailThreadID,
+                subject: subject,
+                title: title,
+                summary: nil,
+                totalMessages: totalMessages,
+                limit: limit,
+                offset: 0,
+                hasMore: hasMore,
+                messages: messages
+            )
         }
         inFlightThreads[threadID] = task
         inFlightThreadLabelMutationGenerations[threadID] = inFlightLabelMutationGeneration
@@ -2642,9 +2801,8 @@ public final class InboxStore: ObservableObject {
     }
 
     private func rowNeedsMarkRead(threadID: String, focusedMessageID: String?) -> Bool {
-        flatRows.contains { row in
-            row.threadID == threadID && row.focusedMessageID == focusedMessageID && row.isUnread
-        }
+        _ = sections
+        return inboxSectionsCache?.rowsByID[Self.rowID(threadID: threadID, focusedMessageID: focusedMessageID)]?.isUnread == true
     }
 
     private func readActionKey(threadID: String, focusedMessageID: String?) -> String {
@@ -2657,7 +2815,7 @@ public final class InboxStore: ObservableObject {
     private func seedActiveSelectionIfNeeded() {
         let rows = flatRows
         if let activeThreadID,
-           rows.contains(where: { $0.threadID == activeThreadID && $0.focusedMessageID == activeMessageID }) {
+           inboxSectionsCache?.rowsByID[Self.rowID(threadID: activeThreadID, focusedMessageID: activeMessageID)] != nil {
             if selectedThreadID == nil {
                 selectedThreadID = activeThreadID
                 selectedMessageID = activeMessageID
@@ -2668,30 +2826,53 @@ public final class InboxStore: ObservableObject {
         activeThreadID = firstRow?.threadID
         activeMessageID = firstRow?.focusedMessageID
         if selectedThreadID == nil
-            || !rows.contains(where: { $0.threadID == selectedThreadID && $0.focusedMessageID == selectedMessageID }) {
+            || inboxSectionsCache?.rowsByID[
+                Self.rowID(threadID: selectedThreadID, focusedMessageID: selectedMessageID)
+            ] == nil {
             selectedThreadID = firstRow?.threadID
             selectedMessageID = firstRow?.focusedMessageID
         }
     }
 
     private func rowViewModel(threadID: String) -> InboxRowViewModel? {
-        flatRows.first { $0.threadID == threadID }
+        _ = sections
+        return inboxSectionsCache?.firstRowByThreadID[threadID]
+    }
+
+    private static func rowID(threadID: String?, focusedMessageID: String?) -> String {
+        guard let threadID else {
+            return ""
+        }
+        guard let focusedMessageID else {
+            return threadID
+        }
+        return "\(threadID)::message::\(focusedMessageID)"
     }
 
     private func refreshReaderRow() {
         guard let readerThreadID else {
             return
         }
-        readerRow = rowViewModel(threadID: readerThreadID)
+        let nextRow = rowViewModel(threadID: readerThreadID)
+        if readerRow != nextRow {
+            readerRow = nextRow
+        }
     }
 
     private func updateReader(threadID: String, thread: ThreadReaderResponse, error: String?) {
         guard readerThreadID == threadID else {
             return
         }
-        readerThread = thread
-        readerRow = rowViewModel(threadID: threadID)
-        readerError = error
+        if readerThread != thread {
+            readerThread = thread
+        }
+        let nextRow = rowViewModel(threadID: threadID)
+        if readerRow != nextRow {
+            readerRow = nextRow
+        }
+        if readerError != error {
+            readerError = error
+        }
     }
 
     private func recordThreadError(_ message: String, threadID: String) {
@@ -2699,8 +2880,13 @@ public final class InboxStore: ObservableObject {
         guard readerThreadID == threadID else {
             return
         }
-        readerError = message
-        readerRow = rowViewModel(threadID: threadID)
+        if readerError != message {
+            readerError = message
+        }
+        let nextRow = rowViewModel(threadID: threadID)
+        if readerRow != nextRow {
+            readerRow = nextRow
+        }
     }
 
     private func startPendingHydrationRefreshAfterCurrentRequest(
@@ -3188,11 +3374,17 @@ public final class InboxStore: ObservableObject {
     }
 
     private func visibleRows(in section: GmailThreadSection) -> [GmailThreadRow] {
-        section.rows.filter { $0.isVisible(in: activeMailboxLabel) }
+        if activeMailboxLabel == .all || activeMailboxLabel == .archive {
+            return section.rows
+        }
+        return section.rows.filter { $0.isVisible(in: activeMailboxLabel) }
     }
 
     private func visibleChildren(for row: GmailThreadRow) -> [GmailThreadChildRow] {
-        row.childRows.filter { $0.isVisible(in: activeMailboxLabel) }
+        if activeMailboxLabel == .all || activeMailboxLabel == .archive {
+            return row.childRows
+        }
+        return row.childRows.filter { $0.isVisible(in: activeMailboxLabel) }
     }
 
     private func invalidateInboxSections() {
@@ -3239,49 +3431,57 @@ public final class InboxStore: ObservableObject {
 
 private extension GmailThreadRow {
     func isVisible(in mailboxLabel: MailboxLabel) -> Bool {
-        let rowLabels = Set((labelIDs + labels).map { $0.uppercased() })
         switch mailboxLabel {
         case .all:
             return true
         case .inbox:
-            return rowLabels.contains("INBOX")
+            return containsMailboxLabel("INBOX")
         case .sent:
-            return rowLabels.contains("SENT")
+            return containsMailboxLabel("SENT")
         case .drafts:
-            return rowLabels.contains("DRAFT")
+            return containsMailboxLabel("DRAFT")
         case .spam:
-            return rowLabels.contains("SPAM")
+            return containsMailboxLabel("SPAM")
         case .trash:
-            return rowLabels.contains("TRASH")
+            return containsMailboxLabel("TRASH")
         case .archive:
             return true
         case .starred:
-            return rowLabels.contains("STARRED")
+            return containsMailboxLabel("STARRED")
         }
+    }
+
+    private func containsMailboxLabel(_ target: String) -> Bool {
+        labelIDs.contains { $0.caseInsensitiveCompare(target) == .orderedSame }
+            || labels.contains { $0.caseInsensitiveCompare(target) == .orderedSame }
     }
 }
 
 private extension GmailThreadChildRow {
     func isVisible(in mailboxLabel: MailboxLabel) -> Bool {
-        let rowLabels = Set((labelIDs + labels).map { $0.uppercased() })
         switch mailboxLabel {
         case .all:
             return true
         case .inbox:
-            return rowLabels.contains("INBOX")
+            return containsMailboxLabel("INBOX")
         case .sent:
-            return rowLabels.contains("SENT")
+            return containsMailboxLabel("SENT")
         case .drafts:
-            return rowLabels.contains("DRAFT")
+            return containsMailboxLabel("DRAFT")
         case .spam:
-            return rowLabels.contains("SPAM")
+            return containsMailboxLabel("SPAM")
         case .trash:
-            return rowLabels.contains("TRASH")
+            return containsMailboxLabel("TRASH")
         case .archive:
             return true
         case .starred:
-            return rowLabels.contains("STARRED")
+            return containsMailboxLabel("STARRED")
         }
+    }
+
+    private func containsMailboxLabel(_ target: String) -> Bool {
+        labelIDs.contains { $0.caseInsensitiveCompare(target) == .orderedSame }
+            || labels.contains { $0.caseInsensitiveCompare(target) == .orderedSame }
     }
 }
 

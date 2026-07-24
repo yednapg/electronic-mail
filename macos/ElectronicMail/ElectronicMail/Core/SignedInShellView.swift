@@ -110,7 +110,7 @@ public struct SignedInShellView: View {
                             .help("New Message")
                             .accessibilityLabel("New Message")
 
-                            MailboxToolbarSearchField(text: $mailboxSearchText)
+                            DebouncedMailboxToolbarSearchField(query: $mailboxSearchText)
                                 .frame(width: 360, height: 28)
                         }
 
@@ -139,18 +139,21 @@ public struct SignedInShellView: View {
                 .zIndex(10)
             }
 
-            if let composer {
-                MailComposerOverlay(
-                    presentation: composer,
-                    recoverySnapshot: recoveredComposerSnapshot,
-                    store: store,
-                    colorScheme: colorScheme,
-                    onReauthorizeGoogle: onReauthorizeGoogle,
-                    onClose: closeComposer(preserving:)
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .center)))
-                .zIndex(12)
+            Group {
+                if let composer {
+                    MailComposerOverlay(
+                        presentation: composer,
+                        recoverySnapshot: recoveredComposerSnapshot,
+                        store: store,
+                        colorScheme: colorScheme,
+                        onReauthorizeGoogle: onReauthorizeGoogle,
+                        onClose: closeComposer(preserving:)
+                    )
+                    .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .center)))
+                    .zIndex(12)
+                }
             }
+            .animation(.easeInOut(duration: 0.14), value: composer)
 
             CommandPaletteKeyboardCapture(
                 isOpen: $commandPaletteOpen
@@ -159,7 +162,6 @@ public struct SignedInShellView: View {
             .opacity(0.01)
         }
         .background(ElectronicMailDesign.background(for: colorScheme))
-        .animation(.easeInOut(duration: 0.14), value: composer)
         .task(id: selection) {
             await applyMailboxSelection()
         }
@@ -376,6 +378,38 @@ public struct SignedInShellView: View {
         )
         guard composer == nil, let presentation else { return }
         presentComposerAfterRecoveryLoad(presentation)
+    }
+}
+
+private struct DebouncedMailboxToolbarSearchField: View {
+    @Binding private var query: String
+    @State private var fieldText: String
+
+    init(query: Binding<String>) {
+        self._query = query
+        self._fieldText = State(initialValue: query.wrappedValue)
+    }
+
+    var body: some View {
+        MailboxToolbarSearchField(text: $fieldText)
+            .task(id: fieldText) {
+                if fieldText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if query != fieldText {
+                        query = fieldText
+                    }
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                guard !Task.isCancelled, query != fieldText else {
+                    return
+                }
+                query = fieldText
+            }
+            .onChange(of: query) { _, nextQuery in
+                if fieldText != nextQuery {
+                    fieldText = nextQuery
+                }
+            }
     }
 }
 

@@ -8,7 +8,6 @@ public struct InboxView: View {
     private let onOpenDraft: (String) -> Void
     @Binding private var searchText: String
     @State private var permanentDeleteTarget: MailboxPermanentDeleteTarget?
-    @FocusState private var mailboxListIsFocused: Bool
 
     public init(
         store: InboxStore,
@@ -134,125 +133,32 @@ public struct InboxView: View {
     }
 
     private func inboxList(snapshot: InboxRenderSnapshot, metrics: InboxLayoutMetrics) -> some View {
-        ScrollViewReader { scrollProxy in
-            ScrollView(.vertical) {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    if !snapshot.hasRows {
-                        InboxEmptyState(
-                            title: snapshot.emptyStateTitle,
-                            message: snapshot.emptyStateMessage,
-                            isLoading: snapshot.emptyStateIsLoading,
-                            showsRetry: snapshot.emptyStateShowsRetry,
-                            colorScheme: colorScheme,
-                            onRetry: {
-                                Task {
-                                    if snapshot.isSearchActive {
-                                        await store.searchMailbox(snapshot.searchQuery)
-                                    } else {
-                                        await store.syncNow()
-                                    }
-                                }
-                            }
-                        )
-                        .frame(width: metrics.windowWidth)
-                    }
-
-                    ForEach(snapshot.sections) { section in
-                        InboxSectionHeader(
-                            title: section.title,
-                            isFirstSection: section.isFirstSection,
-                            metrics: metrics,
-                            colorScheme: colorScheme
-                        )
-                        .equatable()
-
-                        ForEach(section.rows) { row in
-                            InboxRowView(
-                                row: row,
-                                isSelected: snapshot.selectedRowID == row.id,
-                                metrics: metrics,
-                                colorScheme: colorScheme,
-                                actionHint: snapshot.mailboxLabel == .drafts ? "Open draft" : "Open email",
-                                onSelect: { activate(row: row) },
-                                onToggleExpansion: row.isExpandable ? { store.toggleExpansion(threadID: row.threadID) } : nil
-                            )
-                            .equatable()
-                            .id(row.id)
-                        }
-                    }
-
-                    if let footer = snapshot.footer {
-                        InboxFooterView(
-                            text: footer.text,
-                            canLoadMore: footer.canLoadMore,
-                            isLoading: snapshot.mailboxPageLoading,
-                            metrics: metrics,
-                            colorScheme: colorScheme,
-                            onLoadMore: {
-                                Task {
-                                    await store.loadMoreMailbox()
-                                }
-                            }
-                        )
+        InboxMailboxList(
+            snapshot: snapshot,
+            metrics: metrics,
+            colorScheme: colorScheme,
+            onRetry: {
+                Task {
+                    if snapshot.isSearchActive {
+                        await store.searchMailbox(snapshot.searchQuery)
+                    } else {
+                        await store.syncNow()
                     }
                 }
-                .frame(width: metrics.windowWidth, alignment: .topLeading)
-            }
-            .scrollIndicators(.automatic)
-            .focusable()
-            .focusEffectDisabled()
-            .focused($mailboxListIsFocused)
-            .onAppear {
-                mailboxListIsFocused = true
-            }
-            .onKeyPress(.upArrow) {
-                moveSelection(by: -1, snapshot: snapshot, scrollProxy: scrollProxy)
-                return .handled
-            }
-            .onKeyPress(.downArrow) {
-                moveSelection(by: 1, snapshot: snapshot, scrollProxy: scrollProxy)
-                return .handled
-            }
-            .onKeyPress(.return) {
-                openActiveSelection()
-                return .handled
-            }
-            .onKeyPress(.delete, phases: .down) { keyPress in
-                guard keyPress.modifiers.contains(.command) else {
-                    return .ignored
+            },
+            onActivate: activate(row:),
+            onSelect: select(row:),
+            onToggleExpansion: { store.toggleExpansion(threadID: $0) },
+            onLoadMore: {
+                Task {
+                    await store.loadMoreMailbox()
                 }
-                requestPermanentDelete()
-                return .handled
-            }
-            .onDeleteCommand {
-                moveSelectedThreadToTrash()
-            }
-            .transaction { transaction in
-                transaction.disablesAnimations = true
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        }
-    }
-
-    private func moveSelection(
-        by delta: Int,
-        snapshot: InboxRenderSnapshot,
-        scrollProxy: ScrollViewProxy
-    ) {
-        guard !snapshot.flatRows.isEmpty else {
-            return
-        }
-        let currentIndex = snapshot.selectedRowID.flatMap { selectedID in
-            snapshot.flatRows.firstIndex(where: { $0.id == selectedID })
-        }
-        let fallbackIndex = delta > 0 ? -1 : snapshot.flatRows.count
-        let nextIndex = min(
-            max((currentIndex ?? fallbackIndex) + delta, 0),
-            snapshot.flatRows.count - 1
+            },
+            onOpenSelection: openActiveSelection,
+            onMoveToTrash: moveSelectedThreadToTrash,
+            onPermanentDelete: requestPermanentDelete
         )
-        let nextRow = snapshot.flatRows[nextIndex]
-        select(row: nextRow)
-        scrollProxy.scrollTo(nextRow.id, anchor: .center)
+        .equatable()
     }
 
     private func applySearchText() async {
@@ -263,8 +169,6 @@ public struct InboxView: View {
             }
             return
         }
-        try? await Task.sleep(nanoseconds: 350_000_000)
-        guard !Task.isCancelled else { return }
         await store.searchMailbox(query)
     }
 
@@ -322,8 +226,9 @@ private struct MailboxPermanentDeleteTarget: Equatable {
     let messageID: String?
 }
 
-@MainActor
-private struct InboxRenderSnapshot {
+private struct InboxRenderSnapshot: Equatable {
+    let storeIdentity: ObjectIdentifier
+    let revision: UInt
     let sections: [InboxRenderSection]
     let flatRows: [InboxRowViewModel]
     let selectedRowID: String?
@@ -341,26 +246,21 @@ private struct InboxRenderSnapshot {
 
     @MainActor
     init(store: InboxStore) {
+        self.storeIdentity = ObjectIdentifier(store)
+        self.revision = store.inboxPresentationRevision
         let sections = store.sections
-        var renderSections: [InboxRenderSection] = []
-        var flatRows: [InboxRowViewModel] = []
-        var isFirstVisibleSection = true
-
-        for section in sections where !section.rows.isEmpty {
-            renderSections.append(
-                InboxRenderSection(
-                    id: section.id,
-                    title: section.title,
-                    isFirstSection: isFirstVisibleSection,
-                    rows: section.rows
-                )
+        self.sections = sections.enumerated().compactMap { index, section in
+            guard !section.rows.isEmpty else {
+                return nil
+            }
+            return InboxRenderSection(
+                id: section.id,
+                title: section.title,
+                isFirstSection: index == sections.startIndex,
+                rows: section.rows
             )
-            flatRows.append(contentsOf: section.rows)
-            isFirstVisibleSection = false
         }
-
-        self.sections = renderSections
-        self.flatRows = flatRows
+        self.flatRows = store.flatRows
         if let selectedThreadID = store.selectedThreadID {
             if let selectedMessageID = store.selectedMessageID {
                 self.selectedRowID = "\(selectedThreadID)::message::\(selectedMessageID)"
@@ -370,7 +270,7 @@ private struct InboxRenderSnapshot {
         } else {
             self.selectedRowID = nil
         }
-        self.hasRows = !flatRows.isEmpty
+        self.hasRows = !self.flatRows.isEmpty
         self.footer = store.mailboxFooter
         self.mailboxPageLoading = store.mailboxPageLoading
         self.mailboxLabel = store.activeMailboxLabel
@@ -415,6 +315,147 @@ private struct InboxRenderSnapshot {
 
     var emptyStateShowsRetry: Bool {
         searchError != nil || mailboxError != nil || mailboxRefreshFailed
+    }
+
+    static func == (lhs: InboxRenderSnapshot, rhs: InboxRenderSnapshot) -> Bool {
+        lhs.storeIdentity == rhs.storeIdentity
+            && lhs.revision == rhs.revision
+            && lhs.selectedRowID == rhs.selectedRowID
+            && lhs.footer == rhs.footer
+            && lhs.mailboxPageLoading == rhs.mailboxPageLoading
+            && lhs.mailboxLabel == rhs.mailboxLabel
+            && lhs.mailboxTitle == rhs.mailboxTitle
+            && lhs.isSearchActive == rhs.isSearchActive
+            && lhs.searchQuery == rhs.searchQuery
+            && lhs.searchError == rhs.searchError
+            && lhs.emptyStateIsLoading == rhs.emptyStateIsLoading
+            && lhs.mailboxError == rhs.mailboxError
+            && lhs.mailboxRefreshFailed == rhs.mailboxRefreshFailed
+    }
+}
+
+private struct InboxMailboxList: View, Equatable {
+    let snapshot: InboxRenderSnapshot
+    let metrics: InboxLayoutMetrics
+    let colorScheme: ColorScheme
+    let onRetry: () -> Void
+    let onActivate: (InboxRowViewModel) -> Void
+    let onSelect: (InboxRowViewModel) -> Void
+    let onToggleExpansion: (String) -> Void
+    let onLoadMore: () -> Void
+    let onOpenSelection: () -> Void
+    let onMoveToTrash: () -> Void
+    let onPermanentDelete: () -> Void
+    @FocusState private var isFocused: Bool
+
+    static func == (lhs: InboxMailboxList, rhs: InboxMailboxList) -> Bool {
+        lhs.snapshot == rhs.snapshot
+            && lhs.metrics == rhs.metrics
+            && lhs.colorScheme == rhs.colorScheme
+    }
+
+    var body: some View {
+        ScrollViewReader { scrollProxy in
+            ScrollView(.vertical) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if !snapshot.hasRows {
+                        InboxEmptyState(
+                            title: snapshot.emptyStateTitle,
+                            message: snapshot.emptyStateMessage,
+                            isLoading: snapshot.emptyStateIsLoading,
+                            showsRetry: snapshot.emptyStateShowsRetry,
+                            colorScheme: colorScheme,
+                            onRetry: onRetry
+                        )
+                        .frame(width: metrics.windowWidth)
+                    }
+
+                    ForEach(snapshot.sections) { section in
+                        InboxSectionHeader(
+                            title: section.title,
+                            isFirstSection: section.isFirstSection,
+                            metrics: metrics,
+                            colorScheme: colorScheme
+                        )
+                        .equatable()
+
+                        ForEach(section.rows) { row in
+                            InboxRowView(
+                                row: row,
+                                isSelected: snapshot.selectedRowID == row.id,
+                                metrics: metrics,
+                                colorScheme: colorScheme,
+                                actionHint: snapshot.mailboxLabel == .drafts ? "Open draft" : "Open email",
+                                onSelect: { onActivate(row) },
+                                onToggleExpansion: row.isExpandable ? { onToggleExpansion(row.threadID) } : nil
+                            )
+                            .equatable()
+                            .id(row.id)
+                        }
+                    }
+
+                    if let footer = snapshot.footer {
+                        InboxFooterView(
+                            text: footer.text,
+                            canLoadMore: footer.canLoadMore,
+                            isLoading: snapshot.mailboxPageLoading,
+                            metrics: metrics,
+                            colorScheme: colorScheme,
+                            onLoadMore: onLoadMore
+                        )
+                    }
+                }
+                .frame(width: metrics.windowWidth, alignment: .topLeading)
+            }
+            .scrollIndicators(.automatic)
+            .focusable()
+            .focusEffectDisabled()
+            .focused($isFocused)
+            .onAppear {
+                isFocused = true
+            }
+            .onKeyPress(.upArrow) {
+                moveSelection(by: -1, scrollProxy: scrollProxy)
+                return .handled
+            }
+            .onKeyPress(.downArrow) {
+                moveSelection(by: 1, scrollProxy: scrollProxy)
+                return .handled
+            }
+            .onKeyPress(.return) {
+                onOpenSelection()
+                return .handled
+            }
+            .onKeyPress(.delete, phases: .down) { keyPress in
+                guard keyPress.modifiers.contains(.command) else {
+                    return .ignored
+                }
+                onPermanentDelete()
+                return .handled
+            }
+            .onDeleteCommand(perform: onMoveToTrash)
+            .transaction { transaction in
+                transaction.disablesAnimations = true
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+    }
+
+    private func moveSelection(by delta: Int, scrollProxy: ScrollViewProxy) {
+        guard !snapshot.flatRows.isEmpty else {
+            return
+        }
+        let currentIndex = snapshot.selectedRowID.flatMap { selectedID in
+            snapshot.flatRows.firstIndex(where: { $0.id == selectedID })
+        }
+        let fallbackIndex = delta > 0 ? -1 : snapshot.flatRows.count
+        let nextIndex = min(
+            max((currentIndex ?? fallbackIndex) + delta, 0),
+            snapshot.flatRows.count - 1
+        )
+        let nextRow = snapshot.flatRows[nextIndex]
+        onSelect(nextRow)
+        scrollProxy.scrollTo(nextRow.id, anchor: .center)
     }
 }
 
