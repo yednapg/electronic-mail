@@ -59,22 +59,60 @@ Artifacts are written to `artifacts/macos-beta/`:
 
 ## Publish as a GitHub prerelease
 
-Review the generated metadata and notes first. Then use the generated notes and attach all four files. This example creates a prerelease; it does not mark the build as latest or production-ready:
+Do not call `gh release create` directly. When the requested tag does not already
+exist, GitHub CLI otherwise creates it from the repository's default branch,
+which can differ from the source commit recorded in the DMG metadata.
+
+The repository publisher validates the local metadata and all three checksummed
+files, requires the full metadata source commit to exist in the exact remote
+repository, creates or verifies the remote tag at that commit, and creates only
+a **draft prerelease** with `latest=false`. It then downloads all four draft
+assets and verifies their names, sizes, and SHA-256 digests against the local
+files. The source commit must already exist in that repository; this script
+never pushes source or branches. The command returns with the release still
+unpublished:
+
+Every publisher operation is explicitly bound to `github.com`; an inherited
+`GH_HOST` or GitHub Enterprise default cannot redirect the owner/repository to a
+different host.
 
 ```bash
-VERSION=0.1.0
-BUILD_NUMBER=1
-STEM="ElectronicMail-Beta-$VERSION-$BUILD_NUMBER"
+REPOSITORY=owner/electronic-mail
+METADATA=artifacts/macos-beta/ElectronicMail-Beta-0.1.0-1-metadata.json
 
-gh release create "v$VERSION-beta.$BUILD_NUMBER" \
-  --prerelease \
-  --title "Electronic Mail $VERSION ($BUILD_NUMBER) beta" \
-  --notes-file "artifacts/macos-beta/$STEM-release-notes.md" \
-  "artifacts/macos-beta/$STEM.dmg" \
-  "artifacts/macos-beta/$STEM-metadata.json" \
-  "artifacts/macos-beta/$STEM-release-notes.md" \
-  "artifacts/macos-beta/$STEM-SHA256SUMS.txt"
+npm run release:macos:beta:github:create-draft -- \
+  --repo "$REPOSITORY" \
+  --metadata "$METADATA"
 ```
+
+Review the draft in GitHub and independently verify it again without changing
+remote state:
+
+```bash
+npm run release:macos:beta:github:verify-draft -- \
+  --repo "$REPOSITORY" \
+  --metadata "$METADATA"
+```
+
+Publishing is a separate, explicit operation. Copy the complete
+`source_commit` from the generated metadata; a short SHA is rejected. Immediately
+before publishing, the command re-resolves the remote tag and commit, requires
+the release to still be a draft prerelease, downloads and byte-verifies all four
+assets again, and only then changes `draft` to false. It performs the same
+verification once more after GitHub publishes the prerelease:
+
+```bash
+SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567
+
+npm run release:macos:beta:github:publish -- \
+  --repo "$REPOSITORY" \
+  --metadata "$METADATA" \
+  --confirm-source-commit "$SOURCE_COMMIT"
+```
+
+The publisher never marks this beta as latest or production-ready. If any local
+or remote file, tag, commit, draft state, prerelease state, filename, size, or
+digest differs, it exits before the publish command.
 
 Tell testers to use a dedicated Gmail account. For localhost builds, start the backend before opening the app. macOS may block an unnotarized download or require an explicit tester override; this beta path intentionally does not run `spctl` or claim that Gatekeeper will accept it. Library validation is disabled only in this local-testing artifact, so testers must verify the exact source SHA and DMG checksum recorded in the metadata before running it.
 

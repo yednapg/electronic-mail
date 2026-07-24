@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr
+import io
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from urllib.parse import quote
 from unittest.mock import Mock, patch
 import unittest
 
@@ -30,7 +32,10 @@ def production_environment(**overrides: str) -> dict[str, str]:
     values = {
         "APP_ENV": "production",
         "PORT": "3001",
-        "DATABASE_URL": "postgresql://database.mail-launch.co/electronic_mail",
+        "DATABASE_URL": (
+            "postgresql://database.mail-launch.co/electronic_mail"
+            "?sslmode=verify-full&sslrootcert=system&gssencmode=disable"
+        ),
         "CORS_ORIGIN": "https://app.mail-launch.co",
         "WEB_APP_URL": "https://app.mail-launch.co",
         "APP_SESSION_SECRET": "session-secret-material-that-is-long-and-unique",
@@ -200,7 +205,10 @@ class ReleaseReadinessTests(unittest.TestCase):
 
     def test_production_rejects_template_placeholders_and_reused_key_material(self) -> None:
         placeholder_environment = production_environment(
-            DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/electronic_mail",
+            DATABASE_URL=(
+                "postgresql://USER:PASSWORD@HOST:5432/electronic_mail"
+                "?sslmode=verify-full&sslrootcert=system&gssencmode=disable"
+            ),
             APP_SESSION_SECRET="generate-at-least-32-random-characters",
             APP_ENCRYPTION_KEY="generate-at-least-32-random-characters",
             GOOGLE_CLIENT_ID="replace-in-secret-store",
@@ -216,6 +224,154 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertTrue(any("Google OAuth" in error for error in errors))
         self.assertTrue(any("GMAIL_PUBSUB_TOPIC" in error for error in errors))
         self.assertTrue(any("RELEASE_SHA" in error for error in errors))
+
+    def test_production_requires_peer_verified_database_transport(self) -> None:
+        cases = (
+            (
+                "postgresql://database.mail-launch.co/electronic_mail",
+                "sslmode=verify-full",
+            ),
+            (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                "?sslmode=require&sslrootcert=system&gssencmode=disable",
+                "sslmode=verify-full",
+            ),
+            (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                "?sslmode=verify-full&gssencmode=disable",
+                "sslrootcert=system",
+            ),
+            (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                "?sslmode=verify-full&sslrootcert=relative-ca.pem&gssencmode=disable",
+                "readable existing absolute CA-bundle",
+            ),
+            (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                "?sslmode=verify-full&sslrootcert=system&gssencmode=prefer",
+                "gssencmode=disable",
+            ),
+            (
+                "postgresql:///electronic_mail"
+                "?sslmode=verify-full&sslrootcert=system&gssencmode=disable",
+                "include a database host",
+            ),
+            (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                "?sslmode=verify-full&sslmode=verify-full&sslrootcert=system&gssencmode=disable",
+                "sslmode=verify-full exactly once",
+            ),
+            (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                "?sslmode=verify-full&sslrootcert=system&gssencmode=disable#ignored",
+                "must not contain URL parameters or a fragment",
+            ),
+            (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                "?sslmode=verify-full&sslrootcert=system&gssencmode=disable&host=/tmp",
+                "query must contain only exact lowercase",
+            ),
+            (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                "?sslmode=verify-full&sslrootcert=system&gssencmode=disable&hostaddr=127.0.0.1",
+                "query must contain only exact lowercase",
+            ),
+            (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                "?sslmode=verify-full&sslrootcert=system&gssencmode=disable&service=attacker",
+                "query must contain only exact lowercase",
+            ),
+            (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                "?sslmode=verify-full&sslrootcert=system&gssencmode=disable&options=-csearch_path%3Dattacker",
+                "query must contain only exact lowercase",
+            ),
+            (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                "?SSLMODE=verify-full&sslrootcert=system&gssencmode=disable",
+                "query must contain only exact lowercase",
+            ),
+            (
+                "postgresql://database.mail-launch.co,evasion.internal/electronic_mail"
+                "?sslmode=verify-full&sslrootcert=system&gssencmode=disable",
+                "include a database host",
+            ),
+            (
+                "postgresql://database.mail-launch.co:0/electronic_mail"
+                "?sslmode=verify-full&sslrootcert=system&gssencmode=disable",
+                "include a database host",
+            ),
+            (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                "?sslmode=verify-full&sslrootcert=system&gssencmode=disable&malformed",
+                "valid PostgreSQL URL",
+            ),
+        )
+
+        for database_url, expected_error in cases:
+            with self.subTest(database_url=database_url):
+                with patch.dict(
+                    os.environ,
+                    production_environment(DATABASE_URL=database_url),
+                    clear=True,
+                ):
+                    settings = load_settings()
+                    deploy_result = deploy_check.main()
+
+                self.assertTrue(
+                    any(expected_error in error for error in settings.readiness_errors()),
+                    settings.readiness_errors(),
+                )
+                self.assertEqual(deploy_result, 1)
+
+    def test_production_accepts_readable_absolute_database_ca_bundle(self) -> None:
+        with TemporaryDirectory(prefix="database ca ") as directory:
+            ca_bundle = Path(directory) / "database-ca.pem"
+            ca_bundle.write_text("test CA bundle\n", encoding="utf-8")
+            database_url = (
+                "postgresql://database.mail-launch.co/electronic_mail"
+                f"?sslmode=verify-full&sslrootcert={quote(str(ca_bundle), safe='/')}&gssencmode=disable"
+            )
+            with patch.dict(
+                os.environ,
+                production_environment(DATABASE_URL=database_url),
+                clear=True,
+            ):
+                errors = load_settings().readiness_errors()
+
+        self.assertEqual(errors, [])
+
+    def test_production_database_transport_errors_do_not_leak_url_secrets(self) -> None:
+        database_url = (
+            "postgresql://launch-user:database-password@database.mail-launch.co/electronic_mail"
+            "?sslmode=verify-full&sslrootcert=/private/secret-ca.pem&gssencmode=disable&host=/tmp"
+        )
+        stderr = io.StringIO()
+        with patch.dict(
+            os.environ,
+            production_environment(DATABASE_URL=database_url),
+            clear=True,
+        ), redirect_stderr(stderr):
+            deploy_result = deploy_check.main()
+
+        output = stderr.getvalue()
+        self.assertEqual(deploy_result, 1)
+        self.assertNotIn("database-password", output)
+        self.assertNotIn("secret-ca.pem", output)
+        self.assertNotIn("/tmp", output)
+
+    def test_staging_can_use_an_ephemeral_local_postgres_without_production_ca_policy(self) -> None:
+        with patch.dict(
+            os.environ,
+            production_environment(
+                APP_ENV="staging",
+                DATABASE_URL="postgresql://127.0.0.1:5432/electronic_mail",
+            ),
+            clear=True,
+        ):
+            errors = load_settings().readiness_errors()
+
+        self.assertEqual(errors, [])
 
     def test_production_rejects_placeholder_pubsub_subscription_and_non_service_identity(self) -> None:
         with patch.dict(
@@ -643,6 +799,14 @@ class ReleaseReadinessTests(unittest.TestCase):
             self.assertIn("python -m app.deploy_check", command)
             self.assertIn("python -m app.schema_check --wait-seconds 120", command)
             self.assertIn("exec ", command)
+
+    def test_all_canonical_production_entrypoints_run_the_deployment_guard(self) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        dockerfile = (repository_root / "backend" / "Dockerfile").read_text()
+        migration_script = (repository_root / "scripts" / "migrate-production.sh").read_text()
+
+        self.assertIn("python -m app.deploy_check", dockerfile)
+        self.assertIn("python -m app.deploy_check", migration_script)
 
     def test_schema_startup_gate_checks_revision_and_launch_columns(self) -> None:
         settings = type(

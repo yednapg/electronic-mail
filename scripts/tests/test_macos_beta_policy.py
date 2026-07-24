@@ -246,7 +246,7 @@ class MacOSBetaPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             package["scripts"]["release:macos:beta:test"],
-            "python3 -m unittest scripts/tests/test_macos_beta_policy.py scripts/tests/test_macos_distribution_safety.py scripts/tests/test_verify_macos_dmg_layout.py",
+            "python3 -m unittest scripts/tests/test_macos_beta_policy.py scripts/tests/test_macos_distribution_safety.py scripts/tests/test_verify_macos_dmg_layout.py scripts/tests/test_publish_macos_beta.py",
         )
         self.assertIn("npm run release:macos:beta:test", self.text(".github/workflows/quality.yml"))
         handoff = self.text("docs/MACOS_BETA.md")

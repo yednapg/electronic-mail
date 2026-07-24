@@ -44,9 +44,16 @@ Run the guard without printing secret values:
 PYTHONPATH=backend .venv/bin/python -m app.deploy_check
 ```
 
+Production startup requires `DATABASE_URL` to use hostname-authenticated
+PostgreSQL TLS: `sslmode=verify-full`, `gssencmode=disable`, and exactly one
+`sslrootcert=system` or readable absolute CA-bundle path. Install or mount the
+reviewed CA bundle in every API, worker, poller, migration, backup, and restore
+runtime. Encryption-only `sslmode=require` is rejected because it does not
+authenticate the database peer.
+
 ## Reproducible inputs
 
-Run `npm run reproducibility:verify:test && npm run reproducibility:verify` before accepting any dependency or workflow change. The gate requires every direct Node dependency to be an exact version matching `package-lock.json`, every installed npm package to carry an integrity digest, every Python runtime dependency to be exactly pinned in `backend/requirements.lock`, exact Node/Python runtime versions, digest-pinned Dockerfile frontends and base images, digest-pinned CI service images, and commit-pinned third-party GitHub Actions. Production installs use `npm ci` and install `requirements.lock` with `--no-deps`, so an omitted transitive package cannot be resolved at an unreviewed version. Do not use `npm install`, `latest`, version ranges, or `requirements.txt` in a release image.
+Run `npm run reproducibility:verify:test && npm run reproducibility:verify` before accepting any dependency or workflow change. The gate requires every direct Node dependency to be an exact version matching `package-lock.json`, every installed npm package to carry an integrity digest, every Python runtime dependency to be exactly pinned in `backend/requirements.lock`, exact Node/Python runtime versions, digest-pinned Dockerfile frontends and base images, digest-pinned CI service images, and commit-pinned third-party GitHub Actions. `.python-version` is the canonical backend/Linux pin, Python 3.12.13. Hosted macOS quality and release automation instead uses Python 3.12.10, the exact patch available on `macos-15-intel`; the verifier derives the required pin from each setup-python job's static `runs-on` context and fails on missing, dynamic, or mismatched context. CI also performs a hash-only binary download of every runtime-lock and audit-lock pin for CPython 3.12 on macOS Intel. `scripts/refresh-python-lock-hashes.py` applies the same target proof before atomically replacing a lock; `cryptography==48.0.1` is retained because 49.0.0 does not publish a compatible macOS Intel wheel. Production installs use `npm ci` and install `requirements.lock` with `--no-deps`, so an omitted transitive package cannot be resolved at an unreviewed version. Do not use `npm install`, `latest`, version ranges, or `requirements.txt` in a release image.
 
 Digest pins intentionally prevent automatic base-image updates. Review vulnerability advisories, refresh the relevant tag/digest and lockfiles deliberately, run both container jobs, and record the change in the release review. A reproducible old image is not necessarily a secure image, so the npm and Python advisory audits remain separate launch gates.
 

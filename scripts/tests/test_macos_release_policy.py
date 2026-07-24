@@ -42,7 +42,7 @@ class MacOSReleaseToolchainPolicyTests(unittest.TestCase):
         self.assertEqual(workflow.count('EXPECTED_XCODE_VERSION: "16.4"'), 2)
         self.assertEqual(workflow.count("EXPECTED_XCODE_BUILD: 16F6"), 2)
         self.assertEqual(workflow.count("run: bash scripts/verify-macos-toolchain.sh"), 2)
-        self.assertEqual(workflow.count('python-version: "3.12.13"'), 2)
+        self.assertEqual(workflow.count('python-version: "3.12.10"'), 2)
 
     def test_quality_job_uses_the_same_toolchain_and_runs_this_policy(self) -> None:
         workflow = self.text(".github/workflows/quality.yml")
@@ -50,6 +50,7 @@ class MacOSReleaseToolchainPolicyTests(unittest.TestCase):
         self.assertIn("DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer", workflow)
         self.assertIn('EXPECTED_XCODE_VERSION: "16.4"', workflow)
         self.assertIn("EXPECTED_XCODE_BUILD: 16F6", workflow)
+        self.assertIn('python-version: "3.12.10"', workflow)
         self.assertIn("python3 -m unittest scripts/tests/test_macos_release_policy.py", workflow)
         self.assertIn("run: bash scripts/verify-macos-toolchain.sh", workflow)
 

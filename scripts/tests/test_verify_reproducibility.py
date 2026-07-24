@@ -17,6 +17,11 @@ verifier = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(verifier)
 
 VALID_SHA512_SRI = "sha512-" + base64.b64encode(bytes(64)).decode("ascii")
+VALID_PYTHON_HASH = "--hash=sha256:" + "a" * 64
+
+
+def hashed_python_lock(*pins: str) -> str:
+    return "".join(f"{pin} {VALID_PYTHON_HASH}\n" for pin in pins)
 
 
 class ReproducibilityVerifierTests(unittest.TestCase):
@@ -63,28 +68,51 @@ class ReproducibilityVerifierTests(unittest.TestCase):
             encoding="utf-8",
         )
         (self.root / "backend/requirements.lock").write_text(
-            "fastapi==0.139.0\ngreenlet==3.5.3\n",
+            hashed_python_lock("fastapi==0.139.0", "greenlet==3.5.3"),
+            encoding="utf-8",
+        )
+        (self.root / "backend/audit-requirements.lock").write_text(
+            hashed_python_lock("pip==26.1.2", "pip-audit==2.10.1"),
             encoding="utf-8",
         )
         pinned = "sha256:" + "a" * 64
-        dockerfile = f"# syntax=docker/dockerfile:1.7@{pinned}\nFROM example.invalid/runtime:1@{pinned}\nRUN pip install --no-deps -r requirements.lock && python -m pip check\n"
+        dockerfile = (
+            f"# syntax=docker/dockerfile:1.7@{pinned}\n"
+            f"FROM example.invalid/runtime:1@{pinned}\n"
+            "RUN pip install --no-deps --require-hashes --only-binary=:all: "
+            "-r requirements.lock && python -m pip check\n"
+        )
         (self.root / "Dockerfile.web").write_text(dockerfile, encoding="utf-8")
         (self.root / "backend/Dockerfile").write_text(dockerfile, encoding="utf-8")
         (self.root / "scripts").mkdir()
         (self.root / "scripts/bootstrap.sh").write_text(
-            "pip install --no-deps -r backend/requirements.lock\n"
+            "pip install --no-deps --require-hashes --only-binary=:all: -r backend/requirements.lock\n"
             '"$VENV_DIR/bin/pip" check\n',
+            encoding="utf-8",
+        )
+        (self.root / "scripts/verify_python_wheels.py").write_text(
+            'platform="macosx_15_0_x86_64"\n'
+            'python_version="3.12"\n'
+            'implementation="cp"\n'
+            'flags = ("--require-hashes", "--only-binary=:all:")\n',
             encoding="utf-8",
         )
         action = "a" * 40
         (self.root / ".github/workflows/quality.yml").write_text(
             f"steps:\n  - uses: actions/checkout@{action}\n  - node-version: 22.22.0\n"
-            "  - run: pip install --no-deps -r backend/requirements.lock\n"
+            "  - cache-dependency-path: |\n"
+            "      backend/requirements.lock\n"
+            "      backend/audit-requirements.lock\n"
+            "  - run: pip install --no-deps --require-hashes --only-binary=:all: -r backend/requirements.lock\n"
             "  - run: .venv/bin/pip check\n"
-            "  - run: pip install --no-deps -r backend/requirements.lock\n"
+            "  - run: pip install --no-deps --require-hashes --only-binary=:all: -r backend/requirements.lock\n"
             "  - run: .venv/bin/pip check\n"
             "  - run: |\n"
-            "      .audit-venv/bin/python -m pip_audit --strict --no-deps --disable-pip -r backend/requirements.lock\n",
+            "      pip install --no-deps --require-hashes --only-binary=:all: -r backend/audit-requirements.lock\n"
+            "      .audit-venv/bin/pip check\n"
+            "      .audit-venv/bin/python scripts/verify_python_wheels.py backend/requirements.lock backend/audit-requirements.lock\n"
+            "      .audit-venv/bin/python -m pip_audit --strict --no-deps --disable-pip -r backend/requirements.lock\n"
+            "      .audit-venv/bin/python -m pip_audit --strict --no-deps --disable-pip -r backend/audit-requirements.lock\n",
             encoding="utf-8",
         )
 
@@ -251,7 +279,10 @@ class ReproducibilityVerifierTests(unittest.TestCase):
             verifier.verify_python_lock()
 
     def test_python_lock_must_satisfy_direct_requirement_bounds(self) -> None:
-        (self.root / "backend/requirements.lock").write_text("fastapi==1.0.0\n", encoding="utf-8")
+        (self.root / "backend/requirements.lock").write_text(
+            hashed_python_lock("fastapi==1.0.0", "greenlet==3.5.3"),
+            encoding="utf-8",
+        )
         with self.assertRaisesRegex(verifier.ReproducibilityError, "violates <1.0.0"):
             verifier.verify_python_lock()
 
@@ -260,14 +291,58 @@ class ReproducibilityVerifierTests(unittest.TestCase):
             "psycopg[binary]>=3.2.0,<4.0.0\n",
             encoding="utf-8",
         )
-        (self.root / "backend/requirements.lock").write_text("psycopg==3.3.4\n", encoding="utf-8")
+        (self.root / "backend/requirements.lock").write_text(
+            hashed_python_lock("psycopg==3.3.4", "greenlet==3.5.3"),
+            encoding="utf-8",
+        )
         with self.assertRaisesRegex(verifier.ReproducibilityError, "missing extra provider psycopg-binary"):
             verifier.verify_python_lock()
 
     def test_python_lock_must_include_required_sqlalchemy_runtime_dependency(self) -> None:
-        (self.root / "backend/requirements.lock").write_text("fastapi==0.139.0\n", encoding="utf-8")
+        (self.root / "backend/requirements.lock").write_text(
+            hashed_python_lock("fastapi==0.139.0"),
+            encoding="utf-8",
+        )
         with self.assertRaisesRegex(verifier.ReproducibilityError, "required transitive package greenlet"):
             verifier.verify_python_lock()
+
+    def test_python_lock_rejects_missing_artifact_hash(self) -> None:
+        (self.root / "backend/requirements.lock").write_text(
+            f"fastapi==0.139.0\ngreenlet==3.5.3 {VALID_PYTHON_HASH}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "missing a SHA-256 artifact hash"):
+            verifier.verify_python_lock()
+
+    def test_python_lock_rejects_non_sha256_or_malformed_hash(self) -> None:
+        (self.root / "backend/requirements.lock").write_text(
+            "fastapi==0.139.0 --hash=sha512:abcd\n"
+            f"greenlet==3.5.3 {VALID_PYTHON_HASH}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "unsupported lock option or hash"):
+            verifier.verify_python_lock()
+
+    def test_python_lock_rejects_duplicate_artifact_hash(self) -> None:
+        (self.root / "backend/requirements.lock").write_text(
+            f"fastapi==0.139.0 {VALID_PYTHON_HASH} {VALID_PYTHON_HASH}\n"
+            f"greenlet==3.5.3 {VALID_PYTHON_HASH}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "duplicate SHA-256 hash"):
+            verifier.verify_python_lock()
+
+    def test_python_lock_supports_multiline_wheel_hashes(self) -> None:
+        second_hash = "--hash=sha256:" + "b" * 64
+        (self.root / "backend/requirements.lock").write_text(
+            "fastapi==0.139.0 \\\n"
+            f"    {VALID_PYTHON_HASH} \\\n"
+            f"    {second_hash}\n"
+            f"greenlet==3.5.3 {VALID_PYTHON_HASH}\n",
+            encoding="utf-8",
+        )
+
+        verifier.verify_python_lock()
 
     def test_mutable_override_is_rejected(self) -> None:
         self.write_json(
@@ -284,10 +359,38 @@ class ReproducibilityVerifierTests(unittest.TestCase):
 
     def test_python_runtime_install_must_disable_dependency_resolution(self) -> None:
         (self.root / "scripts/bootstrap.sh").write_text(
-            "pip install -r backend/requirements.lock\n",
+            "pip install --require-hashes --only-binary=:all: -r backend/requirements.lock\n",
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(verifier.ReproducibilityError, "must install requirements.lock with --no-deps"):
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "missing --no-deps"):
+            verifier.verify_python_lock()
+
+    def test_python_runtime_install_must_require_hashes(self) -> None:
+        bootstrap = self.root / "scripts/bootstrap.sh"
+        bootstrap.write_text(
+            bootstrap.read_text(encoding="utf-8").replace(" --require-hashes", ""),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "missing --require-hashes"):
+            verifier.verify_python_lock()
+
+    def test_python_runtime_install_must_reject_source_distributions(self) -> None:
+        bootstrap = self.root / "scripts/bootstrap.sh"
+        bootstrap.write_text(
+            bootstrap.read_text(encoding="utf-8").replace(" --only-binary=:all:", ""),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "missing --only-binary=:all:"):
+            verifier.verify_python_lock()
+
+    def test_unhashed_python_tool_bootstrap_is_rejected(self) -> None:
+        dockerfile = self.root / "backend/Dockerfile"
+        dockerfile.write_text(
+            dockerfile.read_text(encoding="utf-8")
+            + "RUN python -m pip install --upgrade pip==26.1.2\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "outside an approved hash lock"):
             verifier.verify_python_lock()
 
     def test_every_python_lock_install_must_be_followed_by_graph_validation(self) -> None:
@@ -306,6 +409,19 @@ class ReproducibilityVerifierTests(unittest.TestCase):
             encoding="utf-8",
         )
         with self.assertRaisesRegex(verifier.ReproducibilityError, "audit must include --no-deps"):
+            verifier.verify_python_lock()
+
+    def test_python_ci_must_prove_macos_intel_target_wheels(self) -> None:
+        workflow = self.root / ".github/workflows/quality.yml"
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(
+                "      .audit-venv/bin/python scripts/verify_python_wheels.py "
+                "backend/requirements.lock backend/audit-requirements.lock\n",
+                "",
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(verifier.ReproducibilityError, "CPython 3.12 macOS Intel wheel"):
             verifier.verify_python_lock()
 
     def test_mutable_container_base_is_rejected(self) -> None:
@@ -573,25 +689,34 @@ class ReproducibilityVerifierTests(unittest.TestCase):
     def test_every_setup_python_version_must_match_python_version_file(self) -> None:
         action = "a" * 40
         (self.root / ".github/workflows/quality.yml").write_text(
-            f"steps:\n"
-            f"  - uses: actions/setup-python@{action}\n"
-            "    with:\n"
-            "      python-version: \"3.12.13\"\n"
-            f"  - uses : actions/setup-python@{action}\n"
-            "    with:\n"
-            "      python-version : '3.11.9'\n",
+            "jobs:\n"
+            "  backend:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    steps:\n"
+            f"      - uses: actions/setup-python@{action}\n"
+            "        with:\n"
+            "          python-version: \"3.12.13\"\n"
+            f"      - uses : actions/setup-python@{action}\n"
+            "        with:\n"
+            "          python-version : '3.11.9'\n",
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(verifier.ReproducibilityError, "setup-python must pin Python 3.12.13"):
+        with self.assertRaisesRegex(
+            verifier.ReproducibilityError,
+            "setup-python on ubuntu-24.04 must pin Python 3.12.13",
+        ):
             verifier.verify_actions()
 
     def test_commented_python_version_does_not_satisfy_setup_python(self) -> None:
         action = "a" * 40
         (self.root / ".github/workflows/quality.yml").write_text(
-            f"steps:\n"
-            f"  - uses: actions/setup-python@{action}\n"
-            "    with:\n"
-            "      # python-version: \"3.12.13\"\n",
+            "jobs:\n"
+            "  backend:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    steps:\n"
+            f"      - uses: actions/setup-python@{action}\n"
+            "        with:\n"
+            "          # python-version: \"3.12.13\"\n",
             encoding="utf-8",
         )
         with self.assertRaisesRegex(verifier.ReproducibilityError, "setup-python must pin python-version"):
@@ -618,8 +743,12 @@ class ReproducibilityVerifierTests(unittest.TestCase):
                 "setup-node must pin node-version",
             ),
             (
-                f"steps:\n  - uses: actions/setup-python@{action}\n"
-                "    name: |\n      python-version: 3.12.13\n",
+                "jobs:\n"
+                "  backend:\n"
+                "    runs-on: ubuntu-24.04\n"
+                "    steps:\n"
+                f"      - uses: actions/setup-python@{action}\n"
+                "        name: |\n          python-version: 3.12.13\n",
                 "setup-python must pin python-version",
             ),
         )
@@ -653,8 +782,12 @@ class ReproducibilityVerifierTests(unittest.TestCase):
                 "setup-node must pin node-version",
             ),
             (
-                f"steps:\n  - uses: actions/setup-python@{action}\n"
-                "    with:\n      cache-options:\n        python-version: 3.12.13\n",
+                "jobs:\n"
+                "  backend:\n"
+                "    runs-on: ubuntu-24.04\n"
+                "    steps:\n"
+                f"      - uses: actions/setup-python@{action}\n"
+                "        with:\n          cache-options:\n            python-version: 3.12.13\n",
                 "setup-python must pin python-version",
             ),
             (
@@ -677,13 +810,16 @@ class ReproducibilityVerifierTests(unittest.TestCase):
     def test_setup_runtime_pins_allow_safe_inline_comments(self) -> None:
         action = "a" * 40
         (self.root / ".github/workflows/quality.yml").write_text(
-            f"steps:\n"
-            f"  - uses: actions/setup-node@{action}\n"
-            "    with:\n"
-            "      node-version : 22.22.0 # repository Node pin\n"
-            f"  - uses: actions/setup-python@{action}\n"
-            "    with:\n"
-            "      python-version : \"3.12.13\" # repository Python pin\n",
+            "jobs:\n"
+            "  backend:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    steps:\n"
+            f"      - uses: actions/setup-node@{action}\n"
+            "        with:\n"
+            "          node-version : 22.22.0 # repository Node pin\n"
+            f"      - uses: actions/setup-python@{action}\n"
+            "        with:\n"
+            "          python-version : \"3.12.13\" # repository Python pin\n",
             encoding="utf-8",
         )
         verifier.verify_actions()
@@ -702,6 +838,91 @@ class ReproducibilityVerifierTests(unittest.TestCase):
             encoding="utf-8",
         )
         verifier.verify_actions()
+
+    def test_linux_setup_python_uses_canonical_pin(self) -> None:
+        action = "a" * 40
+        (self.root / ".github/workflows/quality.yml").write_text(
+            "jobs:\n"
+            "  backend:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    steps:\n"
+            f"      - uses: actions/setup-python@{action}\n"
+            "        with:\n"
+            "          python-version: \"3.12.13\"\n",
+            encoding="utf-8",
+        )
+        verifier.verify_actions()
+
+    def test_linux_setup_python_rejects_macos_automation_pin(self) -> None:
+        action = "a" * 40
+        (self.root / ".github/workflows/quality.yml").write_text(
+            "jobs:\n"
+            "  backend:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    steps:\n"
+            f"      - uses: actions/setup-python@{action}\n"
+            "        with:\n"
+            "          python-version: \"3.12.10\"\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            verifier.ReproducibilityError,
+            "setup-python on ubuntu-24.04 must pin Python 3.12.13",
+        ):
+            verifier.verify_actions()
+
+    def test_macos_setup_python_uses_runner_available_pin(self) -> None:
+        action = "a" * 40
+        (self.root / ".github/workflows/quality.yml").write_text(
+            "jobs:\n"
+            "  macos:\n"
+            "    runs-on: macos-15-intel\n"
+            "    steps:\n"
+            f"      - uses: actions/setup-python@{action}\n"
+            "        with:\n"
+            "          python-version: \"3.12.10\"\n",
+            encoding="utf-8",
+        )
+        verifier.verify_actions()
+
+    def test_macos_setup_python_rejects_canonical_backend_pin(self) -> None:
+        action = "a" * 40
+        (self.root / ".github/workflows/quality.yml").write_text(
+            "jobs:\n"
+            "  macos:\n"
+            "    runs-on: macos-15-intel\n"
+            "    steps:\n"
+            f"      - uses: actions/setup-python@{action}\n"
+            "        with:\n"
+            "          python-version: \"3.12.13\"\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            verifier.ReproducibilityError,
+            "setup-python on macos-15-intel must pin Python 3.12.10",
+        ):
+            verifier.verify_actions()
+
+    def test_setup_python_without_static_job_runner_context_is_rejected(self) -> None:
+        action = "a" * 40
+        fixtures = (
+            f"steps:\n  - uses: actions/setup-python@{action}\n",
+            (
+                "jobs:\n"
+                "  backend:\n"
+                "    runs-on: \"${{ matrix.runner }}\"\n"
+                "    steps:\n"
+                f"      - uses: actions/setup-python@{action}\n"
+            ),
+        )
+        for workflow_text in fixtures:
+            with self.subTest(workflow_text=workflow_text):
+                (self.root / ".github/workflows/quality.yml").write_text(
+                    workflow_text,
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(verifier.ReproducibilityError, "runner context|runs-on"):
+                    verifier.verify_actions()
 
     def test_quoted_scalars_expressions_and_block_scalar_contents_are_not_mapping_syntax(self) -> None:
         action = "a" * 40

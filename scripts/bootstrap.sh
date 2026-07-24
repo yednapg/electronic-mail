@@ -48,8 +48,11 @@ else
 fi
 
 echo "==> Installing Python dependencies for the backend"
-"$VENV_DIR/bin/pip" install --upgrade "pip==26.1.2"
-"$VENV_DIR/bin/pip" install --no-deps -r "$ROOT_DIR/backend/requirements.lock"
+"$VENV_DIR/bin/pip" install \
+  --no-deps \
+  --require-hashes \
+  --only-binary=:all: \
+  -r "$ROOT_DIR/backend/requirements.lock"
 "$VENV_DIR/bin/pip" check
 
 if [ "${SETUP_DATABASE:-0}" = "1" ]; then
