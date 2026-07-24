@@ -14,7 +14,7 @@ import {
 test('public landing page presents the native Mac app without a web sign-in', () => {
   const markup = renderToStaticMarkup(React.createElement(HomePageContent, {
     downloadConfig: {
-      enabled: true,
+      enablement: 'enabled',
       url: 'https://downloads.electronicmail.app/ElectronicMail.dmg',
     },
   }));
@@ -29,14 +29,35 @@ test('public landing page presents the native Mac app without a web sign-in', ()
 test('public landing page fails closed when downloads are paused', () => {
   const markup = renderToStaticMarkup(React.createElement(HomePageContent, {
     downloadConfig: {
-      enabled: false,
-      url: 'https://downloads.electronicmail.app/ElectronicMail.dmg',
+      enablement: 'paused',
+      url: '',
     },
   }));
 
   assert.match(markup, /Downloads paused/);
   assert.doesNotMatch(markup, /Download for macOS/);
   assert.doesNotMatch(markup, /href="https:\/\/downloads\.electronicmail\.app/);
+});
+
+test('public landing page does not describe broken configuration as an intentional pause', () => {
+  for (const downloadConfig of [
+    {
+      enablement: 'invalid' as const,
+      url: 'https://downloads.electronicmail.app/ElectronicMail.dmg',
+    },
+    {
+      enablement: 'enabled' as const,
+      url: '',
+    },
+  ]) {
+    const markup = renderToStaticMarkup(React.createElement(HomePageContent, {
+      downloadConfig,
+    }));
+
+    assert.match(markup, /Download unavailable/);
+    assert.doesNotMatch(markup, /Downloads paused|Download for macOS/);
+    assert.doesNotMatch(markup, /href="https:\/\/downloads\.electronicmail\.app/);
+  }
 });
 
 test('OAuth completion tells the user to return to the native app', () => {

@@ -18,8 +18,36 @@ fi
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
+health_status="$(curl --silent --show-error --retry 3 --max-time 30 \
+  --proto '=https' \
+  --dump-header "$tmp_dir/healthz.headers" \
+  --output "$tmp_dir/healthz.json" \
+  --write-out '%{http_code}' \
+  "$WEB_URL/healthz")"
+[ "$health_status" = "200" ] || {
+  echo "public web readiness returned HTTP $health_status instead of 200" >&2
+  exit 1
+}
+python3 - "$tmp_dir/healthz.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+expected = {
+    "status": "ready",
+    "checks": {"backend": True, "download": True, "legal": True},
+}
+if payload != expected:
+    raise SystemExit("public web readiness did not prove backend, download, and legal configuration ready")
+PY
+grep -qi '^cache-control:.*no-store' "$tmp_dir/healthz.headers" || {
+  echo "public web readiness is missing no-store cache protection" >&2
+  exit 1
+}
+
 curl --silent --show-error --fail-with-body --retry 3 --max-time 30 \
-  --dump-header "$tmp_dir/home.headers" "$WEB_URL/" > "$tmp_dir/home.html"
+  --proto '=https' --dump-header "$tmp_dir/home.headers" "$WEB_URL/" > "$tmp_dir/home.html"
 grep -qi '<html' "$tmp_dir/home.html"
 grep -qi 'native Gmail client for macOS' "$tmp_dir/home.html"
 grep -qi '^strict-transport-security:.*max-age=' "$tmp_dir/home.headers" || {
@@ -113,7 +141,7 @@ else
 fi
 
 for route in privacy terms support; do
-  curl --silent --show-error --fail-with-body --retry 3 --max-time 30 "$WEB_URL/$route" > "$tmp_dir/$route.html"
+  curl --silent --show-error --fail-with-body --retry 3 --max-time 30 --proto '=https' "$WEB_URL/$route" > "$tmp_dir/$route.html"
   grep -qi '<html' "$tmp_dir/$route.html"
   if grep -Eqi 'OWNER REVIEW REQUIRED|not approved for public launch|support@example\.com|your-owned-domain\.example|replace-with|replace-after' "$tmp_dir/$route.html"; then
     echo "$route page still contains an unapproved placeholder" >&2
@@ -174,6 +202,7 @@ if ! curl --silent --show-error --fail --location --retry 3 --max-time 30 --max-
 fi
 
 post_login_status="$(curl --silent --show-error --retry 3 --max-time 30 \
+  --proto '=https' \
   --dump-header "$tmp_dir/post-login.headers" \
   --output "$tmp_dir/post-login.html" \
   --write-out '%{http_code}' \
@@ -195,7 +224,7 @@ grep -qi '^cache-control:.*no-store' "$tmp_dir/post-login.headers" || {
 }
 
 for route in gmail dashboard api/dashboard; do
-  status="$(curl --silent --show-error --retry 3 --max-time 30 --output "$tmp_dir/${route//\//-}.txt" --write-out '%{http_code}' "$WEB_URL/$route")"
+  status="$(curl --silent --show-error --retry 3 --max-time 30 --proto '=https' --output "$tmp_dir/${route//\//-}.txt" --write-out '%{http_code}' "$WEB_URL/$route")"
   if [ "$status" != "404" ]; then
     echo "$route must return 404 on the native-only production web service (received $status)" >&2
     exit 1

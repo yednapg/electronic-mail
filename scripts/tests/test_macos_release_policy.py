@@ -6,6 +6,16 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 
+SETUP_PYTHON_V7 = (
+    "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0"
+)
+SETUP_BUILDX_V4 = (
+    "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0"
+)
+BUILD_PUSH_V7 = (
+    "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0"
+)
+
 
 class MacOSReleaseToolchainPolicyTests(unittest.TestCase):
     def text(self, relative: str) -> str:
@@ -53,6 +63,24 @@ class MacOSReleaseToolchainPolicyTests(unittest.TestCase):
         self.assertIn('python-version: "3.12.10"', workflow)
         self.assertIn("python3 -m unittest scripts/tests/test_macos_release_policy.py", workflow)
         self.assertIn("run: bash scripts/verify-macos-toolchain.sh", workflow)
+
+    def test_workflows_pin_node24_action_runtime_releases(self) -> None:
+        quality = self.text(".github/workflows/quality.yml")
+        release = self.text(".github/workflows/release-macos.yml")
+
+        self.assertEqual(quality.count(SETUP_PYTHON_V7), 3)
+        self.assertEqual(release.count(SETUP_PYTHON_V7), 2)
+        self.assertEqual(quality.count(SETUP_BUILDX_V4), 2)
+        self.assertEqual(quality.count(BUILD_PUSH_V7), 2)
+
+        for retired_pin in (
+            "a26af69be951a213d495a4c3e4e4022e16d87065",
+            "8d2750c68a42422c14e847fe6c8ac0403b4cbd6f",
+            "10e90e3645eae34f1e60eeb005ba3a3d33f178e8",
+        ):
+            with self.subTest(retired_pin=retired_pin):
+                self.assertNotIn(retired_pin, quality)
+                self.assertNotIn(retired_pin, release)
 
     def test_release_requires_successful_quality_gates_from_main_for_the_exact_commit(self) -> None:
         workflow = self.text(".github/workflows/release-macos.yml")

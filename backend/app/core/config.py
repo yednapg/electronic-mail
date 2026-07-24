@@ -280,7 +280,13 @@ def load_settings() -> Settings:
     database_url = os.getenv("DATABASE_URL", "").strip().strip("\"'")
     app_env = os.getenv("APP_ENV", "local").strip().lower() or "local"
     web_app_url = os.getenv("WEB_APP_URL", os.getenv("CORS_ORIGIN", "http://localhost:5173"))
-    release_sha = os.getenv("RELEASE_SHA", "local") or "local"
+    configured_release_sha = os.getenv("RELEASE_SHA", "")
+    railway_release_sha = os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
+    # A GitHub-triggered Railway deployment already carries the immutable
+    # source revision. Prefer that platform identity so every API and worker
+    # heartbeat is bound to the image Railway actually built, not a manually
+    # copied variable that can drift between services.
+    release_sha = railway_release_sha or configured_release_sha or "local"
     if app_env == "local":
         web_app_url = web_app_url.strip().rstrip("/")
         release_sha = release_sha.strip()[:64] or "local"
@@ -397,6 +403,17 @@ def _explicit_runtime_configuration_errors(
 
     if environment.get("RATE_LIMIT_ENABLED") != "true":
         errors.append("RATE_LIMIT_ENABLED must be explicitly set to true outside local development")
+
+    configured_release_sha = environment.get("RELEASE_SHA", "")
+    railway_release_sha = environment.get("RAILWAY_GIT_COMMIT_SHA", "")
+    if (
+        configured_release_sha
+        and railway_release_sha
+        and configured_release_sha != railway_release_sha
+    ):
+        errors.append(
+            "RELEASE_SHA must match Railway's RAILWAY_GIT_COMMIT_SHA when both are set"
+        )
 
     return tuple(errors)
 

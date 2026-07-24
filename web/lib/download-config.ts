@@ -1,7 +1,9 @@
 export type DownloadConfig = {
-  enabled: boolean;
+  enablement: 'enabled' | 'paused' | 'invalid';
   url: string;
 };
+
+export type DownloadAvailability = 'available' | 'paused' | 'misconfigured';
 
 const RESERVED_HOSTS = new Set([
   'example.com',
@@ -25,17 +27,30 @@ const RESERVED_HOST_SUFFIXES = [
 export function loadDownloadConfig(
   environment: Record<string, string | undefined> = process.env,
 ): DownloadConfig {
+  const enablementValue = environment.MACOS_DOWNLOAD_ENABLED?.trim().toLowerCase();
+
   return {
-    enabled: environment.MACOS_DOWNLOAD_ENABLED?.trim().toLowerCase() === 'true',
+    enablement: enablementValue === 'true'
+      ? 'enabled'
+      : enablementValue === 'false'
+        ? 'paused'
+        : 'invalid',
     url: environment.MACOS_DOWNLOAD_URL?.trim() || '',
   };
 }
 
 export function downloadConfigIssues(config: DownloadConfig): string[] {
+  if (config.enablement === 'paused') return ['downloads disabled'];
+
   const issues: string[] = [];
-  if (!config.enabled) issues.push('downloads disabled');
+  if (config.enablement !== 'enabled') issues.push('macOS download enablement');
   if (!isPublicHTTPSURL(config.url)) issues.push('macOS download URL');
   return issues;
+}
+
+export function downloadAvailability(config: DownloadConfig): DownloadAvailability {
+  if (config.enablement === 'paused') return 'paused';
+  return downloadConfigIssues(config).length === 0 ? 'available' : 'misconfigured';
 }
 
 function isPublicHTTPSURL(value: string): boolean {

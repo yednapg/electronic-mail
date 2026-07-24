@@ -36,7 +36,6 @@ REQUIRED_PRODUCTION_ENV_VARS = (
     "MOBILE_REDIRECT_URI",
     "OPS_ADMIN_EMAILS",
     "RATE_LIMIT_ENABLED",
-    "RELEASE_SHA",
 )
 
 
@@ -49,6 +48,11 @@ def main() -> int:
         return 0
 
     missing = [name for name in REQUIRED_PRODUCTION_ENV_VARS if not os.getenv(name, "").strip()]
+    if not (
+        os.getenv("RELEASE_SHA", "").strip()
+        or os.getenv("RAILWAY_GIT_COMMIT_SHA", "").strip()
+    ):
+        missing.append("RELEASE_SHA or RAILWAY_GIT_COMMIT_SHA")
     if missing:
         print(f"Missing required deployment env vars: {', '.join(missing)}", file=sys.stderr)
         return 1

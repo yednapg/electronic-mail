@@ -9,14 +9,32 @@ test('download launch configuration accepts an enabled public HTTPS artifact', (
     MACOS_DOWNLOAD_URL: 'https://downloads.electronicmail.app/ElectronicMail.dmg',
   });
 
+  assert.equal(config.enablement, 'enabled');
   assert.deepEqual(downloadConfigIssues(config), []);
 });
 
-test('download launch configuration rejects disabled, local, and placeholder artifacts', () => {
+test('download launch configuration distinguishes an explicit pause from a missing flag', () => {
+  assert.deepEqual(loadDownloadConfig({
+    MACOS_DOWNLOAD_ENABLED: ' FALSE ',
+  }), {
+    enablement: 'paused',
+    url: '',
+  });
+  assert.deepEqual(downloadConfigIssues(loadDownloadConfig({
+    MACOS_DOWNLOAD_ENABLED: 'false',
+  })), ['downloads disabled']);
+
   assert.deepEqual(downloadConfigIssues(loadDownloadConfig({})), [
-    'downloads disabled',
+    'macOS download enablement',
     'macOS download URL',
   ]);
+  assert.deepEqual(downloadConfigIssues(loadDownloadConfig({
+    MACOS_DOWNLOAD_ENABLED: 'sometimes',
+    MACOS_DOWNLOAD_URL: 'https://downloads.electronicmail.app/ElectronicMail.dmg',
+  })), ['macOS download enablement']);
+});
+
+test('download launch configuration rejects local and placeholder artifacts', () => {
 
   for (const url of [
     'http://downloads.electronicmail.app/ElectronicMail.dmg',
