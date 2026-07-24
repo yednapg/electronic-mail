@@ -107,17 +107,17 @@ public enum ElectronicMailType {
     }
 }
 
-/// Mailbox-specific type roles. The reader and composer keep the product's
-/// original, larger rounded scale; the dense mailbox uses a macOS hierarchy.
+/// Mailbox-specific type roles. The reader, composer, and mailbox share the
+/// product's larger rounded scale while preserving distinct semantic weights.
 public enum ElectronicMailMailboxType {
-    public static let rowHeight: CGFloat = 32
+    public static let rowHeight: CGFloat = 40
     public static let sidebarHeaderSize: CGFloat = 12
     public static let sidebarItemSize: CGFloat = 14
     public static let sidebarAccountSize: CGFloat = 13
-    public static let sectionSize: CGFloat = 12
-    public static let senderSize: CGFloat = 15
-    public static let subjectSize: CGFloat = 14
-    public static let metadataSize: CGFloat = 12
+    public static let sectionSize: CGFloat = 18
+    public static let senderSize: CGFloat = 18
+    public static let subjectSize: CGFloat = 18
+    public static let metadataSize: CGFloat = 17
 
     public static func sidebarHeader() -> Font {
         .system(size: sidebarHeaderSize, weight: .semibold, design: .rounded)
@@ -132,19 +132,19 @@ public enum ElectronicMailMailboxType {
     }
 
     public static func section() -> Font {
-        .system(size: sectionSize, weight: .semibold, design: .rounded)
+        .system(size: sectionSize, weight: .regular, design: .rounded)
     }
 
     public static func sender(unread: Bool) -> Font {
-        .system(size: senderSize, weight: unread ? .semibold : .medium, design: .rounded)
+        .system(size: senderSize, weight: unread ? .semibold : .regular, design: .rounded)
     }
 
-    public static func subject(unread: Bool) -> Font {
-        .system(size: subjectSize, weight: unread ? .medium : .regular, design: .rounded)
+    public static func subject(unread _: Bool) -> Font {
+        .system(size: subjectSize, weight: .regular, design: .rounded)
     }
 
-    public static func metadata(unread: Bool = false) -> Font {
-        .system(size: metadataSize, weight: unread ? .medium : .regular, design: .rounded)
+    public static func metadata(unread _: Bool = false) -> Font {
+        .system(size: metadataSize, weight: .regular, design: .rounded)
     }
 }
 

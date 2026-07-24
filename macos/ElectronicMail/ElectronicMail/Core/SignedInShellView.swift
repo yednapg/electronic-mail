@@ -7,14 +7,25 @@ import UniformTypeIdentifiers
 enum ElectronicMailShellMetrics {
     static let navTop: CGFloat = 12
     static let navLeading: CGFloat = 20
-    static let navIconFrame: CGFloat = 16
-    static let navHitFrame: CGFloat = 32
+    static let navIconFrame: CGFloat = 22
+    static let navHitFrame: CGFloat = 40
     static let navTitleGap: CGFloat = 8
     static let navHeaderTitleGap: CGFloat = 4
     static let navTextLeading: CGFloat = navLeading + navHitFrame + navHeaderTitleGap
     static let contentTop: CGFloat = navTop + 44
     static let contentMaxWidth: CGFloat = 900
-    static let drawerWidth: CGFloat = 280
+
+    private static let figmaCanvasWidth: CGFloat = 1_724
+    private static let figmaUtilityCenterX: CGFloat = 77
+    private static let figmaTextLeadingX: CGFloat = 129
+
+    static func utilityCenter(for width: CGFloat) -> CGFloat {
+        width * figmaUtilityCenterX / figmaCanvasWidth
+    }
+
+    static func textLeading(for width: CGFloat) -> CGFloat {
+        width * figmaTextLeadingX / figmaCanvasWidth
+    }
 }
 
 @MainActor
@@ -60,8 +71,10 @@ public struct SignedInShellView: View {
     private let onSignOut: () async throws -> Void
     private let onDisconnectGoogle: () async throws -> Void
     private let onDeleteAccount: () async throws -> Void
-    @State private var selection: SignedInDestination? = .inbox
-    @State private var columnVisibility: NavigationSplitViewVisibility = .detailOnly
+    @State private var selection: SignedInDestination = .inbox
+    @State private var supplementalDestination: ShellSupplementalDestination?
+    @State private var navigationOpen = false
+    @State private var mailboxSearchOpen = false
     @State private var commandPaletteOpen = false
     @State private var composer: MailComposerPresentation?
     @State private var recoveredComposerSnapshot: ComposerRecoverySnapshot?
@@ -84,91 +97,102 @@ public struct SignedInShellView: View {
     }
 
     public var body: some View {
-        ZStack(alignment: .topLeading) {
-            NavigationSplitView(columnVisibility: $columnVisibility) {
-                mailboxSidebar
-            } detail: {
+        GeometryReader { proxy in
+            ZStack(alignment: .topLeading) {
                 content
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .navigationTitle(navigationTitle)
-                    .toolbar {
-                        ToolbarItemGroup(placement: .primaryAction) {
-                            Button(action: syncNow) {
-                                Label(store.manualSyncInProgress ? "Getting Mail" : "Get New Mail", systemImage: "arrow.clockwise")
-                            }
-                            .labelStyle(.iconOnly)
-                            .controlSize(.regular)
-                            .help(store.manualSyncInProgress ? "Getting Mail" : "Get New Mail")
-                            .disabled(store.manualSyncInProgress)
-                            .accessibilityLabel(store.manualSyncInProgress ? "Getting Mail" : "Get New Mail")
+                    .allowsHitTesting(!navigationOpen && !mailboxSearchOpen)
+                    .accessibilityHidden(navigationOpen || mailboxSearchOpen)
 
-                            Button(action: openComposeComposer) {
-                                Label("New Message", systemImage: "square.and.pencil")
-                            }
-                            .labelStyle(.iconOnly)
-                            .controlSize(.regular)
-                            .help("New Message")
-                            .accessibilityLabel("New Message")
+                if !navigationOpen,
+                   store.readerThreadID == nil,
+                   supplementalDestination != .todos {
+                    ShellHeaderTitle(
+                        title: headerTitle,
+                        width: proxy.size.width,
+                        colorScheme: colorScheme
+                    )
+                    .transition(.opacity)
+                    .accessibilityHidden(mailboxSearchOpen)
+                    .zIndex(4)
+                }
 
-                            DebouncedMailboxToolbarSearchField(query: $mailboxSearchText)
-                                .frame(width: 360, height: 28)
-                        }
+                if navigationOpen {
+                    ShellNavigationCanvas(
+                        width: proxy.size.width,
+                        selection: primaryNavigationSelection,
+                        colorScheme: colorScheme,
+                        onSelect: selectPrimaryNavigation
+                    )
+                    .transition(.opacity)
+                    .zIndex(2)
+                }
 
-                        if store.readerThreadID != nil {
-                            ToolbarItem(placement: .navigation) {
-                                Button(action: closeReader) {
-                                    Label("Back", systemImage: "chevron.backward")
-                                }
-                                .labelStyle(.iconOnly)
-                                .help("Back")
-                                .accessibilityLabel("Back")
-                            }
-                        }
-                    }
-            }
-            .navigationSplitViewStyle(.prominentDetail)
+                fixedNavigationButton(width: proxy.size.width)
+                    .allowsHitTesting(!mailboxSearchOpen)
+                    .accessibilityHidden(mailboxSearchOpen)
+                    .zIndex(6)
 
-            if commandPaletteOpen {
-                CommandPaletteView(
-                    store: store,
-                    colorScheme: colorScheme,
-                    onRun: runCommand,
-                    onClose: closeCommandPalette
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
-                .zIndex(10)
-            }
+                if mailboxSearchOpen {
+                    MailboxSearchOverlay(
+                        query: $mailboxSearchText,
+                        colorScheme: colorScheme,
+                        onClose: closeMailboxSearch
+                    )
+                    .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
+                    .zIndex(8)
+                }
 
-            Group {
-                if let composer {
-                    MailComposerOverlay(
-                        presentation: composer,
-                        recoverySnapshot: recoveredComposerSnapshot,
+                if commandPaletteOpen {
+                    CommandPaletteView(
                         store: store,
                         colorScheme: colorScheme,
-                        onReauthorizeGoogle: onReauthorizeGoogle,
-                        onClose: closeComposer(preserving:)
+                        onRun: runCommand,
+                        onClose: closeCommandPalette
                     )
-                    .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .center)))
-                    .zIndex(12)
+                    .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
+                    .zIndex(10)
                 }
-            }
-            .animation(.easeInOut(duration: 0.14), value: composer)
 
-            CommandPaletteKeyboardCapture(
-                isOpen: $commandPaletteOpen
-            )
-            .frame(width: 1, height: 1)
-            .opacity(0.01)
+                Group {
+                    if let composer {
+                        MailComposerOverlay(
+                            presentation: composer,
+                            recoverySnapshot: recoveredComposerSnapshot,
+                            store: store,
+                            colorScheme: colorScheme,
+                            onReauthorizeGoogle: onReauthorizeGoogle,
+                            onClose: closeComposer(preserving:)
+                        )
+                        .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .center)))
+                        .zIndex(12)
+                    }
+                }
+                .animation(.easeInOut(duration: 0.14), value: composer)
+
+                CommandPaletteKeyboardCapture(
+                    isOpen: $commandPaletteOpen
+                )
+                .frame(width: 1, height: 1)
+                .opacity(0.01)
+
+                ShellAccountCommandHandler(
+                    onSignOut: onSignOut,
+                    onDisconnectGoogle: onDisconnectGoogle,
+                    onDeleteAccount: onDeleteAccount
+                )
+                .frame(width: 1, height: 1)
+                .zIndex(20)
+            }
         }
         .background(ElectronicMailDesign.background(for: colorScheme))
         .task(id: selection) {
             await applyMailboxSelection()
         }
-        .task(id: columnVisibility) {
-            await store.setFolderCountPrefetchEnabled(columnVisibility != .detailOnly)
-        }
         .onChange(of: store.activeMailboxLabel) { _, label in
+            guard supplementalDestination == nil else {
+                return
+            }
             let destination = SignedInDestination(mailboxLabel: label)
             if selection != destination {
                 selection = destination
@@ -183,29 +207,148 @@ public struct SignedInShellView: View {
         .onReceive(NotificationCenter.default.publisher(for: .electronicMailSyncMailbox)) { _ in
             syncNow()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .electronicMailToggleNavigation)) { _ in
+            toggleNavigation()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .electronicMailOpenMailboxSearch)) { _ in
+            openMailboxSearch()
+        }
         .task {
+            await store.setFolderCountPrefetchEnabled(false)
             await restoreRecoveredComposerIfNeeded()
         }
-    }
-
-    private var content: some View {
-        InboxView(
-            store: store,
-            searchText: $mailboxSearchText,
-            onRespond: openResponseComposer,
-            onOpenDraft: openDraftComposer
-        )
-    }
-
-    private var navigationTitle: String {
-        guard columnVisibility == .detailOnly else {
-            return ""
+        .onExitCommand {
+            if commandPaletteOpen {
+                closeCommandPalette()
+            } else if mailboxSearchOpen {
+                closeMailboxSearch()
+            } else if navigationOpen {
+                closeNavigation()
+            } else if store.readerThreadID != nil {
+                closeReader()
+            }
         }
-        return store.readerThreadID == nil ? store.mailboxTitle : "Message"
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch supplementalDestination {
+        case .todos:
+            TodoHomeView(
+                store: store,
+                onCompose: openComposeComposer,
+                onOpenSource: openTodoSource
+            )
+        case nil:
+            InboxView(
+                store: store,
+                searchText: $mailboxSearchText,
+                onRespond: openResponseComposer,
+                onOpenDraft: openDraftComposer
+            )
+        }
+    }
+
+    private var headerTitle: String {
+        switch supplementalDestination {
+        case .todos:
+            return "To-dos"
+        case nil:
+            return store.mailboxTitle
+        }
+    }
+
+    private var primaryNavigationSelection: ShellPrimaryNavigationDestination? {
+        if let supplementalDestination {
+            return supplementalDestination.primaryNavigationDestination
+        }
+        return ShellPrimaryNavigationDestination(mailboxDestination: selection)
+    }
+
+    @ViewBuilder
+    private func fixedNavigationButton(width: CGFloat) -> some View {
+        if store.readerThreadID != nil, !navigationOpen {
+            ShellBackButton(colorScheme: colorScheme, action: closeReader)
+                .position(
+                    x: ElectronicMailShellMetrics.utilityCenter(for: width),
+                    y: ElectronicMailShellMetrics.navTop + ElectronicMailShellMetrics.navHitFrame / 2
+                )
+        } else {
+            ShellMenuButton(
+                colorScheme: colorScheme,
+                accessibilityLabel: navigationOpen ? "Hide navigation" : "Show navigation",
+                action: toggleNavigation
+            )
+            .position(
+                x: ElectronicMailShellMetrics.utilityCenter(for: width),
+                y: ElectronicMailShellMetrics.navTop + ElectronicMailShellMetrics.navHitFrame / 2
+            )
+        }
+    }
+
+    private func toggleNavigation() {
+        withAnimation(ShellNavigationMotion.screen) {
+            mailboxSearchOpen = false
+            commandPaletteOpen = false
+            navigationOpen.toggle()
+        }
+    }
+
+    private func closeNavigation() {
+        withAnimation(ShellNavigationMotion.screen) {
+            navigationOpen = false
+        }
+    }
+
+    private func openMailboxSearch() {
+        store.closeReader()
+        withAnimation(.easeInOut(duration: 0.12)) {
+            supplementalDestination = nil
+            navigationOpen = false
+            commandPaletteOpen = false
+            mailboxSearchOpen = true
+        }
+    }
+
+    private func closeMailboxSearch() {
+        withAnimation(.easeInOut(duration: 0.12)) {
+            mailboxSearchOpen = false
+        }
+    }
+
+    private func selectPrimaryNavigation(_ destination: ShellPrimaryNavigationDestination) {
+        pendingCommandThreadID = nil
+        store.closeReader()
+
+        withAnimation(ShellNavigationMotion.screen) {
+            navigationOpen = false
+            mailboxSearchOpen = false
+            supplementalDestination = destination.supplementalDestination
+            if let mailboxDestination = destination.mailboxDestination {
+                selection = mailboxDestination
+            }
+        }
+    }
+
+    private func openTodoSource(_ entityID: String) {
+        pendingCommandThreadID = entityID
+        withAnimation(.easeInOut(duration: 0.16)) {
+            supplementalDestination = nil
+            selection = .inbox
+        }
+        Task {
+            await store.setMailboxLabel(.inbox)
+            guard supplementalDestination == nil, selection == .inbox else {
+                return
+            }
+            applyPendingCommandThreadIfNeeded(for: .inbox)
+        }
     }
 
     private func openCommandPalette() {
         withAnimation(.easeInOut(duration: 0.12)) {
+            navigationOpen = false
+            mailboxSearchOpen = false
             commandPaletteOpen = true
         }
     }
@@ -225,31 +368,15 @@ public struct SignedInShellView: View {
         case .openThread(let threadID):
             pendingCommandThreadID = threadID
             if selection == .inbox, store.activeMailboxLabel == .inbox {
+                supplementalDestination = nil
                 applyPendingCommandThreadIfNeeded(for: .inbox)
             } else {
+                supplementalDestination = nil
                 selection = .inbox
             }
         case .compose:
             openComposeComposer()
         }
-    }
-
-    private var mailboxSidebar: some View {
-        MailboxSidebarView(
-            selection: $selection,
-            mailboxCounts: store.mailboxCounts,
-            pendingLocalActionCount: store.pendingLocalActionCount,
-            accountEmail: store.session?.user.email,
-            colorScheme: colorScheme,
-            onSignOut: onSignOut,
-            onDisconnectGoogle: onDisconnectGoogle,
-            onDeleteAccount: onDeleteAccount
-        )
-        .navigationSplitViewColumnWidth(
-            min: 180,
-            ideal: 220,
-            max: ElectronicMailShellMetrics.drawerWidth
-        )
     }
 
     private func closeReader() {
@@ -258,6 +385,9 @@ public struct SignedInShellView: View {
 
     private func select(_ destination: SignedInDestination) {
         pendingCommandThreadID = nil
+        supplementalDestination = nil
+        navigationOpen = false
+        mailboxSearchOpen = false
         selection = destination
     }
 
@@ -266,6 +396,8 @@ public struct SignedInShellView: View {
             return
         }
         withAnimation(.easeInOut(duration: 0.12)) {
+            navigationOpen = false
+            mailboxSearchOpen = false
             commandPaletteOpen = false
         }
         presentComposer(
@@ -281,10 +413,7 @@ public struct SignedInShellView: View {
 
     @MainActor
     private func applyMailboxSelection() async {
-        guard let destination = selection else {
-            selection = SignedInDestination(mailboxLabel: store.activeMailboxLabel)
-            return
-        }
+        let destination = selection
         if destination != .inbox {
             pendingCommandThreadID = nil
         }
@@ -381,17 +510,291 @@ public struct SignedInShellView: View {
     }
 }
 
+private enum ShellNavigationMotion {
+    static let screen = Animation.easeInOut(duration: 0.15)
+}
+
+enum ShellSupplementalDestination: Equatable {
+    case todos
+
+    var primaryNavigationDestination: ShellPrimaryNavigationDestination {
+        switch self {
+        case .todos:
+            return .todos
+        }
+    }
+}
+
+enum ShellPrimaryNavigationDestination: String, CaseIterable, Identifiable {
+    case inbox = "Inbox"
+    case starred = "Starred"
+    case drafts = "Drafts"
+    case sent = "Sent"
+    case spam = "Spam"
+    case trash = "Trash"
+    case archive = "Archive"
+    case all = "All Mail"
+    case todos = "To-dos"
+
+    var id: Self {
+        self
+    }
+
+    var title: String {
+        rawValue
+    }
+
+    init?(mailboxDestination: SignedInDestination) {
+        switch mailboxDestination {
+        case .inbox:
+            self = .inbox
+        case .starred:
+            self = .starred
+        case .drafts:
+            self = .drafts
+        case .sent:
+            self = .sent
+        case .spam:
+            self = .spam
+        case .trash:
+            self = .trash
+        case .archive:
+            self = .archive
+        case .all:
+            self = .all
+        }
+    }
+
+    var mailboxDestination: SignedInDestination? {
+        switch self {
+        case .inbox:
+            return .inbox
+        case .starred:
+            return .starred
+        case .drafts:
+            return .drafts
+        case .sent:
+            return .sent
+        case .spam:
+            return .spam
+        case .trash:
+            return .trash
+        case .archive:
+            return .archive
+        case .all:
+            return .all
+        case .todos:
+            return nil
+        }
+    }
+
+    var supplementalDestination: ShellSupplementalDestination? {
+        switch self {
+        case .todos:
+            return .todos
+        case .inbox, .starred, .drafts, .sent, .spam, .trash, .archive, .all:
+            return nil
+        }
+    }
+
+    var isSupplemental: Bool {
+        self == .todos
+    }
+}
+
+private struct ShellHeaderTitle: View {
+    let title: String
+    let width: CGFloat
+    let colorScheme: ColorScheme
+
+    var body: some View {
+        Text(title)
+            .font(ElectronicMailType.headerTitle())
+            .tracking(ElectronicMailType.titleTracking)
+            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+            .lineLimit(1)
+            .frame(height: ElectronicMailShellMetrics.navHitFrame, alignment: .leading)
+            .padding(.top, ElectronicMailShellMetrics.navTop)
+            .padding(.leading, ElectronicMailShellMetrics.textLeading(for: width))
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .allowsHitTesting(false)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
+private struct ShellMenuButton: View {
+    let colorScheme: ColorScheme
+    let accessibilityLabel: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ElectronicMailHamburgerIcon()
+                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .frame(
+                    width: ElectronicMailShellMetrics.navIconFrame,
+                    height: ElectronicMailShellMetrics.navIconFrame
+                )
+                .frame(
+                    width: ElectronicMailShellMetrics.navHitFrame,
+                    height: ElectronicMailShellMetrics.navHitFrame
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .frame(
+            width: ElectronicMailShellMetrics.navHitFrame,
+            height: ElectronicMailShellMetrics.navHitFrame
+        )
+        .contentShape(Rectangle())
+        .help(accessibilityLabel)
+        .accessibilityLabel(accessibilityLabel)
+    }
+}
+
+private struct ShellBackButton: View {
+    let colorScheme: ColorScheme
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "chevron.backward")
+                .font(.system(size: 18, weight: .semibold, design: .rounded))
+                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .frame(
+                    width: ElectronicMailShellMetrics.navHitFrame,
+                    height: ElectronicMailShellMetrics.navHitFrame
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .frame(
+            width: ElectronicMailShellMetrics.navHitFrame,
+            height: ElectronicMailShellMetrics.navHitFrame
+        )
+        .contentShape(Rectangle())
+        .help("Back")
+        .accessibilityLabel("Back")
+    }
+}
+
+private struct ShellNavigationCanvas: View {
+    let width: CGFloat
+    let selection: ShellPrimaryNavigationDestination?
+    let colorScheme: ColorScheme
+    let onSelect: (ShellPrimaryNavigationDestination) -> Void
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            ElectronicMailDesign.background(for: colorScheme)
+                .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(ShellPrimaryNavigationDestination.allCases) { destination in
+                    ShellNavigationItem(
+                        destination: destination,
+                        isSelected: selection == destination,
+                        colorScheme: colorScheme,
+                        action: { onSelect(destination) }
+                    )
+                    .padding(.top, destination.isSupplemental ? 12 : 0)
+                }
+            }
+            .padding(.top, ElectronicMailShellMetrics.navTop)
+            .padding(.leading, ElectronicMailShellMetrics.textLeading(for: width))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Mailbox navigation")
+    }
+}
+
+private struct ShellNavigationItem: View {
+    let destination: ShellPrimaryNavigationDestination
+    let isSelected: Bool
+    let colorScheme: ColorScheme
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(destination.title)
+                .font(ElectronicMailType.title())
+                .tracking(ElectronicMailType.titleTracking)
+                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .opacity(isSelected ? 1 : 0.78)
+                .frame(height: ElectronicMailShellMetrics.navHitFrame)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(destination.title)
+        .accessibilityLabel(destination.title)
+        .accessibilityHint(
+            isSelected
+                ? "Currently selected"
+                : "Opens \(destination.title)"
+        )
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+private struct MailboxSearchOverlay: View {
+    @Binding var query: String
+    let colorScheme: ColorScheme
+    let onClose: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            Button(action: onClose) {
+                Rectangle()
+                    .fill(
+                        ElectronicMailDesign.background(for: colorScheme)
+                            .opacity(colorScheme == .dark ? 0.78 : 0.72)
+                    )
+                    .ignoresSafeArea()
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close mailbox search")
+
+            HStack(spacing: 10) {
+                DebouncedMailboxToolbarSearchField(
+                    query: $query,
+                    onCancel: onClose
+                )
+                    .frame(width: 420, height: 30)
+
+                Button("Done", action: onClose)
+                    .buttonStyle(.plain)
+                    .font(ElectronicMailType.small(weight: .semibold))
+                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                    .accessibilityHint("Closes the search field and keeps the current results")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(ElectronicMailDesign.divider(for: colorScheme), lineWidth: 1)
+            }
+            .padding(.top, ElectronicMailShellMetrics.navTop)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onExitCommand(perform: onClose)
+    }
+}
+
 private struct DebouncedMailboxToolbarSearchField: View {
     @Binding private var query: String
     @State private var fieldText: String
+    private let onCancel: () -> Void
 
-    init(query: Binding<String>) {
+    init(query: Binding<String>, onCancel: @escaping () -> Void) {
         self._query = query
         self._fieldText = State(initialValue: query.wrappedValue)
+        self.onCancel = onCancel
     }
 
     var body: some View {
-        MailboxToolbarSearchField(text: $fieldText)
+        MailboxToolbarSearchField(text: $fieldText, onCancel: onCancel)
             .task(id: fieldText) {
                 if fieldText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     if query != fieldText {
@@ -415,14 +818,16 @@ private struct DebouncedMailboxToolbarSearchField: View {
 
 private struct MailboxToolbarSearchField: NSViewRepresentable {
     @Binding var text: String
+    let onCancel: () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text)
+        Coordinator(text: $text, onCancel: onCancel)
     }
 
-    func makeNSView(context: Context) -> NSSearchField {
-        let field = NSSearchField()
+    func makeNSView(context: Context) -> ElectronicMailSearchField {
+        let field = ElectronicMailSearchField()
         field.delegate = context.coordinator
+        field.onCancel = context.coordinator.onCancel
         field.placeholderString = "Search Mail"
         field.controlSize = .regular
         field.bezelStyle = .roundedBezel
@@ -433,8 +838,10 @@ private struct MailboxToolbarSearchField: NSViewRepresentable {
         return field
     }
 
-    func updateNSView(_ field: NSSearchField, context: Context) {
+    func updateNSView(_ field: ElectronicMailSearchField, context: Context) {
         context.coordinator.text = $text
+        context.coordinator.onCancel = onCancel
+        field.onCancel = context.coordinator.onCancel
         if field.stringValue != text {
             field.stringValue = text
         }
@@ -442,9 +849,11 @@ private struct MailboxToolbarSearchField: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSSearchFieldDelegate {
         var text: Binding<String>
+        var onCancel: () -> Void
 
-        init(text: Binding<String>) {
+        init(text: Binding<String>, onCancel: @escaping () -> Void) {
             self.text = text
+            self.onCancel = onCancel
         }
 
         func controlTextDidChange(_ notification: Notification) {
@@ -456,10 +865,32 @@ private struct MailboxToolbarSearchField: NSViewRepresentable {
     }
 }
 
+final class ElectronicMailSearchField: NSSearchField {
+    var onCancel: () -> Void = {}
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let window else {
+            return
+        }
+        window.makeFirstResponder(self)
+        selectText(nil)
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        onCancel()
+    }
+}
+
 public extension Notification.Name {
+    static let electronicMailToggleNavigation = Notification.Name("ElectronicMailToggleNavigation")
+    static let electronicMailOpenMailboxSearch = Notification.Name("ElectronicMailOpenMailboxSearch")
     static let electronicMailOpenCommandPalette = Notification.Name("ElectronicMailOpenCommandPalette")
     static let electronicMailOpenComposer = Notification.Name("ElectronicMailOpenComposer")
     static let electronicMailSyncMailbox = Notification.Name("ElectronicMailSyncMailbox")
+    static let electronicMailSignOut = Notification.Name("ElectronicMailSignOut")
+    static let electronicMailDisconnectGoogle = Notification.Name("ElectronicMailDisconnectGoogle")
+    static let electronicMailDeleteAccount = Notification.Name("ElectronicMailDeleteAccount")
     static let electronicMailComposerCloseRequested = Notification.Name("ElectronicMailComposerCloseRequested")
 }
 
@@ -2659,12 +3090,7 @@ private struct ComposerKeyboardCapture: NSViewRepresentable {
     }
 }
 
-private struct MailboxSidebarView: View {
-    @Binding var selection: SignedInDestination?
-    let mailboxCounts: [MailboxLabel: MailboxFolderCount]
-    let pendingLocalActionCount: Int
-    let accountEmail: String?
-    let colorScheme: ColorScheme
+private struct ShellAccountCommandHandler: View {
     let onSignOut: () async throws -> Void
     let onDisconnectGoogle: () async throws -> Void
     let onDeleteAccount: () async throws -> Void
@@ -2680,41 +3106,21 @@ private struct MailboxSidebarView: View {
     @State private var disconnectError: String?
 
     var body: some View {
-        List(selection: $selection) {
-            Section {
-                ForEach(SignedInDestination.allCases) { destination in
-                    MailboxSidebarRow(
-                        title: destination.title,
-                        symbolName: destination.systemImage,
-                        count: mailboxCount(destination.mailboxLabel),
-                        isSelected: selection == destination
-                    )
-                    .tag(destination)
-                }
-            } header: {
-                Text("Mailboxes")
-                    .font(ElectronicMailMailboxType.sidebarHeader())
-                    .foregroundStyle(ElectronicMailDesign.sidebarSecondaryText)
-                    .textCase(nil)
+        Color.clear
+            .onReceive(NotificationCenter.default.publisher(for: .electronicMailSignOut)) { _ in
+                signOut()
             }
-        }
-        .listStyle(.sidebar)
-        .environment(\.defaultMinListRowHeight, 30)
-        .scrollContentBackground(.hidden)
-        .background(ElectronicMailDesign.sidebarBackground)
-        .environment(\.colorScheme, .dark)
-        .tint(ElectronicMailDesign.appleBlue)
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 0) {
-                Rectangle()
-                    .fill(Color.white.opacity(0.12))
-                    .frame(height: 1)
-                accountMenu
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
+            .onReceive(NotificationCenter.default.publisher(for: .electronicMailDisconnectGoogle)) { _ in
+                guard !disconnecting else { return }
+                disconnectError = nil
+                confirmDisconnect = true
             }
-            .background(ElectronicMailDesign.sidebarBackground)
-        }
+            .onReceive(NotificationCenter.default.publisher(for: .electronicMailDeleteAccount)) { _ in
+                guard !deletingAccount else { return }
+                deleteAccountConfirmation = ""
+                deleteAccountError = nil
+                confirmDeleteAccount = true
+            }
         .alert(
             "Could Not Sign Out",
             isPresented: Binding(
@@ -2732,16 +3138,7 @@ private struct MailboxSidebarView: View {
             titleVisibility: .visible
         ) {
             Button("Disconnect and Delete Local Data", role: .destructive) {
-                Task {
-                    disconnecting = true
-                    disconnectError = nil
-                    do {
-                        try await onDisconnectGoogle()
-                    } catch {
-                        disconnectError = error.localizedDescription
-                    }
-                    disconnecting = false
-                }
+                disconnectGoogle()
             }
             .disabled(disconnecting)
             Button("Cancel", role: .cancel) {}
@@ -2782,17 +3179,7 @@ private struct MailboxSidebarView: View {
                     }
                     .disabled(deletingAccount)
                     Button("Delete Account", role: .destructive) {
-                        Task {
-                            deletingAccount = true
-                            deleteAccountError = nil
-                            do {
-                                try await onDeleteAccount()
-                                confirmDeleteAccount = false
-                            } catch {
-                                deleteAccountError = "Could not delete your account: \(error.localizedDescription)"
-                            }
-                            deletingAccount = false
-                        }
+                        deleteAccount()
                     }
                     .disabled(
                         deletingAccount
@@ -2805,97 +3192,46 @@ private struct MailboxSidebarView: View {
         }
     }
 
-    private var accountMenu: some View {
-        Menu {
-            if let accountEmail {
-                Text(accountEmail)
-                Divider()
+    private func signOut() {
+        guard !signingOut else { return }
+        Task {
+            signingOut = true
+            signOutError = nil
+            do {
+                try await onSignOut()
+            } catch {
+                signOutError = error.localizedDescription
             }
-            if pendingLocalActionCount > 0 {
-                Text("\(pendingLocalActionCount) change\(pendingLocalActionCount == 1 ? "" : "s") waiting to sync")
-            }
-            Button(pendingLocalActionCount > 0 ? "Sync and Sign Out" : "Sign Out") {
-                Task {
-                    signingOut = true
-                    signOutError = nil
-                    do {
-                        try await onSignOut()
-                    } catch {
-                        signOutError = error.localizedDescription
-                    }
-                    signingOut = false
-                }
-            }
-            .disabled(signingOut)
-            Button("Disconnect Google", role: .destructive) {
-                disconnectError = nil
-                confirmDisconnect = true
-            }
-            .disabled(disconnecting)
-            Button("Delete Account…", role: .destructive) {
-                deleteAccountConfirmation = ""
-                deleteAccountError = nil
-                confirmDeleteAccount = true
-            }
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "person.crop.circle")
-                    .imageScale(.medium)
-                Text("Account")
-                Spacer()
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 10, weight: .medium))
-            }
-            .font(ElectronicMailMailboxType.sidebarAccount())
-            .foregroundStyle(ElectronicMailDesign.sidebarSecondaryText)
-            .frame(height: 30)
-            .contentShape(Rectangle())
+            signingOut = false
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize(horizontal: false, vertical: true)
     }
 
-    private func mailboxCount(_ label: MailboxLabel) -> String? {
-        guard let count = mailboxCounts[label] else {
-            return nil
-        }
-        if label == .drafts {
-            return count.total > 0 ? "\(count.total)" : nil
-        }
-        return count.unread > 0 ? "\(count.unread)" : nil
-    }
-}
-
-private struct MailboxSidebarRow: View {
-    let title: String
-    let symbolName: String
-    var count: String? = nil
-    let isSelected: Bool
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: symbolName)
-                .font(.system(size: 14, weight: .regular))
-                .imageScale(.medium)
-                .symbolRenderingMode(.monochrome)
-                .frame(width: 18, alignment: .center)
-
-            Text(title)
-                .font(ElectronicMailMailboxType.sidebarItem(selected: isSelected))
-
-            Spacer(minLength: 8)
-
-            if let count {
-                Text(count)
-                    .font(ElectronicMailMailboxType.metadata(unread: isSelected))
-                    .monospacedDigit()
-                    .foregroundStyle(isSelected ? Color.white.opacity(0.82) : ElectronicMailDesign.sidebarSecondaryText)
+    private func disconnectGoogle() {
+        guard !disconnecting else { return }
+        Task {
+            disconnecting = true
+            disconnectError = nil
+            do {
+                try await onDisconnectGoogle()
+            } catch {
+                disconnectError = error.localizedDescription
             }
+            disconnecting = false
         }
-        .foregroundStyle(isSelected ? Color.white : ElectronicMailDesign.sidebarText)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-        .help(title)
-        .accessibilityLabel(title)
+    }
+
+    private func deleteAccount() {
+        guard !deletingAccount else { return }
+        Task {
+            deletingAccount = true
+            deleteAccountError = nil
+            do {
+                try await onDeleteAccount()
+                confirmDeleteAccount = false
+            } catch {
+                deleteAccountError = "Could not delete your account: \(error.localizedDescription)"
+            }
+            deletingAccount = false
+        }
     }
 }
