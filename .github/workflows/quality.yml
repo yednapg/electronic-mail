@@ -69,6 +69,10 @@ jobs:
       GMAIL_PUBSUB_PUSH_AUDIENCE: https://api.ci.electronicmail.dev/v1/mailbox/pubsub
       GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL: gmail-push@ci.iam.gserviceaccount.com
       GMAIL_WATCH_RENEWAL_HOURS: 24
+      AI_GROUPING_ENABLED: "false"
+      OPENAI_REQUIRED: "false"
+      OPENAI_DEBUG_LOGS: "false"
+      OPENAI_API_KEY: ""
       RATE_LIMIT_ENABLED: "true"
       OPS_ADMIN_EMAILS: ci@example.test
       RELEASE_SHA: ${{ github.sha }}
@@ -91,7 +95,7 @@ jobs:
           python -m venv .audit-venv
           .audit-venv/bin/pip install --upgrade pip==26.1.2
           .audit-venv/bin/pip install pip-audit==2.10.1
-          .audit-venv/bin/python -m pip_audit -r backend/requirements.lock
+          .audit-venv/bin/python -m pip_audit --strict --no-deps --disable-pip -r backend/requirements.lock
       - run: cd backend && ../.venv/bin/alembic upgrade head
       - run: PYTHONPATH=backend .venv/bin/python -m app.deploy_check
       - run: PYTHONPATH=backend .venv/bin/python -m unittest discover -s backend/tests -t . -p 'test_*.py'
@@ -372,57 +376,18 @@ jobs:
             exit 1
           }
 
-          curl --fail --silent --show-error --dump-header "$page_dir/home.headers" \
-            http://127.0.0.1:5173/ > "$page_dir/home.html"
-          curl --fail --silent --show-error http://127.0.0.1:5173/privacy > "$page_dir/privacy.html"
-          curl --fail --silent --show-error http://127.0.0.1:5173/terms > "$page_dir/terms.html"
-
-          post_login_status="$(curl --silent --show-error --output "$page_dir/post-login.html" \
-            --write-out '%{http_code}' http://127.0.0.1:5173/post-login)"
-          if [ "$post_login_status" != "200" ]; then
-            echo "The OAuth completion fallback must remain available when the backend is unreachable (received $post_login_status)." >&2
-            exit 1
-          fi
-          grep -Fq 'Connection status unavailable' "$page_dir/post-login.html"
-          grep -Fq 'Try again' "$page_dir/post-login.html"
-
-          grep -Fqi 'native Gmail client for macOS' "$page_dir/home.html"
-          grep -Fq "href=\"$MACOS_DOWNLOAD_URL\"" "$page_dir/home.html"
-          grep -Fq 'Download for macOS' "$page_dir/home.html"
-          grep -qi '^content-security-policy:.*frame-ancestors.*none' "$page_dir/home.headers"
-          grep -qi "^content-security-policy:.*font-src[[:space:]]*'none'" "$page_dir/home.headers"
-          grep -qi '^x-content-type-options:[[:space:]]*nosniff' "$page_dir/home.headers"
-          grep -qi '^x-frame-options:[[:space:]]*DENY' "$page_dir/home.headers"
-          grep -qi '^referrer-policy:[[:space:]]*no-referrer' "$page_dir/home.headers"
-          grep -qi '^permissions-policy:.*camera=()' "$page_dir/home.headers"
-          ! grep -qi '^x-powered-by:' "$page_dir/home.headers"
-          grep -Fq 'support@ci.electronicmail.dev' "$page_dir/support.html"
-          grep -Fq 'href="https://status.ci.electronicmail.dev"' "$page_dir/support.html"
-          grep -Fq 'Report a security issue' "$page_dir/support.html"
-          grep -Fq '2026-07-13' "$page_dir/privacy.html"
-          grep -Fq 'Electronic Mail CI hosting providers' "$page_dir/privacy.html"
-          grep -Fq 'CI ephemeral test region' "$page_dir/privacy.html"
-          grep -Fq 'up to <!-- -->14<!-- --> days' "$page_dir/privacy.html"
-          if grep -Eqi 'OWNER REVIEW REQUIRED|not approved for public launch|support@example\.com' "$page_dir"/*.html; then
-            echo "The built web image rendered invalid legal configuration." >&2
-            exit 1
-          fi
-          if grep -Eqi 'Continue with Google|href="/gmail|href="/dashboard' "$page_dir/home.html"; then
-            echo "The production home page exposed the retired web product UI." >&2
-            exit 1
-          fi
-
-          for route in gmail dashboard api/dashboard; do
-            status="$(curl --silent --show-error --output "$page_dir/${route//\//-}.txt" \
-              --write-out '%{http_code}' "http://127.0.0.1:5173/$route")"
-            if [ "$status" != "404" ]; then
-              echo "$route must return 404 in the native-only web runtime (received $status)." >&2
-              exit 1
-            fi
-          done
+          python3 scripts/verify_web_runtime.py \
+            --web-url http://127.0.0.1:5173 \
+            --download-url "$MACOS_DOWNLOAD_URL" \
+            --support-email "$LEGAL_SUPPORT_EMAIL" \
+            --status-page-url "$STATUS_PAGE_URL" \
+            --effective-date "$LEGAL_EFFECTIVE_DATE" \
+            --hosting-providers "$LEGAL_HOSTING_PROVIDERS" \
+            --data-regions "$LEGAL_DATA_REGIONS" \
+            --backup-retention-days "$LEGAL_BACKUP_RETENTION_DAYS"
 
   macos:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 60
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
@@ -444,6 +409,7 @@ jobs:
       - run: python -m venv .venv
       - run: .venv/bin/pip install --upgrade pip==26.1.2
       - run: .venv/bin/pip install --no-deps -r backend/requirements.lock
+      - run: .venv/bin/pip check
       - run: bash scripts/verify-macos-toolchain.sh
       - run: npm run verify:macos
       - run: npm run release:macos:preflight

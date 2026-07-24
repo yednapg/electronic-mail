@@ -50,6 +50,13 @@ create_app() {
   <key>NSHumanReadableCopyright</key><string>Copyright 2026 Electronic Mail</string>
 </dict></plist>
 EOF
+  cat > "$app_path/Contents/Frameworks/ElectronicMailCore.framework/Resources/Info.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>app.electronicmail.core</string>
+</dict></plist>
+EOF
   printf '%s\n' 'test universal executable' > "$app_path/Contents/MacOS/ElectronicMail"
   printf '%s\n' 'test universal framework' > "$app_path/Contents/Frameworks/ElectronicMailCore.framework/ElectronicMailCore"
   printf '%s\n' 'test app icon' > "$app_path/Contents/Resources/AppIcon.icns"
@@ -92,6 +99,23 @@ EOF
 }
 
 write_checksums() {
+  (
+    cd "$ARTIFACT_DIR"
+    shasum -a 256 \
+      "$(basename "$APP_ZIP_PATH")" \
+      "$(basename "$DMG_PATH")" \
+      "$(basename "$DSYM_ZIP_PATH")" \
+      "$(basename "$ARCHIVE_ZIP_PATH")" \
+      "$(basename "$METADATA_PATH")" \
+      "$(basename "$APP_NOTARY_RESULT_PATH")" \
+      "$(basename "$DMG_NOTARY_RESULT_PATH")" \
+      "$(basename "$APP_NOTARY_LOG_PATH")" \
+      "$(basename "$DMG_NOTARY_LOG_PATH")" \
+      > "$(basename "$CHECKSUM_PATH")"
+  )
+}
+
+write_reduced_checksums() {
   (
     cd "$ARTIFACT_DIR"
     shasum -a 256 "$(basename "$DMG_PATH")" "$(basename "$METADATA_PATH")" > "$(basename "$CHECKSUM_PATH")"
@@ -198,6 +222,9 @@ run_verify() {
   LAUNCH_TEST_RELEASE_SHA="$RELEASE_SHA" \
   LAUNCH_TEST_TEAM_ID="$TEAM_ID" \
   LAUNCH_TEST_DMG_APP_PATH="${LAUNCH_TEST_DMG_APP_OVERRIDE-$DMG_APP_PATH}" \
+  LAUNCH_TEST_DMG_EXTRA_FILE="${LAUNCH_TEST_DMG_EXTRA_FILE_OVERRIDE-0}" \
+  LAUNCH_TEST_CODESIGN_TIMESTAMP="${LAUNCH_TEST_CODESIGN_TIMESTAMP_OVERRIDE-1}" \
+  LAUNCH_TEST_STATUS_PAGE_FAIL="${LAUNCH_TEST_STATUS_PAGE_FAIL_OVERRIDE-0}" \
   LAUNCH_TEST_HEALTH_RELEASE="${LAUNCH_TEST_HEALTH_RELEASE_OVERRIDE-$RELEASE_SHA}" \
   LAUNCH_TEST_READY_RELEASE="${LAUNCH_TEST_READY_RELEASE_OVERRIDE-$RELEASE_SHA}" \
   LAUNCH_TEST_READY_ENVIRONMENT="${LAUNCH_TEST_READY_ENVIRONMENT_OVERRIDE-production}" \
@@ -240,8 +267,15 @@ DMG_APP_PATH="$TEST_DIR/dmg-source/ElectronicMail.app"
 MISMATCHED_DMG_APP_PATH="$TEST_DIR/mismatched-dmg-source/ElectronicMail.app"
 MISMATCHED_COMMIT_APP_PATH="$TEST_DIR/mismatched-commit/ElectronicMail.app"
 DMG_PATH="$ARTIFACT_DIR/ElectronicMail-$VERSION-$BUILD_NUMBER.dmg"
+APP_ZIP_PATH="$ARTIFACT_DIR/ElectronicMail-$VERSION-$BUILD_NUMBER.zip"
+DSYM_ZIP_PATH="$ARTIFACT_DIR/ElectronicMail-$VERSION-$BUILD_NUMBER-dSYMs.zip"
+ARCHIVE_ZIP_PATH="$ARTIFACT_DIR/ElectronicMail-$VERSION-$BUILD_NUMBER.xcarchive.zip"
 METADATA_PATH="$ARTIFACT_DIR/RELEASE-METADATA-$VERSION-$BUILD_NUMBER.json"
 CHECKSUM_PATH="$ARTIFACT_DIR/SHA256SUMS-$VERSION-$BUILD_NUMBER.txt"
+APP_NOTARY_RESULT_PATH="$ARTIFACT_DIR/NOTARY-APP-$VERSION-$BUILD_NUMBER.json"
+DMG_NOTARY_RESULT_PATH="$ARTIFACT_DIR/NOTARY-DMG-$VERSION-$BUILD_NUMBER.json"
+APP_NOTARY_LOG_PATH="$ARTIFACT_DIR/NOTARY-APP-LOG-$VERSION-$BUILD_NUMBER.json"
+DMG_NOTARY_LOG_PATH="$ARTIFACT_DIR/NOTARY-DMG-LOG-$VERSION-$BUILD_NUMBER.json"
 ACCEPTANCE_PATH="$TEST_DIR/launch-acceptance.json"
 
 mkdir -p "$FAKE_BIN" "$ARTIFACT_DIR"
@@ -254,6 +288,17 @@ create_app "$DMG_APP_PATH" "$VERSION" "$BUILD_NUMBER" "$BACKEND_ORIGIN"
 create_app "$MISMATCHED_DMG_APP_PATH" 9.9.9 "$BUILD_NUMBER" "$BACKEND_ORIGIN"
 create_app "$MISMATCHED_COMMIT_APP_PATH" "$VERSION" "$BUILD_NUMBER" "$BACKEND_ORIGIN" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 printf '%s\n' 'deterministic fake DMG' > "$DMG_PATH"
+for release_file in \
+  "$APP_ZIP_PATH" \
+  "$DSYM_ZIP_PATH" \
+  "$ARCHIVE_ZIP_PATH" \
+  "$APP_NOTARY_RESULT_PATH" \
+  "$DMG_NOTARY_RESULT_PATH" \
+  "$APP_NOTARY_LOG_PATH" \
+  "$DMG_NOTARY_LOG_PATH"
+do
+  printf '%s\n' "deterministic fixture for $(basename "$release_file")" > "$release_file"
+done
 write_metadata "$VERSION"
 write_checksums
 write_acceptance
@@ -273,6 +318,21 @@ LAUNCH_TEST_ACCEPTANCE_PATH='' \
 LAUNCH_TEST_EVIDENCE_TOKEN='' \
   expect_failure missing-evidence-token 'EVIDENCE_BEARER_TOKEN is required for production launch verification' run_verify
 
+LAUNCH_TEST_BACKEND_URL=https://API.launch-test.electronicmail.dev \
+  expect_failure noncanonical-backend 'BACKEND_URL must be a canonical HTTPS origin' run_verify
+
+LAUNCH_TEST_BACKEND_URL=https://bad_label.launch-test.electronicmail.dev \
+  expect_failure invalid-backend-dns-label 'BACKEND_URL must use valid lowercase ASCII DNS labels or a canonical public IP address' run_verify
+
+LAUNCH_TEST_WEB_URL=https://999.999.999.999 \
+  expect_failure malformed-web-ip 'WEB_URL must use valid lowercase ASCII DNS labels or a canonical public IP address' run_verify
+
+LAUNCH_TEST_BACKEND_URL='https://[2606:4700:4700:0:0:0:0:1111]' \
+  expect_failure noncanonical-backend-ip 'BACKEND_URL IP address must use its canonical compressed representation' run_verify
+
+LAUNCH_TEST_WEB_URL=https://www.launch-test.electronicmail.dev/ \
+  expect_failure noncanonical-web 'WEB_URL must be an origin without credentials, path, query, or fragment' run_verify
+
 write_acceptance 455
 expect_failure acceptance-build-mismatch "manifest release build_number mismatch: expected '456'" run_verify
 write_acceptance "$BUILD_NUMBER" blocked
@@ -284,6 +344,10 @@ LAUNCH_TEST_EVIDENCE_BODY_OVERRIDE='tampered launch evidence' \
 
 LAUNCH_TEST_EVIDENCE_EMPTY=1 \
   expect_failure empty-evidence 'launch evidence record manual-install-1 is empty' run_verify
+
+write_reduced_checksums
+expect_failure reduced-release-manifest 'SHA256SUMS release artifact set mismatch: missing=' run_verify
+write_checksums
 
 LAUNCH_TEST_READY_ENVIRONMENT_OVERRIDE=staging \
   expect_failure ready-environment "/ready environment mismatch: expected 'production'" run_verify
@@ -320,11 +384,20 @@ write_checksums
 LAUNCH_TEST_DMG_APP_OVERRIDE="$MISMATCHED_DMG_APP_PATH" \
   expect_failure mounted-app-version 'version mismatch: expected 1.2.3, found 9.9.9' run_verify
 
+LAUNCH_TEST_DMG_EXTRA_FILE_OVERRIDE=1 \
+  expect_failure mounted-dmg-extra-payload 'mounted DMG root contents differ from policy' run_verify
+
+LAUNCH_TEST_CODESIGN_TIMESTAMP_OVERRIDE=0 \
+  expect_failure dmg-signing-timestamp 'DMG secure signing timestamp is missing' run_verify
+
 LAUNCH_TEST_APP_PATH="$MISMATCHED_COMMIT_APP_PATH" \
   expect_failure supplied-app-commit 'source-commit mismatch: expected 0123456789abcdef0123456789abcdef01234567, found aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' run_verify
 
 LAUNCH_TEST_DOWNLOAD_BODY_OVERRIDE='stale public DMG' \
   expect_failure public-download-mismatch 'public macOS download does not match the approved DMG' run_verify
+
+LAUNCH_TEST_STATUS_PAGE_FAIL_OVERRIDE=1 \
+  expect_failure public-status-unavailable 'public status page is unavailable over HTTPS' run_verify
 
 run_verify > "$TEST_DIR/production-success.stdout"
 grep -Fq 'Production launch verification passed' "$TEST_DIR/production-success.stdout" \

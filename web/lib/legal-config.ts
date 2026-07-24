@@ -105,12 +105,35 @@ function isPublicSupportEmail(value: string): boolean {
 
 function isPublicHTTPSURL(value: string): boolean {
   try {
+    if (value !== value.trim() || /[\u0000-\u0020\u007f]/.test(value)) return false;
     const url = new URL(value);
+    const hostname = url.hostname;
+    const canonicalValue = `${url.origin}${url.pathname}`;
+    const isCanonicalValue = value === canonicalValue || (url.pathname === '/' && value === url.origin);
+    let decodedPath = '';
+    try {
+      decodedPath = decodeURIComponent(url.pathname);
+    } catch {
+      return false;
+    }
+    const hasNonCanonicalPath = value.includes('\\')
+      || decodedPath.includes('\\')
+      || url.pathname.includes('//')
+      || decodedPath.includes('//')
+      || /[\u0000-\u001f\u007f]/.test(decodedPath)
+      || decodedPath.split('/').some((segment) => segment === '.' || segment === '..');
     return (
       url.protocol === 'https:'
       && url.username === ''
       && url.password === ''
-      && isPlausiblePublicHostname(url.hostname)
+      && url.port === ''
+      && url.search === ''
+      && url.hash === ''
+      && isCanonicalValue
+      && !hasNonCanonicalPath
+      && hostname === hostname.toLowerCase()
+      && !hostname.endsWith('.')
+      && isPlausiblePublicHostname(hostname)
     );
   } catch {
     return false;

@@ -38,7 +38,13 @@ class RateLimitMiddleware:
         # identity lets every attempt rotate the header and bypass the limit.
         identity = _request_identity(
             scope,
-            use_credentials=rule_name not in {"oauth", "mobile-exchange", "mobile-handoff"},
+            use_credentials=rule_name
+            not in {
+                "oauth",
+                "mobile-exchange",
+                "mobile-handoff",
+                "gmail-pubsub-verification",
+            },
             trust_proxy_headers=self.trust_proxy_headers,
         )
         allowed, retry_after = self._consume(rule_name, identity, maximum, window_seconds)
@@ -90,6 +96,12 @@ def _rule_for(method: str, path: str) -> tuple[str, int, int] | None:
         return ("mobile-exchange", 20, 60)
     if path.startswith("/v1/auth/mobile/handoff/") or path == "/auth/mobile/complete":
         return ("mobile-handoff", 180, 60)
+    if method == "POST" and path == "/v1/mailbox/pubsub":
+        # This cheap source bucket runs before certificate verification. It is
+        # deliberately separate from the verified-delivery quota in the route:
+        # rotating attacker-controlled bearer tokens cannot bypass it or spend
+        # capacity reserved for authenticated Google deliveries.
+        return ("gmail-pubsub-verification", 60, 60)
     if method == "POST" and path in {"/v1/mailbox/sync", "/v1/mailbox/sync-now"}:
         return ("mailbox-sync", 12, 60)
     if method in {"POST", "PUT", "PATCH", "DELETE"} and (

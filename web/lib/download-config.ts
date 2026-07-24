@@ -40,12 +40,20 @@ export function downloadConfigIssues(config: DownloadConfig): string[] {
 
 function isPublicHTTPSURL(value: string): boolean {
   try {
+    if (value !== value.trim() || /[\u0000-\u0020\u007f]/.test(value)) return false;
     const url = new URL(value);
-    const hostname = url.hostname.trim().toLowerCase().replace(/\.$/, '');
+    const hostname = url.hostname;
+    const pathSegments = url.pathname.split('/').slice(1);
     return (
       url.protocol === 'https:'
       && url.username === ''
       && url.password === ''
+      && url.port === ''
+      && url.search === ''
+      && url.hash === ''
+      && value === url.href
+      && hostname === hostname.toLowerCase()
+      && !hostname.endsWith('.')
       && hostname.includes('.')
       && !hostname.includes(':')
       && !/^[\d.]+$/.test(hostname)
@@ -56,6 +64,9 @@ function isPublicHTTPSURL(value: string): boolean {
         && label.length <= 63
         && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)
       ))
+      && pathSegments.length > 0
+      && pathSegments.every((segment) => segment !== '' && segment !== '.' && segment !== '..')
+      && /^[A-Za-z0-9._~/-]+\.dmg$/.test(url.pathname)
     );
   } catch {
     return false;

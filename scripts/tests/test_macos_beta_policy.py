@@ -48,6 +48,8 @@ class MacOSBetaPolicyTests(unittest.TestCase):
         self.assertEqual(info["ElectronicMailDistributionChannel"], "local-testing-beta")
         self.assertIs(info["ElectronicMailNotarized"], False)
         self.assertEqual(info["CFBundleDisplayName"], "Electronic Mail Beta")
+        self.assertEqual(info["CFBundleURLTypes"][0]["CFBundleURLName"], "app.electronicmail.mac.beta")
+        self.assertEqual(info["CFBundleURLTypes"][0]["CFBundleURLSchemes"], ["electronicmail"])
         self.assertEqual(
             info["NSAppTransportSecurity"],
             {
@@ -143,11 +145,12 @@ class MacOSBetaPolicyTests(unittest.TestCase):
             'ARCHS="arm64 x86_64"',
             'ONLY_ACTIVE_ARCH=NO',
             'CODE_SIGNING_ALLOWED=NO',
+            'PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.mac.beta;',
             "ELECTRONIC_MAIL_LOCAL_BETA",
             'codesign --force --sign - --options runtime "$FRAMEWORK_PATH"',
             'codesign --force --sign - --options runtime --entitlements "$BETA_ENTITLEMENTS_PATH" "$APP_PATH"',
             '"$APP_PATH/Contents/MacOS/ElectronicMail" --electronic-mail-beta-launch-smoke',
-            '"$DMG_MOUNT_POINT/ElectronicMail.app/Contents/MacOS/ElectronicMail" --electronic-mail-beta-launch-smoke',
+            '"$DMG_MOUNT_POINT/Electronic Mail Beta.app/Contents/MacOS/ElectronicMail" --electronic-mail-beta-launch-smoke',
             'INFO_POLICY=local-beta',
             'REQUIRE_ADHOC_SIGNATURE=1',
             'REQUIRE_NOTARIZATION=0',
@@ -156,6 +159,7 @@ class MacOSBetaPolicyTests(unittest.TestCase):
             'hdiutil attach "$DMG_PATH" -nobrowse -readonly',
             'ln -s /Applications "$DMG_ROOT/Applications"',
             'README-BETA.txt',
+            'verify_macos_dmg_layout.py',
             'shasum -a 256 -c "$CHECKSUM_NAME"',
             'github-prerelease-testing',
             'gatekeeper_acceptance_claimed',
@@ -166,6 +170,15 @@ class MacOSBetaPolicyTests(unittest.TestCase):
         for fragment in required_fragments:
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, script)
+
+        self.assertNotIn(
+            "\n  PRODUCT_BUNDLE_IDENTIFIER=app.electronicmail.mac.beta \\\n",
+            script,
+        )
+        self.assertIn(
+            '[ "$FRAMEWORK_BUNDLE_ID" = "app.electronicmail.core" ]',
+            verifier,
+        )
 
         self.assertIn('status --porcelain --untracked-files=all', script)
         self.assertIn('SOURCE_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)"', script)
@@ -233,7 +246,7 @@ class MacOSBetaPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             package["scripts"]["release:macos:beta:test"],
-            "python3 -m unittest scripts/tests/test_macos_beta_policy.py",
+            "python3 -m unittest scripts/tests/test_macos_beta_policy.py scripts/tests/test_macos_distribution_safety.py scripts/tests/test_verify_macos_dmg_layout.py",
         )
         self.assertIn("npm run release:macos:beta:test", self.text(".github/workflows/quality.yml"))
         handoff = self.text("docs/MACOS_BETA.md")

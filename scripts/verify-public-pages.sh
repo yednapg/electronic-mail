@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 WEB_URL="${WEB_URL:-}"
 EXPECTED_DMG_SHA256="${EXPECTED_DMG_SHA256:-}"
 [ -n "$WEB_URL" ] || { echo "WEB_URL is required" >&2; exit 1; }
@@ -123,7 +125,53 @@ grep -qi 'Google API Services User Data Policy' "$tmp_dir/privacy.html"
 grep -qi 'Terms of Service' "$tmp_dir/terms.html"
 grep -qi 'Support' "$tmp_dir/support.html"
 grep -qi 'Report a security issue' "$tmp_dir/support.html"
-grep -Eqi 'href="https://[^\"]+"[^>]*>Electronic Mail service status page</a>' "$tmp_dir/support.html"
+status_page_url="$(python3 - "$tmp_dir/support.html" "$ROOT_DIR/scripts" <<'PY'
+from html.parser import HTMLParser
+import sys
+
+sys.path.insert(0, sys.argv[2])
+from public_url_policy import validate_public_status_url
+
+
+class StatusLinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self._href = None
+        self._text = []
+        self.matches = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "a":
+            self._href = dict(attrs).get("href")
+            self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() != "a" or self._href is None:
+            return
+        if "Electronic Mail service status page" in " ".join(self._text):
+            self.matches.append(self._href)
+        self._href = None
+        self._text = []
+
+
+parser = StatusLinkParser()
+with open(sys.argv[1], encoding="utf-8") as handle:
+    parser.feed(handle.read())
+if len(parser.matches) != 1:
+    raise SystemExit("support page must contain exactly one Electronic Mail service status page link")
+value = parser.matches[0]
+print(validate_public_status_url(value))
+PY
+)"
+if ! curl --silent --show-error --fail --location --retry 3 --max-time 30 --max-filesize 10485760 \
+  --proto '=https' --proto-redir '=https' --output /dev/null "$status_page_url"; then
+  echo "public status page is unavailable over HTTPS: $status_page_url" >&2
+  exit 1
+fi
 
 post_login_status="$(curl --silent --show-error --retry 3 --max-time 30 \
   --dump-header "$tmp_dir/post-login.headers" \

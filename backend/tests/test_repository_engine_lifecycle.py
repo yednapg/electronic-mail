@@ -4,7 +4,7 @@ from contextlib import nullcontext
 import unittest
 from unittest.mock import patch
 
-from sqlalchemy.pool import QueuePool
+from sqlalchemy.pool import NullPool, QueuePool
 
 from app.db import mail_groups, repository
 
@@ -18,6 +18,15 @@ class _DisposableEngine:
         self.dispose_calls += 1
         if self.fail:
             raise RuntimeError("forced disposal failure")
+
+
+class _ProbeEngine(_DisposableEngine):
+    def __init__(self, connection: object) -> None:
+        super().__init__()
+        self.connection = connection
+
+    def connect(self):
+        return nullcontext(self.connection)
 
 
 class RepositoryEngineLifecycleTests(unittest.TestCase):
@@ -89,6 +98,62 @@ class RepositoryEngineLifecycleTests(unittest.TestCase):
             repository.ADVISORY_LOCK_POOL_TIMEOUT_SECONDS,
         )
         self.assertIs(repository.get_advisory_lock_engine(database_url), lock_engine)
+
+    def test_every_postgres_pool_has_a_bounded_connect_timeout(self) -> None:
+        database_url = "postgresql://localhost/electronic_mail_timeout_test"
+        main_engine = _DisposableEngine()
+        advisory_engine = _DisposableEngine()
+
+        with patch.object(
+            repository,
+            "create_engine",
+            side_effect=[main_engine, advisory_engine],
+        ) as create_engine:
+            self.assertIs(repository.get_engine(database_url), main_engine)
+            self.assertIs(
+                repository.get_advisory_lock_engine(database_url),
+                advisory_engine,
+            )
+
+        self.assertEqual(create_engine.call_count, 2)
+        for call in create_engine.call_args_list:
+            self.assertEqual(
+                call.kwargs["connect_args"],
+                {"connect_timeout": repository.POSTGRES_CONNECT_TIMEOUT_SECONDS},
+            )
+
+    def test_schema_probe_bypasses_cached_pool_and_pre_ping_with_startup_budgets(self) -> None:
+        connection = object()
+        engine = _ProbeEngine(connection)
+
+        with patch.object(repository, "create_engine", return_value=engine) as create_engine:
+            with repository.connect_bounded_schema_probe(
+                "postgresql://localhost/electronic_mail_probe_test",
+                connect_timeout_seconds=5,
+                lock_timeout_ms=5_000,
+                statement_timeout_ms=15_000,
+                transaction_timeout_ms=20_000,
+            ) as actual_connection:
+                self.assertIs(actual_connection, connection)
+
+        self.assertEqual(engine.dispose_calls, 1)
+        create_engine.assert_called_once()
+        arguments = create_engine.call_args
+        self.assertIs(arguments.kwargs["poolclass"], NullPool)
+        self.assertIs(arguments.kwargs["pool_pre_ping"], False)
+        self.assertEqual(
+            arguments.kwargs["connect_args"],
+            {
+                "connect_timeout": 5,
+                "options": (
+                    "-c lock_timeout=5000 "
+                    "-c statement_timeout=15000 "
+                    "-c transaction_timeout=20000"
+                ),
+            },
+        )
+        self.assertEqual(repository._ENGINES, {})
+        self.assertEqual(repository._ADVISORY_LOCK_ENGINES, {})
 
     def test_draft_session_lock_does_not_consume_the_main_queue_pool(self) -> None:
         with patch.object(

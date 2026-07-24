@@ -34,6 +34,7 @@ class MacOSReleaseToolchainPolicyTests(unittest.TestCase):
 
     def test_release_workflow_pins_both_jobs_to_the_approved_toolchain(self) -> None:
         workflow = self.text(".github/workflows/release-macos.yml")
+        self.assertEqual(workflow.count("runs-on: macos-15-intel"), 2)
         self.assertEqual(
             workflow.count("DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer"),
             2,
@@ -45,11 +46,22 @@ class MacOSReleaseToolchainPolicyTests(unittest.TestCase):
 
     def test_quality_job_uses_the_same_toolchain_and_runs_this_policy(self) -> None:
         workflow = self.text(".github/workflows/quality.yml")
+        self.assertEqual(workflow.count("runs-on: macos-15-intel"), 1)
         self.assertIn("DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer", workflow)
         self.assertIn('EXPECTED_XCODE_VERSION: "16.4"', workflow)
         self.assertIn("EXPECTED_XCODE_BUILD: 16F6", workflow)
         self.assertIn("python3 -m unittest scripts/tests/test_macos_release_policy.py", workflow)
         self.assertIn("run: bash scripts/verify-macos-toolchain.sh", workflow)
+
+    def test_release_requires_successful_quality_gates_from_main_for_the_exact_commit(self) -> None:
+        workflow = self.text(".github/workflows/release-macos.yml")
+        self.assertIn('--workflow quality.yml \\\n              --branch main \\\n              --commit "$GITHUB_SHA"', workflow)
+        self.assertIn("--json conclusion,headBranch,headSha,status", workflow)
+        self.assertIn(
+            '.headBranch == "main" and .headSha == env.GITHUB_SHA '
+            'and .status == "completed" and .conclusion == "success"',
+            workflow,
+        )
 
     def test_preflight_and_release_fail_closed_through_shared_verifier(self) -> None:
         for relative in ("scripts/preflight-macos-release.sh", "scripts/release-macos.sh"):
@@ -84,6 +96,10 @@ class MacOSReleaseToolchainPolicyTests(unittest.TestCase):
         self.assertGreaterEqual(project.count('"ENABLE_HARDENED_RUNTIME": "YES"'), 2)
         self.assertEqual(generated_project.count("ENABLE_HARDENED_RUNTIME = YES;"), 4)
         self.assertIn('for code_path in "$APP_PATH" "$FRAMEWORK"; do', verifier)
+        self.assertIn(
+            '[ "$FRAMEWORK_BUNDLE_ID" = "app.electronicmail.core" ]',
+            verifier,
+        )
         self.assertIn(
             'fail "Hardened Runtime is missing from signed code: $code_path"',
             verifier,

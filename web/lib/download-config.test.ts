@@ -22,6 +22,14 @@ test('download launch configuration rejects disabled, local, and placeholder art
     'http://downloads.electronicmail.app/ElectronicMail.dmg',
     'https://downloads.example.com/ElectronicMail.dmg',
     'https://localhost/ElectronicMail.dmg',
+    'https://downloads.electronicmail.app:443/ElectronicMail.dmg',
+    'https://downloads.electronicmail.app/ElectronicMail.zip',
+    'https://downloads.electronicmail.app/ElectronicMail.dmg?token=public',
+    'https://downloads.electronicmail.app/ElectronicMail.dmg#latest',
+    'https://downloads.electronicmail.app/releases/../ElectronicMail.dmg',
+    'https://DOWNLOADS.electronicmail.app/ElectronicMail.dmg',
+    'https://downloads.electronicmail.app./ElectronicMail.dmg',
+    'https://user@downloads.electronicmail.app/ElectronicMail.dmg',
     'not-a-url',
   ]) {
     const config = loadDownloadConfig({

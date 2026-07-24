@@ -44,7 +44,7 @@ Hardened Runtime remains enabled for the beta. An ad-hoc signature has no Apple 
 
 The DMG contains exactly:
 
-- `ElectronicMail.app`
+- `Electronic Mail Beta.app` with the separate `app.electronicmail.mac.beta` bundle identifier (this prevents an install overwrite; it does not isolate OAuth scheme routing)
 - an `Applications` symlink
 - `README-BETA.txt`, with the unnotarized warning and exact build binding
 
@@ -77,3 +77,5 @@ gh release create "v$VERSION-beta.$BUILD_NUMBER" \
 ```
 
 Tell testers to use a dedicated Gmail account. For localhost builds, start the backend before opening the app. macOS may block an unnotarized download or require an explicit tester override; this beta path intentionally does not run `spctl` or claim that Gatekeeper will accept it. Library validation is disabled only in this local-testing artifact, so testers must verify the exact source SHA and DMG checksum recorded in the metadata before running it.
+
+Beta and production intentionally share the backend-compatible `electronicmail://` OAuth callback scheme. macOS does not guarantee which app receives a shared custom-scheme callback when both are installed. Before signing in or reconnecting an account in the beta, remove every production `ElectronicMail.app` copy from the Mac; production can be reinstalled after beta authentication finishes. The beta README, release notes, and metadata repeat this limitation, and the mounted-DMG check fails if the README warning is absent.

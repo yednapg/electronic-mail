@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   preflight:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 45
     env:
       VERSION: ${{ inputs.version }}
@@ -48,11 +48,12 @@ jobs:
             gh run list \
               --repo "$GITHUB_REPOSITORY" \
               --workflow quality.yml \
+              --branch main \
               --commit "$GITHUB_SHA" \
               --event push \
               --limit 20 \
-              --json conclusion,headSha,status \
-              --jq '[.[] | select(.headSha == env.GITHUB_SHA and .status == "completed" and .conclusion == "success")] | length'
+              --json conclusion,headBranch,headSha,status \
+              --jq '[.[] | select(.headBranch == "main" and .headSha == env.GITHUB_SHA and .status == "completed" and .conclusion == "success")] | length'
           )"
           if [ "$successful_runs" -lt 1 ]; then
             echo "No successful Quality and release gates run exists for exact commit $GITHUB_SHA." >&2
@@ -84,7 +85,7 @@ jobs:
 
   release:
     needs: preflight
-    runs-on: macos-15
+    runs-on: macos-15-intel
     environment: production-macos
     timeout-minutes: 90
     env:

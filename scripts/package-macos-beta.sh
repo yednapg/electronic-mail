@@ -152,7 +152,7 @@ DSYM_PATH="$DERIVED_DATA_PATH/Build/Products/Release/ElectronicMail.app.dSYM"
 FRAMEWORK_PATH="$APP_PATH/Contents/Frameworks/ElectronicMailCore.framework"
 BETA_ENTITLEMENTS_PATH="$SOURCE_COPY/Config/Entitlements/ElectronicMail-Beta.entitlements"
 DMG_ROOT="$WORK_DIR/dmg-root"
-DMG_APP_PATH="$DMG_ROOT/ElectronicMail.app"
+DMG_APP_PATH="$DMG_ROOT/Electronic Mail Beta.app"
 BETA_README_PATH="$DMG_ROOT/README-BETA.txt"
 
 ARTIFACT_STEM="ElectronicMail-Beta-$VERSION-$BUILD_NUMBER"
@@ -178,12 +178,24 @@ with open(path, encoding="utf-8") as handle:
     project = handle.read()
 release = 'INFOPLIST_FILE = "Config/InfoPlists/ElectronicMail-Release-Info.plist";'
 beta = 'INFOPLIST_FILE = "Config/InfoPlists/ElectronicMail-Beta-Info.plist";'
-if project.count(release) != 1:
+production_identifier = 'PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.mac;'
+beta_identifier = 'PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.mac.beta;'
+release_index = project.find(release)
+if release_index < 0 or project.find(release, release_index + 1) >= 0:
     raise SystemExit("copied Xcode project did not contain exactly one macOS app Release Info.plist setting")
-if beta in project:
+settings_start = project.rfind("buildSettings = {", 0, release_index)
+settings_end = project.find("\n\t\t\t};", release_index)
+if settings_start < 0 or settings_end < 0:
+    raise SystemExit("copied Xcode project macOS app Release settings block is malformed")
+settings_end += len("\n\t\t\t};")
+settings = project[settings_start:settings_end]
+if settings.count(release) != 1 or settings.count(production_identifier) != 1:
+    raise SystemExit("copied Xcode project macOS app Release identity is not uniquely patchable")
+if beta in settings or beta_identifier in settings:
     raise SystemExit("copied Xcode project unexpectedly already contains the beta Info.plist setting")
+settings = settings.replace(release, beta, 1).replace(production_identifier, beta_identifier, 1)
 with open(path, "w", encoding="utf-8", newline="") as handle:
-    handle.write(project.replace(release, beta, 1))
+    handle.write(project[:settings_start] + settings + project[settings_end:])
 PY
 
 echo "==> Building Electronic Mail local beta $VERSION ($BUILD_NUMBER) from $SOURCE_COMMIT"
@@ -262,9 +274,15 @@ LIBRARY VALIDATION IS DISABLED IN THIS TEST BUILD. This narrow runtime
 exception lets the ad-hoc-signed app load its ad-hoc-signed embedded framework.
 The signed and notarized production release does not contain this exception.
 
-To install, drag ElectronicMail.app to the Applications shortcut. The app is
+To install, drag Electronic Mail Beta.app to the Applications shortcut. The app is
 named “Electronic Mail Beta” in Finder and in the menu bar. Because it is not
 notarized, macOS may refuse to open it without an explicit tester override.
+
+OAUTH COINSTALLATION LIMITATION: the beta and production apps intentionally use
+the same electronicmail:// callback scheme. macOS does not guarantee which
+installed app receives a shared custom-scheme callback. Before signing in or
+reconnecting an account in this beta, remove every production ElectronicMail.app
+copy from the Mac. Reinstall production only after beta authentication finishes.
 
 For local-backend builds, start the backend on http://localhost:3001 before
 signing in. Test data and credentials are real: use a dedicated test account.
@@ -288,27 +306,22 @@ mkdir -p "$DMG_MOUNT_POINT"
 hdiutil attach "$DMG_PATH" -nobrowse -readonly -mountpoint "$DMG_MOUNT_POINT" >/dev/null
 DMG_IS_MOUNTED=1
 
-python3 - "$DMG_MOUNT_POINT" <<'PY'
-import os
+python3 "$ROOT_DIR/scripts/verify_macos_dmg_layout.py" \
+  --mount "$DMG_MOUNT_POINT" \
+  --app-name "Electronic Mail Beta.app" \
+  --required-file README-BETA.txt
+
+python3 - "$DMG_MOUNT_POINT/README-BETA.txt" <<'PY'
 import sys
 
-root = sys.argv[1]
-expected = {"Applications", "ElectronicMail.app", "README-BETA.txt"}
-actual = set(os.listdir(root))
-if actual != expected:
-    raise SystemExit(f"mounted beta DMG has unexpected root contents: {sorted(actual)}")
-applications = os.path.join(root, "Applications")
-if not os.path.islink(applications) or os.readlink(applications) != "/Applications":
-    raise SystemExit("mounted beta DMG Applications item is not the exact /Applications symlink")
-readme = os.path.join(root, "README-BETA.txt")
-with open(readme, encoding="utf-8") as handle:
+with open(sys.argv[1], encoding="utf-8") as handle:
     text = handle.read()
-for marker in ("UNNOTARIZED TEST SOFTWARE", "NOT A PRODUCTION RELEASE", "LIBRARY VALIDATION IS DISABLED", "Gatekeeper-acceptance claim"):
+for marker in ("UNNOTARIZED TEST SOFTWARE", "NOT A PRODUCTION RELEASE", "LIBRARY VALIDATION IS DISABLED", "Gatekeeper-acceptance claim", "OAUTH COINSTALLATION LIMITATION", "remove every production ElectronicMail.app"):
     if marker not in text:
         raise SystemExit(f"mounted beta README is missing warning: {marker}")
 PY
 
-APP_PATH="$DMG_MOUNT_POINT/ElectronicMail.app" \
+APP_PATH="$DMG_MOUNT_POINT/Electronic Mail Beta.app" \
 EXPECTED_BACKEND_URL="$BACKEND_URL" \
 EXPECTED_VERSION="$VERSION" \
 EXPECTED_BUILD_NUMBER="$BUILD_NUMBER" \
@@ -320,7 +333,7 @@ REQUIRE_NOTARIZATION=0 \
 bash "$ROOT_DIR/scripts/verify-macos-release.sh"
 
 echo "==> Smoke-testing the mounted DMG app's dynamic-library launch policy"
-if ! "$DMG_MOUNT_POINT/ElectronicMail.app/Contents/MacOS/ElectronicMail" --electronic-mail-beta-launch-smoke; then
+if ! "$DMG_MOUNT_POINT/Electronic Mail Beta.app/Contents/MacOS/ElectronicMail" --electronic-mail-beta-launch-smoke; then
   fail "mounted beta DMG app failed its headless launch smoke"
 fi
 
@@ -364,7 +377,11 @@ metadata = {
     "configuration": "Release",
     "architectures": ["arm64", "x86_64"],
     "minimum_macos": "14.0",
-    "bundle_identifier": "app.electronicmail.mac",
+    "bundle_identifier": "app.electronicmail.mac.beta",
+    "oauth_callback": {
+        "scheme": "electronicmail",
+        "coinstallation_supported_during_sign_in": False,
+    },
     "signing": {
         "mode": "ad-hoc",
         "identity": "-",
@@ -417,9 +434,15 @@ text = f"""# Electronic Mail {version} ({build}) — local testing beta
 - Checksum manifest: `{checksums}`
 
 Use a dedicated test account. For the localhost build, start the backend at
-`http://localhost:3001` before signing in. Drag `ElectronicMail.app` to the
+`http://localhost:3001` before signing in. Drag `Electronic Mail Beta.app` to the
 Applications shortcut in the DMG. macOS may require an explicit tester
 override because this beta has not been notarized.
+
+**OAuth co-installation limitation:** beta and production both register the
+`electronicmail://` callback scheme, and macOS does not guarantee which installed
+app receives it. Remove every production `ElectronicMail.app` copy before signing
+in or reconnecting an account in the beta. Reinstall production only after beta
+authentication finishes.
 
 Known distribution limitation: this artifact is intended only for trusted
 GitHub prerelease testers and must not replace the signed/notarized production
