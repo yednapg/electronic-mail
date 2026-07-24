@@ -22,21 +22,61 @@ TAG_BYTES = 16
 CHUNK_BYTES = 1024 * 1024
 KEY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+LOCK_PIN_PATTERN = re.compile(
+    r"^(?P<name>[A-Za-z0-9_.-]+)==(?P<version>[0-9][0-9A-Za-z.!+_-]*)$"
+)
+LOCK_HASH_PATTERN = re.compile(r"^--hash=sha256:(?P<digest>[0-9a-f]{64})$")
 
 
 class BackupCryptoError(RuntimeError):
     pass
 
 
-def _expected_cryptography_version() -> str:
-    matches: list[str] = []
-    for raw_line in REQUIREMENTS_LOCK.read_text(encoding="utf-8").splitlines():
+def _hashed_lock_pins(path: Path) -> dict[str, str]:
+    error_message = "backend/requirements.lock must contain one exact cryptography pin"
+    logical_requirements: list[str] = []
+    continuation: list[str] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
-        if line.lower().startswith("cryptography=="):
-            matches.append(line.split("==", 1)[1].split(";", 1)[0].strip())
-    if len(matches) != 1 or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", matches[0]):
+        if not line or line.startswith("#"):
+            if continuation:
+                raise BackupCryptoError(error_message)
+            continue
+        continued = line.endswith("\\")
+        token_text = line[:-1].rstrip() if continued else line
+        if not token_text:
+            raise BackupCryptoError(error_message)
+        continuation.append(token_text)
+        if not continued:
+            logical_requirements.append(" ".join(continuation))
+            continuation = []
+    if continuation:
+        raise BackupCryptoError(error_message)
+
+    pins: dict[str, str] = {}
+    for requirement in logical_requirements:
+        tokens = requirement.split()
+        pin_match = LOCK_PIN_PATTERN.fullmatch(tokens[0]) if tokens else None
+        if pin_match is None or len(tokens) < 2:
+            raise BackupCryptoError(error_message)
+        hashes: set[str] = set()
+        for token in tokens[1:]:
+            hash_match = LOCK_HASH_PATTERN.fullmatch(token)
+            if hash_match is None or hash_match.group("digest") in hashes:
+                raise BackupCryptoError(error_message)
+            hashes.add(hash_match.group("digest"))
+        name = re.sub(r"[-_.]+", "-", pin_match.group("name").lower())
+        if name in pins:
+            raise BackupCryptoError(error_message)
+        pins[name] = pin_match.group("version")
+    return pins
+
+
+def _expected_cryptography_version() -> str:
+    version = _hashed_lock_pins(REQUIREMENTS_LOCK).get("cryptography")
+    if version is None or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None:
         raise BackupCryptoError("backend/requirements.lock must contain one exact cryptography pin")
-    return matches[0]
+    return version
 
 
 def _verify_runtime() -> None:
