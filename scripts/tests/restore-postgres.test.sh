@@ -44,7 +44,7 @@ if [ "${0##*/}" = "psql" ]; then
     printf 'PGOPTIONS=%s\n' "${PGOPTIONS:-}"
     if [ -n "${PGPASSFILE:-}" ] && [ -f "$PGPASSFILE" ]; then
       printf 'PGPASS=%s\n' "$(tr -d '\n' < "$PGPASSFILE")"
-      printf 'PGPASSMODE=%s\n' "$(stat -f '%Lp' "$PGPASSFILE" 2>/dev/null || stat -c '%a' "$PGPASSFILE")"
+      printf 'PGPASSMODE=%s\n' "$(stat -c '%a' "$PGPASSFILE" 2>/dev/null || stat -f '%Lp' "$PGPASSFILE")"
     fi
     for argument in "$@"; do
       printf 'ARG=%s\n' "$argument"
