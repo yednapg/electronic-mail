@@ -837,6 +837,8 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertTrue(any("gmail_thread_order_state" in query for query in connection.queries))
         self.assertTrue(any("gmail_thread_order_entries" in query for query in connection.queries))
         self.assertTrue(any("reconcile_generation" in query for query in connection.queries))
+        self.assertTrue(any("last_delta_sync_at" in query for query in connection.queries))
+        self.assertTrue(any("history_cursor_authoritative" in query for query in connection.queries))
         self.assertTrue(any("gmail_reconcile_seen" in query for query in connection.queries))
         self.assertTrue(any("started_epoch FROM oauth_login_sessions" in query for query in connection.queries))
         self.assertTrue(any("google_subject_deletion_tombstones" in query for query in connection.queries))

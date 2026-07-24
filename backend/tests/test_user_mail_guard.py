@@ -392,7 +392,7 @@ class UserMailGuardUnitTests(unittest.TestCase):
 class GmailRecoveryPollerTests(unittest.TestCase):
     def _state(self, *, completed_seconds_ago: int, watch_error: str | None = None):
         return SimpleNamespace(
-            last_import_completed_at=(
+            last_delta_sync_at=(
                 datetime.now(timezone.utc) - timedelta(seconds=completed_seconds_ago)
             ).isoformat(),
             gmail_watch_error=watch_error,
@@ -424,6 +424,45 @@ class GmailRecoveryPollerTests(unittest.TestCase):
                 self._state(completed_seconds_ago=40, watch_error="watch failed"),
             )
         )
+
+    def test_recent_backfill_completion_does_not_suppress_delta_recovery(self) -> None:
+        settings = SimpleNamespace(gmail_pubsub_topic="")
+        state = SimpleNamespace(
+            last_import_completed_at=datetime.now(timezone.utc).isoformat(),
+            last_delta_sync_at=None,
+            gmail_watch_error=None,
+            gmail_watch_expiration_at=None,
+        )
+
+        self.assertTrue(gmail_poller._should_poll(settings, state))
+
+    def test_poller_does_not_run_delta_from_untrusted_legacy_cursor(self) -> None:
+        settings = SimpleNamespace(
+            database_path="postgresql://example/db",
+            release_sha="release-1",
+        )
+        state = SimpleNamespace(
+            last_history_id="102",
+            history_cursor_authoritative=False,
+            reconcile_generation=None,
+        )
+        with (
+            patch.object(gmail_poller, "renew_heartbeat"),
+            patch.object(
+                gmail_poller,
+                "list_connected_gmail_user_ids",
+                return_value=["user-1"],
+            ),
+            patch.object(gmail_poller, "_credentials_available", return_value=True),
+            patch.object(gmail_poller, "get_import_state", return_value=state),
+            patch.object(gmail_poller, "enqueue_job") as enqueue,
+        ):
+            queued = gmail_poller.poll_once(settings)
+
+        self.assertEqual(queued, 1)
+        enqueue.assert_called_once()
+        self.assertEqual(enqueue.call_args.kwargs["kind"], "gmail_import_batch")
+        self.assertFalse(enqueue.call_args.kwargs["payload"]["first_run"])
 
     def test_retention_cleanup_is_a_global_deduplicated_slow_job(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")

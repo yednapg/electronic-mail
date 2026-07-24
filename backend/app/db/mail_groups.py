@@ -288,6 +288,7 @@ class MailboxEventRecord:
 class GmailImportState:
     user_id: str
     last_history_id: str | None
+    history_cursor_authoritative: bool
     full_backfill_cursor: str | None
     full_backfill_started_at: str | None
     full_backfill_completed_at: str | None
@@ -296,6 +297,7 @@ class GmailImportState:
     first_dashboard_ready_at: str | None
     last_import_started_at: str | None
     last_import_completed_at: str | None
+    last_delta_sync_at: str | None
     last_sync_error: str | None
     gmail_watch_history_id: str | None
     gmail_watch_expiration_at: str | None
@@ -312,6 +314,15 @@ class GmailImportState:
 class GmailReconcileFinalizeResult:
     deleted_message_count: int
     affected_group_ids: list[str]
+
+
+def gmail_history_cursor_is_authoritative(state: Any) -> bool:
+    """Return whether a cursor has durable fully-consumed-history provenance."""
+    return bool(
+        state
+        and getattr(state, "history_cursor_authoritative", False)
+        and str(getattr(state, "last_history_id", "") or "").isdigit()
+    )
 
 
 @dataclass(frozen=True)
@@ -547,26 +558,21 @@ def mark_import_completed(
     first_batch: bool = False,
     groups_ready: bool = False,
     dashboard_ready: bool = False,
-    last_history_id: str | None = None,
     full_backfill_cursor: str | None = None,
     clear_full_backfill_cursor: bool = False,
     full_backfill_started: bool = False,
     full_backfill_completed: bool = False,
 ) -> None:
-    if last_history_id is not None:
-        last_history_id = last_history_id.strip()
-        if not last_history_id.isdigit():
-            raise ValueError("Gmail history ID must be numeric")
     with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
         connection.execute(
             text(
                 """
                 INSERT INTO gmail_import_state (
-                  user_id, last_history_id, full_backfill_cursor, full_backfill_started_at,
+                  user_id, full_backfill_cursor, full_backfill_started_at,
                   full_backfill_completed_at, first_batch_imported_at,
                   first_groups_ready_at, first_dashboard_ready_at, last_import_completed_at, updated_at
                 ) VALUES (
-                  :user_id, :last_history_id, :full_backfill_cursor,
+                  :user_id, :full_backfill_cursor,
                   CASE WHEN :full_backfill_started THEN now() ELSE NULL END,
                   CASE WHEN :full_backfill_completed THEN now() ELSE NULL END,
                   CASE WHEN :first_batch THEN now() ELSE NULL END,
@@ -575,15 +581,6 @@ def mark_import_completed(
                   now(), now()
                 )
                 ON CONFLICT (user_id) DO UPDATE SET
-                  last_history_id = CASE
-                    WHEN excluded.last_history_id IS NULL THEN gmail_import_state.last_history_id
-                    WHEN gmail_import_state.last_history_id IS NULL
-                      OR gmail_import_state.last_history_id !~ '^[0-9]+$'
-                      THEN excluded.last_history_id
-                    WHEN excluded.last_history_id::NUMERIC >= gmail_import_state.last_history_id::NUMERIC
-                      THEN excluded.last_history_id
-                    ELSE gmail_import_state.last_history_id
-                  END,
                   full_backfill_cursor = CASE
                     WHEN :clear_full_backfill_cursor THEN NULL
                     ELSE COALESCE(excluded.full_backfill_cursor, gmail_import_state.full_backfill_cursor)
@@ -604,7 +601,6 @@ def mark_import_completed(
             ),
             {
                 "user_id": user_id,
-                "last_history_id": last_history_id,
                 "full_backfill_cursor": full_backfill_cursor,
                 "clear_full_backfill_cursor": clear_full_backfill_cursor,
                 "full_backfill_started": full_backfill_started,
@@ -613,6 +609,48 @@ def mark_import_completed(
                 "groups_ready": groups_ready,
                 "dashboard_ready": dashboard_ready,
             },
+        )
+
+
+def mark_history_delta_completed(
+    database_url: str,
+    *,
+    user_id: str,
+    last_history_id: str,
+) -> None:
+    """Publish a cursor only after its Gmail history traversal fully completed."""
+    last_history_id = last_history_id.strip()
+    if not last_history_id.isdigit():
+        raise ValueError("Gmail history ID must be numeric")
+    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO gmail_import_state (
+                  user_id, last_history_id, last_import_completed_at,
+                  last_delta_sync_at, history_cursor_authoritative, updated_at
+                ) VALUES (
+                  :user_id, :last_history_id, now(), now(), TRUE, now()
+                )
+                ON CONFLICT (user_id) DO UPDATE SET
+                  last_history_id = CASE
+                    WHEN gmail_import_state.history_cursor_authoritative IS NOT TRUE
+                      THEN excluded.last_history_id
+                    WHEN gmail_import_state.last_history_id IS NULL
+                      OR gmail_import_state.last_history_id !~ '^[0-9]+$'
+                      THEN excluded.last_history_id
+                    WHEN excluded.last_history_id::NUMERIC >= gmail_import_state.last_history_id::NUMERIC
+                      THEN excluded.last_history_id
+                    ELSE gmail_import_state.last_history_id
+                  END,
+                  last_import_completed_at = now(),
+                  last_delta_sync_at = now(),
+                  history_cursor_authoritative = TRUE,
+                  last_sync_error = NULL,
+                  updated_at = now()
+                """
+            ),
+            {"user_id": user_id, "last_history_id": last_history_id},
         )
 
 
@@ -714,6 +752,7 @@ def start_gmail_reconciliation(
                     reconcile_cursor = :initial_cursor,
                     reconcile_baseline_history_id = :baseline_history_id,
                     reconcile_started_at = now(),
+                    history_cursor_authoritative = FALSE,
                     last_import_started_at = now(),
                     last_sync_error = NULL,
                     updated_at = now()
@@ -937,6 +976,8 @@ def finalize_gmail_reconciliation(
                 """
                 UPDATE gmail_import_state
                 SET last_history_id = CASE
+                      WHEN history_cursor_authoritative IS NOT TRUE
+                        THEN CAST(:final_history_id AS TEXT)
                       WHEN last_history_id IS NULL OR last_history_id !~ '^[0-9]+$'
                         THEN CAST(:final_history_id AS TEXT)
                       WHEN CAST(:final_history_id AS NUMERIC) >= last_history_id::NUMERIC
@@ -948,6 +989,8 @@ def finalize_gmail_reconciliation(
                     reconcile_baseline_history_id = NULL,
                     reconcile_started_at = NULL,
                     last_import_completed_at = now(),
+                    last_delta_sync_at = now(),
+                    history_cursor_authoritative = TRUE,
                     last_sync_error = NULL,
                     updated_at = now()
                 WHERE user_id = :user_id
@@ -992,6 +1035,7 @@ def reset_gmail_reconciliation(
                     reconcile_cursor = NULL,
                     reconcile_baseline_history_id = NULL,
                     reconcile_started_at = NULL,
+                    history_cursor_authoritative = FALSE,
                     updated_at = now()
                 WHERE user_id = :user_id
                   AND reconcile_generation = :generation_id
@@ -3934,6 +3978,11 @@ def _state_from_row(row) -> GmailImportState:
     return GmailImportState(
         user_id=str(row["user_id"]),
         last_history_id=str(row["last_history_id"]) if row["last_history_id"] is not None else None,
+        history_cursor_authoritative=(
+            bool(row["history_cursor_authoritative"])
+            if "history_cursor_authoritative" in row
+            else False
+        ),
         full_backfill_cursor=str(row["full_backfill_cursor"]) if row["full_backfill_cursor"] is not None else None,
         full_backfill_started_at=_iso(row["full_backfill_started_at"]) if "full_backfill_started_at" in row and row["full_backfill_started_at"] is not None else None,
         full_backfill_completed_at=_iso(row["full_backfill_completed_at"]) if "full_backfill_completed_at" in row and row["full_backfill_completed_at"] is not None else None,
@@ -3942,6 +3991,11 @@ def _state_from_row(row) -> GmailImportState:
         first_dashboard_ready_at=_iso(row["first_dashboard_ready_at"]) if row["first_dashboard_ready_at"] is not None else None,
         last_import_started_at=_iso(row["last_import_started_at"]) if row["last_import_started_at"] is not None else None,
         last_import_completed_at=_iso(row["last_import_completed_at"]) if row["last_import_completed_at"] is not None else None,
+        last_delta_sync_at=(
+            _iso(row["last_delta_sync_at"])
+            if "last_delta_sync_at" in row and row["last_delta_sync_at"] is not None
+            else None
+        ),
         last_sync_error=str(row["last_sync_error"]) if row["last_sync_error"] is not None else None,
         gmail_watch_history_id=str(row["gmail_watch_history_id"]) if "gmail_watch_history_id" in row and row["gmail_watch_history_id"] is not None else None,
         gmail_watch_expiration_at=_iso(row["gmail_watch_expiration_at"]) if "gmail_watch_expiration_at" in row and row["gmail_watch_expiration_at"] is not None else None,

@@ -87,7 +87,6 @@ public final class MemoryLocalMailStore: LocalMailStore {
     public func writeSession(_ session: AppSessionResponse) {
         currentUserID = session.user.id
         sessions[session.user.id] = session
-        writeMailbox(session.mailbox, userID: session.user.id, label: session.mailbox.label)
     }
 
     public func readMailbox(userID: String, label: MailboxLabel) -> MailboxResponse? {
