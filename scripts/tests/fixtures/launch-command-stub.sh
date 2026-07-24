@@ -117,6 +117,10 @@ case "$command_name" in
       */support)
         emit_body '<html>Support <h2>Report a security issue</h2><a href="https://status.electronicmail.dev">Electronic Mail service status page</a></html>'
         ;;
+      https://status.electronicmail.dev | https://status.electronicmail.dev/)
+        [ "${LAUNCH_TEST_STATUS_PAGE_FAIL:-0}" != "1" ] || exit 22
+        emit_body '<html>Electronic Mail service status</html>'
+        ;;
       */ElectronicMail.dmg)
         emit_body "${LAUNCH_TEST_DOWNLOAD_BODY-deterministic fake DMG}"
         ;;
@@ -165,6 +169,9 @@ case "$command_name" in
         [ -d "${LAUNCH_TEST_DMG_APP_PATH:?}" ] || stub_fail "DMG source app is missing"
         cp -R "$LAUNCH_TEST_DMG_APP_PATH" "$mount_point/ElectronicMail.app"
         ln -s /Applications "$mount_point/Applications"
+        if [ "${LAUNCH_TEST_DMG_EXTRA_FILE:-0}" = "1" ]; then
+          printf '%s\n' 'unexpected payload' > "$mount_point/Install.command"
+        fi
         ;;
       *)
         stub_fail "unexpected hdiutil action: $action"
@@ -186,9 +193,21 @@ case "$command_name" in
 </dict></plist>
 EOF
     elif [ "${1:-}" = "-dvvv" ]; then
+      emit_timestamp=1
+      if [ "${LAUNCH_TEST_CODESIGN_TIMESTAMP:-1}" != "1" ]; then
+        for argument in "$@"; do
+          case "$argument" in
+            *.dmg) emit_timestamp=0 ;;
+          esac
+        done
+      fi
+      printf '%s\n' \
+        "Authority=Developer ID Application: Launch Test (${LAUNCH_TEST_TEAM_ID:?})" \
+        >&2
+      if [ "$emit_timestamp" = "1" ]; then
+        printf '%s\n' 'Timestamp=Jul 21, 2026 at 10:00:00 AM' >&2
+      fi
       cat >&2 <<EOF
-Authority=Developer ID Application: Launch Test (${LAUNCH_TEST_TEAM_ID:?})
-Timestamp=Jul 21, 2026 at 10:00:00 AM
 TeamIdentifier=${LAUNCH_TEST_TEAM_ID:?}
 flags=0x10000(runtime) hashes=1+1 location=embedded
 EOF

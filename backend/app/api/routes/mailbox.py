@@ -3,9 +3,12 @@ from __future__ import annotations
 """Mailbox endpoints backed by raw Gmail threads."""
 
 from base64 import urlsafe_b64decode
+from collections import deque
 import asyncio
 import json
 import logging
+from threading import BoundedSemaphore, Lock
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -40,8 +43,43 @@ from app.services.mail_groups import build_app_session_response, build_group_det
 
 router = APIRouter(tags=["mailbox"])
 MAX_PUBSUB_BODY_BYTES = 64 * 1024
+MAX_PUBSUB_TOKEN_BYTES = 8 * 1024
+PUBSUB_CERTIFICATE_TIMEOUT_SECONDS = 5
+PUBSUB_VERIFICATION_CONCURRENCY = 8
+PUBSUB_VERIFICATION_RETRY_AFTER_SECONDS = 1
+PUBSUB_VERIFIED_MAXIMUM = 120
+PUBSUB_VERIFIED_WINDOW_SECONDS = 60
 settings = load_settings()
 logger = logging.getLogger(__name__)
+
+
+class _VerifiedPubSubRateLimiter:
+    """Limit only authenticated Pub/Sub deliveries, never attacker traffic."""
+
+    def __init__(self, *, maximum: int, window_seconds: int) -> None:
+        self.maximum = maximum
+        self.window_seconds = window_seconds
+        self._events: deque[float] = deque()
+        self._lock = Lock()
+
+    def consume(self) -> tuple[bool, int]:
+        now = time.monotonic()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            while self._events and self._events[0] <= cutoff:
+                self._events.popleft()
+            if len(self._events) >= self.maximum:
+                retry_after = max(1, int(self.window_seconds - (now - self._events[0])) + 1)
+                return False, retry_after
+            self._events.append(now)
+        return True, 0
+
+
+_PUBSUB_VERIFICATION_SLOTS = BoundedSemaphore(PUBSUB_VERIFICATION_CONCURRENCY)
+_VERIFIED_PUBSUB_RATE_LIMITER = _VerifiedPubSubRateLimiter(
+    maximum=PUBSUB_VERIFIED_MAXIMUM,
+    window_seconds=PUBSUB_VERIFIED_WINDOW_SECONDS,
+)
 
 
 @router.get("/v1/mailbox", response_model=MailboxResponse)
@@ -362,8 +400,14 @@ def _verify_pubsub_push(request: Request) -> None:
     scheme, _, token = auth_header.partition(" ")
     if scheme.lower() != "bearer" or not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing Pub/Sub push token")
+    if len(token.encode("utf-8")) > MAX_PUBSUB_TOKEN_BYTES or token.count(".") != 2:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Pub/Sub push token")
     try:
-        claims = id_token.verify_oauth2_token(token, google_requests.Request(), settings.resolved_gmail_pubsub_push_audience)
+        claims = id_token.verify_oauth2_token(
+            token,
+            _BoundedGoogleAuthRequest(),
+            settings.resolved_gmail_pubsub_push_audience,
+        )
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Pub/Sub push token") from exc
     expected_email = settings.gmail_pubsub_push_service_account_email
@@ -373,9 +417,69 @@ def _verify_pubsub_push(request: Request) -> None:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unexpected Pub/Sub push identity")
 
 
+class _BoundedGoogleAuthRequest:
+    """Force Google certificate retrieval below the public request budget."""
+
+    def __init__(self) -> None:
+        self._delegate = google_requests.Request()
+
+    def __call__(
+        self,
+        url: str,
+        method: str = "GET",
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        del timeout
+        return self._delegate(
+            url,
+            method=method,
+            body=body,
+            headers=headers,
+            timeout=PUBSUB_CERTIFICATE_TIMEOUT_SECONDS,
+            **kwargs,
+        )
+
+
+async def _verify_pubsub_push_with_capacity(request: Request) -> None:
+    """Bound concurrent certificate work without creating an attacker-owned quota."""
+    if not settings.is_production_like:
+        await asyncio.to_thread(_verify_pubsub_push, request)
+        return
+    slots = _PUBSUB_VERIFICATION_SLOTS
+    if not slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Pub/Sub push verification is busy",
+            headers={"Retry-After": str(PUBSUB_VERIFICATION_RETRY_AFTER_SECONDS)},
+        )
+
+    try:
+        verification = asyncio.create_task(asyncio.to_thread(_verify_pubsub_push, request))
+    except BaseException:
+        slots.release()
+        raise
+    verification.add_done_callback(lambda _task: slots.release())
+    await asyncio.shield(verification)
+
+
+def _limit_verified_pubsub_delivery() -> None:
+    if not settings.is_production_like:
+        return
+    allowed, retry_after = _VERIFIED_PUBSUB_RATE_LIMITER.consume()
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many verified Pub/Sub deliveries. Try again shortly.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
 @router.post("/v1/mailbox/pubsub", status_code=202)
 async def mailbox_pubsub(request: Request) -> dict[str, object]:
-    _verify_pubsub_push(request)
+    await _verify_pubsub_push_with_capacity(request)
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -403,6 +507,7 @@ async def mailbox_pubsub(request: Request) -> dict[str, object]:
     history_id = str(decoded.get("historyId") or "")
     if not email_address or not history_id or not history_id.isdigit():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing Pub/Sub Gmail emailAddress or historyId")
+    _limit_verified_pubsub_delivery()
     user = get_user_by_email(str(settings.database_path), email_address) if email_address else None
     if user is None:
         logger.info("Ignoring Gmail Pub/Sub notification for an unknown account")

@@ -18,9 +18,52 @@ assert_file_absent() {
   [ ! -e "$1" ] || fail "expected $1 to be absent"
 }
 
+expect_failure() {
+  local label="$1"
+  local expected_message="$2"
+  shift 2
+  set +e
+  "$@" > "$TEST_DIR/$label.stdout" 2> "$TEST_DIR/$label.stderr"
+  local status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "$label unexpectedly succeeded"
+  grep -Fq "$expected_message" "$TEST_DIR/$label.stderr" \
+    || fail "$label did not report: $expected_message"
+}
+
 fake_bin="$TEST_DIR/bin"
 mkdir -p "$fake_bin"
-ln -s "$STUB" "$fake_bin/pg_dump"
+cat > "$fake_bin/pg_dump" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1:-}" = "--version" ]; then
+  printf 'pg_dump (PostgreSQL) %s\n' "${BACKUP_TEST_PG_VERSION:-17.10}"
+  exit 0
+fi
+
+if [ -n "${BACKUP_TEST_ENV_LOG:-}" ]; then
+  {
+    printf 'PGSSLMODE=%s\n' "${PGSSLMODE:-}"
+    printf 'PGSSLROOTCERT=%s\n' "${PGSSLROOTCERT:-}"
+    printf 'PGSSLCERT=%s\n' "${PGSSLCERT:-}"
+    printf 'PGSSLKEY=%s\n' "${PGSSLKEY:-}"
+    printf 'PGSSLCRL=%s\n' "${PGSSLCRL:-}"
+    printf 'PGSSLCRLDIR=%s\n' "${PGSSLCRLDIR:-}"
+    printf 'PGSSLPASSWORD=%s\n' "${PGSSLPASSWORD:-}"
+    printf 'PGGSSENCMODE=%s\n' "${PGGSSENCMODE:-}"
+    printf 'PGCHANNELBINDING=%s\n' "${PGCHANNELBINDING:-}"
+    printf 'PGTARGETSESSIONATTRS=%s\n' "${PGTARGETSESSIONATTRS:-}"
+    printf 'PGOPTIONS=%s\n' "${PGOPTIONS:-}"
+    printf 'PGAPPNAME=%s\n' "${PGAPPNAME:-}"
+    printf 'PGCONNECT_TIMEOUT=%s\n' "${PGCONNECT_TIMEOUT:-}"
+    printf 'SSL_CERT_FILE=%s\n' "${SSL_CERT_FILE:-}"
+    printf 'SSL_CERT_DIR=%s\n' "${SSL_CERT_DIR:-}"
+  } > "$BACKUP_TEST_ENV_LOG"
+fi
+exec "${BACKUP_TEST_PG_DUMP_STUB:?BACKUP_TEST_PG_DUMP_STUB is required}" "$@"
+SH
+chmod 700 "$fake_bin/pg_dump"
 ln -s "$STUB" "$fake_bin/dirname"
 ln -s "$STUB" "$fake_bin/mkdir"
 ln -s "$STUB" "$fake_bin/mktemp"
@@ -33,6 +76,11 @@ export SECRET_TEST_REAL_MKDIR="$(type -P mkdir)"
 export SECRET_TEST_REAL_MKTEMP="$(type -P mktemp)"
 export SECRET_TEST_REAL_PYTHON="$ROOT_DIR/.venv/bin/python"
 export BACKUP_CRYPTO_PYTHON="$fake_bin/python-wrapper"
+export BACKUP_TEST_PG_DUMP_STUB="$STUB"
+export EXPECTED_BACKUP_DATABASE=electronic_mail
+export EXPECTED_BACKUP_HOST=db.internal
+export EXPECTED_BACKUP_PORT=5432
+verified_tls_query='sslmode=verify-full&sslrootcert=system&gssencmode=disable'
 
 success_dir="$TEST_DIR/success"
 success_log="$TEST_DIR/success-pg-dump.log"
@@ -61,17 +109,28 @@ for path in (sys.argv[2], sys.argv[4]):
     os.utime(path, (now - retention_seconds + 5, now - retention_seconds + 5))
 PY
 
-success_database_url='postgresql://backup_user:s3cr%3At@db.internal:5433/electronic_mail?sslmode=require'
+success_database_url="postgresql://backup_user:s3cr%3At@db.internal:5433/electronic_mail?$verified_tls_query"
+success_env_log="$TEST_DIR/success-pg-dump-env.log"
 PATH="$test_path" \
 DATABASE_URL="$success_database_url" \
+RESTORE_DATABASE_URL='postgresql://restore_user:poison-restore-secret@restore-db.internal/electronic_mail_restore' \
+EXPECTED_BACKUP_PORT=5433 \
 BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" \
 raw_database_url=preexported-raw-url backup_encryption_key=preexported-key \
 BACKUP_DIR="$success_dir" \
 RETENTION_DAYS=14 \
 BACKUP_TEST_LOG="$success_log" \
+BACKUP_TEST_ENV_LOG="$success_env_log" \
 PGHOST=poison-host PGHOSTADDR=203.0.113.10 PGPORT=9999 PGUSER=poison-user \
 PGDATABASE=poison-database PGPASSWORD=poison-password PGPASSFILE="$TEST_DIR/poison-pgpass" \
 PGSERVICE=poison-service PGSERVICEFILE="$TEST_DIR/poison-service.conf" \
+PGSSLMODE=disable PGSSLROOTCERT="$TEST_DIR/poison-ca.pem" \
+PGSSLCERT="$TEST_DIR/poison-client.crt" PGSSLKEY="$TEST_DIR/poison-client.key" \
+PGSSLCRL="$TEST_DIR/poison.crl" PGSSLCRLDIR="$TEST_DIR/poison-crl" \
+PGSSLPASSWORD=poison-tls-private-key-password \
+PGGSSENCMODE=require PGCHANNELBINDING=disable PGTARGETSESSIONATTRS=read-only \
+PGOPTIONS='-c search_path=poison' PGAPPNAME=poison-app PGCONNECT_TIMEOUT=999 \
+SSL_CERT_FILE="$TEST_DIR/poison-openssl.pem" SSL_CERT_DIR="$TEST_DIR/poison-openssl" \
 bash "$SCRIPT" > "$TEST_DIR/success.stdout"
 
 assert_file_absent "$success_dir/electronic-mail-20200101T000000Z.dump.enc"
@@ -111,13 +170,37 @@ grep -Fxq 'DATABASE_URL=' "$success_log" || fail "pg_dump inherited DATABASE_URL
 grep -Fxq 'RESTORE_DATABASE_URL=' "$success_log" || fail "pg_dump inherited RESTORE_DATABASE_URL"
 grep -Fxq 'BACKUP_ENCRYPTION_KEY=' "$success_log" || fail "pg_dump inherited BACKUP_ENCRYPTION_KEY"
 grep -Fxq 'PGPASSWORD=' "$success_log" || fail "pg_dump inherited PGPASSWORD"
-grep -Fxq 'PGDATABASE=postgresql://backup_user@db.internal:5433/electronic_mail?sslmode=require' "$success_log" \
+grep -Fxq 'PGDATABASE=postgresql://backup_user@db.internal:5433/electronic_mail?sslmode=verify-full&sslrootcert=system&gssencmode=disable' "$success_log" \
   || fail "pg_dump did not receive the sanitized connection URL"
+
+ipv4_success_dir="$TEST_DIR/ipv4-success"
+ipv4_success_log="$TEST_DIR/ipv4-success-pg-dump.log"
+mkdir -p "$ipv4_success_dir"
+env PATH="$test_path" \
+  DATABASE_URL="postgresql://backup_user:secret@127.0.0.1:5433/electronic_mail?$verified_tls_query" \
+  EXPECTED_BACKUP_DATABASE=electronic_mail EXPECTED_BACKUP_HOST=127.0.0.1 \
+  EXPECTED_BACKUP_PORT=5433 BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" \
+  BACKUP_DIR="$ipv4_success_dir" BACKUP_TEST_LOG="$ipv4_success_log" \
+  bash "$SCRIPT" > "$TEST_DIR/ipv4-success.stdout"
+grep -Fxq 'PGDATABASE=postgresql://backup_user@127.0.0.1:5433/electronic_mail?sslmode=verify-full&sslrootcert=system&gssencmode=disable' \
+  "$ipv4_success_log" || fail "canonical IPv4 backup endpoint was altered or rejected"
+
 grep -Fxq 'PGPASS=*:*:*:*:s3cr\:t' "$success_log" || fail "PGPASSFILE did not contain the decoded escaped password"
 for cleared_routing_variable in PGHOST PGHOSTADDR PGPORT PGUSER PGSERVICE PGSERVICEFILE; do
   grep -Fxq "$cleared_routing_variable=" "$success_log" \
     || fail "pg_dump inherited $cleared_routing_variable"
 done
+for cleared_transport_variable in \
+  PGSSLMODE PGSSLROOTCERT PGSSLCERT PGSSLKEY PGSSLCRL PGSSLCRLDIR PGSSLPASSWORD \
+  PGGSSENCMODE PGCHANNELBINDING PGTARGETSESSIONATTRS PGOPTIONS PGAPPNAME \
+  SSL_CERT_FILE SSL_CERT_DIR; do
+  grep -Fxq "$cleared_transport_variable=" "$success_env_log" \
+    || fail "pg_dump inherited $cleared_transport_variable"
+done
+grep -Fxq 'PGCONNECT_TIMEOUT=10' "$success_env_log" \
+  || fail "pg_dump did not use the bounded reviewed connection timeout"
+grep -Fxq 'ARG=--lock-wait-timeout=10s' "$success_log" \
+  || fail "pg_dump did not use a bounded lock wait"
 if grep -Eq 'ARG=.*(--dbname|s3cr|postgresql://)' "$success_log"; then
   fail "pg_dump arguments exposed connection details"
 fi
@@ -149,7 +232,7 @@ xtrace_dir="$TEST_DIR/xtrace-success"
 xtrace_log="$TEST_DIR/xtrace-pg-dump.log"
 mkdir -p "$xtrace_dir"
 PATH="$test_path" \
-DATABASE_URL="postgresql://backup_user:$xtrace_password@db.internal/electronic_mail" \
+DATABASE_URL="postgresql://backup_user:$xtrace_password@db.internal/electronic_mail?$verified_tls_query" \
 BACKUP_ENCRYPTION_KEY="$xtrace_key" \
 BACKUP_DIR="$xtrace_dir" \
 RETENTION_DAYS=14 \
@@ -177,7 +260,7 @@ touch -t 202001010000 "$failure_dir/electronic-mail-20200101T000000Z.dump.enc" "
 
 set +e
 PATH="$test_path" \
-DATABASE_URL='postgresql://backup_user:failure-secret@db.internal/electronic_mail' \
+DATABASE_URL="postgresql://backup_user:failure-secret@db.internal/electronic_mail?$verified_tls_query" \
 BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" \
 BACKUP_DIR="$failure_dir" \
 RETENTION_DAYS=14 \
@@ -203,7 +286,7 @@ mkdir -p "$checksum_failure_dir" "$checksum_failure_bin"
 ln -s "$(type -P false)" "$checksum_failure_bin/sha256sum"
 set +e
 PATH="$checksum_failure_bin:$test_path" \
-DATABASE_URL='postgresql://backup_user:secret@db.internal/electronic_mail' \
+DATABASE_URL="postgresql://backup_user:secret@db.internal/electronic_mail?$verified_tls_query" \
 BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" \
 BACKUP_DIR="$checksum_failure_dir" \
 RETENTION_DAYS=14 \
@@ -304,6 +387,181 @@ grep -Fq 'BACKUP_ENCRYPTION_KEY must be exactly 64 lowercase hexadecimal charact
   || fail "invalid backup key did not report the format requirement"
 [ ! -e "$TEST_DIR/invalid-key.log" ] || fail "pg_dump ran after backup key validation failed"
 
+expect_failure missing-backup-database 'EXPECTED_BACKUP_DATABASE is required' \
+  env PATH="$test_path" \
+    DATABASE_URL="postgresql://backup_user:secret@db.internal/electronic_mail?$verified_tls_query" \
+    EXPECTED_BACKUP_DATABASE= EXPECTED_BACKUP_HOST=db.internal EXPECTED_BACKUP_PORT=5432 \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/missing-backup-database" \
+    BACKUP_TEST_LOG="$TEST_DIR/missing-backup-database.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/missing-backup-database.log" ] \
+  || fail "pg_dump ran without a database-bound backup target"
+
+expect_failure missing-backup-host 'EXPECTED_BACKUP_HOST is required' \
+  env PATH="$test_path" \
+    DATABASE_URL="postgresql://backup_user:secret@db.internal/electronic_mail?$verified_tls_query" \
+    EXPECTED_BACKUP_DATABASE=electronic_mail EXPECTED_BACKUP_HOST= EXPECTED_BACKUP_PORT=5432 \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/missing-backup-host" \
+    BACKUP_TEST_LOG="$TEST_DIR/missing-backup-host.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/missing-backup-host.log" ] \
+  || fail "pg_dump ran without a host-bound backup target"
+
+expect_failure missing-backup-port 'EXPECTED_BACKUP_PORT is required' \
+  env PATH="$test_path" \
+    DATABASE_URL="postgresql://backup_user:secret@db.internal/electronic_mail?$verified_tls_query" \
+    EXPECTED_BACKUP_DATABASE=electronic_mail EXPECTED_BACKUP_HOST=db.internal EXPECTED_BACKUP_PORT= \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/missing-backup-port" \
+    BACKUP_TEST_LOG="$TEST_DIR/missing-backup-port.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/missing-backup-port.log" ] \
+  || fail "pg_dump ran without a port-bound backup target"
+
+expect_failure old-pg-dump-client 'Production backups require the reviewed PostgreSQL 17.10 or newer 17.x pg_dump client' \
+  env PATH="$test_path" BACKUP_TEST_PG_VERSION=16.4 \
+    DATABASE_URL="postgresql://backup_user:secret@db.internal/electronic_mail?$verified_tls_query" \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/old-pg-dump-client" \
+    BACKUP_TEST_LOG="$TEST_DIR/old-pg-dump-client.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/old-pg-dump-client.log" ] \
+  || fail "pg_dump ran with an unreviewed client major"
+
+expect_failure vulnerable-pg-dump-patch 'Production backups require the reviewed PostgreSQL 17.10 or newer 17.x pg_dump client' \
+  env PATH="$test_path" BACKUP_TEST_PG_VERSION=17.9 \
+    DATABASE_URL="postgresql://backup_user:secret@db.internal/electronic_mail?$verified_tls_query" \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/vulnerable-pg-dump-patch" \
+    BACKUP_TEST_LOG="$TEST_DIR/vulnerable-pg-dump-patch.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/vulnerable-pg-dump-patch.log" ] \
+  || fail "pg_dump ran with an unreviewed vulnerable patch level"
+
+expect_failure wrong-backup-database \
+  'Backup database mismatch: expected other_database, URL targets electronic_mail' \
+  env PATH="$test_path" \
+    DATABASE_URL="postgresql://backup_user:secret@db.internal/electronic_mail?$verified_tls_query" \
+    EXPECTED_BACKUP_DATABASE=other_database EXPECTED_BACKUP_HOST=db.internal EXPECTED_BACKUP_PORT=5432 \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/wrong-backup-database" \
+    BACKUP_TEST_LOG="$TEST_DIR/wrong-backup-database.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/wrong-backup-database.log" ] \
+  || fail "pg_dump ran for a mismatched backup database"
+
+expect_failure wrong-backup-host \
+  'Backup host mismatch: expected other-db.internal, URL targets db.internal' \
+  env PATH="$test_path" \
+    DATABASE_URL="postgresql://backup_user:secret@db.internal/electronic_mail?$verified_tls_query" \
+    EXPECTED_BACKUP_DATABASE=electronic_mail EXPECTED_BACKUP_HOST=other-db.internal EXPECTED_BACKUP_PORT=5432 \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/wrong-backup-host" \
+    BACKUP_TEST_LOG="$TEST_DIR/wrong-backup-host.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/wrong-backup-host.log" ] \
+  || fail "pg_dump ran for a mismatched backup host"
+
+expect_failure wrong-backup-port \
+  'Backup port mismatch: expected 5433, URL targets 5432' \
+  env PATH="$test_path" \
+    DATABASE_URL="postgresql://backup_user:secret@db.internal/electronic_mail?$verified_tls_query" \
+    EXPECTED_BACKUP_DATABASE=electronic_mail EXPECTED_BACKUP_HOST=db.internal EXPECTED_BACKUP_PORT=5433 \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/wrong-backup-port" \
+    BACKUP_TEST_LOG="$TEST_DIR/wrong-backup-port.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/wrong-backup-port.log" ] \
+  || fail "pg_dump ran for a mismatched backup port"
+
+expect_failure noncanonical-backup-host \
+  'EXPECTED_BACKUP_HOST must use canonical lowercase ASCII DNS labels' \
+  env PATH="$test_path" \
+    DATABASE_URL="postgresql://backup_user:secret@db_internal/electronic_mail?$verified_tls_query" \
+    EXPECTED_BACKUP_DATABASE=electronic_mail EXPECTED_BACKUP_HOST=db_internal EXPECTED_BACKUP_PORT=5432 \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/noncanonical-backup-host" \
+    BACKUP_TEST_LOG="$TEST_DIR/noncanonical-backup-host.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/noncanonical-backup-host.log" ] \
+  || fail "pg_dump ran with a noncanonical expected backup host"
+
+expect_failure noncanonical-url-host \
+  'DATABASE_URL host and port must use their canonical representation' \
+  env PATH="$test_path" \
+    DATABASE_URL="postgresql://backup_user:secret@DB.INTERNAL/electronic_mail?$verified_tls_query" \
+    EXPECTED_BACKUP_DATABASE=electronic_mail EXPECTED_BACKUP_HOST=db.internal EXPECTED_BACKUP_PORT=5432 \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/noncanonical-url-host" \
+    BACKUP_TEST_LOG="$TEST_DIR/noncanonical-url-host.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/noncanonical-url-host.log" ] \
+  || fail "pg_dump ran with a noncanonical URL host"
+
+expect_failure zero-backup-port 'DATABASE_URL port must be between 1 and 65535' \
+  env PATH="$test_path" \
+    DATABASE_URL="postgresql://backup_user:secret@db.internal:0/electronic_mail?$verified_tls_query" \
+    EXPECTED_BACKUP_DATABASE=electronic_mail EXPECTED_BACKUP_HOST=db.internal EXPECTED_BACKUP_PORT=5432 \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/zero-backup-port" \
+    BACKUP_TEST_LOG="$TEST_DIR/zero-backup-port.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/zero-backup-port.log" ] \
+  || fail "pg_dump ran for an explicit zero port"
+
+expect_failure missing-verified-tls 'production backup requires sslmode=verify-full' \
+  env PATH="$test_path" \
+    DATABASE_URL='postgresql://backup_user:secret@db.internal/electronic_mail?sslmode=require&sslrootcert=system&gssencmode=disable' \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/missing-verified-tls" \
+    BACKUP_TEST_LOG="$TEST_DIR/missing-verified-tls.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/missing-verified-tls.log" ] \
+  || fail "pg_dump ran without authenticated production TLS"
+
+expect_failure missing-root-cert 'production backup requires an explicit sslrootcert trust source' \
+  env PATH="$test_path" \
+    DATABASE_URL='postgresql://backup_user:secret@db.internal/electronic_mail?sslmode=verify-full&gssencmode=disable' \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/missing-root-cert" \
+    BACKUP_TEST_LOG="$TEST_DIR/missing-root-cert.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/missing-root-cert.log" ] \
+  || fail "pg_dump ran without an explicit production trust source"
+
+expect_failure gss-tls-bypass 'production backup requires gssencmode=disable' \
+  env PATH="$test_path" \
+    DATABASE_URL='postgresql://backup_user:secret@db.internal/electronic_mail?sslmode=verify-full&sslrootcert=system&gssencmode=require' \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/gss-tls-bypass" \
+    BACKUP_TEST_LOG="$TEST_DIR/gss-tls-bypass.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/gss-tls-bypass.log" ] \
+  || fail "pg_dump ran with GSS able to bypass TLS verification"
+
+expect_failure relative-root-cert \
+  "production sslrootcert must be 'system' or an existing absolute CA bundle path" \
+  env PATH="$test_path" \
+    DATABASE_URL='postgresql://backup_user:secret@db.internal/electronic_mail?sslmode=verify-full&sslrootcert=relative-ca.pem&gssencmode=disable' \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/relative-root-cert" \
+    BACKUP_TEST_LOG="$TEST_DIR/relative-root-cert.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/relative-root-cert.log" ] \
+  || fail "pg_dump ran with a relative CA bundle"
+
+expect_failure missing-root-cert-file \
+  "production sslrootcert must be 'system' or an existing absolute CA bundle path" \
+  env PATH="$test_path" \
+    DATABASE_URL='postgresql://backup_user:secret@db.internal/electronic_mail?sslmode=verify-full&sslrootcert=/missing/electronic-mail-ca.pem&gssencmode=disable' \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/missing-root-cert-file" \
+    BACKUP_TEST_LOG="$TEST_DIR/missing-root-cert-file.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/missing-root-cert-file.log" ] \
+  || fail "pg_dump ran with a nonexistent CA bundle"
+
+expect_failure duplicate-tls-policy 'DATABASE_URL contains duplicate query parameters: sslmode' \
+  env PATH="$test_path" \
+    DATABASE_URL='postgresql://backup_user:secret@db.internal/electronic_mail?sslmode=verify-full&sslmode=require&sslrootcert=system&gssencmode=disable' \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/duplicate-tls-policy" \
+    BACKUP_TEST_LOG="$TEST_DIR/duplicate-tls-policy.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/duplicate-tls-policy.log" ] \
+  || fail "pg_dump ran with an ambiguous TLS policy"
+
+expect_failure tls-key-password-in-url 'DATABASE_URL sslpassword is forbidden' \
+  env PATH="$test_path" \
+    DATABASE_URL='postgresql://backup_user:secret@db.internal/electronic_mail?sslmode=verify-full&sslrootcert=system&gssencmode=disable&sslpassword=tls-secret' \
+    BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$TEST_DIR/tls-key-password-in-url" \
+    BACKUP_TEST_LOG="$TEST_DIR/tls-key-password-in-url.log" bash "$SCRIPT"
+[ ! -e "$TEST_DIR/tls-key-password-in-url.log" ] \
+  || fail "pg_dump ran with a TLS private-key password in DATABASE_URL"
+
+ca_bundle="$TEST_DIR/reviewed-ca.pem"
+ca_success_dir="$TEST_DIR/absolute-ca-success"
+ca_success_log="$TEST_DIR/absolute-ca-success.log"
+printf '%s\n' 'reviewed test CA bundle' > "$ca_bundle"
+mkdir -p "$ca_success_dir"
+env PATH="$test_path" \
+  DATABASE_URL="postgresql://backup_user:secret@db.internal/electronic_mail?sslmode=verify-full&sslrootcert=$ca_bundle&gssencmode=disable" \
+  BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" BACKUP_DIR="$ca_success_dir" \
+  BACKUP_TEST_LOG="$ca_success_log" bash "$SCRIPT" > "$TEST_DIR/absolute-ca-success.stdout"
+ca_success_dump="$(find "$ca_success_dir" -type f -name 'electronic-mail-*.dump.enc' -print -quit)"
+[ -n "$ca_success_dump" ] && [ -s "$ca_success_dump.sha256" ] \
+  || fail "backup with an existing absolute CA bundle did not complete"
+grep -Fq 'PGDATABASE=postgresql://backup_user@db.internal/electronic_mail?sslmode=verify-full&sslrootcert=%2F' \
+  "$ca_success_log" || fail "backup did not retain its reviewed absolute CA trust source"
+
 for routing_override in \
   'dbname=electronic_mail_shadow' \
   'host=other-db.internal' \
@@ -311,7 +569,7 @@ for routing_override in \
   routing_label="${routing_override%%=*}"
   set +e
   PATH="$test_path" \
-  DATABASE_URL="postgresql://backup_user:secret@db.internal/electronic_mail?sslmode=require&$routing_override" \
+  DATABASE_URL="postgresql://backup_user:secret@db.internal/electronic_mail?$verified_tls_query&$routing_override" \
   BACKUP_ENCRYPTION_KEY="$BACKUP_KEY" \
   BACKUP_DIR="$TEST_DIR/routing-$routing_label" \
   RETENTION_DAYS=14 \

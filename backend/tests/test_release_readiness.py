@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import logging
 import os
@@ -216,6 +217,26 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertTrue(any("GMAIL_PUBSUB_TOPIC" in error for error in errors))
         self.assertTrue(any("RELEASE_SHA" in error for error in errors))
 
+    def test_production_rejects_placeholder_pubsub_subscription_and_non_service_identity(self) -> None:
+        with patch.dict(
+            os.environ,
+            production_environment(
+                GMAIL_PUBSUB_SUBSCRIPTION="replace-in-secret-store",
+                GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL="launch@mail-launch.co",
+            ),
+            clear=True,
+        ):
+            errors = load_settings().readiness_errors()
+
+        self.assertIn(
+            "GMAIL_PUBSUB_SUBSCRIPTION still contains a placeholder value",
+            errors,
+        )
+        self.assertIn(
+            "GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL must be a concrete Google service-account email",
+            errors,
+        )
+
     def test_production_rejects_reserved_service_url_hostnames(self) -> None:
         cases = (
             (
@@ -409,6 +430,41 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertTrue(all(response.status_code == 200 for response in responses[:20]))
         self.assertEqual(responses[20].status_code, 429)
 
+    def test_pubsub_preverification_limit_is_per_network_and_ignores_token_rotation(self) -> None:
+        limited_app = FastAPI()
+        limited_app.add_middleware(
+            RateLimitMiddleware,
+            enabled=True,
+            trust_proxy_headers=True,
+        )
+
+        @limited_app.post("/v1/mailbox/pubsub")
+        def pubsub() -> dict[str, str]:
+            return {"status": "ok"}
+
+        client = TestClient(limited_app)
+        responses = [
+            client.post(
+                "/v1/mailbox/pubsub",
+                headers={
+                    "Authorization": f"Bearer attacker-controlled-{index}",
+                    "X-Forwarded-For": "192.0.2.10",
+                },
+            )
+            for index in range(61)
+        ]
+
+        self.assertTrue(all(response.status_code == 200 for response in responses[:60]))
+        self.assertEqual(responses[60].status_code, 429)
+        other_source = client.post(
+            "/v1/mailbox/pubsub",
+            headers={
+                "Authorization": "Bearer attacker-controlled-new-source",
+                "X-Forwarded-For": "192.0.2.11",
+            },
+        )
+        self.assertEqual(other_source.status_code, 200)
+
     def test_authenticated_limit_uses_only_stable_app_session_cookie(self) -> None:
         limited_app = FastAPI()
         limited_app.add_middleware(RateLimitMiddleware, enabled=True)
@@ -595,21 +651,47 @@ class ReleaseReadinessTests(unittest.TestCase):
             {"database_backend": "postgres", "database_path": "postgresql://example/db"},
         )()
         connection = _SchemaConnection(revision=schema_check.ALEMBIC_HEAD_REVISION)
-        with patch.object(schema_check, "get_engine", return_value=_SchemaEngine(connection)):
+        with patch.object(
+            schema_check,
+            "connect_bounded_schema_probe",
+            return_value=nullcontext(connection),
+        ) as bounded_probe:
             self.assertTrue(schema_check.schema_is_current(settings))
 
+        bounded_probe.assert_called_once_with(
+            "postgresql://example/db",
+            connect_timeout_seconds=schema_check.SCHEMA_PROBE_CONNECT_TIMEOUT_SECONDS,
+            lock_timeout_ms=schema_check.SCHEMA_PROBE_LOCK_TIMEOUT_MS,
+            statement_timeout_ms=schema_check.SCHEMA_PROBE_STATEMENT_TIMEOUT_MS,
+            transaction_timeout_ms=schema_check.SCHEMA_PROBE_TRANSACTION_TIMEOUT_MS,
+        )
+
         self.assertTrue(any("gmail_client_drafts" in query for query in connection.queries))
+        self.assertTrue(any("previous_labels_json" in query for query in connection.queries))
+        self.assertTrue(any("request_hash" in query for query in connection.queries))
         self.assertTrue(any("exchange_code_challenge" in query for query in connection.queries))
         self.assertTrue(any("gmail_thread_order_state" in query for query in connection.queries))
         self.assertTrue(any("gmail_thread_order_entries" in query for query in connection.queries))
+        self.assertTrue(any("reconcile_generation" in query for query in connection.queries))
+        self.assertTrue(any("gmail_reconcile_seen" in query for query in connection.queries))
         self.assertTrue(any("started_epoch FROM oauth_login_sessions" in query for query in connection.queries))
         self.assertTrue(any("google_subject_deletion_tombstones" in query for query in connection.queries))
         self.assertTrue(any("release_sha FROM worker_heartbeats" in query for query in connection.queries))
+        self.assertIn(
+            f"SET LOCAL lock_timeout = '{schema_check.SCHEMA_PROBE_LOCK_TIMEOUT_MS}ms'",
+            connection.queries,
+        )
+        self.assertIn(
+            f"SET LOCAL statement_timeout = '{schema_check.SCHEMA_PROBE_STATEMENT_TIMEOUT_MS}ms'",
+            connection.queries,
+        )
+        self.assertIn(schema_check.ALEMBIC_REVISION_PROBE, connection.queries)
+        self.assertIn("HAVING COUNT(*) = 1", schema_check.ALEMBIC_REVISION_PROBE)
 
         with patch.object(
             schema_check,
-            "get_engine",
-            return_value=_SchemaEngine(_SchemaConnection(revision="20260713_0019")),
+            "connect_bounded_schema_probe",
+            return_value=nullcontext(_SchemaConnection(revision="20260713_0019")),
         ):
             self.assertFalse(schema_check.schema_is_current(settings))
 
@@ -636,14 +718,6 @@ class _SchemaConnection:
     def exec_driver_sql(self, query: str) -> _SchemaResult:
         self.queries.append(query)
         return _SchemaResult(self.revision if "alembic_version" in query else None)
-
-
-class _SchemaEngine:
-    def __init__(self, connection: _SchemaConnection) -> None:
-        self.connection = connection
-
-    def connect(self) -> _SchemaConnection:
-        return self.connection
 
 
 if __name__ == "__main__":

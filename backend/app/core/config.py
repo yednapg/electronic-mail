@@ -231,13 +231,28 @@ class Settings:
                 r"projects/[^/]+/topics/[^/]+", self.gmail_pubsub_topic
             ):
                 errors.append("GMAIL_PUBSUB_TOPIC must be a concrete projects/.../topics/... resource")
+            if self.gmail_pubsub_subscription and _looks_like_placeholder(
+                self.gmail_pubsub_subscription
+            ):
+                errors.append(
+                    "GMAIL_PUBSUB_SUBSCRIPTION still contains a placeholder value"
+                )
             expected_push_audience = f"{self.backend_origin}/v1/mailbox/pubsub"
             if not _is_https_url(self.gmail_pubsub_push_audience) or self.gmail_pubsub_push_audience != expected_push_audience:
                 errors.append("GMAIL_PUBSUB_PUSH_AUDIENCE must exactly match the deployed /v1/mailbox/pubsub URL")
             if _uses_reserved_service_hostname(self.gmail_pubsub_push_audience):
                 errors.append("GMAIL_PUBSUB_PUSH_AUDIENCE must use a concrete non-reserved hostname")
-            if _looks_like_placeholder(self.gmail_pubsub_push_service_account_email):
-                errors.append("GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL still contains a placeholder value")
+            if self.gmail_pubsub_push_service_account_email and (
+                _looks_like_placeholder(self.gmail_pubsub_push_service_account_email)
+                or re.fullmatch(
+                    r"[^@\s]+@[^@\s]+\.iam\.gserviceaccount\.com",
+                    self.gmail_pubsub_push_service_account_email,
+                )
+                is None
+            ):
+                errors.append(
+                    "GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL must be a concrete Google service-account email"
+                )
             if self.cors_origin == "*":
                 errors.append("CORS_ORIGIN cannot be '*' when credentialed authentication is enabled")
             if not self.rate_limit_enabled:

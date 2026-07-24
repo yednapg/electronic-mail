@@ -8,6 +8,7 @@ import binascii
 import json
 import platform
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ EXACT_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
 SHA256_REFERENCE = re.compile(r"@sha256:[0-9a-f]{64}(?:\s|$)")
 ACTION_SHA = re.compile(r"^[^\s@]+@[0-9a-f]{40}$")
 NODE_SHA512_SRI = re.compile(r"^sha512-(?P<digest>[A-Za-z0-9+/]+={0,2})$")
+PINNED_NPM_VERSION = "10.9.4"
 DOCKER_FROM_INSTRUCTION = re.compile(
     r"^\s*FROM\s+"
     r"(?:(?:--platform(?:\s*=\s*|\s+))\S+\s+)?"
@@ -43,6 +45,11 @@ WORKFLOW_PYTHON_VERSION = re.compile(
     r"(?:'(?P<single>[^']*)'|\"(?P<double>[^\"]*)\"|(?P<bare>[^\s#]+))"
     r"(?:\s+#.*)?\s*$"
 )
+WORKFLOW_RUNS_ON = re.compile(
+    r"^\s*runs-on\s*:\s*"
+    r"(?:'(?P<single>[^']*)'|\"(?P<double>[^\"]*)\"|(?P<bare>[^\s#]+))"
+    r"(?:\s+#.*)?\s*$"
+)
 WORKFLOW_QUOTED_MAPPING_KEY = re.compile(
     r"^\s*(?:-\s*)?(?P<quote>['\"])(?P<key>[^'\"]+)(?P=quote)\s*:"
 )
@@ -60,6 +67,7 @@ PYTHON_DIRECT_REQUIREMENT = re.compile(
 PYTHON_EXTRA_LOCK_PACKAGES: dict[tuple[str, str], tuple[str, bool]] = {
     ("psycopg", "binary"): ("psycopg-binary", True),
 }
+REQUIRED_PYTHON_TRANSITIVE_PINS = {"greenlet"}
 
 
 class ReproducibilityError(RuntimeError):
@@ -180,15 +188,48 @@ def verify_runtime_environment() -> None:
         executing_node_version == node_version,
         f"executing Node must match .nvmrc ({node_version}); found {executing_node_version or 'unknown'}",
     )
+    try:
+        npm_result = subprocess.run(
+            ["npm", "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise ReproducibilityError(f"could not execute pinned npm package manager: {error}") from error
+    require(npm_result.returncode == 0, "npm --version failed")
+    executing_npm_version = npm_result.stdout.strip()
+    require(
+        executing_npm_version == PINNED_NPM_VERSION,
+        f"executing npm must match the repository pin ({PINNED_NPM_VERSION}); "
+        f"found {executing_npm_version or 'unknown'}",
+    )
     _verify_local_venv(python_version)
 
 
 def verify_node_manifests() -> None:
     manifests = [ROOT / "package.json", ROOT / "web/package.json", ROOT / "packages/types/package.json"]
+    root_manifest = load_json(ROOT / "package.json")
     lock = load_json(ROOT / "package-lock.json")
     require(lock.get("lockfileVersion") == 3, "package-lock.json must use lockfileVersion 3")
     lock_packages = lock.get("packages")
     require(isinstance(lock_packages, dict), "package-lock.json is missing packages")
+    node_version, _ = _runtime_pins()
+    expected_engines = {"node": node_version, "npm": PINNED_NPM_VERSION}
+    require(
+        root_manifest.get("packageManager") == f"npm@{PINNED_NPM_VERSION}",
+        f"package.json packageManager must pin npm@{PINNED_NPM_VERSION}",
+    )
+    require(
+        root_manifest.get("engines") == expected_engines,
+        f"package.json engines must exactly pin Node {node_version} and npm {PINNED_NPM_VERSION}",
+    )
+    locked_root = lock_packages.get("")
+    require(isinstance(locked_root, dict), "package-lock.json is missing the root package")
+    require(
+        locked_root.get("engines") == expected_engines,
+        "package-lock.json root engines do not exactly match package.json",
+    )
 
     for manifest_path in manifests:
         manifest = load_json(manifest_path)
@@ -297,29 +338,56 @@ def verify_python_lock() -> None:
                     f"backend/requirements.lock {provider} must match {direct_name}=={pins[direct_name]}",
                 )
 
-    install_policy = {
-        "backend/Dockerfile": 1,
-        "scripts/bootstrap.sh": 1,
-        ".github/workflows/quality.yml": 2,
-    }
-    no_deps_install = re.compile(r"pip[\"']?\s+install\s+--no-deps\s+(?:--requirement|-r)\s+")
-    for relative, minimum_count in install_policy.items():
-        normalized = " ".join((ROOT / relative).read_text(encoding="utf-8").replace("\\\n", " ").split())
+    for required_pin in REQUIRED_PYTHON_TRANSITIVE_PINS:
         require(
-            len(no_deps_install.findall(normalized)) >= minimum_count,
-            f"{relative} must install requirements.lock with --no-deps",
+            required_pin in pins,
+            f"backend/requirements.lock is missing required transitive package {required_pin}",
         )
 
-    pip_check_policy = {
-        "backend/Dockerfile": "python -m pip check",
-        "scripts/bootstrap.sh": '"$VENV_DIR/bin/pip" check',
-        ".github/workflows/quality.yml": ".venv/bin/pip check",
-    }
-    for relative, required_command in pip_check_policy.items():
-        require(
-            required_command in (ROOT / relative).read_text(encoding="utf-8"),
-            f"{relative} must verify the installed Python graph with {required_command}",
+    install_policy = ("backend/Dockerfile", "scripts/bootstrap.sh", ".github/workflows/quality.yml")
+    no_deps_install = re.compile(r"pip[\"']?\s+install\s+--no-deps\s+(?:--requirement|-r)\s+")
+    pip_check = re.compile(r"(?:[^\s]*pip[\"']?|python\s+-m\s+pip)\s+check(?:\s|$)")
+    for relative in install_policy:
+        policy_text = "\n".join(
+            line
+            for line in (ROOT / relative).read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
         )
+        normalized = " ".join(policy_text.replace("\\\n", " ").split())
+        locked_install_count = len(no_deps_install.findall(normalized))
+        require(
+            locked_install_count >= 1,
+            f"{relative} must install requirements.lock with --no-deps",
+        )
+        require(
+            len(pip_check.findall(normalized)) >= locked_install_count,
+            f"{relative} must run pip check for every requirements.lock install",
+        )
+
+    workflow_text = (ROOT / ".github/workflows/quality.yml").read_text(encoding="utf-8")
+    audit_commands = [
+        line.strip()
+        for line in workflow_text.splitlines()
+        if line.strip().startswith(".audit-venv/bin/python -m pip_audit ")
+    ]
+    require(len(audit_commands) == 1, ".github/workflows/quality.yml must define exactly one Python lock audit")
+    audit_arguments = shlex.split(audit_commands[0])
+    for required_argument in ("--strict", "--no-deps", "--disable-pip"):
+        require(
+            required_argument in audit_arguments,
+            f"Python lock audit must include {required_argument}",
+        )
+    lock_argument_indexes = [
+        index
+        for index, argument in enumerate(audit_arguments)
+        if argument in ("-r", "--requirement")
+    ]
+    require(
+        len(lock_argument_indexes) == 1
+        and lock_argument_indexes[0] + 1 < len(audit_arguments)
+        and audit_arguments[lock_argument_indexes[0] + 1] == "backend/requirements.lock",
+        "Python lock audit must inspect backend/requirements.lock exactly once",
+    )
 
 
 def verify_container_inputs() -> None:
@@ -766,6 +834,15 @@ def verify_actions() -> None:
                     _workflow_scalar(node_version_match) == "22.22.0",
                     f"{workflow.relative_to(ROOT)} must pin Node 22.22.0",
                 )
+            runs_on_match = WORKFLOW_RUNS_ON.fullmatch(raw_line)
+            if runs_on_match:
+                runner_label = _workflow_scalar(runs_on_match)
+                if runner_label.startswith("macos-"):
+                    require(
+                        runner_label == "macos-15-intel",
+                        f"{workflow.relative_to(ROOT)}:{line_number} macOS jobs must use "
+                        "macos-15-intel so exact Python and Xcode pins are available",
+                    )
 
 
 def main() -> int:
