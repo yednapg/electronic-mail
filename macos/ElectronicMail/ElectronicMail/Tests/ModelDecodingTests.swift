@@ -804,6 +804,41 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(labels.map(SignedInDestination.init(mailboxLabel:)), SignedInDestination.allCases)
     }
 
+    func testFullScreenNavigationExposesEveryMailboxBeforeFunctionalSupplementalDestinations() {
+        let destinations = ShellPrimaryNavigationDestination.allCases
+
+        XCTAssertEqual(
+            destinations.compactMap(\.mailboxDestination),
+            SignedInDestination.allCases
+        )
+        XCTAssertEqual(
+            destinations.map(\.title),
+            ["Inbox", "Starred", "Drafts", "Sent", "Spam", "Trash", "Archive", "All Mail", "To-dos"]
+        )
+        XCTAssertFalse(destinations.map(\.title).contains("Calendar"))
+        XCTAssertEqual(destinations.filter(\.isSupplemental), [.todos])
+    }
+
+    func testMailboxSearchFieldFocusesOnAttachmentAndRoutesEscape() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 80),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let container = NSView(frame: window.contentLayoutRect)
+        window.contentView = container
+        let field = ElectronicMailSearchField(frame: NSRect(x: 10, y: 20, width: 400, height: 30))
+        var cancelCount = 0
+        field.onCancel = { cancelCount += 1 }
+
+        container.addSubview(field)
+
+        XCTAssertTrue(window.firstResponder === field.currentEditor())
+        field.cancelOperation(nil)
+        XCTAssertEqual(cancelCount, 1)
+    }
+
     func testReplyAllPrefillKeepsSenderInToAndCopiesOtherRecipients() {
         let recipients = MailReplyPrefillPolicy.recipients(
             mode: .replyAll,
