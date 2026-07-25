@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from html import escape
 import json
+import logging
 import re
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -69,6 +70,7 @@ from app.services.mail_groups import enqueue_first_run
 
 router = APIRouter()
 settings = load_settings()
+logger = logging.getLogger(__name__)
 _MOBILE_HANDOFF_TTL_SECONDS = 5 * 60
 _NO_STORE_HEADERS = {"Cache-Control": "no-store, private", "Pragma": "no-cache"}
 _HANDOFF_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
@@ -534,6 +536,16 @@ def auth_google_callback(
                     enqueue_first_run(settings, user_id=user.id)
                 except Exception:
                     pass
+                logger.info(
+                    "gmail.oauth_completed",
+                    extra={
+                        "event_fields": {
+                            "event": "gmail.oauth_completed",
+                            "user_id": user.id,
+                            "mobile_handoff": bool(redirect_to),
+                        }
+                    },
+                )
             finally:
                 if unpersisted_google_tokens is not None:
                     tracked_user_id = callback_user_id

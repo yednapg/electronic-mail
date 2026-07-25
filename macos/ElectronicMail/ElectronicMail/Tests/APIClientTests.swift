@@ -612,6 +612,119 @@ final class APIClientTests: XCTestCase {
         XCTAssertNil(localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox))
     }
 
+    func testGatedAppSessionResponseCannotRecreateAccountAfterLogoutPurge() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailAppSessionFence-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gate = AccountFenceRequestGate()
+        let mailbox = accountFenceMailbox()
+        let backend = GatedAccountFenceAppClient(
+            session: appSession(
+                userID: "fenced-user",
+                email: "fenced@example.com",
+                mailbox: mailbox
+            ),
+            mailbox: mailbox,
+            appSessionGate: gate
+        )
+        let localStore = try XCTUnwrap(
+            SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3"))
+        )
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+        client.sessionToken = "live-session-token"
+
+        let request = Task { try await client.appSession() }
+        await gate.waitUntilRequestStarts()
+        try await client.logout()
+        await gate.releaseRequest()
+
+        do {
+            _ = try await request.value
+            XCTFail("A pre-purge app-session response must be cancelled")
+        } catch is CancellationError {
+            // Expected.
+        }
+        XCTAssertNil(localStore.readSession())
+        XCTAssertNil(localStore.readMailbox(userID: "fenced-user", label: .inbox))
+        XCTAssertEqual(backend.batchCallCount, 0)
+        XCTAssertEqual(backend.metadataMailboxCallCount, 0)
+    }
+
+    func testGatedMailboxResponseCannotRestartOfflineSyncAfterLogoutPurge() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailMailboxFence-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gate = AccountFenceRequestGate()
+        let mailbox = accountFenceMailbox()
+        let session = appSession(userID: "fenced-user", email: "fenced@example.com", mailbox: mailbox)
+        let backend = GatedAccountFenceAppClient(
+            session: session,
+            mailbox: mailbox,
+            mailboxGate: gate
+        )
+        backend.sessionToken = "live-session-token"
+        let localStore = try XCTUnwrap(
+            SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3"))
+        )
+        localStore.writeSession(session)
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+
+        let request = Task { try await client.mailbox(label: .inbox, limit: 100, cursor: nil) }
+        await gate.waitUntilRequestStarts()
+        try await client.logout()
+        await gate.releaseRequest()
+
+        do {
+            _ = try await request.value
+            XCTFail("A pre-purge mailbox response must be cancelled")
+        } catch is CancellationError {
+            // Expected.
+        }
+        XCTAssertNil(localStore.readSession())
+        XCTAssertNil(localStore.readMailbox(userID: "fenced-user", label: .inbox))
+        XCTAssertEqual(backend.batchCallCount, 0)
+        XCTAssertEqual(backend.metadataMailboxCallCount, 0)
+    }
+
+    func testGatedSyncProgressCannotRestartMetadataCrawlAfterLogoutPurge() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailProgressFence-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gate = AccountFenceRequestGate()
+        let mailbox = accountFenceMailbox()
+        let session = appSession(userID: "fenced-user", email: "fenced@example.com", mailbox: mailbox)
+        let backend = GatedAccountFenceAppClient(
+            session: session,
+            mailbox: mailbox,
+            syncStateGate: gate
+        )
+        backend.sessionToken = "live-session-token"
+        let localStore = try XCTUnwrap(
+            SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3"))
+        )
+        localStore.writeSession(session)
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+
+        let request = Task { try await client.mailboxSyncState() }
+        await gate.waitUntilRequestStarts()
+        try await client.logout()
+        await gate.releaseRequest()
+
+        do {
+            _ = try await request.value
+            XCTFail("Pre-purge sync progress must be cancelled")
+        } catch is CancellationError {
+            // Expected.
+        }
+        for _ in 0..<5 { await Task.yield() }
+        XCTAssertNil(localStore.readSession())
+        XCTAssertEqual(backend.metadataMailboxCallCount, 0)
+        XCTAssertEqual(backend.batchCallCount, 0)
+    }
+
     func testOfflineFirstClientDoesNotQueueNonRetryableThreadActionFailures() async throws {
         for status in [400, 401, 403] {
             let backend = ToggleThreadActionAppClient()
@@ -1000,6 +1113,223 @@ private func singleRowMailbox(threadID: String, title: String) -> MailboxRespons
         fullImportRunning: false,
         fullImportCompleted: true
     )
+}
+
+private func accountFenceMailbox() -> MailboxResponse {
+    let base = singleRowMailbox(threadID: "fenced-thread", title: "Fenced message")
+    var row = base.sections[0].rows[0]
+    row.bodyReady = true
+    row.contentRevision = "sha256:fenced-thread"
+    row.initialWindowPosition = 0
+    return MailboxResponse(
+        label: .inbox,
+        totalThreads: 1,
+        loadedThreads: 1,
+        sections: [GmailThreadSection(id: "today", title: "Today", rows: [row])],
+        mailboxRevision: "fenced-revision",
+        fullImportRunning: false,
+        fullImportCompleted: true,
+        syncGeneration: "fenced-generation",
+        phase: "complete",
+        initialTargetCount: 1,
+        initialMetadataCount: 1,
+        initialBodyTargetCount: 1,
+        initialBodyReadyCount: 1,
+        historyMetadataCount: 1,
+        historyBodyReadyCount: 1,
+        estimatedTotalCount: 1,
+        initialWindowComplete: true,
+        historyMetadataComplete: true,
+        historyBodyComplete: true,
+        lastProgressAt: "2026-07-25T12:00:00Z"
+    )
+}
+
+private actor AccountFenceRequestGate {
+    private var requestStarted = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func suspendRequest() async {
+        requestStarted = true
+        startWaiters.forEach { $0.resume() }
+        startWaiters = []
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilRequestStarts() async {
+        guard !requestStarted else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func releaseRequest() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private final class GatedAccountFenceAppClient: AppClient {
+    var baseURL = URL(string: "http://localhost:3001")!
+    var sessionToken: String?
+    let mode: AppRunMode = .localBackend
+
+    private let session: AppSessionResponse
+    private let fixedMailbox: MailboxResponse
+    private let appSessionGate: AccountFenceRequestGate?
+    private let mailboxGate: AccountFenceRequestGate?
+    private let syncStateGate: AccountFenceRequestGate?
+    private let lock = NSLock()
+    private var storedBatchCallCount = 0
+    private var storedMetadataMailboxCallCount = 0
+
+    init(
+        session: AppSessionResponse,
+        mailbox: MailboxResponse,
+        appSessionGate: AccountFenceRequestGate? = nil,
+        mailboxGate: AccountFenceRequestGate? = nil,
+        syncStateGate: AccountFenceRequestGate? = nil
+    ) {
+        self.session = session
+        fixedMailbox = mailbox
+        self.appSessionGate = appSessionGate
+        self.mailboxGate = mailboxGate
+        self.syncStateGate = syncStateGate
+    }
+
+    var batchCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedBatchCallCount
+    }
+
+    var metadataMailboxCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedMetadataMailboxCallCount
+    }
+
+    func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
+        try await DemoAppClient().exchangeMobileSession(loginCode: loginCode)
+    }
+
+    func logout() async throws {}
+
+    func appSession() async throws -> AppSessionResponse {
+        if let appSessionGate {
+            await appSessionGate.suspendRequest()
+        }
+        return session
+    }
+
+    func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
+        if label == .inbox, cursor == nil, let mailboxGate {
+            await mailboxGate.suspendRequest()
+            return fixedMailbox
+        }
+        if label != .inbox {
+            lock.lock()
+            storedMetadataMailboxCallCount += 1
+            lock.unlock()
+        }
+        return MailboxResponse(
+            label: label,
+            totalThreads: 0,
+            loadedThreads: 0,
+            sections: [],
+            fullImportRunning: false,
+            fullImportCompleted: true,
+            syncGeneration: "fenced-generation",
+            historyMetadataCount: 0,
+            estimatedTotalCount: 0,
+            historyMetadataComplete: true
+        )
+    }
+
+    func batchThreads(threadIDs: [String]) async throws -> MailboxThreadBatchResponse {
+        lock.lock()
+        storedBatchCallCount += 1
+        lock.unlock()
+        return MailboxThreadBatchResponse(threads: [], pendingThreadIDs: threadIDs)
+    }
+
+    func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
+        DemoAppFixtures.threads["demo-google-today"]!
+    }
+
+    func mailboxSyncState() async throws -> MailboxSyncStateResponse {
+        if let syncStateGate {
+            await syncStateGate.suspendRequest()
+        }
+        var state = MailboxSyncStateResponse(
+            connected: true,
+            lastHistoryID: "history-fenced",
+            lastFullSyncAt: nil,
+            watchExpirationAt: nil,
+            lastSyncStartedAt: nil,
+            lastSyncCompletedAt: nil,
+            lastSyncError: nil,
+            totalThreads: 1
+        )
+        state.syncGeneration = "fenced-generation"
+        state.phase = "syncing_history"
+        state.initialMetadataCount = 1
+        state.historyMetadataCount = 1
+        state.estimatedTotalCount = 1
+        state.initialWindowComplete = true
+        state.historyMetadataComplete = false
+        state.lastProgressAt = "2026-07-25T12:00:00Z"
+        return state
+    }
+
+    func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
+        try await DemoAppClient().triggerMailboxSync()
+    }
+
+    func syncMailboxNow() async throws -> MailboxSyncTriggerResponse {
+        try await DemoAppClient().syncMailboxNow()
+    }
+
+    func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .archive)
+    }
+
+    func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .unarchive)
+    }
+
+    func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .markRead)
+    }
+
+    func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
+        QueuedThreadActionResponse(
+            clientActionID: request.clientActionID,
+            serverActionID: "server-\(request.clientActionID)",
+            mailboxThreadID: request.mailboxThreadID,
+            targetMessageID: request.targetMessageID,
+            action: request.action,
+            state: .applied,
+            queuedAt: request.createdAt,
+            appliedAt: request.createdAt,
+            error: nil
+        )
+    }
+
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        try await DemoAppClient().createTask(request)
+    }
+
+    func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse {
+        try await DemoAppClient().updateTask(taskID, request: request)
+    }
+
+    func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
+        try await DemoAppClient().completeEntity(entityID, request: request)
+    }
 }
 
 private final class FixedUserMailboxAppClient: AppClient {

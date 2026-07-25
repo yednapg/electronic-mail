@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 import unittest
@@ -7,9 +8,14 @@ from unittest.mock import ANY, call, patch
 
 from googleapiclient.errors import HttpError
 
-from app.db.mail_groups import GmailMessageRecord, MailGroupDetail, MailGroupRecord
+from app.db.mail_groups import GmailMessageRecord, GmailThreadMessagePage, MailGroupDetail, MailGroupRecord
 from app.services.gmail_importer import _batch_get_message_payloads, _mark_full_payload_body_fetch_status, run_gmail_body_fetch
-from app.services.mail_groups import build_group_detail_response
+from app.services.mail_groups import (
+    _enqueue_body_fetch_for_gmail_thread,
+    _gmail_thread_content_revision,
+    _needs_body_fetch,
+    build_group_detail_response,
+)
 
 
 def sample_message() -> GmailMessageRecord:
@@ -37,6 +43,20 @@ def sample_message() -> GmailMessageRecord:
 
 
 RICH_APPLICATION_HTML = '<html><body><table style="width:100%"><tr><td><img src="https://example.com/logo.png">Full application email</td></tr></table></body></html>'
+
+
+def reader_page(messages: list[GmailMessageRecord]) -> GmailThreadMessagePage | None:
+    if not messages:
+        return None
+    latest = max(messages, key=lambda item: item.internal_date or item.updated_at)
+    return GmailThreadMessagePage(
+        gmail_thread_id=messages[0].gmail_thread_id or messages[0].message_id,
+        messages=messages,
+        total_messages=len(messages),
+        latest_subject=latest.subject,
+        incomplete_body_count=sum(1 for message in messages if _needs_body_fetch(message)),
+        content_revision=_gmail_thread_content_revision(messages),
+    )
 
 
 def sample_group() -> MailGroupRecord:
@@ -132,18 +152,56 @@ class _PartialBatchService:
 
 
 class MailGroupDetailBodyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.body_lock_patch = patch(
+            "app.services.gmail_importer._gmail_body_fetch_account_scope",
+            return_value=nullcontext(),
+        )
+        self.body_lock_patch.start()
+        self.addCleanup(self.body_lock_patch.stop)
+        self.body_recheck_patch = patch(
+            "app.services.gmail_importer.list_messages_by_ids",
+            side_effect=lambda _database_url, *, user_id, message_ids: [
+                replace(
+                    sample_message(),
+                    user_id=user_id,
+                    message_id=message_id,
+                    body_fetch_status="missing",
+                )
+                for message_id in message_ids
+            ],
+        )
+        self.body_recheck_patch.start()
+        self.addCleanup(self.body_recheck_patch.stop)
+
     def test_batch_body_fetch_preserves_success_when_another_message_is_missing(self) -> None:
         service = _PartialBatchService()
+        terminal_not_found: set[str] = set()
 
         payloads = _batch_get_message_payloads(
             service,
             ["msg-good", "msg-missing"],
             format="full",
             continue_on_error=True,
+            terminal_not_found_ids=terminal_not_found,
         )
 
         self.assertEqual(payloads, {"msg-good": {"id": "msg-good"}})
-        self.assertEqual(service.direct_execute_ids, ["msg-missing"])
+        self.assertEqual(terminal_not_found, {"msg-missing"})
+        self.assertEqual(service.direct_execute_ids, [])
+
+    def test_bulk_body_warmup_does_not_wake_delayed_retry(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        with patch("app.services.mail_groups.enqueue_job") as enqueue:
+            enqueue.return_value = SimpleNamespace(id="job-1")
+            _enqueue_body_fetch_for_gmail_thread(
+                settings,
+                user_id="user-1",
+                gmail_thread_id="thread-1",
+                priority=70,
+            )
+
+        self.assertFalse(enqueue.call_args.kwargs["wake_existing"])
 
     def test_batch_body_fetch_propagates_transient_errors_without_request_amplification(self) -> None:
         for status in (429, 503):
@@ -210,8 +268,8 @@ class MailGroupDetailBodyTests(unittest.TestCase):
             "app.services.mail_groups.get_mail_group_detail",
             return_value=MailGroupDetail(group=group, messages=[reply]),
         ) as get_detail, patch(
-            "app.services.mail_groups.list_messages_for_gmail_thread",
-            return_value=[],
+            "app.services.mail_groups.get_gmail_thread_message_page",
+            return_value=None,
         ), patch("app.services.mail_groups.enqueue_job") as enqueue_job:
             response = build_group_detail_response(settings, user_id="user-1", group_id="group-ai")
 
@@ -224,8 +282,8 @@ class MailGroupDetailBodyTests(unittest.TestCase):
         metadata_only = sample_message()
 
         with patch(
-            "app.services.mail_groups.list_messages_for_gmail_thread",
-            return_value=[metadata_only],
+            "app.services.mail_groups.get_gmail_thread_message_page",
+            return_value=reader_page([metadata_only]),
         ), patch("app.services.mail_groups.enqueue_job") as enqueue_job, patch("app.services.gmail_importer.run_gmail_body_fetch") as body_fetch:
             enqueue_job.return_value = SimpleNamespace(id="job-1")
             response = build_group_detail_response(settings, user_id="user-1", group_id="thread-1")
@@ -238,9 +296,9 @@ class MailGroupDetailBodyTests(unittest.TestCase):
             queue="reader",
             user_id="user-1",
             dedupe_key="gmail-body-fetch-thread:user-1:thread-1",
-            priority=90,
+            priority=100,
             payload={"user_id": "user-1", "gmail_thread_id": "thread-1"},
-            wake_existing=False,
+            wake_existing=True,
         )
         self.assertEqual(response.messages[0].body, metadata_only.snippet)
         self.assertFalse(response.messages[0].body_complete)
@@ -254,8 +312,8 @@ class MailGroupDetailBodyTests(unittest.TestCase):
         metadata_only = sample_message()
 
         with patch(
-            "app.services.mail_groups.list_messages_for_gmail_thread",
-            return_value=[metadata_only],
+            "app.services.mail_groups.get_gmail_thread_message_page",
+            return_value=reader_page([metadata_only]),
         ), patch("app.services.mail_groups.enqueue_job") as enqueue_job, patch("app.services.gmail_importer.run_gmail_body_fetch") as body_fetch:
             enqueue_job.side_effect = RuntimeError("queue unavailable")
             response = build_group_detail_response(settings, user_id="user-1", group_id="thread-1")
@@ -268,9 +326,9 @@ class MailGroupDetailBodyTests(unittest.TestCase):
             queue="reader",
             user_id="user-1",
             dedupe_key="gmail-body-fetch-thread:user-1:thread-1",
-            priority=90,
+            priority=100,
             payload={"user_id": "user-1", "gmail_thread_id": "thread-1"},
-            wake_existing=False,
+            wake_existing=True,
         )
         self.assertEqual(response.messages[0].body, "Gaurav, Thank you for choosing the California State University.")
         self.assertFalse(response.messages[0].body_complete)
@@ -284,8 +342,8 @@ class MailGroupDetailBodyTests(unittest.TestCase):
         hydrated = replace(sample_message(), html_body_sanitized=RICH_APPLICATION_HTML, html_render_document=RICH_APPLICATION_HTML, text_body="Full application email")
 
         with patch(
-            "app.services.mail_groups.list_messages_for_gmail_thread",
-            return_value=[hydrated],
+            "app.services.mail_groups.get_gmail_thread_message_page",
+            return_value=reader_page([hydrated]),
         ), patch("app.services.mail_groups.enqueue_job") as enqueue_job, patch("app.services.gmail_importer.run_gmail_body_fetch") as body_fetch:
             response = build_group_detail_response(settings, user_id="user-1", group_id="thread-1")
 
@@ -322,8 +380,8 @@ class MailGroupDetailBodyTests(unittest.TestCase):
         )
 
         with patch(
-            "app.services.mail_groups.list_messages_for_gmail_thread",
-            return_value=[attachment_only],
+            "app.services.mail_groups.get_gmail_thread_message_page",
+            return_value=reader_page([attachment_only]),
         ), patch("app.services.mail_groups.enqueue_job") as enqueue_job:
             response = build_group_detail_response(settings, user_id="user-1", group_id="thread-1")
 
@@ -331,6 +389,105 @@ class MailGroupDetailBodyTests(unittest.TestCase):
         enqueue_job.assert_not_called()
         self.assertTrue(response.messages[0].body_complete)
         self.assertEqual(response.messages[0].attachments[0].filename, "statement.pdf")
+
+    def test_reader_treats_terminal_unavailable_body_as_complete_snippet(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        unavailable = replace(
+            sample_message(),
+            text_body=None,
+            html_body_sanitized=None,
+            html_render_document=None,
+            raw_payload={},
+            body_fetch_status="unavailable",
+            body_fetch_error="Malformed provider MIME payload",
+        )
+
+        with patch(
+            "app.services.mail_groups.get_gmail_thread_message_page",
+            return_value=reader_page([unavailable]),
+        ), patch("app.services.mail_groups.enqueue_job") as enqueue_job:
+            response = build_group_detail_response(
+                settings,
+                user_id="user-1",
+                group_id="thread-1",
+            )
+
+        self.assertIsNotNone(response)
+        enqueue_job.assert_not_called()
+        self.assertTrue(response.messages[0].body_complete)
+        self.assertEqual(response.messages[0].body, unavailable.snippet)
+
+    def test_reader_pages_keep_complete_identity_count_and_revision_stable(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        messages = [
+            replace(
+                sample_message(),
+                message_id=f"msg-{index}",
+                internal_date=f"2026-05-15T1{index}:00:00+00:00",
+                subject="Newest subject" if index == 2 else f"Subject {index}",
+                text_body=f"Complete body {index}",
+                body_fetch_status="fetched",
+                content_revision=index + 1,
+            )
+            for index in range(3)
+        ]
+        revision = _gmail_thread_content_revision(messages)
+        first_page = GmailThreadMessagePage(
+            gmail_thread_id="thread-1",
+            messages=messages[:2],
+            total_messages=3,
+            latest_subject="Newest subject",
+            incomplete_body_count=0,
+            content_revision=revision,
+        )
+        second_page = GmailThreadMessagePage(
+            gmail_thread_id="thread-1",
+            messages=messages[2:],
+            total_messages=3,
+            latest_subject="Newest subject",
+            incomplete_body_count=0,
+            content_revision=revision,
+        )
+
+        with patch(
+            "app.services.mail_groups.get_gmail_thread_message_page",
+            side_effect=[first_page, second_page],
+        ) as get_page, patch("app.services.mail_groups.enqueue_job") as enqueue_job:
+            first = build_group_detail_response(
+                settings,
+                user_id="user-1",
+                group_id="thread-1",
+                limit=2,
+                offset=0,
+            )
+            second = build_group_detail_response(
+                settings,
+                user_id="user-1",
+                group_id="thread-1",
+                limit=2,
+                offset=2,
+            )
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertEqual(first.entity_id, second.entity_id)
+        self.assertEqual(first.gmail_thread_id, second.gmail_thread_id)
+        self.assertEqual(first.title, "Newest subject")
+        self.assertEqual(second.title, "Newest subject")
+        self.assertEqual(first.total_messages, 3)
+        self.assertEqual(second.total_messages, 3)
+        self.assertTrue(first.has_more)
+        self.assertFalse(second.has_more)
+        self.assertEqual(first.content_revision, revision)
+        self.assertEqual(second.content_revision, revision)
+        self.assertEqual([message.id for message in first.messages], ["msg-0", "msg-1"])
+        self.assertEqual([message.id for message in second.messages], ["msg-2"])
+        self.assertEqual(get_page.call_args_list[0].kwargs["limit"], 2)
+        self.assertEqual(get_page.call_args_list[0].kwargs["offset"], 0)
+        self.assertEqual(get_page.call_args_list[1].kwargs["limit"], 2)
+        self.assertEqual(get_page.call_args_list[1].kwargs["offset"], 2)
+        enqueue_job.assert_not_called()
 
     def test_body_worker_emits_targeted_hydration_event_after_persisting_full_content(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
@@ -417,9 +574,50 @@ class MailGroupDetailBodyTests(unittest.TestCase):
                 run_gmail_body_fetch(settings, user_id="user-1", gmail_thread_id="thread-1")
 
         self.assertEqual(mark_state.call_count, 2)
-        self.assertEqual(mark_state.call_args.kwargs["status"], "failed")
+        self.assertEqual(mark_state.call_args.kwargs["status"], "missing")
         upsert.assert_not_called()
         emit.assert_not_called()
+
+    def test_body_worker_terminalizes_malformed_payload_without_retry_loop(self) -> None:
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+        metadata_only = sample_message()
+        malformed = ValueError("malformed MIME payload")
+
+        with patch("app.services.gmail_importer.user_can_write_gmail", return_value=True), patch(
+            "app.services.gmail_importer.list_messages_for_gmail_thread",
+            return_value=[metadata_only],
+        ), patch(
+            "app.services.gmail_importer.mark_gmail_messages_body_fetch_state"
+        ) as mark_state, patch(
+            "app.services.gmail_importer.create_authorized_credentials",
+            return_value=object(),
+        ), patch(
+            "app.services.gmail_importer.build_google_service",
+            return_value=object(),
+        ), patch(
+            "app.services.gmail_importer._batch_get_message_payloads",
+            return_value={"msg-1": {"id": "msg-1"}},
+        ), patch(
+            "app.services.gmail_importer.parse_gmail_message",
+            side_effect=malformed,
+        ), patch(
+            "app.services.gmail_importer._emit_terminal_body_states"
+        ) as emit_terminal:
+            count = run_gmail_body_fetch(
+                settings,
+                user_id="user-1",
+                gmail_thread_id="thread-1",
+            )
+
+        self.assertEqual(count, 0)
+        self.assertEqual(mark_state.call_count, 2)
+        self.assertEqual(mark_state.call_args.kwargs["status"], "unavailable")
+        emit_terminal.assert_called_once_with(
+            settings,
+            user_id="user-1",
+            message_ids=["msg-1"],
+            source="gmail_body_fetch",
+        )
 
     def test_body_worker_persists_successful_subset_before_retrying_unresolved_message(self) -> None:
         settings = SimpleNamespace(database_path="postgresql://example/db")
@@ -507,7 +705,7 @@ class MailGroupDetailBodyTests(unittest.TestCase):
                     "postgresql://example/db",
                     user_id="user-1",
                     message_ids=["msg-bad"],
-                    status="failed",
+                    status="missing",
                     error=ANY,
                 ),
             ],
@@ -564,6 +762,7 @@ class MailGroupDetailBodyTests(unittest.TestCase):
             ["msg-bad"],
             format="full",
             continue_on_error=True,
+            terminal_not_found_ids=set(),
         )
         self.assertEqual(mark_state.call_args_list[0].kwargs["message_ids"], ["msg-bad"])
         self.assertEqual(mark_state.call_args_list[1].kwargs["message_ids"], ["msg-bad"])

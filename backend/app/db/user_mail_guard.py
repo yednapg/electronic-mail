@@ -68,6 +68,11 @@ def gmail_draft_lock_key(user_id: str, gmail_draft_id: str) -> int:
     return _advisory_lock_key("gmail-provider-draft", f"{user_id}:{gmail_draft_id}")
 
 
+def gmail_body_fetch_lock_key(user_id: str) -> int:
+    """Return the account lock used to serialize Gmail body downloads."""
+    return _advisory_lock_key("gmail-body-fetch", user_id)
+
+
 def google_subject_tombstone_hash(google_sub: str) -> str:
     """Return the stable, non-reversible key used for subject revocation ordering."""
     subject = google_sub.strip()

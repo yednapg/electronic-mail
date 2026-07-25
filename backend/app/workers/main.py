@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from base64 import urlsafe_b64decode
+from datetime import datetime, timezone
 import json
 import logging
 import signal
@@ -13,7 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.core.config import load_settings
-from app.core.error_safety import GoogleCredentialsUnavailable, safe_job_error
+from app.core.error_safety import GoogleCredentialsUnavailable, safe_google_error, safe_job_error
 from app.core.observability import configure_observability
 from app.db.jobs import (
     cancel_claimed_job,
@@ -22,21 +23,27 @@ from app.db.jobs import (
     complete_job,
     fail_job,
     renew_heartbeat,
+    retry_backoff_seconds,
 )
 from app.db.repository import get_user_by_email
-from app.db.mail_groups import gmail_history_cursor_is_authoritative
+from app.db.mail_groups import (
+    gmail_history_cursor_is_authoritative,
+    mark_google_disconnected,
+    mark_import_error,
+)
 from app.db.user_mail_guard import UserMailWorkBlocked
 from app.services.gmail_importer import (
     GMAIL_SEARCH_MAX_PAGES,
     refresh_gmail_thread_order,
     run_gmail_backfill,
+    run_gmail_body_backfill,
     run_gmail_delta_sync,
     run_gmail_full_reconciliation,
     run_gmail_import_batch,
 )
 from app.services.gmail_watch import ensure_gmail_watch
 from app.services.integrations.google import retry_encrypted_google_token_revocation
-from app.services.mailbox_events import DASHBOARD_CHANGED, MAILBOX_CHANGED, emit_mailbox_event
+from app.services.mailbox_events import DASHBOARD_CHANGED, MAILBOX_CHANGED, MAILBOX_SYNC_PROGRESS, emit_mailbox_event
 from app.services.mailbox_actions import rollback_failed_thread_action, run_pending_thread_action
 from app.services.mailbox_sends import run_pending_send
 from app.services.mailbox_search import run_mailbox_search_hydration
@@ -48,10 +55,20 @@ from app.services.mail_groups import (
     refresh_app_session_snapshot,
     refresh_visible_mail_projection,
 )
+from app.workers.retry_policy import gmail_is_authorization_failure, gmail_retry_delay_seconds
 
 STOP = False
 logger = logging.getLogger(__name__)
 LOOP_ERROR_BACKOFF_SECONDS = 5.0
+_PROGRESSIVE_GMAIL_JOB_KINDS = {
+    "gmail_import_batch",
+    "gmail_backfill",
+    "gmail_full_reconcile",
+    "gmail_delta_sync",
+    "gmail_pubsub_sync",
+    "gmail_body_fetch",
+    "gmail_body_backfill",
+}
 
 
 def main() -> None:
@@ -104,6 +121,22 @@ def _run_worker_cycle(settings, *, worker_id: str, queues: list[str], heartbeat_
     job = claim_job(database_url, worker_id=worker_id, queues=queues)
     if job is None:
         return False
+    queue_wait_ms = _job_queue_wait_ms(
+        str(getattr(job, "created_at", "") or ""),
+        getattr(job, "started_at", None),
+    )
+    logger.info(
+        "worker.job_started",
+        extra={
+            "event_fields": {
+                "event": "worker.job_started",
+                "job_kind": job.kind,
+                "queue": getattr(job, "queue", None),
+                "attempt_count": job.attempt_count,
+                "queue_wait_ms": queue_wait_ms,
+            }
+        },
+    )
     renew_heartbeat(
         database_url,
         worker_id=worker_id,
@@ -131,12 +164,28 @@ def _run_worker_cycle(settings, *, worker_id: str, queues: list[str], heartbeat_
         complete_job(database_url, job.id, worker_id=worker_id)
     except UserMailWorkBlocked:
         cancel_claimed_job(database_url, job.id, worker_id=worker_id)
-    except GoogleCredentialsUnavailable:
+    except GoogleCredentialsUnavailable as exc:
         # Retrying cannot repair revoked or expired credentials. Preserve the
         # local mailbox and wait for the user to complete Google OAuth again.
+        _mark_gmail_reauthorization_required(settings, job=job, exc=exc)
         cancel_claimed_job(database_url, job.id, worker_id=worker_id)
     except Exception as exc:
-        failed = fail_job(database_url, job, safe_job_error(exc), worker_id=worker_id)
+        if job.kind.startswith("gmail_") and gmail_is_authorization_failure(exc):
+            _mark_gmail_reauthorization_required(settings, job=job, exc=exc)
+            cancel_claimed_job(database_url, job.id, worker_id=worker_id)
+            return True
+        retry_delay_seconds = gmail_retry_delay_seconds(
+            job.kind,
+            exc,
+            exponential_delay_seconds=retry_backoff_seconds(job.attempt_count),
+        )
+        failed = fail_job(
+            database_url,
+            job,
+            safe_job_error(exc),
+            worker_id=worker_id,
+            retry_delay_seconds=retry_delay_seconds,
+        )
         action_user_id = job.payload.get("user_id") or job.user_id
         if (
             failed
@@ -149,6 +198,18 @@ def _run_worker_cycle(settings, *, worker_id: str, queues: list[str], heartbeat_
                 user_id=action_user_id,
                 server_action_id=str(job.payload.get("server_action_id") or ""),
             )
+        if (
+            failed
+            and job.attempt_count >= job.max_attempts
+            and job.kind in _PROGRESSIVE_GMAIL_JOB_KINDS
+            and isinstance(action_user_id, str)
+        ):
+            _mark_progressive_gmail_job_failed(
+                settings,
+                user_id=action_user_id,
+                job_kind=job.kind,
+                error=safe_job_error(exc),
+            )
     finally:
         stop_heartbeat.set()
         heartbeat_thread.join(timeout=1.0)
@@ -159,6 +220,89 @@ def _run_worker_cycle(settings, *, worker_id: str, queues: list[str], heartbeat_
             release_sha=settings.release_sha,
         )
     return True
+
+
+def _job_queue_wait_ms(created_at: str, started_at: str | None) -> int | None:
+    try:
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        started = (
+            datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            if started_at
+            else datetime.now(timezone.utc)
+        )
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return max(0, int((started - created).total_seconds() * 1000))
+    except (TypeError, ValueError):
+        return None
+
+
+def _mark_gmail_reauthorization_required(settings, *, job, exc: BaseException) -> None:
+    user_id = job.payload.get("user_id") or job.user_id
+    if not isinstance(user_id, str):
+        return
+    database_url = str(settings.database_path)
+    error = safe_google_error(exc, operation="mail sync")
+    try:
+        mark_google_disconnected(database_url, user_id=user_id)
+        mark_import_error(database_url, user_id=user_id, error=error)
+        emit_mailbox_event(
+            settings,
+            user_id=user_id,
+            event_type=MAILBOX_SYNC_PROGRESS,
+            payload={
+                "source": "gmail_authorization",
+                "phase": "failed",
+                "reauthorization_required": True,
+            },
+        )
+    except Exception as state_error:
+        logger.warning(
+            "gmail.authorization_state_failed",
+            extra={
+                "event_fields": {
+                    "event": "gmail.authorization_state_failed",
+                    "user_id": user_id,
+                    "exception_type": type(state_error).__name__,
+                }
+            },
+        )
+
+
+def _mark_progressive_gmail_job_failed(
+    settings,
+    *,
+    user_id: str,
+    job_kind: str,
+    error: str,
+) -> None:
+    """Expose terminal generation failure without removing committed mail."""
+    try:
+        mark_import_error(str(settings.database_path), user_id=user_id, error=error)
+        emit_mailbox_event(
+            settings,
+            user_id=user_id,
+            event_type=MAILBOX_SYNC_PROGRESS,
+            payload={
+                "source": job_kind,
+                "phase": "failed",
+                "terminal": True,
+            },
+        )
+    except Exception as state_error:
+        logger.warning(
+            "gmail.progress_failure_state_failed",
+            extra={
+                "event_fields": {
+                    "event": "gmail.progress_failure_state_failed",
+                    "user_id": user_id,
+                    "job_kind": job_kind,
+                    "exception_type": type(state_error).__name__,
+                }
+            },
+        )
 
 
 def _run_job(settings, job) -> None:
@@ -246,6 +390,25 @@ def _run_job(settings, job) -> None:
             group_id=str(payload.get("group_id") or ""),
             gmail_thread_id=str(payload.get("gmail_thread_id") or ""),
         )
+        refresh_app_session_snapshot(settings, user_id=user_id)
+        return
+    if job.kind == "gmail_body_backfill":
+        if not isinstance(user_id, str):
+            raise RuntimeError("gmail_body_backfill missing user_id")
+        run_gmail_body_backfill(
+            settings,
+            user_id=user_id,
+            batch_size=int(payload.get("batch_size") or 25),
+            descriptor_after_message_id=(
+                str(payload["descriptor_after_message_id"])
+                if payload.get("descriptor_after_message_id")
+                else None
+            ),
+            descriptor_backfill_complete=bool(
+                payload.get("descriptor_backfill_complete", False)
+            ),
+        )
+        refresh_app_session_snapshot(settings, user_id=user_id)
         return
     if job.kind == "gmail_search_hydrate":
         if not isinstance(user_id, str):

@@ -3,6 +3,16 @@ import CoreServices
 import CryptoKit
 import Foundation
 
+public struct AttachmentDownloadID: Hashable, Sendable {
+    public let messageID: String
+    public let attachmentID: String
+
+    public init(messageID: String, attachmentID: String) {
+        self.messageID = messageID
+        self.attachmentID = attachmentID
+    }
+}
+
 private struct PendingMailActionError: LocalizedError {
     let count: Int
 
@@ -30,6 +40,31 @@ enum AttachmentFileHandlingError: LocalizedError {
             return "The attachment was saved, but macOS could not mark it as a downloaded email attachment, so Electronic Mail did not open it. \(error.localizedDescription)"
         case .couldNotOpen:
             return "The attachment was saved, but macOS could not open it. Open it from Finder or choose a default app and try again."
+        }
+    }
+}
+
+/// A foreground attachment open is not itself stored in an actor task map.
+/// This lock-backed fence lets account invalidation stop it at every suspension
+/// and file-operation boundary without relying only on cooperative Task
+/// cancellation.
+final class AttachmentOpenAuthorization: @unchecked Sendable {
+    private let lock = NSLock()
+    private var valid = true
+
+    func invalidate() {
+        lock.lock()
+        valid = false
+        lock.unlock()
+    }
+
+    func check() throws {
+        try Task.checkCancellation()
+        lock.lock()
+        let isValid = valid
+        lock.unlock()
+        guard isValid else {
+            throw CancellationError()
         }
     }
 }
@@ -78,8 +113,13 @@ struct AttachmentFileOperations: Sendable {
     let quarantineFile: FileQuarantiner
     let openFile: FileOpener
 
-    func saveAndOpen(data: Data, at fileURL: URL) throws -> AttachmentFileHandlingResult {
+    func saveAndOpen(
+        data: Data,
+        at fileURL: URL,
+        authorization: AttachmentOpenAuthorization? = nil
+    ) throws -> AttachmentFileHandlingResult {
         try Task.checkCancellation()
+        try authorization?.check()
         let accessed = startAccessingSecurityScope(fileURL)
         defer {
             if accessed {
@@ -88,6 +128,7 @@ struct AttachmentFileOperations: Sendable {
         }
 
         try Task.checkCancellation()
+        try authorization?.check()
         do {
             try writeData(data, fileURL)
         } catch {
@@ -95,6 +136,7 @@ struct AttachmentFileOperations: Sendable {
         }
 
         try Task.checkCancellation()
+        try authorization?.check()
         do {
             try quarantineFile(fileURL)
         } catch {
@@ -102,6 +144,7 @@ struct AttachmentFileOperations: Sendable {
         }
 
         try Task.checkCancellation()
+        try authorization?.check()
         guard openFile(fileURL) else {
             throw AttachmentFileHandlingError.couldNotOpen
         }
@@ -165,17 +208,25 @@ struct AttachmentFileHandler {
 
     func saveAndOpen(
         _ attachment: DownloadedAttachment,
-        suggestedFilename: String
+        suggestedFilename: String,
+        authorization: AttachmentOpenAuthorization? = nil
     ) async throws -> AttachmentFileHandlingResult {
         try Task.checkCancellation()
+        try authorization?.check()
         guard let fileURL = chooseDestination(suggestedFilename) else {
             return .cancelled
         }
+        try Task.checkCancellation()
+        try authorization?.check()
 
         let operations = operations
         let data = attachment.data
         let fileTask = Task.detached(priority: .userInitiated) {
-            try operations.saveAndOpen(data: data, at: fileURL)
+            try operations.saveAndOpen(
+                data: data,
+                at: fileURL,
+                authorization: authorization
+            )
         }
         return try await withTaskCancellationHandler {
             try await fileTask.value
@@ -190,6 +241,94 @@ public enum LoadPhase: Equatable {
     case loading
     case loaded
     case failed(String)
+}
+
+public enum MailboxSetupDeadlineDecision: Equatable {
+    case wait
+    case enter
+    case retry
+}
+
+public struct MailboxSetupDeadlinePolicy {
+    public let startedAt: Date
+    public let minimumDisplaySeconds: TimeInterval
+    public let maximumWaitSeconds: TimeInterval
+
+    public init(
+        startedAt: Date,
+        minimumDisplaySeconds: TimeInterval,
+        maximumWaitSeconds: TimeInterval
+    ) {
+        self.startedAt = startedAt
+        self.minimumDisplaySeconds = max(0, minimumDisplaySeconds)
+        self.maximumWaitSeconds = max(0, maximumWaitSeconds)
+    }
+
+    public func decision(
+        now: Date,
+        initialWindowReady: Bool,
+        committedBatchReady: Bool
+    ) -> MailboxSetupDeadlineDecision {
+        let elapsed = max(0, now.timeIntervalSince(startedAt))
+        if elapsed >= minimumDisplaySeconds, initialWindowReady {
+            return .enter
+        }
+        if elapsed >= maximumWaitSeconds {
+            return committedBatchReady ? .enter : .retry
+        }
+        return .wait
+    }
+}
+
+public struct MailboxSetupProgressSnapshot: Equatable {
+    public let phase: String
+    public let initialMetadataCount: Int
+    public let initialTargetCount: Int
+    public let initialBodyReadyCount: Int
+    public let initialBodyTargetCount: Int
+    public let historyMetadataCount: Int
+    public let historyBodyReadyCount: Int
+    public let estimatedTotalCount: Int
+    public let initialWindowComplete: Bool
+    public let historyMetadataComplete: Bool
+    public let historyBodyComplete: Bool
+    public let hasVerifiedBatch: Bool
+    public let confirmedEmpty: Bool
+
+    public var initialTargetReady: Bool {
+        guard hasVerifiedBatch || confirmedEmpty else {
+            return false
+        }
+        if confirmedEmpty {
+            return true
+        }
+        return initialTargetCount > 0
+            && initialMetadataCount >= initialTargetCount
+            && initialBodyTargetCount > 0
+            && initialBodyReadyCount >= min(25, min(initialTargetCount, initialBodyTargetCount))
+    }
+
+    public var progressFraction: Double {
+        if initialTargetReady {
+            return 1
+        }
+        let metadataFraction = Self.fraction(initialMetadataCount, initialTargetCount)
+        let bodyFraction = Self.fraction(initialBodyReadyCount, initialBodyTargetCount)
+        if initialTargetCount <= 0 {
+            return bodyFraction
+        }
+        if initialBodyTargetCount <= 0 {
+            return metadataFraction
+        }
+        return min(1, (metadataFraction + bodyFraction) / 2)
+    }
+
+    private static func fraction(_ value: Int, _ target: Int) -> Double {
+        guard target > 0 else {
+            return 0
+        }
+        return min(1, max(0, Double(value) / Double(target)))
+    }
 }
 
 public enum InboxRowVisualTone: Equatable {
@@ -306,6 +445,7 @@ private struct MailboxEventEnvelope {
     var mailboxLabels: [String] = []
     var searchKey: String?
     var threadIDs: [String] = []
+    var hydratedThreads: [MailboxHydratedThreadState] = []
 }
 
 private struct MailboxPageContext: Equatable {
@@ -313,6 +453,15 @@ private struct MailboxPageContext: Equatable {
     let label: MailboxLabel
     let searchQuery: String?
     let userID: String
+
+    var paginationKey: MailboxPaginationKey {
+        MailboxPaginationKey(label: label, searchQuery: searchQuery)
+    }
+}
+
+private struct MailboxPaginationKey: Hashable {
+    let label: MailboxLabel
+    let searchQuery: String?
 }
 
 private struct MailboxRefreshContext: Equatable {
@@ -387,35 +536,119 @@ private struct ReaderLabelIntentOverride {
     var settled: Bool
 }
 
+/// A synchronous epoch fence shared by InboxStore and its background writer.
+///
+/// The lock is intentionally held across the underlying store mutation. This
+/// lets a synchronous token clear retire the old epoch and wait for any write
+/// that already passed validation before deleting the database rows and
+/// account key. Writes that have not started yet validate after the retirement
+/// and are discarded.
+private final class LocalMailStoreWriteEpochFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var invalidatedThroughGeneration: UInt?
+
+    func performWrite(
+        operationGeneration: UInt,
+        _ operation: () -> Void
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let invalidatedThroughGeneration,
+           operationGeneration <= invalidatedThroughGeneration {
+            return
+        }
+        operation()
+    }
+
+    func invalidate(through operationGeneration: UInt) {
+        lock.lock()
+        if let invalidatedThroughGeneration {
+            self.invalidatedThroughGeneration = max(
+                invalidatedThroughGeneration,
+                operationGeneration
+            )
+        } else {
+            invalidatedThroughGeneration = operationGeneration
+        }
+        lock.unlock()
+    }
+}
+
 private actor LocalMailStoreWorker {
     private let store: LocalMailStore
+    private let writeEpochFence: LocalMailStoreWriteEpochFence
 
-    init(store: LocalMailStore) {
+    init(store: LocalMailStore, writeEpochFence: LocalMailStoreWriteEpochFence) {
         self.store = store
+        self.writeEpochFence = writeEpochFence
     }
 
     func readSession() -> AppSessionResponse? {
         store.readSession()
     }
 
-    func writeSession(_ session: AppSessionResponse) {
-        store.writeSession(session)
+    func writeSession(_ session: AppSessionResponse, operationGeneration: UInt) {
+        writeEpochFence.performWrite(operationGeneration: operationGeneration) {
+            store.writeSession(session)
+        }
     }
 
     func readMailbox(userID: String, label: MailboxLabel) -> MailboxResponse? {
         store.readMailbox(userID: userID, label: label)
     }
 
-    func writeMailbox(_ mailbox: MailboxResponse, userID: String, label: MailboxLabel) {
-        store.writeMailbox(mailbox, userID: userID, label: label)
+    func writeMailbox(
+        _ mailbox: MailboxResponse,
+        userID: String,
+        label: MailboxLabel,
+        operationGeneration: UInt
+    ) {
+        writeEpochFence.performWrite(operationGeneration: operationGeneration) {
+            store.writeMailbox(mailbox, userID: userID, label: label)
+        }
+    }
+
+    func writeMailbox(
+        _ mailbox: MailboxResponse,
+        userID: String,
+        label: MailboxLabel,
+        removingThreadIDs: [String],
+        reenteringThreadIDs: [String],
+        reentryLabels: [MailboxLabel],
+        operationGeneration: UInt
+    ) {
+        writeEpochFence.performWrite(operationGeneration: operationGeneration) {
+            store.writeMailbox(
+                mailbox,
+                userID: userID,
+                label: label,
+                removingThreadIDs: removingThreadIDs,
+                reenteringThreadIDs: reenteringThreadIDs,
+                reentryLabels: reentryLabels
+            )
+        }
     }
 
     func readThread(userID: String, threadID: String) -> ThreadReaderResponse? {
         store.readThread(userID: userID, threadID: threadID)
     }
 
-    func writeThread(_ thread: ThreadReaderResponse, userID: String, threadID: String) {
-        store.writeThread(thread, userID: userID, threadID: threadID)
+    func writeThread(
+        _ thread: ThreadReaderResponse,
+        userID: String,
+        threadID: String,
+        operationGeneration: UInt
+    ) {
+        writeEpochFence.performWrite(operationGeneration: operationGeneration) {
+            store.writeThread(thread, userID: userID, threadID: threadID)
+        }
+    }
+
+    /// Actor isolation makes this a drain barrier for writes already submitted
+    /// to the worker. The shared fence also rejects stale writes submitted by a
+    /// caller that resumes only after this method returns.
+    func invalidateWritesAndDrain(through operationGeneration: UInt) {
+        writeEpochFence.invalidate(through: operationGeneration)
     }
 
     func pendingThreadActionCount(userID: String) -> Int {
@@ -428,7 +661,10 @@ public final class InboxStore: ObservableObject {
     @Published public private(set) var phase: LoadPhase = .idle
     @Published private(set) var session: AppSessionResponse?
     @Published private(set) var activeMailboxLabel: MailboxLabel = .inbox {
-        didSet { invalidateInboxSections() }
+        didSet {
+            invalidateInboxSections()
+            updateVisibleMailboxPageLoading()
+        }
     }
     @Published private(set) var activeMailbox: MailboxResponse? {
         didSet { invalidateInboxSections() }
@@ -455,7 +691,10 @@ public final class InboxStore: ObservableObject {
     @Published private(set) var mailboxCounts: [MailboxLabel: MailboxFolderCount] = [:]
     @Published public private(set) var pendingLocalActionCount = 0
     @Published private(set) var searchQuery = "" {
-        didSet { invalidateInboxSections() }
+        didSet {
+            invalidateInboxSections()
+            updateVisibleMailboxPageLoading()
+        }
     }
     @Published private(set) var searchResults: MailboxResponse? {
         didSet { invalidateInboxSections() }
@@ -470,18 +709,20 @@ public final class InboxStore: ObservableObject {
     private(set) var lastForcedMailboxRefreshAt: Date?
     private(set) var lastForcedMailboxRefreshError: String?
     @Published private(set) var attachmentErrorMessage: String?
+    @Published public private(set) var downloadingAttachmentIDs: Set<AttachmentDownloadID> = []
 
     private let client: AppClient
     private let sessionCache: AppSessionCache
     private let threadCache: ThreadCache
     private let localMailStore: LocalMailStore
+    private let localMailStoreWriteEpochFence: LocalMailStoreWriteEpochFence
     private let localMailStoreWorker: LocalMailStoreWorker
     private let automaticallyPrefetchThreads: Bool
     private let bodyRefreshDelaysNanoseconds: [UInt64]
     private var inFlightSessionRefresh: Task<AppSessionResponse, Error>?
     private var inFlightMailboxRefresh: Task<MailboxResponse, Error>?
     private var inFlightMailboxRefreshContext: MailboxRefreshContext?
-    private var inFlightMailboxPage: Task<MailboxResponse, Error>?
+    private var inFlightMailboxPages: [MailboxPaginationKey: Task<MailboxResponse, Error>] = [:]
     private var inFlightThreads: [String: Task<ThreadReaderResponse, Error>] = [:]
     private var inFlightThreadLabelMutationGenerations: [String: UInt] = [:]
     private var selectionPrefetchTask: Task<Void, Never>?
@@ -490,10 +731,12 @@ public final class InboxStore: ObservableObject {
     private var eventStreamTask: Task<Void, Never>?
     private var eventRefreshTask: Task<Void, Never>?
     private var postSendRefreshTask: Task<Void, Never>?
+    private var readinessRefreshTask: Task<Void, Never>?
+    private var readinessRefreshOwnerID: UUID?
     private var lastSyncTriggerAt: Date?
     private var lastMailboxRefreshAt: [MailboxLabel: Date] = [:]
-    private var mailboxPageGeneration: UInt = 0
-    private var mailboxPageRequestID: UUID?
+    private var mailboxPageGenerations: [MailboxPaginationKey: UInt] = [:]
+    private var mailboxPageRequestIDs: [MailboxPaginationKey: UUID] = [:]
     private var searchRequestID: UUID?
     private var pendingSearchCompletionRefresh = false
     private var searchHydrationRefreshTask: Task<Void, Never>?
@@ -517,6 +760,8 @@ public final class InboxStore: ObservableObject {
     private var inFlightFolderCountRequest: Task<MailboxResponse, Error>?
     private var inFlightFolderCountRequestID: UUID?
     private var accountOperationGeneration: UInt = 0
+    private var localMailStoreWritesBlocked = false
+    private var attachmentOpenAuthorizations: [UUID: AttachmentOpenAuthorization] = [:]
     private var readerLabelMutationOwners: [ReaderLabelMutationKey: UUID] = [:]
     private var readerLabelMutationGenerations: [String: UInt] = [:]
     private var readerLabelMutationLabelGenerations: [String: [String: UInt]] = [:]
@@ -529,6 +774,7 @@ public final class InboxStore: ObservableObject {
     private let eventRefreshDebounce: TimeInterval = 1
     private let threadFetchLimit = 50
     private let mailboxPageLimit = 100
+    private let mailboxPagePublicationRowBatchSize = 500
     private let maximumAutomaticMailboxPages = 1_000
     private let maximumMailboxReconciliationRestarts = 3
     private let mailboxReconciliationRestartDelayNanoseconds: UInt64 = 25_000_000
@@ -556,7 +802,12 @@ public final class InboxStore: ObservableObject {
         self.sessionCache = sessionCache
         self.threadCache = threadCache
         self.localMailStore = localMailStore
-        self.localMailStoreWorker = LocalMailStoreWorker(store: localMailStore)
+        let localMailStoreWriteEpochFence = LocalMailStoreWriteEpochFence()
+        self.localMailStoreWriteEpochFence = localMailStoreWriteEpochFence
+        self.localMailStoreWorker = LocalMailStoreWorker(
+            store: localMailStore,
+            writeEpochFence: localMailStoreWriteEpochFence
+        )
         self.automaticallyPrefetchThreads = automaticallyPrefetchThreads
         self.bodyRefreshDelaysNanoseconds = bodyRefreshDelaysNanoseconds
     }
@@ -598,12 +849,17 @@ public final class InboxStore: ObservableObject {
         client.sessionToken = token
         let tokenChanged = previousToken != token
         if tokenChanged {
+            let retiringWriteGeneration = accountOperationGeneration
+            localMailStoreWritesBlocked = token?.isEmpty != false
             invalidateAccountScopedOperations()
+            // This synchronous retirement shares the same lock held across
+            // worker mutations. A direct token clear therefore cannot delete
+            // mail and its encryption key while an already-authorized writer
+            // is still committing, and queued old-generation writes are
+            // rejected when they eventually execute.
+            localMailStoreWriteEpochFence.invalidate(through: retiringWriteGeneration)
         }
         if token == nil {
-            let pendingThreadActions = preservingPendingThreadActions && tokenChanged
-                ? localMailStore.pendingThreadActions()
-                : []
             session = nil
             activeMailboxLabel = .inbox
             activeMailbox = nil
@@ -656,11 +912,19 @@ public final class InboxStore: ObservableObject {
             lastSSEEventAt = nil
             lastForcedMailboxRefreshAt = nil
             lastForcedMailboxRefreshError = nil
+            downloadingAttachmentIDs = []
+            attachmentErrorMessage = nil
             timestampLabelCache.removeAll(keepingCapacity: false)
             sessionCache.clear()
             if tokenChanged {
-                localMailStore.clearAll()
-                pendingThreadActions.forEach(localMailStore.writePendingThreadAction)
+                if preservingPendingThreadActions {
+                    // Authentication expiry clears only identity/session state.
+                    // Encrypted mail, its account key, and queued actions remain
+                    // available for the same account after reauthentication.
+                    localMailStore.clearSession()
+                } else {
+                    localMailStore.clearAll()
+                }
             }
             threadCache.clearMemory()
             phase = .idle
@@ -693,21 +957,33 @@ public final class InboxStore: ObservableObject {
                 throw PendingMailActionError(count: pendingAfterReplay)
             }
         }
+        await prepareLocalMailStoreForAccountPurge()
         try await client.logout()
     }
 
     public func disconnectGoogleAndDeleteData() async throws {
+        await prepareLocalMailStoreForAccountPurge()
         try await client.disconnectGoogle(deleteData: true, revokeSessions: true)
     }
 
     public func deleteAccountPermanently() async throws {
+        await prepareLocalMailStoreForAccountPurge()
         try await client.deleteAccount()
     }
 
     public func deleteSyncedGoogleData() async throws {
-        try await client.deleteGoogleData()
-        invalidateAccountScopedOperations()
+        await prepareLocalMailStoreForAccountPurge()
+        do {
+            try await client.deleteGoogleData()
+        } catch {
+            // OfflineFirstAppClient resumes its authenticated account
+            // generation after this scoped data purge, including on failure.
+            // Match that contract so a retry can rebuild the local cache.
+            localMailStoreWritesBlocked = false
+            throw error
+        }
         localMailStore.clearAll()
+        localMailStoreWritesBlocked = false
         pendingLocalActionCount = 0
         threadCache.clearMemory()
         sessionCache.clear()
@@ -868,25 +1144,73 @@ public final class InboxStore: ObservableObject {
         return syncState == nil ? "Checking mail..." : "Up to date"
     }
 
+    public var setupProgress: MailboxSetupProgressSnapshot {
+        let progress = preferredMailboxSyncProgress
+        let mailbox = activeMailboxLabel == .inbox ? activeMailbox : session?.mailbox
+        let rows = mailbox?.sections.flatMap(\.rows) ?? []
+        let estimatedTotal = max(
+            0,
+            max(progress.estimatedTotalCount ?? 0, mailbox?.totalThreads ?? 0)
+        )
+        let defaultInitialTarget = min(100, estimatedTotal)
+        let reportedInitialTarget = progress.initialTargetCount ?? 0
+        let initialTarget = reportedInitialTarget > 0 ? reportedInitialTarget : defaultInitialTarget
+        let defaultBodyTarget = min(25, initialTarget)
+        let reportedBodyTarget = progress.initialBodyTargetCount ?? 0
+        let bodyTarget = reportedBodyTarget > 0
+            ? min(25, min(initialTarget, reportedBodyTarget))
+            : defaultBodyTarget
+        let metadataCount = max(
+            0,
+            max(progress.initialMetadataCount ?? 0, min(rows.count, initialTarget))
+        )
+        let rowBodyReadyCount = rows.prefix(max(0, bodyTarget)).filter { $0.bodyReady == true }.count
+        let bodyReadyCount = max(0, max(progress.initialBodyReadyCount ?? 0, rowBodyReadyCount))
+        let confirmedEmpty = mailbox.map {
+            Self.isConfirmedEmptyMailbox($0, progress: progress)
+        } == true
+        let completeLegacySnapshot = mailbox.map(Self.isCompleteMailboxSnapshot) == true
+        let verifiedBatch = mailbox.map {
+            Self.isVerifiedMailboxSnapshot($0, progress: progress)
+        } == true
+        let reportedPhase = progress.phase?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let phase = reportedPhase?.isEmpty == false ? reportedPhase! : (currentReadiness?.stage ?? "starting")
+
+        return MailboxSetupProgressSnapshot(
+            phase: phase,
+            initialMetadataCount: metadataCount,
+            initialTargetCount: initialTarget,
+            initialBodyReadyCount: bodyReadyCount,
+            initialBodyTargetCount: bodyTarget,
+            historyMetadataCount: max(0, progress.historyMetadataCount ?? 0),
+            historyBodyReadyCount: max(0, progress.historyBodyReadyCount ?? 0),
+            estimatedTotalCount: estimatedTotal,
+            initialWindowComplete: progress.initialWindowComplete ?? completeLegacySnapshot,
+            historyMetadataComplete: progress.historyMetadataComplete ?? completeLegacySnapshot,
+            historyBodyComplete: progress.historyBodyComplete ?? completeLegacySnapshot,
+            hasVerifiedBatch: verifiedBatch,
+            confirmedEmpty: confirmedEmpty
+        )
+    }
+
     public var isReadyForMainInterface: Bool {
-        guard let readiness = session?.readiness else {
-            return false
-        }
-        return readiness.readyToEnter
+        let legacyReady = !preferredMailboxSyncProgress.hasReportedProgress
+            && session?.readiness.readyToEnter == true
+        return mailboxPresentationReady && (setupProgress.initialTargetReady || legacyReady)
     }
 
     public var canEnterWithBuildingDashboard: Bool {
-        guard let readiness = session?.readiness else {
-            return false
-        }
-        return readiness.mailboxReady
+        setupProgress.hasVerifiedBatch || setupProgress.confirmedEmpty
     }
 
     public var mailboxPresentationReady: Bool {
         guard let mailbox = visibleMailbox else {
             return false
         }
-        return Self.isCompleteMailboxSnapshot(mailbox)
+        let progress = mailbox.label == .inbox
+            ? preferredMailboxSyncProgress
+            : mailbox.mailboxSyncProgress
+        return Self.isVerifiedMailboxSnapshot(mailbox, progress: progress)
     }
 
     public var mailboxLoadingProgressText: String? {
@@ -907,6 +1231,58 @@ public final class InboxStore: ObservableObject {
             return "Finishing mailbox sync..."
         }
         return "Loading \(loadedThreads) of \(mailbox.totalThreads) emails..."
+    }
+
+    public var mailboxFooterProgressText: String? {
+        guard mailboxPresentationReady, let mailbox = visibleMailbox else {
+            return nil
+        }
+        if refreshFailed {
+            return "Sync paused. Your saved email is still available."
+        }
+        if isSearchActive {
+            guard mailboxPageLoading || mailbox.nextCursor?.isEmpty == false else {
+                return nil
+            }
+            let loaded = mailbox.sections.reduce(0) { $0 + $1.rows.count }
+            return "Loading more results · \(loaded) of \(max(loaded, mailbox.totalThreads))"
+        }
+
+        let progress = preferredMailboxSyncProgress
+        if progress.hasReportedProgress {
+            let metadataCount = max(
+                mailbox.sections.reduce(0) { $0 + $1.rows.count },
+                max(progress.initialMetadataCount ?? 0, progress.historyMetadataCount ?? 0)
+            )
+            let estimatedTotal = max(0, progress.estimatedTotalCount ?? 0)
+            if progress.historyMetadataComplete != true {
+                return estimatedTotal > 0
+                    ? "Loading older mail… \(metadataCount.formatted(.number)) of \(max(metadataCount, estimatedTotal).formatted(.number))"
+                    : "\(metadataCount.formatted(.number)) conversations ready"
+            }
+            if progress.historyBodyComplete != true {
+                let readyBodies = max(
+                    progress.initialBodyReadyCount ?? 0,
+                    progress.historyBodyReadyCount ?? 0
+                )
+                return estimatedTotal > 0
+                    ? "Saving email for offline use · \(readyBodies) of \(estimatedTotal)"
+                    : "Saving email for offline use · \(readyBodies) conversations ready"
+            }
+        }
+        if mailboxPageLoading || mailbox.nextCursor?.isEmpty == false {
+            let loaded = mailbox.sections.reduce(0) { $0 + $1.rows.count }
+            return "Loading older mail… \(loaded.formatted(.number)) of \(max(loaded, mailbox.totalThreads).formatted(.number))"
+        }
+        return nil
+    }
+
+    public var mailboxFooterShowsProgress: Bool {
+        mailboxFooterProgressText != nil && !refreshFailed
+    }
+
+    public var mailboxFooterShowsRetry: Bool {
+        mailboxPresentationReady && refreshFailed
     }
 
     public var mailboxTitle: String {
@@ -938,14 +1314,8 @@ public final class InboxStore: ObservableObject {
             phase = .failed("Sign in with Google to load your mailbox.")
             return
         }
-        let memoryCachedSession = sessionCache.read()
-        let diskCachedSession = memoryCachedSession == nil ? await localMailStoreWorker.readSession() : nil
-        if let cached = memoryCachedSession ?? diskCachedSession {
-            session = cached
-            activeMailbox = await localMailStoreWorker.readMailbox(userID: cached.user.id, label: activeMailboxLabel)
-            phase = activeMailbox.map(Self.isCompleteMailboxSnapshot) == true ? .loaded : .loading
-            await refreshPendingLocalActionCount()
-        } else {
+        _ = await restoreLocalCache()
+        if session == nil {
             phase = .loading
         }
         await refresh(allowEmptyDashboard: false, forceMailbox: true)
@@ -955,12 +1325,169 @@ public final class InboxStore: ObservableObject {
         }
     }
 
+    @discardableResult
+    public func restoreLocalCache() async -> Bool {
+        let operationGeneration = accountOperationGeneration
+        let memoryCachedSession = session ?? sessionCache.read()
+        let diskCachedSession = memoryCachedSession == nil ? await localMailStoreWorker.readSession() : nil
+        guard operationGeneration == accountOperationGeneration else {
+            return false
+        }
+        guard let cached = memoryCachedSession ?? diskCachedSession else {
+            return false
+        }
+        if session != cached {
+            session = cached
+        }
+        let separatelyCachedMailbox = await localMailStoreWorker.readMailbox(
+            userID: cached.user.id,
+            label: activeMailboxLabel
+        )
+        guard operationGeneration == accountOperationGeneration,
+              session?.user.id == cached.user.id else {
+            return false
+        }
+        let candidate = Self.preferredRestoredMailbox(
+            session: cached,
+            separatelyCachedMailbox: separatelyCachedMailbox,
+            label: activeMailboxLabel
+        )
+        if activeMailbox != candidate {
+            activeMailbox = candidate
+        }
+        let verified = candidate.map {
+            Self.isVerifiedMailboxSnapshot($0, progress: cached.readiness.mailboxSyncProgress)
+        } == true
+        phase = verified ? .loaded : .loading
+        await refreshPendingLocalActionCount()
+        guard operationGeneration == accountOperationGeneration,
+              session?.user.id == cached.user.id else {
+            return false
+        }
+        if verified {
+            seedActiveSelectionIfNeeded()
+            refreshReaderRow()
+        }
+        return verified
+    }
+
+    private static func preferredRestoredMailbox(
+        session: AppSessionResponse,
+        separatelyCachedMailbox: MailboxResponse?,
+        label: MailboxLabel
+    ) -> MailboxResponse? {
+        guard label == .inbox else {
+            return separatelyCachedMailbox
+        }
+        guard let separatelyCachedMailbox else {
+            return session.mailbox
+        }
+        let sessionMailbox = session.mailbox
+        guard sessionMailbox.label == label else {
+            return separatelyCachedMailbox
+        }
+
+        let progress = MailboxSyncProgress.newestMerged([
+            session.readiness.mailboxSyncProgress,
+            session.sync.mailboxSyncProgress,
+            sessionMailbox.mailboxSyncProgress,
+        ])
+        let sessionGeneration = normalizedMailboxGeneration(sessionMailbox.syncGeneration)
+        let separateGeneration = normalizedMailboxGeneration(separatelyCachedMailbox.syncGeneration)
+        let reportedGeneration = normalizedMailboxGeneration(progress.syncGeneration)
+
+        if sessionGeneration != separateGeneration {
+            if reportedGeneration == sessionGeneration, sessionGeneration != nil {
+                return sessionMailbox
+            }
+            if reportedGeneration == separateGeneration, separateGeneration != nil {
+                return separatelyCachedMailbox
+            }
+            switch (
+                mailboxProgressDate(sessionMailbox),
+                mailboxProgressDate(separatelyCachedMailbox)
+            ) {
+            case let (sessionDate?, separateDate?) where sessionDate != separateDate:
+                return sessionDate > separateDate ? sessionMailbox : separatelyCachedMailbox
+            default:
+                // Generation identifiers are opaque. The embedded mailbox is
+                // part of the newest committed app-session record, so it is
+                // the safe tie-breaker for an interrupted generation switch.
+                return sessionMailbox
+            }
+        }
+
+        if isConfirmedEmptyMailbox(sessionMailbox, progress: progress) {
+            return sessionMailbox
+        }
+        let sessionIsAuthoritative = isCompleteMailboxSnapshot(sessionMailbox)
+        let separateIsAuthoritative = isCompleteMailboxSnapshot(separatelyCachedMailbox)
+        if sessionIsAuthoritative != separateIsAuthoritative {
+            return sessionIsAuthoritative ? sessionMailbox : separatelyCachedMailbox
+        }
+
+        let sessionRows = sessionMailbox.sections.reduce(0) { $0 + $1.rows.count }
+        let separateRows = separatelyCachedMailbox.sections.reduce(0) { $0 + $1.rows.count }
+        if sessionRows != separateRows {
+            return sessionRows > separateRows ? sessionMailbox : separatelyCachedMailbox
+        }
+        switch (
+            mailboxProgressDate(sessionMailbox),
+            mailboxProgressDate(separatelyCachedMailbox)
+        ) {
+        case let (sessionDate?, separateDate?) where sessionDate != separateDate:
+            return sessionDate > separateDate ? sessionMailbox : separatelyCachedMailbox
+        default:
+            return sessionMailbox
+        }
+    }
+
+    private static func normalizedMailboxGeneration(_ generation: String?) -> String? {
+        guard let generation = generation?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !generation.isEmpty else {
+            return nil
+        }
+        return generation
+    }
+
+    private static func mailboxProgressDate(_ mailbox: MailboxResponse) -> Date? {
+        [mailbox.lastProgressAt, mailbox.generatedAt]
+            .compactMap(mailboxTimestampDate)
+            .max()
+    }
+
+    private static func mailboxTimestampDate(_ value: String?) -> Date? {
+        guard let value, !value.isEmpty else {
+            return nil
+        }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+    }
+
     public func refresh() async {
         await refresh(allowEmptyDashboard: false)
     }
 
     public func refreshForReadiness() async {
-        await refresh(allowEmptyDashboard: true)
+        await refreshSetupSyncState()
+    }
+
+    public func beginReadinessRefresh() {
+        guard readinessRefreshTask == nil else {
+            return
+        }
+        let ownerID = UUID()
+        readinessRefreshOwnerID = ownerID
+        readinessRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            await self.refreshForReadiness()
+            guard self.readinessRefreshOwnerID == ownerID else {
+                return
+            }
+            self.readinessRefreshTask = nil
+            self.readinessRefreshOwnerID = nil
+        }
     }
 
     public func createManualTask(title: String, notes: String? = nil, section: String = "today") async throws -> TaskResponse {
@@ -1171,10 +1698,11 @@ public final class InboxStore: ObservableObject {
         searchHydrationRefreshTask = nil
         pendingSearchCompletionRefresh = false
         cancelActiveMailboxRefresh()
-        resetMailboxPagination()
+        resetSearchMailboxPagination()
         let requestID = UUID()
+        let paginationKey = MailboxPaginationKey(label: activeMailboxLabel, searchQuery: normalized)
         let pageContext = MailboxPageContext(
-            generation: mailboxPageGeneration,
+            generation: mailboxPageGeneration(for: paginationKey),
             label: activeMailboxLabel,
             searchQuery: normalized,
             userID: userID
@@ -1215,7 +1743,7 @@ public final class InboxStore: ObservableObject {
         searchHydrationRefreshTask?.cancel()
         searchHydrationRefreshTask = nil
         pendingSearchCompletionRefresh = false
-        resetMailboxPagination()
+        resetSearchMailboxPagination()
         searchRequestID = nil
         searchQuery = ""
         searchResults = nil
@@ -1252,8 +1780,19 @@ public final class InboxStore: ObservableObject {
                 session = merged
             }
             sessionCache.write(merged)
-            await localMailStoreWorker.writeSession(merged)
+            await persistLocalSession(
+                merged,
+                operationGeneration: operationGeneration
+            )
+            guard operationGeneration == accountOperationGeneration,
+                  session?.user.id == merged.user.id else {
+                return
+            }
             await refreshPendingLocalActionCount()
+            guard operationGeneration == accountOperationGeneration,
+                  session?.user.id == merged.user.id else {
+                return
+            }
             if refreshFailed {
                 refreshFailed = false
             }
@@ -1284,11 +1823,18 @@ public final class InboxStore: ObservableObject {
             }
             let memoryCachedSession = sessionCache.read()
             let diskCachedSession = memoryCachedSession == nil ? await localMailStoreWorker.readSession() : nil
+            guard operationGeneration == accountOperationGeneration else {
+                return
+            }
             if session == nil, let cached = memoryCachedSession ?? diskCachedSession {
                 if session != cached {
                     session = cached
                 }
                 let cachedMailbox = await localMailStoreWorker.readMailbox(userID: cached.user.id, label: activeMailboxLabel)
+                guard operationGeneration == accountOperationGeneration,
+                      session?.user.id == cached.user.id else {
+                    return
+                }
                 if activeMailbox != cachedMailbox {
                     activeMailbox = cachedMailbox
                 }
@@ -1365,6 +1911,11 @@ public final class InboxStore: ObservableObject {
             return
         }
         let label = activeMailboxLabel
+        let paginationKey = MailboxPaginationKey(label: label, searchQuery: nil)
+        if inFlightMailboxPages[paginationKey] != nil {
+            updateVisibleMailboxPageLoading()
+            return
+        }
         let now = Date()
         if !force,
            let lastRefresh = lastMailboxRefreshAt[label],
@@ -1385,7 +1936,7 @@ public final class InboxStore: ObservableObject {
             return
         }
         cancelActiveMailboxRefresh()
-        resetMailboxPagination()
+        resetMailboxPagination(for: paginationKey)
         let context = MailboxRefreshContext(
             requestID: UUID(),
             accountGeneration: accountOperationGeneration,
@@ -1410,34 +1961,71 @@ public final class InboxStore: ObservableObject {
                   activeMailboxLabel == context.label else {
                 return
             }
-            let hadCompleteSnapshot = activeMailbox.map(Self.isCompleteMailboxSnapshot) == true
-            let serverReportsIncompleteImport = firstPage.fullImportRunning == true
-                || firstPage.fullImportCompleted == false
-            let canRetainCompleteSnapshot = hadCompleteSnapshot && !serverReportsIncompleteImport
-            let discardLoadedPages = context.force || discardLoadedMailboxPagesOnNextRefresh
-            let initialSnapshot = activeMailbox?.preservingLoadedPages(
-                afterRefreshingFirstPage: firstPage,
-                discardStalePages: discardLoadedPages
-            ) ?? firstPage
+            let hadVerifiedSnapshot = activeMailbox.map {
+                Self.isVerifiedMailboxSnapshot($0, progress: preferredMailboxSyncProgress)
+            } == true
+            let canRetainVerifiedSnapshot = hadVerifiedSnapshot
+            let discardLoadedPages = discardLoadedMailboxPagesOnNextRefresh
+            let requiresFreshAuthoritativeChain = discardLoadedPages
+                || activeMailbox.map {
+                    Self.mailboxRevisionChangedWithinGeneration($0, firstPage)
+                } == true
+            let initialSnapshot = requiresFreshAuthoritativeChain
+                ? firstPage
+                : activeMailbox?.preservingLoadedPages(
+                    afterRefreshingFirstPage: firstPage,
+                    discardStalePages: false
+                ) ?? firstPage
             discardLoadedMailboxPagesOnNextRefresh = false
 
-            // Keep a previously proven-complete mailbox visible while a fresh
-            // cursor generation is accumulated. With no complete fallback,
-            // retain the partial payload only as progress/cache state; the view
-            // deliberately does not expose its rows.
-            if !canRetainCompleteSnapshot, activeMailbox != initialSnapshot {
+            // A changed revision makes the new cursor chain authoritative for
+            // removals as well as additions. Keep the last verified snapshot
+            // visible until that replacement chain reaches its end; publishing
+            // its verified first page would otherwise collapse a large mailbox
+            // to one transport page and disturb selection/scroll position.
+            // Fresh accounts have no verified fallback, so they continue to
+            // publish progressive batches as soon as those batches verify.
+            let defersAuthoritativeReplacement = requiresFreshAuthoritativeChain
+                && canRetainVerifiedSnapshot
+                && initialSnapshot.nextCursor?.isEmpty == false
+
+            // Once rows have been verified, an unverified refresh is only
+            // progress state. It must not empty the list or its disk fallback.
+            let initialSnapshotIsVerified = Self.isVerifiedMailboxSnapshot(
+                initialSnapshot,
+                progress: preferredMailboxSyncProgress
+            )
+            if !defersAuthoritativeReplacement,
+               (!canRetainVerifiedSnapshot || initialSnapshotIsVerified),
+               activeMailbox != initialSnapshot {
                 activeMailbox = initialSnapshot
             }
 
             let pageContext = MailboxPageContext(
-                generation: mailboxPageGeneration,
+                generation: mailboxPageGeneration(for: paginationKey),
                 label: context.label,
                 searchQuery: nil,
                 userID: context.userID
             )
+            if initialSnapshotIsVerified,
+               !defersAuthoritativeReplacement {
+                await publishVerifiedMailboxSnapshot(initialSnapshot, context: context)
+            }
+            let verifiedSnapshotPublisher: (@MainActor (MailboxResponse) async -> Void)?
+            if defersAuthoritativeReplacement {
+                verifiedSnapshotPublisher = nil
+            } else {
+                verifiedSnapshotPublisher = { [weak self] snapshot in
+                    guard let self else {
+                        return
+                    }
+                    await self.publishVerifiedMailboxSnapshot(snapshot, context: context)
+                }
+            }
             let completedSnapshot = try await completeMailboxSnapshot(
                 startingWith: initialSnapshot,
-                context: pageContext
+                context: pageContext,
+                onVerifiedSnapshot: verifiedSnapshotPublisher
             )
             guard ownsActiveMailboxRefresh(context),
                   context.accountGeneration == accountOperationGeneration,
@@ -1447,15 +2035,27 @@ public final class InboxStore: ObservableObject {
             }
 
             let snapshotIsComplete = Self.isCompleteMailboxSnapshot(completedSnapshot)
-            let completedReportsIncompleteImport = completedSnapshot.fullImportRunning == true
-                || completedSnapshot.fullImportCompleted == false
-            let hasPresentableFallback = canRetainCompleteSnapshot && !completedReportsIncompleteImport
-            if snapshotIsComplete || !hasPresentableFallback {
+            let snapshotIsVerified = Self.isVerifiedMailboxSnapshot(
+                completedSnapshot,
+                progress: preferredMailboxSyncProgress
+            )
+            let cursorChainComplete = completedSnapshot.nextCursor?.isEmpty != false
+            let authoritativeReplacementReady = !defersAuthoritativeReplacement
+                || cursorChainComplete
+            let hasPresentableFallback = canRetainVerifiedSnapshot
+            if (snapshotIsVerified && authoritativeReplacementReady) || !hasPresentableFallback {
                 if activeMailbox != completedSnapshot {
                     activeMailbox = completedSnapshot
                 }
             }
-            updateFolderCount(from: completedSnapshot)
+            if defersAuthoritativeReplacement,
+               snapshotIsVerified,
+               cursorChainComplete {
+                await publishVerifiedMailboxSnapshot(completedSnapshot, context: context)
+            }
+            if authoritativeReplacementReady || !hasPresentableFallback {
+                updateFolderCount(from: completedSnapshot)
+            }
             if snapshotIsComplete,
                let revision = completedSnapshot.mailboxRevision,
                !revision.isEmpty {
@@ -1469,7 +2069,7 @@ public final class InboxStore: ObservableObject {
             if refreshFailed {
                 refreshFailed = false
             }
-            let nextPhase: LoadPhase = snapshotIsComplete || hasPresentableFallback ? .loaded : .loading
+            let nextPhase: LoadPhase = snapshotIsVerified || hasPresentableFallback ? .loaded : .loading
             if phase != nextPhase {
                 phase = nextPhase
             }
@@ -1480,13 +2080,13 @@ public final class InboxStore: ObservableObject {
                     prefetchPriorityThreads()
                 }
             }
-            let snapshotToPersist = snapshotIsComplete ? completedSnapshot : nil
             clearActiveMailboxRefresh(context)
-            if let snapshotToPersist {
-                await localMailStoreWorker.writeMailbox(
-                    snapshotToPersist,
+            if snapshotIsVerified, authoritativeReplacementReady {
+                await persistLocalMailbox(
+                    completedSnapshot,
                     userID: context.userID,
-                    label: context.label
+                    label: context.label,
+                    operationGeneration: context.accountGeneration
                 )
             }
         } catch is CancellationError {
@@ -1516,30 +2116,36 @@ public final class InboxStore: ObservableObject {
                 refreshFailed = true
             }
             if let cached,
-               Self.isCompleteMailboxSnapshot(cached) || activeMailbox.map(Self.isCompleteMailboxSnapshot) != true {
+               Self.isVerifiedMailboxSnapshot(cached, progress: preferredMailboxSyncProgress)
+                || activeMailbox.map({ Self.isVerifiedMailboxSnapshot($0, progress: preferredMailboxSyncProgress) }) != true {
                 if activeMailbox != cached {
                     activeMailbox = cached
                 }
-                let nextPhase: LoadPhase = Self.isCompleteMailboxSnapshot(cached) ? .loaded : .failed(error.localizedDescription)
+                let cachedIsVerified = Self.isVerifiedMailboxSnapshot(cached, progress: preferredMailboxSyncProgress)
+                let nextPhase: LoadPhase = cachedIsVerified ? .loaded : .failed(error.localizedDescription)
                 if phase != nextPhase {
                     phase = nextPhase
                 }
-                if Self.isCompleteMailboxSnapshot(cached) {
+                if cachedIsVerified {
                     seedActiveSelectionIfNeeded()
                 }
             } else if context.allowCachedFallback,
                       context.label == .inbox,
                       let sessionInbox = session?.mailbox,
-                      Self.isCompleteMailboxSnapshot(sessionInbox)
-                        || activeMailbox.map(Self.isCompleteMailboxSnapshot) != true {
+                      Self.isVerifiedMailboxSnapshot(sessionInbox, progress: preferredMailboxSyncProgress)
+                        || activeMailbox.map({ Self.isVerifiedMailboxSnapshot($0, progress: preferredMailboxSyncProgress) }) != true {
                 if activeMailbox != sessionInbox {
                     activeMailbox = sessionInbox
                 }
-                let nextPhase: LoadPhase = Self.isCompleteMailboxSnapshot(sessionInbox) ? .loaded : .failed(error.localizedDescription)
+                let sessionInboxIsVerified = Self.isVerifiedMailboxSnapshot(
+                    sessionInbox,
+                    progress: preferredMailboxSyncProgress
+                )
+                let nextPhase: LoadPhase = sessionInboxIsVerified ? .loaded : .failed(error.localizedDescription)
                 if phase != nextPhase {
                     phase = nextPhase
                 }
-                if Self.isCompleteMailboxSnapshot(sessionInbox) {
+                if sessionInboxIsVerified {
                     seedActiveSelectionIfNeeded()
                 }
             } else if activeMailbox == nil {
@@ -1569,7 +2175,43 @@ public final class InboxStore: ObservableObject {
         inFlightMailboxRefreshContext = nil
     }
 
+    private func publishVerifiedMailboxSnapshot(
+        _ snapshot: MailboxResponse,
+        context: MailboxRefreshContext
+    ) async {
+        let progress = mailboxSyncProgress(for: snapshot)
+        guard context.accountGeneration == accountOperationGeneration,
+              session?.user.id == context.userID,
+              snapshot.label == context.label,
+              Self.isVerifiedMailboxSnapshot(snapshot, progress: progress) else {
+            return
+        }
+
+        await persistLocalMailbox(
+            snapshot,
+            userID: context.userID,
+            label: context.label,
+            operationGeneration: context.accountGeneration
+        )
+        guard context.accountGeneration == accountOperationGeneration,
+              session?.user.id == context.userID,
+              activeMailboxLabel == context.label,
+              !isSearchActive else {
+            return
+        }
+        if activeMailbox != snapshot {
+            activeMailbox = snapshot
+        }
+        updateFolderCount(from: snapshot)
+        if phase != .loaded {
+            phase = .loaded
+        }
+        seedActiveSelectionIfNeeded()
+        refreshReaderRow()
+    }
+
     public func loadMoreMailbox(automatic _: Bool = false) async {
+        let operationGeneration = accountOperationGeneration
         guard !mailboxPageLoading,
               let mailbox = visibleMailbox,
               let cursor = mailbox.nextCursor,
@@ -1578,8 +2220,12 @@ public final class InboxStore: ObservableObject {
             return
         }
 
+        let paginationKey = MailboxPaginationKey(
+            label: activeMailboxLabel,
+            searchQuery: isSearchActive ? searchQuery : nil
+        )
         let context = MailboxPageContext(
-            generation: mailboxPageGeneration,
+            generation: mailboxPageGeneration(for: paginationKey),
             label: activeMailboxLabel,
             searchQuery: isSearchActive ? searchQuery : nil,
             userID: userID
@@ -1600,7 +2246,16 @@ public final class InboxStore: ObservableObject {
                 }
                 updateFolderCount(from: completed)
                 if Self.isCompleteMailboxSnapshot(completed) {
-                    await localMailStoreWorker.writeMailbox(completed, userID: userID, label: context.label)
+                    await persistLocalMailbox(
+                        completed,
+                        userID: userID,
+                        label: context.label,
+                        operationGeneration: operationGeneration
+                    )
+                    guard operationGeneration == accountOperationGeneration,
+                          session?.user.id == userID else {
+                        return
+                    }
                 }
             }
             if refreshFailed {
@@ -1623,26 +2278,20 @@ public final class InboxStore: ObservableObject {
 
     private func completeMailboxSnapshot(
         startingWith initialSnapshot: MailboxResponse,
-        context: MailboxPageContext
+        context: MailboxPageContext,
+        onVerifiedSnapshot: (@MainActor (MailboxResponse) async -> Void)? = nil
     ) async throws -> MailboxResponse {
-        // Cursor pages are not stable while the backend is still importing.
-        // Keep showing sync progress and let the next poll/event start from a
-        // new first page rather than mixing two changing revisions.
-        guard initialSnapshot.fullImportRunning != true,
-              initialSnapshot.fullImportCompleted != false else {
-            return initialSnapshot
-        }
         guard let firstCursor = initialSnapshot.nextCursor, !firstCursor.isEmpty else {
             try Self.validateCompletedMailboxSnapshot(initialSnapshot)
             return initialSnapshot
         }
-        guard !mailboxPageLoading else {
+        let paginationKey = context.paginationKey
+        guard inFlightMailboxPages[paginationKey] == nil else {
             throw CancellationError()
         }
 
         let requestID = UUID()
-        mailboxPageRequestID = requestID
-        mailboxPageLoading = true
+        mailboxPageRequestIDs[paginationKey] = requestID
         let task = Task {
             [
                 client,
@@ -1650,102 +2299,133 @@ public final class InboxStore: ObservableObject {
                 maximumAutomaticMailboxPages,
                 maximumMailboxReconciliationRestarts,
                 mailboxReconciliationRestartDelayNanoseconds,
+                mailboxPagePublicationRowBatchSize,
             ] in
-            var accumulated = initialSnapshot
+            let accumulator = MailboxPageAccumulator(initialSnapshot)
             var seenCursors: Set<String> = []
             var requestedPageCount = 0
             var reconciliationRestartCount = 0
+            var rowsSincePublication = 0
+            var finalPublishedSnapshot: MailboxResponse?
 
-            while let cursor = accumulated.nextCursor, !cursor.isEmpty {
-                try Task.checkCancellation()
-                guard seenCursors.insert(cursor).inserted else {
-                    throw MailboxPaginationError.repeatedCursor
-                }
-                requestedPageCount += 1
-                guard requestedPageCount <= maximumAutomaticMailboxPages else {
-                    throw MailboxPaginationError.pageLimitExceeded
-                }
-
-                let page: MailboxResponse
-                if let query = context.searchQuery {
-                    page = try await client.searchMailbox(
-                        query: query,
-                        label: context.label,
-                        limit: mailboxPageLimit,
-                        cursor: cursor,
-                        hydrateInBackground: true
-                    )
-                } else {
-                    page = try await client.mailbox(
-                        label: context.label,
-                        limit: mailboxPageLimit,
-                        cursor: cursor
-                    )
-                }
-                try Task.checkCancellation()
-                guard page.label == context.label else {
-                    throw MailboxPaginationError.mismatchedLabel
-                }
-                guard page.totalThreads == accumulated.totalThreads,
-                      Self.mailboxRevisionsMatch(accumulated, page) else {
-                    reconciliationRestartCount += 1
-                    guard reconciliationRestartCount <= maximumMailboxReconciliationRestarts else {
-                        // The backend is actively reconciling. Return the last
-                        // internally consistent prefix as loading progress; it
-                        // is never presentation-ready or persisted, and a
-                        // later event/poll will start another bounded pass.
-                        return accumulated
-                    }
-                    let delay = mailboxReconciliationRestartDelayNanoseconds
-                        * UInt64(reconciliationRestartCount)
-                    try await Task.sleep(nanoseconds: delay)
+            do {
+                while let cursor = await accumulator.nextCursor(), !cursor.isEmpty {
                     try Task.checkCancellation()
-                    let restarted: MailboxResponse
+                    guard seenCursors.insert(cursor).inserted else {
+                        throw MailboxPaginationError.repeatedCursor
+                    }
+                    requestedPageCount += 1
+                    guard requestedPageCount <= maximumAutomaticMailboxPages else {
+                        throw MailboxPaginationError.pageLimitExceeded
+                    }
+
+                    let page: MailboxResponse
                     if let query = context.searchQuery {
-                        restarted = try await client.searchMailbox(
+                        page = try await client.searchMailbox(
                             query: query,
                             label: context.label,
                             limit: mailboxPageLimit,
-                            cursor: nil,
+                            cursor: cursor,
                             hydrateInBackground: true
                         )
                     } else {
-                        restarted = try await client.mailbox(
+                        page = try await client.mailbox(
                             label: context.label,
                             limit: mailboxPageLimit,
-                            cursor: nil
+                            cursor: cursor
                         )
                     }
                     try Task.checkCancellation()
-                    guard restarted.label == context.label else {
+                    guard page.label == context.label else {
                         throw MailboxPaginationError.mismatchedLabel
                     }
-                    accumulated = restarted
-                    seenCursors.removeAll(keepingCapacity: true)
-                    if restarted.fullImportRunning == true
-                        || restarted.fullImportCompleted == false {
-                        return restarted
+                    let currentIdentity = await accumulator.identitySnapshot()
+                    guard Self.mailboxPaginationIdentityMatches(currentIdentity, page) else {
+                        reconciliationRestartCount += 1
+                        guard reconciliationRestartCount <= maximumMailboxReconciliationRestarts else {
+                            // The backend is actively reconciling. Return the last
+                            // internally consistent prefix as loading progress; it
+                            // is never presentation-ready or persisted, and a
+                            // later event/poll will start another bounded pass.
+                            return await accumulator.snapshot()
+                        }
+                        let delay = mailboxReconciliationRestartDelayNanoseconds
+                            * UInt64(reconciliationRestartCount)
+                        try await Task.sleep(nanoseconds: delay)
+                        try Task.checkCancellation()
+                        let restarted: MailboxResponse
+                        if let query = context.searchQuery {
+                            restarted = try await client.searchMailbox(
+                                query: query,
+                                label: context.label,
+                                limit: mailboxPageLimit,
+                                cursor: nil,
+                                hydrateInBackground: true
+                            )
+                        } else {
+                            restarted = try await client.mailbox(
+                                label: context.label,
+                                limit: mailboxPageLimit,
+                                cursor: nil
+                            )
+                        }
+                        try Task.checkCancellation()
+                        guard restarted.label == context.label else {
+                            throw MailboxPaginationError.mismatchedLabel
+                        }
+                        await accumulator.reset(to: restarted)
+                        seenCursors.removeAll(keepingCapacity: true)
+                        rowsSincePublication = 0
+                        finalPublishedSnapshot = nil
+                        continue
                     }
-                    continue
+                    rowsSincePublication += await accumulator.append(page)
+                    let reachedEnd = page.nextCursor?.isEmpty != false
+                    if let onVerifiedSnapshot,
+                       rowsSincePublication >= mailboxPagePublicationRowBatchSize || reachedEnd {
+                        let snapshot = await accumulator.snapshot()
+                        await onVerifiedSnapshot(snapshot)
+                        rowsSincePublication = 0
+                        if reachedEnd {
+                            finalPublishedSnapshot = snapshot
+                        }
+                    }
                 }
-                accumulated = accumulated.appendingPage(page)
+            } catch {
+                // A successfully decoded page is committed progress even if a
+                // later continuation fails. Publish the bounded in-memory
+                // prefix once before surfacing the retry state; cancellation
+                // deliberately does not expose data to a superseded context.
+                if !(error is CancellationError),
+                   rowsSincePublication > 0,
+                   let onVerifiedSnapshot {
+                    await onVerifiedSnapshot(await accumulator.snapshot())
+                }
+                throw error
             }
 
+            let accumulated: MailboxResponse
+            if let finalPublishedSnapshot {
+                accumulated = finalPublishedSnapshot
+            } else {
+                accumulated = await accumulator.snapshot()
+            }
             try Self.validateCompletedMailboxSnapshot(accumulated)
             return accumulated
         }
-        inFlightMailboxPage = task
+        inFlightMailboxPages[paginationKey] = task
+        updateVisibleMailboxPageLoading()
         defer {
-            if mailboxPageRequestID == requestID {
-                inFlightMailboxPage = nil
-                mailboxPageRequestID = nil
-                mailboxPageLoading = false
+            if mailboxPageRequestIDs[paginationKey] == requestID {
+                inFlightMailboxPages[paginationKey] = nil
+                mailboxPageRequestIDs[paginationKey] = nil
+                updateVisibleMailboxPageLoading()
             }
         }
 
         let completed = try await task.value
-        guard mailboxPageRequestID == requestID,
-              matchesMailboxPageContext(context) else {
+        guard mailboxPageRequestIDs[paginationKey] == requestID,
+              paginationContextIsCurrent(context) else {
             throw CancellationError()
         }
         return completed
@@ -1989,34 +2669,65 @@ public final class InboxStore: ObservableObject {
         messageID: String,
         fileHandler: AttachmentFileHandler
     ) async {
+        let operationGeneration = accountOperationGeneration
+        let authorizationID = UUID()
+        let authorization = AttachmentOpenAuthorization()
+        attachmentOpenAuthorizations[authorizationID] = authorization
+        let downloadID = AttachmentDownloadID(
+            messageID: messageID,
+            attachmentID: attachment.attachmentID
+        )
+        guard downloadingAttachmentIDs.insert(downloadID).inserted else {
+            return
+        }
+        defer {
+            downloadingAttachmentIDs.remove(downloadID)
+            attachmentOpenAuthorizations[authorizationID] = nil
+        }
         attachmentErrorMessage = nil
 
         let downloaded: DownloadedAttachment
         do {
             downloaded = try await client.downloadAttachment(messageID: messageID, attachment: attachment)
         } catch {
+            guard operationGeneration == accountOperationGeneration,
+                  (try? authorization.check()) != nil else {
+                return
+            }
             attachmentErrorMessage = "The attachment could not be downloaded. \(error.localizedDescription)"
             return
         }
 
-        guard !Task.isCancelled else {
+        guard operationGeneration == accountOperationGeneration,
+              (try? authorization.check()) != nil else {
             return
         }
 
         do {
             _ = try await fileHandler.saveAndOpen(
                 downloaded,
-                suggestedFilename: sanitizedAttachmentFilename(downloaded.filename)
+                suggestedFilename: sanitizedAttachmentFilename(downloaded.filename),
+                authorization: authorization
             )
         } catch is CancellationError {
             return
         } catch {
+            guard operationGeneration == accountOperationGeneration,
+                  (try? authorization.check()) != nil else {
+                return
+            }
             attachmentErrorMessage = error.localizedDescription
         }
     }
 
     public func dismissAttachmentError() {
         attachmentErrorMessage = nil
+    }
+
+    public func isAttachmentDownloading(_ attachment: ThreadAttachment, messageID: String) -> Bool {
+        downloadingAttachmentIDs.contains(
+            AttachmentDownloadID(messageID: messageID, attachmentID: attachment.attachmentID)
+        )
     }
 
     @discardableResult
@@ -2052,17 +2763,36 @@ public final class InboxStore: ObservableObject {
             guard operationGeneration == accountOperationGeneration else {
                 return true
             }
+            let removesFromCurrentMailbox = shouldRemoveFromCurrentMailbox(action: action)
+            let reentryLabels = mailboxReentryLabels(for: action)
             applyLocalThreadAction(threadID: threadID, action: action, targetMessageID: targetMessageID)
             if let userID = session?.user.id, let activeMailbox {
                 // Keep the optimistic projection on disk before asking the
                 // offline-first client to refresh. If the network is down, that
                 // refresh falls back to this cache; writing first prevents the
                 // stale pre-action row from immediately reappearing.
-                await localMailStoreWorker.writeMailbox(
-                    activeMailbox,
-                    userID: userID,
-                    label: activeMailboxLabel
-                )
+                if removesFromCurrentMailbox || !reentryLabels.isEmpty {
+                    await persistLocalMailbox(
+                        activeMailbox,
+                        userID: userID,
+                        label: activeMailboxLabel,
+                        removingThreadIDs: removesFromCurrentMailbox ? [threadID] : [],
+                        reenteringThreadIDs: reentryLabels.isEmpty ? [] : [threadID],
+                        reentryLabels: reentryLabels,
+                        operationGeneration: operationGeneration
+                    )
+                } else {
+                    await persistLocalMailbox(
+                        activeMailbox,
+                        userID: userID,
+                        label: activeMailboxLabel,
+                        operationGeneration: operationGeneration
+                    )
+                }
+                guard operationGeneration == accountOperationGeneration,
+                      session?.user.id == userID else {
+                    return true
+                }
             }
             discardLoadedMailboxPagesOnNextRefresh = true
             lastMailboxRefreshAt[activeMailboxLabel] = nil
@@ -2078,6 +2808,9 @@ public final class InboxStore: ObservableObject {
             }
             finishReaderLabelMutation(readerLabelMutation, succeeded: false)
             await persistReaderThreadIfSettled(threadID: threadID)
+            guard operationGeneration == accountOperationGeneration else {
+                return true
+            }
             refreshFailed = true
             return false
         }
@@ -2333,13 +3066,19 @@ public final class InboxStore: ObservableObject {
     }
 
     private func persistReaderThreadIfSettled(threadID: String) async {
+        let operationGeneration = accountOperationGeneration
         guard !readerLabelMutationOwners.keys.contains(where: { $0.threadID == threadID }),
               let thread = openedThreads[threadID],
               let userID = session?.user.id,
               thread.userID == userID else {
             return
         }
-        await localMailStoreWorker.writeThread(thread, userID: userID, threadID: threadID)
+        await persistLocalThread(
+            thread,
+            userID: userID,
+            threadID: threadID,
+            operationGeneration: operationGeneration
+        )
     }
 
     private func preservingReaderLabelMutations(
@@ -2480,6 +3219,7 @@ public final class InboxStore: ObservableObject {
             var gmailThreadID = firstPage.gmailThreadID
             var subject = firstPage.subject
             var title = firstPage.title
+            var contentRevision = firstPage.contentRevision
             var totalMessages = max(firstPage.totalMessages, messages.count)
             var limit = firstPage.limit
             var hasMore = firstPage.hasMore
@@ -2506,6 +3246,7 @@ public final class InboxStore: ObservableObject {
                 gmailThreadID = gmailThreadID ?? page.gmailThreadID
                 subject = subject ?? page.subject
                 title = title ?? page.title
+                contentRevision = page.contentRevision ?? contentRevision
                 totalMessages = max(totalMessages, page.totalMessages, messages.count)
                 limit = max(limit, page.limit)
                 hasMore = page.hasMore
@@ -2532,7 +3273,8 @@ public final class InboxStore: ObservableObject {
                 limit: limit,
                 offset: 0,
                 hasMore: hasMore,
-                messages: messages
+                messages: messages,
+                contentRevision: contentRevision
             )
         }
         inFlightThreads[threadID] = task
@@ -2554,7 +3296,16 @@ public final class InboxStore: ObservableObject {
             threadCache.write(thread, userID: userID, threadID: threadID)
             threadErrors[threadID] = nil
             updateReader(threadID: threadID, thread: thread, error: nil)
-            await localMailStoreWorker.writeThread(thread, userID: userID, threadID: threadID)
+            await persistLocalThread(
+                thread,
+                userID: userID,
+                threadID: threadID,
+                operationGeneration: operationGeneration
+            )
+            guard operationGeneration == accountOperationGeneration,
+                  session?.user.id == userID else {
+                return
+            }
             if startPendingHydrationRefreshAfterCurrentRequest(
                 threadID: threadID,
                 threadNeedsRefresh: thread.needsReaderBodyRefresh
@@ -2627,6 +3378,27 @@ public final class InboxStore: ObservableObject {
                 return
             }
             lastForcedMailboxRefreshError = error.localizedDescription
+        }
+    }
+
+    private func refreshSetupSyncState() async {
+        guard client.mode == .localBackend, hasSessionToken else {
+            return
+        }
+        do {
+            let state = try await client.mailboxSyncState()
+            guard hasSessionToken else {
+                return
+            }
+            syncState = state
+            if !state.connected {
+                transitionToReauthentication()
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            // Setup can still advance from app-session and verified mailbox
+            // snapshots. A progress-only request must not discard those rows.
         }
     }
 
@@ -2751,13 +3523,24 @@ public final class InboxStore: ObservableObject {
             scheduleHydratedSearchRefresh(matchingSearchKey: searchKey)
         case "thread-content-hydrated":
             let envelope = decodedEventEnvelope(event.data)
-            guard let readerThreadID,
-                  envelope.threadIDs.contains(readerThreadID) else {
-                return
+            if let userID = session?.user.id, !envelope.hydratedThreads.isEmpty {
+                Task { [client] in
+                    await client.observeHydratedThreads(envelope.hydratedThreads, userID: userID)
+                }
             }
-            cancelBodyRefresh(for: readerThreadID)
-            pendingHydrationRefreshThreadIDs.insert(readerThreadID)
-            startPendingHydrationRefreshIfPossible(threadID: readerThreadID)
+            if let readerThreadID,
+               envelope.threadIDs.contains(readerThreadID) {
+                cancelBodyRefresh(for: readerThreadID)
+                pendingHydrationRefreshThreadIDs.insert(readerThreadID)
+                startPendingHydrationRefreshIfPossible(threadID: readerThreadID)
+            }
+            // Row body_ready/content_revision observations also changed, even
+            // when none of the hydrated threads is currently open.
+            scheduleEventRefresh(needsSession: false)
+        case "mailbox-sync-progress":
+            // Progress lives on app-session/readiness as well as mailbox
+            // responses, so refresh both through the coalesced event path.
+            scheduleEventRefresh(needsSession: true)
         case "mailbox-changed":
             let envelope = decodedEventEnvelope(event.data)
             guard eventAffectsActiveMailbox(envelope) else {
@@ -2815,10 +3598,11 @@ public final class InboxStore: ObservableObject {
 
         searchHydrationRefreshTask?.cancel()
         cancelActiveMailboxRefresh()
-        resetMailboxPagination()
+        let paginationKey = MailboxPaginationKey(label: label, searchQuery: query)
+        resetMailboxPagination(for: paginationKey)
         let requestID = UUID()
         let pageContext = MailboxPageContext(
-            generation: mailboxPageGeneration,
+            generation: mailboxPageGeneration(for: paginationKey),
             label: label,
             searchQuery: query,
             userID: userID
@@ -2987,11 +3771,21 @@ public final class InboxStore: ObservableObject {
         let labels = payload["mailbox_labels"] as? [String]
         let searchKey = payload["search_key"] as? String
         let threadIDs = payload["thread_ids"] as? [String]
+        let hydratedThreads: [MailboxHydratedThreadState]
+        if let threadsJSON = payload["threads"],
+           JSONSerialization.isValidJSONObject(threadsJSON),
+           let threadsData = try? JSONSerialization.data(withJSONObject: threadsJSON),
+           let decoded = try? JSONDecoder.backend.decode([MailboxHydratedThreadState].self, from: threadsData) {
+            hydratedThreads = decoded
+        } else {
+            hydratedThreads = []
+        }
         return MailboxEventEnvelope(
             mailboxRevision: revision,
             mailboxLabels: labels ?? (mailboxLabel.map { [$0] } ?? []),
             searchKey: searchKey,
-            threadIDs: threadIDs ?? []
+            threadIDs: threadIDs ?? hydratedThreads.map(\.threadID),
+            hydratedThreads: hydratedThreads
         )
     }
 
@@ -3287,7 +4081,20 @@ public final class InboxStore: ObservableObject {
             generatedAt: mailbox.generatedAt,
             oldestImportedAt: mailbox.oldestImportedAt,
             fullImportRunning: mailbox.fullImportRunning,
-            fullImportCompleted: mailbox.fullImportCompleted
+            fullImportCompleted: mailbox.fullImportCompleted,
+            syncGeneration: mailbox.syncGeneration,
+            phase: mailbox.phase,
+            initialTargetCount: mailbox.initialTargetCount,
+            initialMetadataCount: mailbox.initialMetadataCount,
+            initialBodyTargetCount: mailbox.initialBodyTargetCount,
+            initialBodyReadyCount: mailbox.initialBodyReadyCount,
+            historyMetadataCount: mailbox.historyMetadataCount,
+            historyBodyReadyCount: mailbox.historyBodyReadyCount,
+            estimatedTotalCount: mailbox.estimatedTotalCount,
+            initialWindowComplete: mailbox.initialWindowComplete,
+            historyMetadataComplete: mailbox.historyMetadataComplete,
+            historyBodyComplete: mailbox.historyBodyComplete,
+            lastProgressAt: mailbox.lastProgressAt
         )
         if let activeMailbox {
             updateFolderCount(from: activeMailbox)
@@ -3344,7 +4151,20 @@ public final class InboxStore: ObservableObject {
             generatedAt: mailbox.generatedAt,
             oldestImportedAt: mailbox.oldestImportedAt,
             fullImportRunning: mailbox.fullImportRunning,
-            fullImportCompleted: mailbox.fullImportCompleted
+            fullImportCompleted: mailbox.fullImportCompleted,
+            syncGeneration: mailbox.syncGeneration,
+            phase: mailbox.phase,
+            initialTargetCount: mailbox.initialTargetCount,
+            initialMetadataCount: mailbox.initialMetadataCount,
+            initialBodyTargetCount: mailbox.initialBodyTargetCount,
+            initialBodyReadyCount: mailbox.initialBodyReadyCount,
+            historyMetadataCount: mailbox.historyMetadataCount,
+            historyBodyReadyCount: mailbox.historyBodyReadyCount,
+            estimatedTotalCount: mailbox.estimatedTotalCount,
+            initialWindowComplete: mailbox.initialWindowComplete,
+            historyMetadataComplete: mailbox.historyMetadataComplete,
+            historyBodyComplete: mailbox.historyBodyComplete,
+            lastProgressAt: mailbox.lastProgressAt
         )
         if let activeMailbox {
             updateFolderCount(from: activeMailbox)
@@ -3374,6 +4194,25 @@ public final class InboxStore: ObservableObject {
             return true
         case .markRead, .markUnread:
             return false
+        }
+    }
+
+    private func mailboxReentryLabels(for action: GmailThreadAction) -> [MailboxLabel] {
+        switch action {
+        case .archive:
+            return [.archive]
+        case .unarchive:
+            return [.inbox]
+        case .restoreTrash, .notSpam:
+            return [.inbox, .all]
+        case .moveTrash:
+            return [.trash]
+        case .markSpam:
+            return [.spam]
+        case .star:
+            return [.starred]
+        case .unstar, .markRead, .markUnread, .deleteForever:
+            return []
         }
     }
 
@@ -3537,8 +4376,96 @@ public final class InboxStore: ObservableObject {
         )
     }
 
+    /// Retires the currently visible account before an OfflineFirstAppClient
+    /// destructive operation is allowed to remove SQLite rows or the account
+    /// encryption key. The actor call is a drain barrier for writes already
+    /// submitted to the worker; the epoch fence rejects old callers that have
+    /// not reached the worker yet.
+    private func prepareLocalMailStoreForAccountPurge() async {
+        let retiringWriteGeneration = accountOperationGeneration
+        localMailStoreWritesBlocked = true
+        invalidateAccountScopedOperations()
+        await localMailStoreWorker.invalidateWritesAndDrain(
+            through: retiringWriteGeneration
+        )
+    }
+
+    private func persistLocalSession(
+        _ session: AppSessionResponse,
+        operationGeneration: UInt
+    ) async {
+        guard !localMailStoreWritesBlocked else {
+            return
+        }
+        await localMailStoreWorker.writeSession(
+            session,
+            operationGeneration: operationGeneration
+        )
+    }
+
+    private func persistLocalMailbox(
+        _ mailbox: MailboxResponse,
+        userID: String,
+        label: MailboxLabel,
+        operationGeneration: UInt
+    ) async {
+        guard !localMailStoreWritesBlocked else {
+            return
+        }
+        await localMailStoreWorker.writeMailbox(
+            mailbox,
+            userID: userID,
+            label: label,
+            operationGeneration: operationGeneration
+        )
+    }
+
+    private func persistLocalMailbox(
+        _ mailbox: MailboxResponse,
+        userID: String,
+        label: MailboxLabel,
+        removingThreadIDs: [String],
+        reenteringThreadIDs: [String],
+        reentryLabels: [MailboxLabel],
+        operationGeneration: UInt
+    ) async {
+        guard !localMailStoreWritesBlocked else {
+            return
+        }
+        await localMailStoreWorker.writeMailbox(
+            mailbox,
+            userID: userID,
+            label: label,
+            removingThreadIDs: removingThreadIDs,
+            reenteringThreadIDs: reenteringThreadIDs,
+            reentryLabels: reentryLabels,
+            operationGeneration: operationGeneration
+        )
+    }
+
+    private func persistLocalThread(
+        _ thread: ThreadReaderResponse,
+        userID: String,
+        threadID: String,
+        operationGeneration: UInt
+    ) async {
+        guard !localMailStoreWritesBlocked else {
+            return
+        }
+        await localMailStoreWorker.writeThread(
+            thread,
+            userID: userID,
+            threadID: threadID,
+            operationGeneration: operationGeneration
+        )
+    }
+
     private func invalidateAccountScopedOperations() {
         accountOperationGeneration &+= 1
+        for authorization in attachmentOpenAuthorizations.values {
+            authorization.invalidate()
+        }
+        attachmentOpenAuthorizations = [:]
         readerLabelMutationOwners = [:]
         readerLabelMutationGenerations = [:]
         readerLabelMutationLabelGenerations = [:]
@@ -3559,6 +4486,9 @@ public final class InboxStore: ObservableObject {
         eventRefreshTask = nil
         postSendRefreshTask?.cancel()
         postSendRefreshTask = nil
+        readinessRefreshOwnerID = nil
+        readinessRefreshTask?.cancel()
+        readinessRefreshTask = nil
         for task in bodyRefreshTasks.values {
             task.cancel()
         }
@@ -3573,23 +4503,56 @@ public final class InboxStore: ObservableObject {
         pendingSearchCompletionRefresh = false
         cancelFolderCountRefresh()
         lastCompletedFolderCountsRefreshAt = nil
-        resetMailboxPagination()
+        resetAllMailboxPagination()
     }
 
-    private func resetMailboxPagination() {
-        mailboxPageGeneration &+= 1
-        inFlightMailboxPage?.cancel()
-        inFlightMailboxPage = nil
-        mailboxPageRequestID = nil
+    private func mailboxPageGeneration(for key: MailboxPaginationKey) -> UInt {
+        mailboxPageGenerations[key, default: 0]
+    }
+
+    private func resetMailboxPagination(for key: MailboxPaginationKey) {
+        mailboxPageGenerations[key] = mailboxPageGeneration(for: key) &+ 1
+        inFlightMailboxPages[key]?.cancel()
+        inFlightMailboxPages[key] = nil
+        mailboxPageRequestIDs[key] = nil
+        updateVisibleMailboxPageLoading()
+    }
+
+    private func resetSearchMailboxPagination() {
+        let keys = Set(inFlightMailboxPages.keys)
+            .union(mailboxPageGenerations.keys)
+            .filter { $0.searchQuery != nil }
+        for key in keys {
+            resetMailboxPagination(for: key)
+        }
+    }
+
+    private func resetAllMailboxPagination() {
+        let keys = Set(inFlightMailboxPages.keys).union(mailboxPageGenerations.keys)
+        for key in keys {
+            resetMailboxPagination(for: key)
+        }
         mailboxPageLoading = false
+    }
+
+    private func updateVisibleMailboxPageLoading() {
+        let key = MailboxPaginationKey(
+            label: activeMailboxLabel,
+            searchQuery: searchQuery.isEmpty ? nil : searchQuery
+        )
+        mailboxPageLoading = inFlightMailboxPages[key] != nil
+    }
+
+    private func paginationContextIsCurrent(_ context: MailboxPageContext) -> Bool {
+        context.generation == mailboxPageGeneration(for: context.paginationKey)
+            && context.userID == session?.user.id
     }
 
     private func matchesMailboxPageContext(_ context: MailboxPageContext) -> Bool {
         let searchMatches = context.searchQuery.map { isSearchActive && searchQuery == $0 } ?? !isSearchActive
-        return context.generation == mailboxPageGeneration
+        return paginationContextIsCurrent(context)
             && context.label == activeMailboxLabel
             && searchMatches
-            && context.userID == session?.user.id
     }
 
     private static func isCompleteMailboxSnapshot(_ mailbox: MailboxResponse) -> Bool {
@@ -3601,6 +4564,52 @@ public final class InboxStore: ObservableObject {
         let visibleRows = mailbox.sections.reduce(0) { $0 + $1.rows.count }
         let loadedThreads = max(mailbox.loadedThreads ?? visibleRows, visibleRows)
         return loadedThreads >= mailbox.totalThreads && visibleRows >= mailbox.totalThreads
+    }
+
+    private static func isConfirmedEmptyMailbox(
+        _ mailbox: MailboxResponse,
+        progress: MailboxSyncProgress? = nil
+    ) -> Bool {
+        guard mailbox.totalThreads == 0,
+              mailbox.sections.allSatisfy({ $0.rows.isEmpty }),
+              mailbox.nextCursor?.isEmpty != false else {
+            return false
+        }
+        guard mailbox.loadedThreads == nil || mailbox.loadedThreads == 0 else {
+            return false
+        }
+        let completeLegacySnapshot = mailbox.fullImportRunning != true
+            && mailbox.fullImportCompleted != false
+        let explicitlyConfirmedInitialWindow = progress?.initialWindowComplete == true
+            && max(0, progress?.initialTargetCount ?? 0) == 0
+            && max(0, progress?.initialMetadataCount ?? 0) == 0
+            && max(0, progress?.estimatedTotalCount ?? 0) == 0
+        return completeLegacySnapshot || explicitlyConfirmedInitialWindow
+    }
+
+    private static func isVerifiedMailboxSnapshot(
+        _ mailbox: MailboxResponse,
+        progress: MailboxSyncProgress
+    ) -> Bool {
+        let rows = mailbox.sections.flatMap(\.rows)
+        let rowIDs = rows.map(\.threadID)
+        guard Set(rowIDs).count == rowIDs.count else {
+            return false
+        }
+        if isConfirmedEmptyMailbox(mailbox, progress: progress) {
+            return true
+        }
+        if isCompleteMailboxSnapshot(mailbox) {
+            return true
+        }
+
+        let estimatedTotal = max(0, max(progress.estimatedTotalCount ?? 0, mailbox.totalThreads))
+        let initialTarget = max(0, progress.initialTargetCount ?? min(100, estimatedTotal))
+        let committedBatchTarget = min(25, initialTarget)
+        guard committedBatchTarget > 0 else {
+            return false
+        }
+        return max(0, progress.initialMetadataCount ?? 0) >= committedBatchTarget
     }
 
     private static func validateCompletedMailboxSnapshot(_ mailbox: MailboxResponse) throws {
@@ -3626,6 +4635,43 @@ public final class InboxStore: ObservableObject {
         }
     }
 
+    private static func mailboxPaginationIdentityMatches(
+        _ current: MailboxResponse,
+        _ page: MailboxResponse
+    ) -> Bool {
+        let currentGeneration = current.syncGeneration?.isEmpty == false ? current.syncGeneration : nil
+        let pageGeneration = page.syncGeneration?.isEmpty == false ? page.syncGeneration : nil
+        switch (currentGeneration, pageGeneration) {
+        case let (.some(currentGeneration), .some(pageGeneration)):
+            // A sync generation owns a stable-ID/keyset cursor chain. Counts,
+            // revisions, and progress may all advance while that import runs.
+            return currentGeneration == pageGeneration
+        case (nil, nil):
+            // Legacy servers do not expose a generation fence, so retain the
+            // stricter revision contract for their cursor chains.
+            return current.totalThreads == page.totalThreads
+                && mailboxRevisionsMatch(current, page)
+        default:
+            return false
+        }
+    }
+
+    private static func mailboxRevisionChangedWithinGeneration(
+        _ current: MailboxResponse,
+        _ incoming: MailboxResponse
+    ) -> Bool {
+        guard current.label == incoming.label,
+              normalizedMailboxGeneration(current.syncGeneration)
+                == normalizedMailboxGeneration(incoming.syncGeneration),
+              let currentRevision = current.mailboxRevision?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !currentRevision.isEmpty,
+              let incomingRevision = incoming.mailboxRevision?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !incomingRevision.isEmpty else {
+            return false
+        }
+        return currentRevision != incomingRevision
+    }
+
     private func mailboxRow(threadID: String) -> GmailThreadRow? {
         activeMailbox?.sections.lazy.flatMap(\.rows).first { $0.threadID == threadID }
     }
@@ -3638,6 +4684,19 @@ public final class InboxStore: ObservableObject {
             return activeMailbox
         }
         return nil
+    }
+
+    private var preferredMailboxSyncProgress: MailboxSyncProgress {
+        mailboxSyncProgress(for: activeMailbox)
+    }
+
+    private func mailboxSyncProgress(for mailbox: MailboxResponse?) -> MailboxSyncProgress {
+        MailboxSyncProgress.newestMerged([
+            session?.readiness.mailboxSyncProgress,
+            session?.sync.mailboxSyncProgress,
+            syncState?.mailboxSyncProgress,
+            mailbox?.mailboxSyncProgress,
+        ].compactMap { $0 })
     }
 
     private func visibleRows(in section: GmailThreadSection) -> [GmailThreadRow] {
@@ -3660,6 +4719,7 @@ public final class InboxStore: ObservableObject {
     }
 
     private func refreshPendingLocalActionCount() async {
+        let operationGeneration = accountOperationGeneration
         guard let userID = session?.user.id else {
             if pendingLocalActionCount != 0 {
                 pendingLocalActionCount = 0
@@ -3667,6 +4727,10 @@ public final class InboxStore: ObservableObject {
             return
         }
         let nextCount = await localMailStoreWorker.pendingThreadActionCount(userID: userID)
+        guard operationGeneration == accountOperationGeneration,
+              session?.user.id == userID else {
+            return
+        }
         if pendingLocalActionCount != nextCount {
             pendingLocalActionCount = nextCount
         }
@@ -3778,7 +4842,8 @@ private extension ThreadReaderResponse {
                     return message
                 }
                 return message.settingLabel(labelID, isPresent: isPresent)
-            }
+            },
+            contentRevision: contentRevision
         )
     }
 

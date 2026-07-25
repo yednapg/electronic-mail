@@ -18,6 +18,7 @@ struct EmailReaderView: View {
     let onRespond: (MailComposerMode, String) -> Void
     let onThreadAction: (GmailThreadAction, String?) -> Void
     let onOpenAttachment: (ThreadAttachment, String) -> Void
+    let isAttachmentDownloading: (ThreadAttachment, String) -> Bool
 
     @State private var expandedMessageKeys: Set<EmailThreadPresentationItem.ID> = []
     @State private var summaryExpanded = false
@@ -53,7 +54,8 @@ struct EmailReaderView: View {
                                 onRetry: onRetry,
                                 onRespond: onRespond,
                                 onThreadAction: onThreadAction,
-                                onOpenAttachment: onOpenAttachment
+                                onOpenAttachment: onOpenAttachment,
+                                isAttachmentDownloading: isAttachmentDownloading
                             )
                         } else {
                             GroupedEmailContent(
@@ -74,6 +76,7 @@ struct EmailReaderView: View {
                                 onRespond: onRespond,
                                 onThreadAction: onThreadAction,
                                 onOpenAttachment: onOpenAttachment,
+                                isAttachmentDownloading: isAttachmentDownloading,
                                 onFocusedMessageKey: { messageKey in
                                     scrollProxy.scrollTo(messageKey, anchor: .center)
                                 }
@@ -151,6 +154,7 @@ private struct SingleEmailContent: View {
     let onRespond: (MailComposerMode, String) -> Void
     let onThreadAction: (GmailThreadAction, String?) -> Void
     let onOpenAttachment: (ThreadAttachment, String) -> Void
+    let isAttachmentDownloading: (ThreadAttachment, String) -> Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -180,6 +184,7 @@ private struct SingleEmailContent: View {
                     onRespond: onRespond,
                     onThreadAction: onThreadAction,
                     onOpenAttachment: onOpenAttachment,
+                    isAttachmentDownloading: isAttachmentDownloading,
                     onToggle: {}
                 )
                 .padding(.top, 44)
@@ -209,6 +214,7 @@ private struct GroupedEmailContent: View {
     let onRespond: (MailComposerMode, String) -> Void
     let onThreadAction: (GmailThreadAction, String?) -> Void
     let onOpenAttachment: (ThreadAttachment, String) -> Void
+    let isAttachmentDownloading: (ThreadAttachment, String) -> Bool
     let onFocusedMessageKey: (EmailThreadPresentationItem.ID) -> Void
 
     var body: some View {
@@ -252,7 +258,8 @@ private struct GroupedEmailContent: View {
                             mailboxLabel: mailboxLabel,
                             onRespond: onRespond,
                             onThreadAction: onThreadAction,
-                            onOpenAttachment: onOpenAttachment
+                            onOpenAttachment: onOpenAttachment,
+                            isAttachmentDownloading: isAttachmentDownloading
                         ) {
                             toggle(item.id, latestMessageKey: presentation.latestMessageKey)
                         }
@@ -1220,7 +1227,7 @@ private struct EmailHTMLPreparedDocument: @unchecked Sendable {
 
 enum EmailRemoteImagePolicy {
     static func renderDocument(from html: String) -> String {
-        let policy = "default-src 'none'; img-src https: data: cid:; style-src 'unsafe-inline'; font-src data:; media-src data:; frame-src 'none'; script-src 'none'"
+        let policy = "default-src 'none'; img-src electronicmail-image: data: cid:; style-src 'unsafe-inline'; font-src data:; media-src data:; frame-src 'none'; script-src 'none'"
         let meta = #"<meta http-equiv="Content-Security-Policy" content="\#(policy)">"#
         if let headRange = html.range(of: #"(?i)<head(?:\s[^>]*)?>"#, options: .regularExpression) {
             var result = html
@@ -1429,6 +1436,10 @@ enum EmailHTMLWebViewPolicy {
     static func configure(_ configuration: WKWebViewConfiguration) {
         configuration.websiteDataStore = .nonPersistent()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = false
+        configuration.setURLSchemeHandler(
+            EmailRemoteImageSchemeHandler(),
+            forURLScheme: EmailRemoteImageSchemeHandler.scheme
+        )
     }
 }
 
@@ -1864,6 +1875,7 @@ private struct EmailMessageCard: View {
     let onRespond: (MailComposerMode, String) -> Void
     let onThreadAction: (GmailThreadAction, String?) -> Void
     let onOpenAttachment: (ThreadAttachment, String) -> Void
+    let isAttachmentDownloading: (ThreadAttachment, String) -> Bool
     let onToggle: () -> Void
 
     @State private var detailsExpanded = false
@@ -1954,6 +1966,9 @@ private struct EmailMessageCard: View {
                 EmailAttachmentsView(
                     attachments: message.attachments,
                     colorScheme: colorScheme,
+                    isDownloading: { attachment in
+                        isAttachmentDownloading(attachment, message.id)
+                    },
                     onOpen: { attachment in
                         onOpenAttachment(attachment, message.id)
                     }
@@ -1986,11 +2001,13 @@ private struct EmailMessageCard: View {
 private struct EmailAttachmentsView: View {
     let attachments: [ThreadAttachment]
     let colorScheme: ColorScheme
+    let isDownloading: (ThreadAttachment) -> Bool
     let onOpen: (ThreadAttachment) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(attachments) { attachment in
+                let downloading = isDownloading(attachment)
                 Button {
                     onOpen(attachment)
                 } label: {
@@ -2016,9 +2033,15 @@ private struct EmailAttachmentsView: View {
 
                         Spacer(minLength: 12)
 
-                        Image(systemName: "arrow.down.circle")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(ElectronicMailDesign.tertiaryText(for: colorScheme))
+                        if downloading {
+                            ProgressView()
+                                .controlSize(.small)
+                                .accessibilityLabel("Downloading \(attachment.filename)")
+                        } else {
+                            Image(systemName: "arrow.down.circle")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(ElectronicMailDesign.tertiaryText(for: colorScheme))
+                        }
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
@@ -2033,6 +2056,7 @@ private struct EmailAttachmentsView: View {
                     }
                 }
                 .buttonStyle(.plain)
+                .disabled(downloading)
                 .help("Open \(attachment.filename)")
             }
         }
@@ -2893,7 +2917,8 @@ private extension Array where Element: Hashable {
         onRetry: {},
         onRespond: { _, _ in },
         onThreadAction: { _, _ in },
-        onOpenAttachment: { _, _ in }
+        onOpenAttachment: { _, _ in },
+        isAttachmentDownloading: { _, _ in false }
     )
     .frame(width: 1440, height: 900)
 }

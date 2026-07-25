@@ -5,6 +5,7 @@ from __future__ import annotations
 from base64 import urlsafe_b64decode
 from collections import deque
 import asyncio
+import hashlib
 import json
 import logging
 from threading import BoundedSemaphore, Lock
@@ -16,11 +17,17 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
+from pydantic import BaseModel, Field
 
 from app.core.config import load_settings
-from app.core.error_safety import safe_google_error
+from app.core.error_safety import GoogleCredentialsUnavailable, external_error_status, safe_google_error
 from app.db.jobs import enqueue_job
-from app.db.mail_groups import MailboxCursorError, MailSendIdempotencyConflict, list_messages_by_ids
+from app.db.mail_groups import (
+    MailboxCursorError,
+    MailSendIdempotencyConflict,
+    get_gmail_thread_snapshot_stats,
+    list_messages_by_ids,
+)
 from app.db.repository import get_user_by_email
 from app.db.user_mail_guard import UserMailWorkBlocked
 from app.schemas.domain import MailComposeRequest, MailDraftResponse, MailDraftSaveRequest, MailDraftSendRequest, MailReplyRequest, MailSendResponse, MailboxRealtimeStateResponse, MailboxResponse, MailboxSyncStateResponse, MailboxSyncTriggerResponse, QueuedThreadActionRequest, QueuedThreadActionResponse, ThreadReaderResponse
@@ -40,6 +47,7 @@ from app.services.mailbox_events import GMAIL_PUBSUB_RECEIVED, HEARTBEAT, SYNC_S
 from app.services.mailbox_search import enqueue_mailbox_search_hydration
 from app.services.mailbox_sends import _validate_subject, _validated_addresses, _validated_attachments, get_send_status, list_outbox_statuses, retry_send, send_compose, send_reply
 from app.services.mail_groups import build_app_session_response, build_group_detail_response, build_mailbox_realtime_state, build_mailbox_response, build_mailbox_sync_state, enqueue_mailbox_sync, gmail_attachments_for_message, refresh_app_session_snapshot
+from app.services.remote_images import RemoteImageBlocked, RemoteImageError, RemoteImageTokenError, decode_remote_image_asset_id, fetch_remote_image
 
 router = APIRouter(tags=["mailbox"])
 MAX_PUBSUB_BODY_BYTES = 64 * 1024
@@ -49,8 +57,26 @@ PUBSUB_VERIFICATION_CONCURRENCY = 8
 PUBSUB_VERIFICATION_RETRY_AFTER_SECONDS = 1
 PUBSUB_VERIFIED_MAXIMUM = 120
 PUBSUB_VERIFIED_WINDOW_SECONDS = 60
+MAX_BATCH_THREAD_MESSAGES = 500
+MAX_BATCH_THREAD_STORED_BYTES = 8 * 1024 * 1024
+MAX_BATCH_THREAD_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_BATCH_RESPONSE_BYTES = 24 * 1024 * 1024
 settings = load_settings()
 logger = logging.getLogger(__name__)
+
+
+class MailboxThreadBatchRequest(BaseModel):
+    """Bounded native request for complete offline-ready conversations."""
+
+    thread_ids: list[str] = Field(min_length=1, max_length=20)
+
+
+class MailboxThreadBatchResponse(BaseModel):
+    """Complete snapshots plus IDs that are still hydrating or gone."""
+
+    threads: list[ThreadReaderResponse] = Field(default_factory=list)
+    pending_thread_ids: list[str] = Field(default_factory=list)
+    missing_thread_ids: list[str] = Field(default_factory=list)
 
 
 class _VerifiedPubSubRateLimiter:
@@ -155,6 +181,89 @@ def mailbox_thread(
     return detail
 
 
+@router.post("/v1/mailbox/threads/batch", response_model=MailboxThreadBatchResponse)
+def mailbox_threads_batch(request: Request, payload: MailboxThreadBatchRequest) -> MailboxThreadBatchResponse:
+    """Return complete bounded snapshots while cold/oversized threads stay pending."""
+    user = require_current_user(settings, request)
+    unique_thread_ids = list(dict.fromkeys(thread_id.strip() for thread_id in payload.thread_ids if thread_id.strip()))
+    if not unique_thread_ids:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Add at least one thread ID")
+
+    snapshot_stats = get_gmail_thread_snapshot_stats(
+        str(settings.database_path),
+        user_id=user.id,
+        gmail_thread_ids=unique_thread_ids,
+    )
+    threads: list[ThreadReaderResponse] = []
+    pending_thread_ids: list[str] = []
+    missing_thread_ids: list[str] = []
+    response_bytes = 0
+    for thread_id in unique_thread_ids:
+        stats = snapshot_stats.get(thread_id)
+        if stats is None:
+            missing_thread_ids.append(thread_id)
+            continue
+        estimated_response_bytes = max(stats.stored_bytes * 2, stats.message_count * 2_048)
+        if (
+            stats.incomplete_body_count > 0
+            or stats.message_count > MAX_BATCH_THREAD_MESSAGES
+            or stats.stored_bytes > MAX_BATCH_THREAD_STORED_BYTES
+            or estimated_response_bytes > MAX_BATCH_THREAD_RESPONSE_BYTES
+            or response_bytes + estimated_response_bytes > MAX_BATCH_RESPONSE_BYTES
+        ):
+            pending_thread_ids.append(thread_id)
+            continue
+
+        detail = build_group_detail_response(
+            settings,
+            user_id=user.id,
+            group_id=thread_id,
+            # A DB-side aggregate predicate applies these caps in the same
+            # statement that transfers rows. A concurrent thread expansion can
+            # therefore become pending, but can never produce a partial result
+            # or materialize an unbounded response in this process.
+            limit=min(stats.message_count, MAX_BATCH_THREAD_MESSAGES),
+            offset=0,
+            # Offline replication observes backend hydration; it must not
+            # promote an entire history crawl into reader-priority body jobs.
+            # Only an explicit single-thread open uses the priority-100 path.
+            promote_body_fetch=False,
+            maximum_snapshot_messages=MAX_BATCH_THREAD_MESSAGES,
+            maximum_snapshot_stored_bytes=MAX_BATCH_THREAD_STORED_BYTES,
+        )
+        if detail is None:
+            # It existed during preflight, so a bounded read returning no rows
+            # means it either grew beyond the cap or changed concurrently.
+            # Both are retryable/pending rather than proof of deletion.
+            pending_thread_ids.append(thread_id)
+        elif detail.has_more or any(not message.body_complete for message in detail.messages):
+            pending_thread_ids.append(thread_id)
+        else:
+            serialized_bytes = _serialized_model_bytes(detail)
+            if (
+                serialized_bytes > MAX_BATCH_THREAD_RESPONSE_BYTES
+                or response_bytes + serialized_bytes > MAX_BATCH_RESPONSE_BYTES
+            ):
+                pending_thread_ids.append(thread_id)
+            else:
+                threads.append(detail)
+                response_bytes += serialized_bytes
+    return MailboxThreadBatchResponse(
+        threads=threads,
+        pending_thread_ids=pending_thread_ids,
+        missing_thread_ids=missing_thread_ids,
+    )
+
+
+def _serialized_model_bytes(model: BaseModel) -> int:
+    """Measure the exact JSON boundary without retaining a second copy."""
+
+    model_dump_json = getattr(model, "model_dump_json", None)
+    if callable(model_dump_json):
+        return len(model_dump_json().encode("utf-8"))
+    return len(model.json().encode("utf-8"))
+
+
 @router.get("/v1/mailbox/messages/{message_id}/attachments/{attachment_id}")
 def mailbox_attachment(request: Request, message_id: str, attachment_id: str) -> Response:
     user = require_current_user(settings, request)
@@ -174,17 +283,80 @@ def mailbox_attachment(request: Request, message_id: str, attachment_id: str) ->
             raise RuntimeError("Gmail attachment payload is empty")
         padding = "=" * (-len(raw_data) % 4)
         content = urlsafe_b64decode(f"{raw_data}{padding}".encode())
-    except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    except GoogleCredentialsUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=safe_google_error(exc, operation="attachment request"),
+        ) from exc
     except Exception as exc:
+        provider_status = external_error_status(exc)
+        if provider_status == status.HTTP_404_NOT_FOUND:
+            # Gmail can remove an attachment between metadata import and the
+            # user's click. This is terminal for this descriptor; returning a
+            # real 404 lets native clients discard stale local content instead
+            # of retrying a permanent failure as a gateway outage.
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Attachment no longer exists",
+            ) from exc
+        if provider_status in {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN}:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=safe_google_error(exc, operation="attachment request"),
+            ) from exc
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unable to fetch Gmail attachment") from exc
 
     filename = _safe_attachment_filename(attachment.filename)
+    etag = f'"{hashlib.sha256(content).hexdigest()}"'
+    cache_headers = {
+        "Cache-Control": "private, max-age=31536000, immutable",
+        "Content-Length": str(len(content)),
+        "ETag": etag,
+    }
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=cache_headers)
     return Response(
         content=content,
         media_type=attachment.mime_type or "application/octet-stream",
-        headers={"Content-Disposition": _attachment_content_disposition(filename)},
+        headers={
+            **cache_headers,
+            "Content-Disposition": _attachment_content_disposition(filename),
+        },
     )
+
+
+@router.get("/v1/mailbox/remote-images/{asset_id}")
+def mailbox_remote_image(request: Request, asset_id: str) -> Response:
+    """Fetch one message-bound image without exposing the sender URL to WebKit."""
+    user = require_current_user(settings, request)
+    try:
+        asset = decode_remote_image_asset_id(settings, user_id=user.id, asset_id=asset_id)
+    except RemoteImageTokenError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image asset not found") from exc
+
+    messages = list_messages_by_ids(
+        str(settings.database_path),
+        user_id=user.id,
+        message_ids=[asset.message_id],
+    )
+    if not messages:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image asset not found")
+    try:
+        image = fetch_remote_image(asset.source_url)
+    except RemoteImageBlocked as exc:
+        logger.info("Suppressed unsafe remote image user_id=%s message_id=%s", user.id, asset.message_id)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image was suppressed") from exc
+    except RemoteImageError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Remote image could not be loaded") from exc
+
+    headers = {
+        "Cache-Control": "private, max-age=86400",
+        "Content-Length": str(len(image.content)),
+        "ETag": image.etag,
+    }
+    if request.headers.get("if-none-match") == image.etag:
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    return Response(content=image.content, media_type=image.mime_type, headers=headers)
 
 
 @router.post("/v1/mailbox/thread-actions", response_model=QueuedThreadActionResponse, status_code=202)
