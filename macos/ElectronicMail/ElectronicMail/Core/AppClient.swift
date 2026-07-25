@@ -50,6 +50,14 @@ public struct DownloadedAttachment: Equatable {
     let filename: String
     let mimeType: String?
     let data: Data
+    let etag: String?
+
+    public init(filename: String, mimeType: String?, data: Data, etag: String? = nil) {
+        self.filename = filename
+        self.mimeType = mimeType
+        self.data = data
+        self.etag = etag
+    }
 }
 
 public struct MailboxServerEvent: Equatable {
@@ -136,6 +144,8 @@ public protocol AppClient: AnyObject {
         hydrateInBackground: Bool
     ) async throws -> MailboxResponse
     func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse
+    func batchThreads(threadIDs: [String]) async throws -> MailboxThreadBatchResponse
+    func observeHydratedThreads(_ threads: [MailboxHydratedThreadState], userID: String) async
     func mailboxSyncState() async throws -> MailboxSyncStateResponse
     func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse
     func syncMailboxNow() async throws -> MailboxSyncTriggerResponse
@@ -190,6 +200,12 @@ public extension AppClient {
     func mailboxSyncState() async throws -> MailboxSyncStateResponse {
         throw APIError.httpStatus(501)
     }
+
+    func batchThreads(threadIDs: [String]) async throws -> MailboxThreadBatchResponse {
+        throw APIError.httpStatus(501)
+    }
+
+    func observeHydratedThreads(_ threads: [MailboxHydratedThreadState], userID: String) async {}
 
     func sendCompose(_ request: MailComposeRequest) async throws -> MailSendResponse {
         throw APIError.httpStatus(501)
@@ -357,6 +373,16 @@ public final class LiveBackendAppClient: AppClient {
         )
     }
 
+    public func batchThreads(threadIDs: [String]) async throws -> MailboxThreadBatchResponse {
+        var seen = Set<String>()
+        let normalized = threadIDs.filter { !$0.isEmpty && seen.insert($0).inserted }
+        guard !normalized.isEmpty, normalized.count <= 20 else {
+            throw APIError.httpStatus(422)
+        }
+        let body = try JSONEncoder.backend.encode(["thread_ids": normalized])
+        return try await request(path: "/v1/mailbox/threads/batch", method: "POST", body: body)
+    }
+
     public func mailboxSyncState() async throws -> MailboxSyncStateResponse {
         try await request(path: "/v1/mailbox/sync-state")
     }
@@ -441,8 +467,13 @@ public final class LiveBackendAppClient: AppClient {
     public func downloadAttachment(messageID: String, attachment: ThreadAttachment) async throws -> DownloadedAttachment {
         let path = attachment.downloadURL
             ?? "/v1/mailbox/messages/\(messageID.urlPathEncoded)/attachments/\(attachment.attachmentID.urlPathEncoded)"
-        let data = try await rawRequest(path: path)
-        return DownloadedAttachment(filename: attachment.filename, mimeType: attachment.mimeType, data: data)
+        let (data, response) = try await rawRequest(path: path)
+        return DownloadedAttachment(
+            filename: attachment.filename,
+            mimeType: attachment.mimeType ?? response.value(forHTTPHeaderField: "Content-Type"),
+            data: data,
+            etag: response.value(forHTTPHeaderField: "ETag")
+        )
     }
 
     public func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
@@ -502,7 +533,7 @@ public final class LiveBackendAppClient: AppClient {
         return try decoder.decode(Response.self, from: data)
     }
 
-    private func rawRequest(path: String) async throws -> Data {
+    private func rawRequest(path: String) async throws -> (Data, HTTPURLResponse) {
         let url = try authenticatedURL(path: path)
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.httpMethod = "GET"
@@ -518,7 +549,7 @@ public final class LiveBackendAppClient: AppClient {
         guard (200..<300).contains(httpResponse.statusCode) else {
             throw APIError.httpStatus(httpResponse.statusCode)
         }
-        return data
+        return (data, httpResponse)
     }
 
     private func authenticatedURL(path: String) throws -> URL {

@@ -20,7 +20,11 @@ ALEMBIC_REVISION_PROBE = (
     "SELECT MIN(version_num) FROM alembic_version HAVING COUNT(*) = 1"
 )
 REQUIRED_SCHEMA_PROBES = (
-    "SELECT body_fetch_status, render_doc_bytes FROM gmail_messages LIMIT 1",
+    (
+        "SELECT body_fetch_status, body_fetch_updated_at, render_doc_bytes, "
+        "content_revision, attachment_descriptors_json, attachment_descriptors_ready "
+        "FROM gmail_messages LIMIT 1"
+    ),
     "SELECT 1 FROM mail_groups LIMIT 1",
     "SELECT 1 FROM app_session_snapshots LIMIT 1",
     "SELECT previous_labels_json FROM gmail_pending_thread_actions LIMIT 1",
@@ -34,10 +38,19 @@ REQUIRED_SCHEMA_PROBES = (
     (
         "SELECT reconcile_generation, reconcile_cursor, "
         "reconcile_baseline_history_id, reconcile_started_at, last_delta_sync_at, "
-        "history_cursor_authoritative "
+        "history_cursor_authoritative, sync_generation, phase, initial_target_count, "
+        "initial_metadata_count, initial_body_target_count, initial_body_ready_count, "
+        "history_metadata_count, history_body_ready_count, estimated_total_count, "
+        "initial_window_complete, history_metadata_complete, history_body_complete, "
+        "last_progress_at, attachment_descriptors_complete "
         "FROM gmail_import_state LIMIT 1"
     ),
     "SELECT generation_id, message_id FROM gmail_reconcile_seen LIMIT 1",
+    (
+        "SELECT generation_id, gmail_thread_id, position, message_count, "
+        "metadata_ready_at, body_ready_at "
+        "FROM gmail_initial_window_entries LIMIT 1"
+    ),
     "SELECT release_sha FROM worker_heartbeats LIMIT 1",
 )
 

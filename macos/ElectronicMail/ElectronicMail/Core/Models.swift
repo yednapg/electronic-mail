@@ -253,6 +253,19 @@ public struct AppSessionSyncState: Codable, Equatable {
     var lastActionSyncAt: String? = nil
     var lastActionError: String? = nil
     var lastAIError: String? = nil
+    var syncGeneration: String? = nil
+    var phase: String? = nil
+    var initialTargetCount: Int? = nil
+    var initialMetadataCount: Int? = nil
+    var initialBodyTargetCount: Int? = nil
+    var initialBodyReadyCount: Int? = nil
+    var historyMetadataCount: Int? = nil
+    var historyBodyReadyCount: Int? = nil
+    var estimatedTotalCount: Int? = nil
+    var initialWindowComplete: Bool? = nil
+    var historyMetadataComplete: Bool? = nil
+    var historyBodyComplete: Bool? = nil
+    var lastProgressAt: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case lastSyncAt = "last_sync_at"
@@ -267,6 +280,19 @@ public struct AppSessionSyncState: Codable, Equatable {
         case lastActionSyncAt = "last_action_sync_at"
         case lastActionError = "last_action_error"
         case lastAIError = "last_ai_error"
+        case syncGeneration = "sync_generation"
+        case phase
+        case initialTargetCount = "initial_target_count"
+        case initialMetadataCount = "initial_metadata_count"
+        case initialBodyTargetCount = "initial_body_target_count"
+        case initialBodyReadyCount = "initial_body_ready_count"
+        case historyMetadataCount = "history_metadata_count"
+        case historyBodyReadyCount = "history_body_ready_count"
+        case estimatedTotalCount = "estimated_total_count"
+        case initialWindowComplete = "initial_window_complete"
+        case historyMetadataComplete = "history_metadata_complete"
+        case historyBodyComplete = "history_body_complete"
+        case lastProgressAt = "last_progress_at"
     }
 }
 
@@ -282,6 +308,19 @@ public struct PostLoginReadinessResponse: Codable, Equatable {
     public let fullImportCompleted: Bool
     public let userDisplayName: String?
     public let errorMessage: String?
+    public var syncGeneration: String? = nil
+    public var phase: String? = nil
+    public var initialTargetCount: Int? = nil
+    public var initialMetadataCount: Int? = nil
+    public var initialBodyTargetCount: Int? = nil
+    public var initialBodyReadyCount: Int? = nil
+    public var historyMetadataCount: Int? = nil
+    public var historyBodyReadyCount: Int? = nil
+    public var estimatedTotalCount: Int? = nil
+    public var initialWindowComplete: Bool? = nil
+    public var historyMetadataComplete: Bool? = nil
+    public var historyBodyComplete: Bool? = nil
+    public var lastProgressAt: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case mode
@@ -295,6 +334,151 @@ public struct PostLoginReadinessResponse: Codable, Equatable {
         case fullImportCompleted = "full_import_completed"
         case userDisplayName = "user_display_name"
         case errorMessage = "error_message"
+        case syncGeneration = "sync_generation"
+        case phase
+        case initialTargetCount = "initial_target_count"
+        case initialMetadataCount = "initial_metadata_count"
+        case initialBodyTargetCount = "initial_body_target_count"
+        case initialBodyReadyCount = "initial_body_ready_count"
+        case historyMetadataCount = "history_metadata_count"
+        case historyBodyReadyCount = "history_body_ready_count"
+        case estimatedTotalCount = "estimated_total_count"
+        case initialWindowComplete = "initial_window_complete"
+        case historyMetadataComplete = "history_metadata_complete"
+        case historyBodyComplete = "history_body_complete"
+        case lastProgressAt = "last_progress_at"
+    }
+}
+
+/// A normalized view of the optional progressive Gmail sync counters exposed
+/// by app-session, readiness, mailbox, and sync-state responses. Older servers
+/// omit every field, so callers must continue to treat `nil` as unknown.
+public struct MailboxSyncProgress: Equatable, Sendable {
+    public let syncGeneration: String?
+    public let phase: String?
+    public let initialTargetCount: Int?
+    public let initialMetadataCount: Int?
+    public let initialBodyTargetCount: Int?
+    public let initialBodyReadyCount: Int?
+    public let historyMetadataCount: Int?
+    public let historyBodyReadyCount: Int?
+    public let estimatedTotalCount: Int?
+    public let initialWindowComplete: Bool?
+    public let historyMetadataComplete: Bool?
+    public let historyBodyComplete: Bool?
+    public let lastProgressAt: String?
+
+    public init(
+        syncGeneration: String? = nil,
+        phase: String? = nil,
+        initialTargetCount: Int? = nil,
+        initialMetadataCount: Int? = nil,
+        initialBodyTargetCount: Int? = nil,
+        initialBodyReadyCount: Int? = nil,
+        historyMetadataCount: Int? = nil,
+        historyBodyReadyCount: Int? = nil,
+        estimatedTotalCount: Int? = nil,
+        initialWindowComplete: Bool? = nil,
+        historyMetadataComplete: Bool? = nil,
+        historyBodyComplete: Bool? = nil,
+        lastProgressAt: String? = nil
+    ) {
+        self.syncGeneration = syncGeneration
+        self.phase = phase
+        self.initialTargetCount = initialTargetCount
+        self.initialMetadataCount = initialMetadataCount
+        self.initialBodyTargetCount = initialBodyTargetCount
+        self.initialBodyReadyCount = initialBodyReadyCount
+        self.historyMetadataCount = historyMetadataCount
+        self.historyBodyReadyCount = historyBodyReadyCount
+        self.estimatedTotalCount = estimatedTotalCount
+        self.initialWindowComplete = initialWindowComplete
+        self.historyMetadataComplete = historyMetadataComplete
+        self.historyBodyComplete = historyBodyComplete
+        self.lastProgressAt = lastProgressAt
+    }
+
+    public var hasReportedProgress: Bool {
+        syncGeneration != nil
+            || phase != nil
+            || initialTargetCount != nil
+            || initialMetadataCount != nil
+            || initialBodyTargetCount != nil
+            || initialBodyReadyCount != nil
+            || historyMetadataCount != nil
+            || historyBodyReadyCount != nil
+            || estimatedTotalCount != nil
+            || initialWindowComplete != nil
+            || historyMetadataComplete != nil
+            || historyBodyComplete != nil
+            || lastProgressAt != nil
+    }
+
+    /// Chooses the newest generation as one atomic progress stream, then
+    /// merges monotonic counters reported by different endpoints for that
+    /// generation. This prevents a stale app-session snapshot from masking a
+    /// fresher sync-state or mailbox response.
+    static func newestMerged(_ candidates: [MailboxSyncProgress]) -> MailboxSyncProgress {
+        let reported = candidates.enumerated().filter { $0.element.hasReportedProgress }
+        guard var newest = reported.first else {
+            return MailboxSyncProgress()
+        }
+        for candidate in reported.dropFirst() where isNewer(candidate, than: newest) {
+            newest = candidate
+        }
+
+        let generation = newest.element.syncGeneration
+        let compatible = reported.map(\.element).filter { $0.syncGeneration == generation }
+        return MailboxSyncProgress(
+            syncGeneration: generation,
+            phase: newest.element.phase,
+            initialTargetCount: compatible.compactMap(\.initialTargetCount).max(),
+            initialMetadataCount: compatible.compactMap(\.initialMetadataCount).max(),
+            initialBodyTargetCount: compatible.compactMap(\.initialBodyTargetCount).max(),
+            initialBodyReadyCount: compatible.compactMap(\.initialBodyReadyCount).max(),
+            historyMetadataCount: compatible.compactMap(\.historyMetadataCount).max(),
+            historyBodyReadyCount: compatible.compactMap(\.historyBodyReadyCount).max(),
+            estimatedTotalCount: compatible.compactMap(\.estimatedTotalCount).max(),
+            initialWindowComplete: monotonicCompletion(compatible.map(\.initialWindowComplete)),
+            historyMetadataComplete: monotonicCompletion(compatible.map(\.historyMetadataComplete)),
+            historyBodyComplete: monotonicCompletion(compatible.map(\.historyBodyComplete)),
+            lastProgressAt: newest.element.lastProgressAt
+        )
+    }
+
+    private static func isNewer(
+        _ lhs: (offset: Int, element: MailboxSyncProgress),
+        than rhs: (offset: Int, element: MailboxSyncProgress)
+    ) -> Bool {
+        let lhsDate = progressDate(lhs.element.lastProgressAt)
+        let rhsDate = progressDate(rhs.element.lastProgressAt)
+        switch (lhsDate, rhsDate) {
+        case let (lhsDate?, rhsDate?):
+            return lhsDate == rhsDate ? lhs.offset > rhs.offset : lhsDate > rhsDate
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        case (nil, nil):
+            return lhs.offset > rhs.offset
+        }
+    }
+
+    private static func progressDate(_ value: String?) -> Date? {
+        guard let value else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) {
+            return date
+        }
+        return ISO8601DateFormatter().date(from: value)
+    }
+
+    private static func monotonicCompletion(_ values: [Bool?]) -> Bool? {
+        if values.contains(where: { $0 == true }) {
+            return true
+        }
+        return values.contains(where: { $0 == false }) ? false : nil
     }
 }
 
@@ -476,6 +660,9 @@ public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
     let sender: String?
     let participants: [String]
     let messageCount: Int
+    var bodyReady: Bool? = nil
+    var contentRevision: String? = nil
+    var initialWindowPosition: Int? = nil
     let summary: String?
     var aiGroupID: String? = nil
     var aiTitle: String? = nil
@@ -537,6 +724,9 @@ public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
         case sender
         case participants
         case messageCount = "message_count"
+        case bodyReady = "body_ready"
+        case contentRevision = "content_revision"
+        case initialWindowPosition = "initial_window_position"
         case summary
         case aiGroupID = "ai_group_id"
         case aiTitle = "ai_title"
@@ -689,6 +879,19 @@ public struct MailboxResponse: Codable, Equatable {
     let oldestImportedAt: String?
     let fullImportRunning: Bool?
     let fullImportCompleted: Bool?
+    var syncGeneration: String? = nil
+    var phase: String? = nil
+    var initialTargetCount: Int? = nil
+    var initialMetadataCount: Int? = nil
+    var initialBodyTargetCount: Int? = nil
+    var initialBodyReadyCount: Int? = nil
+    var historyMetadataCount: Int? = nil
+    var historyBodyReadyCount: Int? = nil
+    var estimatedTotalCount: Int? = nil
+    var initialWindowComplete: Bool? = nil
+    var historyMetadataComplete: Bool? = nil
+    var historyBodyComplete: Bool? = nil
+    var lastProgressAt: String? = nil
 
     var isEmpty: Bool {
         totalThreads == 0 || sections.allSatisfy { $0.rows.isEmpty }
@@ -708,7 +911,20 @@ public struct MailboxResponse: Codable, Equatable {
         generatedAt: String? = nil,
         oldestImportedAt: String? = nil,
         fullImportRunning: Bool? = nil,
-        fullImportCompleted: Bool? = nil
+        fullImportCompleted: Bool? = nil,
+        syncGeneration: String? = nil,
+        phase: String? = nil,
+        initialTargetCount: Int? = nil,
+        initialMetadataCount: Int? = nil,
+        initialBodyTargetCount: Int? = nil,
+        initialBodyReadyCount: Int? = nil,
+        historyMetadataCount: Int? = nil,
+        historyBodyReadyCount: Int? = nil,
+        estimatedTotalCount: Int? = nil,
+        initialWindowComplete: Bool? = nil,
+        historyMetadataComplete: Bool? = nil,
+        historyBodyComplete: Bool? = nil,
+        lastProgressAt: String? = nil
     ) {
         self.label = label
         self.totalThreads = totalThreads
@@ -724,6 +940,19 @@ public struct MailboxResponse: Codable, Equatable {
         self.oldestImportedAt = oldestImportedAt
         self.fullImportRunning = fullImportRunning
         self.fullImportCompleted = fullImportCompleted
+        self.syncGeneration = syncGeneration
+        self.phase = phase
+        self.initialTargetCount = initialTargetCount
+        self.initialMetadataCount = initialMetadataCount
+        self.initialBodyTargetCount = initialBodyTargetCount
+        self.initialBodyReadyCount = initialBodyReadyCount
+        self.historyMetadataCount = historyMetadataCount
+        self.historyBodyReadyCount = historyBodyReadyCount
+        self.estimatedTotalCount = estimatedTotalCount
+        self.initialWindowComplete = initialWindowComplete
+        self.historyMetadataComplete = historyMetadataComplete
+        self.historyBodyComplete = historyBodyComplete
+        self.lastProgressAt = lastProgressAt
     }
 
     enum CodingKeys: String, CodingKey {
@@ -741,6 +970,19 @@ public struct MailboxResponse: Codable, Equatable {
         case oldestImportedAt = "oldest_imported_at"
         case fullImportRunning = "full_import_running"
         case fullImportCompleted = "full_import_completed"
+        case syncGeneration = "sync_generation"
+        case phase
+        case initialTargetCount = "initial_target_count"
+        case initialMetadataCount = "initial_metadata_count"
+        case initialBodyTargetCount = "initial_body_target_count"
+        case initialBodyReadyCount = "initial_body_ready_count"
+        case historyMetadataCount = "history_metadata_count"
+        case historyBodyReadyCount = "history_body_ready_count"
+        case estimatedTotalCount = "estimated_total_count"
+        case initialWindowComplete = "initial_window_complete"
+        case historyMetadataComplete = "history_metadata_complete"
+        case historyBodyComplete = "history_body_complete"
+        case lastProgressAt = "last_progress_at"
     }
 }
 
@@ -765,6 +1007,19 @@ public struct MailboxSyncStateResponse: Codable, Equatable {
     var lastActionSyncAt: String? = nil
     var lastActionError: String? = nil
     var lastAIError: String? = nil
+    var syncGeneration: String? = nil
+    var phase: String? = nil
+    var initialTargetCount: Int? = nil
+    var initialMetadataCount: Int? = nil
+    var initialBodyTargetCount: Int? = nil
+    var initialBodyReadyCount: Int? = nil
+    var historyMetadataCount: Int? = nil
+    var historyBodyReadyCount: Int? = nil
+    var estimatedTotalCount: Int? = nil
+    var initialWindowComplete: Bool? = nil
+    var historyMetadataComplete: Bool? = nil
+    var historyBodyComplete: Bool? = nil
+    var lastProgressAt: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case connected
@@ -787,6 +1042,19 @@ public struct MailboxSyncStateResponse: Codable, Equatable {
         case lastActionSyncAt = "last_action_sync_at"
         case lastActionError = "last_action_error"
         case lastAIError = "last_ai_error"
+        case syncGeneration = "sync_generation"
+        case phase
+        case initialTargetCount = "initial_target_count"
+        case initialMetadataCount = "initial_metadata_count"
+        case initialBodyTargetCount = "initial_body_target_count"
+        case initialBodyReadyCount = "initial_body_ready_count"
+        case historyMetadataCount = "history_metadata_count"
+        case historyBodyReadyCount = "history_body_ready_count"
+        case estimatedTotalCount = "estimated_total_count"
+        case initialWindowComplete = "initial_window_complete"
+        case historyMetadataComplete = "history_metadata_complete"
+        case historyBodyComplete = "history_body_complete"
+        case lastProgressAt = "last_progress_at"
     }
 }
 
@@ -801,6 +1069,86 @@ public struct MailboxSyncTriggerResponse: Codable, Equatable {
         case state
         case jobID = "job_id"
         case queuedAt = "queued_at"
+    }
+}
+
+extension AppSessionSyncState {
+    var mailboxSyncProgress: MailboxSyncProgress {
+        MailboxSyncProgress(
+            syncGeneration: syncGeneration,
+            phase: phase,
+            initialTargetCount: initialTargetCount,
+            initialMetadataCount: initialMetadataCount,
+            initialBodyTargetCount: initialBodyTargetCount,
+            initialBodyReadyCount: initialBodyReadyCount,
+            historyMetadataCount: historyMetadataCount,
+            historyBodyReadyCount: historyBodyReadyCount,
+            estimatedTotalCount: estimatedTotalCount,
+            initialWindowComplete: initialWindowComplete,
+            historyMetadataComplete: historyMetadataComplete,
+            historyBodyComplete: historyBodyComplete,
+            lastProgressAt: lastProgressAt
+        )
+    }
+}
+
+extension PostLoginReadinessResponse {
+    var mailboxSyncProgress: MailboxSyncProgress {
+        MailboxSyncProgress(
+            syncGeneration: syncGeneration,
+            phase: phase,
+            initialTargetCount: initialTargetCount,
+            initialMetadataCount: initialMetadataCount,
+            initialBodyTargetCount: initialBodyTargetCount,
+            initialBodyReadyCount: initialBodyReadyCount,
+            historyMetadataCount: historyMetadataCount,
+            historyBodyReadyCount: historyBodyReadyCount,
+            estimatedTotalCount: estimatedTotalCount,
+            initialWindowComplete: initialWindowComplete,
+            historyMetadataComplete: historyMetadataComplete,
+            historyBodyComplete: historyBodyComplete,
+            lastProgressAt: lastProgressAt
+        )
+    }
+}
+
+extension MailboxResponse {
+    var mailboxSyncProgress: MailboxSyncProgress {
+        MailboxSyncProgress(
+            syncGeneration: syncGeneration,
+            phase: phase,
+            initialTargetCount: initialTargetCount,
+            initialMetadataCount: initialMetadataCount,
+            initialBodyTargetCount: initialBodyTargetCount,
+            initialBodyReadyCount: initialBodyReadyCount,
+            historyMetadataCount: historyMetadataCount,
+            historyBodyReadyCount: historyBodyReadyCount,
+            estimatedTotalCount: estimatedTotalCount,
+            initialWindowComplete: initialWindowComplete,
+            historyMetadataComplete: historyMetadataComplete,
+            historyBodyComplete: historyBodyComplete,
+            lastProgressAt: lastProgressAt
+        )
+    }
+}
+
+extension MailboxSyncStateResponse {
+    var mailboxSyncProgress: MailboxSyncProgress {
+        MailboxSyncProgress(
+            syncGeneration: syncGeneration,
+            phase: phase,
+            initialTargetCount: initialTargetCount,
+            initialMetadataCount: initialMetadataCount,
+            initialBodyTargetCount: initialBodyTargetCount,
+            initialBodyReadyCount: initialBodyReadyCount,
+            historyMetadataCount: historyMetadataCount,
+            historyBodyReadyCount: historyBodyReadyCount,
+            estimatedTotalCount: estimatedTotalCount,
+            initialWindowComplete: initialWindowComplete,
+            historyMetadataComplete: historyMetadataComplete,
+            historyBodyComplete: historyBodyComplete,
+            lastProgressAt: lastProgressAt
+        )
     }
 }
 
@@ -1839,6 +2187,7 @@ public struct ThreadReaderResponse: Codable, Equatable {
     let offset: Int
     let hasMore: Bool
     let messages: [ThreadMessage]
+    var contentRevision: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case entityID = "entity_id"
@@ -1853,6 +2202,7 @@ public struct ThreadReaderResponse: Codable, Equatable {
         case offset
         case hasMore = "has_more"
         case messages
+        case contentRevision = "content_revision"
     }
 
     init(
@@ -1867,7 +2217,8 @@ public struct ThreadReaderResponse: Codable, Equatable {
         limit: Int = 50,
         offset: Int = 0,
         hasMore: Bool = false,
-        messages: [ThreadMessage]
+        messages: [ThreadMessage],
+        contentRevision: String? = nil
     ) {
         self.entityID = entityID
         self.userID = userID
@@ -1881,6 +2232,62 @@ public struct ThreadReaderResponse: Codable, Equatable {
         self.offset = offset
         self.hasMore = hasMore
         self.messages = messages
+        self.contentRevision = contentRevision
+    }
+}
+
+public struct MailboxThreadBatchResponse: Codable, Equatable {
+    public let threads: [ThreadReaderResponse]
+    public let pendingThreadIDs: [String]
+    public let missingThreadIDs: [String]
+
+    public init(
+        threads: [ThreadReaderResponse],
+        pendingThreadIDs: [String] = [],
+        missingThreadIDs: [String] = []
+    ) {
+        self.threads = threads
+        self.pendingThreadIDs = pendingThreadIDs
+        self.missingThreadIDs = missingThreadIDs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case threads
+        case pendingThreadIDs = "pending_thread_ids"
+        case missingThreadIDs = "missing_thread_ids"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        threads = try container.decodeIfPresent([ThreadReaderResponse].self, forKey: .threads) ?? []
+        pendingThreadIDs = try container.decodeIfPresent([String].self, forKey: .pendingThreadIDs) ?? []
+        missingThreadIDs = try container.decodeIfPresent([String].self, forKey: .missingThreadIDs) ?? []
+    }
+}
+
+public struct MailboxHydratedThreadState: Codable, Equatable {
+    public let threadID: String
+    public let bodyReady: Bool
+    public let contentRevision: String?
+    public let initialWindowPosition: Int?
+
+    public init(
+        threadID: String,
+        bodyReady: Bool,
+        contentRevision: String? = nil,
+        initialWindowPosition: Int? = nil
+    ) {
+        self.threadID = threadID
+        self.bodyReady = bodyReady
+        self.contentRevision = contentRevision
+        self.initialWindowPosition = initialWindowPosition
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "thread_id"
+        case bodyReady = "body_ready"
+        case contentRevision = "content_revision"
+        case initialWindowPosition = "initial_window_position"
     }
 }
 

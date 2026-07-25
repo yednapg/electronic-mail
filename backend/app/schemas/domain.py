@@ -239,6 +239,19 @@ class PostLoginReadinessResponse(BaseModel):
     full_import_completed: bool
     user_display_name: str | None = None
     error_message: str | None = None
+    sync_generation: str | None = None
+    phase: str | None = None
+    initial_target_count: int | None = None
+    initial_metadata_count: int | None = None
+    initial_body_target_count: int | None = None
+    initial_body_ready_count: int | None = None
+    history_metadata_count: int | None = None
+    history_body_ready_count: int | None = None
+    estimated_total_count: int | None = None
+    initial_window_complete: bool | None = None
+    history_metadata_complete: bool | None = None
+    history_body_complete: bool | None = None
+    last_progress_at: str | None = None
 
 
 class GmailThreadUpdate(BaseModel):
@@ -473,6 +486,9 @@ class GmailThreadRow(BaseModel):
     sender: str | None = None
     participants: list[str] = Field(default_factory=list)
     message_count: int
+    body_ready: bool = False
+    content_revision: str | None = None
+    initial_window_position: int | None = None
     summary: str | None = None
     ai_group_id: str | None = None
     ai_title: str | None = None
@@ -545,6 +561,19 @@ class MailboxResponse(BaseModel):
     oldest_imported_at: str | None = None
     full_import_running: bool = False
     full_import_completed: bool = False
+    sync_generation: str | None = None
+    phase: str | None = None
+    initial_target_count: int | None = None
+    initial_metadata_count: int | None = None
+    initial_body_target_count: int | None = None
+    initial_body_ready_count: int | None = None
+    history_metadata_count: int | None = None
+    history_body_ready_count: int | None = None
+    estimated_total_count: int | None = None
+    initial_window_complete: bool | None = None
+    history_metadata_complete: bool | None = None
+    history_body_complete: bool | None = None
+    last_progress_at: str | None = None
 
 
 class MailboxSyncStateResponse(BaseModel):
@@ -570,6 +599,19 @@ class MailboxSyncStateResponse(BaseModel):
     last_action_sync_at: str | None = None
     last_action_error: str | None = None
     last_ai_error: str | None = None
+    sync_generation: str | None = None
+    phase: str | None = None
+    initial_target_count: int | None = None
+    initial_metadata_count: int | None = None
+    initial_body_target_count: int | None = None
+    initial_body_ready_count: int | None = None
+    history_metadata_count: int | None = None
+    history_body_ready_count: int | None = None
+    estimated_total_count: int | None = None
+    initial_window_complete: bool | None = None
+    history_metadata_complete: bool | None = None
+    history_body_complete: bool | None = None
+    last_progress_at: str | None = None
 
 
 class MailboxRealtimeStateResponse(BaseModel):
@@ -671,6 +713,7 @@ class ThreadReaderResponse(BaseModel):
     offset: int
     has_more: bool
     messages: list[ThreadMessage] = Field(default_factory=list)
+    content_revision: str | None = None
 
 
 class BackgroundJobResponse(BaseModel):
@@ -729,6 +772,19 @@ class AppSessionSyncState(BaseModel):
     last_action_sync_at: str | None = None
     last_action_error: str | None = None
     last_ai_error: str | None = None
+    sync_generation: str | None = None
+    phase: str | None = None
+    initial_target_count: int | None = None
+    initial_metadata_count: int | None = None
+    initial_body_target_count: int | None = None
+    initial_body_ready_count: int | None = None
+    history_metadata_count: int | None = None
+    history_body_ready_count: int | None = None
+    estimated_total_count: int | None = None
+    initial_window_complete: bool | None = None
+    history_metadata_complete: bool | None = None
+    history_body_complete: bool | None = None
+    last_progress_at: str | None = None
 
 
 class AppSessionResponse(BaseModel):

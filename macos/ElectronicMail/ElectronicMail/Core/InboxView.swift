@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import SwiftUI
 
@@ -9,6 +10,7 @@ public struct InboxView: View {
     private let onOpenDraft: (String) -> Void
     @Binding private var searchText: String
     @State private var permanentDeleteTarget: MailboxPermanentDeleteTarget?
+    @State private var offlineStorageWarningMessage: String?
 
     public init(
         store: InboxStore,
@@ -56,6 +58,9 @@ public struct InboxView: View {
                             Task {
                                 await store.openAttachment(attachment, messageID: messageID)
                             }
+                        },
+                        isAttachmentDownloading: { attachment, messageID in
+                            store.isAttachmentDownloading(attachment, messageID: messageID)
                         }
                     )
                     .onExitCommand {
@@ -66,7 +71,9 @@ public struct InboxView: View {
                     inboxList(snapshot: snapshot, metrics: metrics)
                 }
 
-                if store.refreshFailed && store.mailboxPresentationReady {
+                if let offlineStorageWarningMessage {
+                    ElectronicMailRefreshFailureToast(message: offlineStorageWarningMessage)
+                } else if store.refreshFailed && store.mailboxPresentationReady {
                     ElectronicMailRefreshFailureToast(message: "Inbox could not refresh. Showing last saved state.")
                 }
             }
@@ -82,6 +89,21 @@ public struct InboxView: View {
         }
         .onChange(of: store.activeMailboxLabel) { _, _ in
             searchText = ""
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .offlineContentSyncStorageWarning)) { notification in
+            let warningUserID = notification.userInfo?["user_id"] as? String
+            guard warningUserID == nil || warningUserID == store.session?.user.id else {
+                return
+            }
+            let message = notification.userInfo?["message"] as? String
+                ?? "Offline mail could not be saved. Online mail is still available."
+            offlineStorageWarningMessage = message
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(8))
+                if offlineStorageWarningMessage == message {
+                    offlineStorageWarningMessage = nil
+                }
+            }
         }
         .task(id: InboxSearchTaskIdentity(query: searchText, mailboxLabel: store.activeMailboxLabel)) {
             await applySearchText()
@@ -244,6 +266,9 @@ private struct InboxRenderSnapshot: Equatable {
     let emptyStateIsLoading: Bool
     let mailboxError: String?
     let mailboxRefreshFailed: Bool
+    let footerProgressText: String?
+    let footerShowsProgress: Bool
+    let footerShowsRetry: Bool
 
     @MainActor
     init(store: InboxStore) {
@@ -296,6 +321,9 @@ private struct InboxRenderSnapshot: Equatable {
             self.mailboxError = nil
         }
         self.mailboxRefreshFailed = store.refreshFailed
+        self.footerProgressText = store.mailboxFooterProgressText
+        self.footerShowsProgress = store.mailboxFooterShowsProgress
+        self.footerShowsRetry = store.mailboxFooterShowsRetry
     }
 
     var emptyStateTitle: String {
@@ -352,6 +380,9 @@ private struct InboxRenderSnapshot: Equatable {
             && lhs.emptyStateIsLoading == rhs.emptyStateIsLoading
             && lhs.mailboxError == rhs.mailboxError
             && lhs.mailboxRefreshFailed == rhs.mailboxRefreshFailed
+            && lhs.footerProgressText == rhs.footerProgressText
+            && lhs.footerShowsProgress == rhs.footerShowsProgress
+            && lhs.footerShowsRetry == rhs.footerShowsRetry
     }
 }
 
@@ -419,6 +450,18 @@ private struct InboxMailboxList: View, Equatable {
                             }
                         }
 
+                        if snapshot.hasRows, let footerText = snapshot.footerProgressText {
+                            InboxSyncFooter(
+                                message: footerText,
+                                showsProgress: snapshot.footerShowsProgress,
+                                showsRetry: snapshot.footerShowsRetry,
+                                colorScheme: colorScheme,
+                                onRetry: onRetry
+                            )
+                            .frame(width: metrics.windowWidth)
+                            .id("mailbox-sync-footer")
+                        }
+
                     }
                     .frame(width: metrics.windowWidth, alignment: .topLeading)
                 }
@@ -470,6 +513,41 @@ private struct InboxMailboxList: View, Equatable {
         let nextRow = snapshot.flatRows[nextIndex]
         onSelect(nextRow)
         scrollProxy.scrollTo(nextRow.id, anchor: .center)
+    }
+}
+
+private struct InboxSyncFooter: View {
+    let message: String
+    let showsProgress: Bool
+    let showsRetry: Bool
+    let colorScheme: ColorScheme
+    let onRetry: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if showsProgress {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityHidden(true)
+            }
+            Text(message)
+                .font(ElectronicMailType.small())
+                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                .lineLimit(1)
+            Spacer(minLength: 12)
+            if showsRetry {
+                Button("Retry", action: onRetry)
+                    .buttonStyle(.plain)
+                    .font(ElectronicMailType.small(weight: .semibold))
+                    .foregroundStyle(ElectronicMailDesign.appleBlue)
+            }
+        }
+        .padding(.horizontal, 28)
+        .padding(.vertical, 18)
+        .transaction { transaction in
+            transaction.disablesAnimations = true
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 

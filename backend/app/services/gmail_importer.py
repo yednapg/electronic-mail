@@ -3,6 +3,7 @@ from __future__ import annotations
 """Durable Gmail raw import jobs for the mailbox product path."""
 
 import base64
+from dataclasses import asdict
 from hashlib import sha256
 import json
 import logging
@@ -14,18 +15,29 @@ from googleapiclient.errors import HttpError
 
 from app.core.config import Settings
 from app.core.error_safety import GoogleCredentialsUnavailable, safe_google_error
-from app.db.jobs import enqueue_job
+from app.db.jobs import count_active_jobs, enqueue_job
+from app.db.user_mail_guard import advisory_session_lock, gmail_body_fetch_lock_key
 from app.db.mail_groups import (
     GmailMessageRecord,
+    GmailSyncProgress,
+    backfill_gmail_attachment_descriptors_page,
+    commit_gmail_initial_window_metadata_batch,
+    commit_gmail_reconciliation_metadata_page,
     delete_gmail_messages,
     existing_gmail_message_ids,
     finalize_gmail_reconciliation,
     get_import_state,
+    gmail_sync_progress,
     gmail_history_cursor_is_authoritative,
     list_group_messages,
+    list_gmail_initial_window_positions,
+    list_gmail_initial_window_entries_needing_body_fetch,
+    list_messages_needing_body_fetch,
     list_messages_by_ids,
     list_messages_for_gmail_thread,
+    list_pending_gmail_initial_window_entries,
     mark_gmail_messages_body_fetch_state,
+    mark_gmail_history_body_complete_if_ready,
     mark_import_completed,
     mark_import_error,
     mark_import_started,
@@ -37,6 +49,8 @@ from app.db.mail_groups import (
     replace_gmail_thread_orders,
     reset_gmail_reconciliation,
     start_gmail_reconciliation,
+    start_gmail_sync_progress,
+    initialize_gmail_initial_window,
     update_gmail_message_bodies,
     upsert_gmail_messages,
     user_can_write_gmail,
@@ -47,10 +61,10 @@ from app.services.email_extraction import (
     parse_gmail_message,
 )
 from app.services.integrations.google import build_google_service, create_authorized_credentials
-from app.services.mailbox_events import MAILBOX_CHANGED, THREAD_CONTENT_HYDRATED, emit_mailbox_event
-from app.services.mail_groups import enqueue_projection_refresh, rebuild_touched_mail_groups
+from app.services.mailbox_events import MAILBOX_CHANGED, MAILBOX_SYNC_PROGRESS, THREAD_CONTENT_HYDRATED, emit_mailbox_event
+from app.services.mail_groups import _gmail_thread_content_revision, enqueue_projection_refresh, rebuild_touched_mail_groups
 
-FIRST_BATCH_SIZE = 50
+FIRST_BATCH_SIZE = 25
 BACKFILL_BATCH_SIZE = 100
 FIRST_RUN_RECENT_DAYS = 90
 FIRST_RUN_RECENT_MAX_MESSAGES = 5000
@@ -59,9 +73,14 @@ FIRST_RUN_SEED_LABELS = ("INBOX", "SENT", "DRAFT", "SPAM", "TRASH", FIRST_RUN_AL
 GMAIL_BATCH_GET_SIZE = 50
 GMAIL_HISTORY_PAGE_SIZE = 500
 GMAIL_HISTORY_MAX_PAGES_PER_SYNC = 2_000
-GMAIL_RECONCILE_BATCH_SIZE = 250
+GMAIL_INITIAL_WINDOW_MAX_THREADS = 100
+GMAIL_INITIAL_METADATA_BATCH_SIZE = 25
+GMAIL_THREAD_BATCH_GET_SIZE = 25
+GMAIL_RECONCILE_BATCH_SIZE = 100
 GMAIL_RECONCILE_PAGES_PER_JOB = 4
 GMAIL_BACKFILL_JOB_PRIORITY = 80
+GMAIL_BODY_BACKFILL_BATCH_SIZE = 25
+GMAIL_BODY_BACKFILL_RESUME_DELAY_SECONDS = 1
 GMAIL_SEARCH_PAGE_SIZE = 100
 GMAIL_SEARCH_MAX_PAGES = 5
 GMAIL_HISTORY_TYPES = ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
@@ -85,6 +104,10 @@ class GmailHistoryTraversalLimit(RuntimeError):
 
 class GmailDurablePageTokenRejected(RuntimeError):
     """Gmail rejected a persisted listing continuation token."""
+
+
+class GmailInlineAttachmentRetryable(RuntimeError):
+    """An inline Gmail asset could not be fetched on this attempt."""
 
 
 def _ai_grouping_enabled(settings: Settings) -> bool:
@@ -115,53 +138,10 @@ def run_gmail_import_batch(settings: Settings, *, user_id: str, batch_size: int,
 
     mark_import_started(database_url, user_id=user_id)
     try:
-        _ensure_gmail_reconciliation_started(settings, user_id=user_id)
-        messages, _hydrated_history_id, next_cursor = _hydrate_first_run_recent_window(
+        return _run_progressive_gmail_bootstrap(
             settings,
             user_id=user_id,
-            batch_size=batch_size,
         )
-        upsert_gmail_messages(database_url, messages)
-        backfill_cursor = next_cursor or _encode_full_mailbox_cursor()
-        mark_import_completed(
-            database_url,
-            user_id=user_id,
-            first_batch=True,
-            groups_ready=False,
-            dashboard_ready=False,
-            full_backfill_cursor=backfill_cursor,
-            clear_full_backfill_cursor=False,
-            full_backfill_started=next_cursor is None,
-        )
-        enqueue_job(
-            database_url,
-            kind="gmail_backfill",
-            queue="slow",
-            user_id=user_id,
-            dedupe_key=f"gmail-backfill:{user_id}",
-            priority=GMAIL_BACKFILL_JOB_PRIORITY,
-            payload={"user_id": user_id, "batch_size": BACKFILL_BATCH_SIZE},
-        )
-        enqueue_gmail_full_reconciliation(settings, user_id=user_id)
-        if _ai_grouping_enabled(settings):
-            enqueue_job(
-                database_url,
-                kind="first_run_ai_grouping",
-                queue="critical",
-                user_id=user_id,
-                dedupe_key=f"first-run-ai-grouping:{user_id}",
-                priority=95,
-                payload={"user_id": user_id, "batch_size": FIRST_BATCH_SIZE},
-            )
-        if messages:
-            emit_mailbox_event(
-                settings,
-                user_id=user_id,
-                event_type=MAILBOX_CHANGED,
-                mailbox_label="all",
-                payload={"source": "first_run", "message_count": len(messages)},
-            )
-        return len(messages)
     except Exception as exc:
         mark_import_error(database_url, user_id=user_id, error=safe_google_error(exc, operation="mail sync"))
         raise
@@ -237,6 +217,16 @@ def run_gmail_delta_sync(
             user_id=user_id,
             last_history_id=latest_history_id,
         )
+        progress = gmail_sync_progress(get_import_state(database_url, user_id=user_id))
+        if progress.sync_generation:
+            _emit_sync_progress(
+                settings,
+                user_id=user_id,
+                progress=progress,
+                source="recent_metadata",
+            )
+            if messages and progress.initial_body_ready_count >= progress.initial_body_target_count:
+                enqueue_gmail_body_backfill(settings, user_id=user_id)
         if messages or deleted_pending_group_ids:
             _enqueue_enrichment_and_projection(settings, user_id=user_id, priority=60)
             emit_mailbox_event(
@@ -301,6 +291,480 @@ def run_gmail_delta_sync(
         raise
 
 
+def _run_progressive_gmail_bootstrap(settings: Settings, *, user_id: str) -> int:
+    """Publish the recent window in durable 25-conversation commits."""
+    database_url = str(settings.database_path)
+    reconcile_state = _ensure_gmail_reconciliation_started(
+        settings,
+        user_id=user_id,
+        use_thread_listing=True,
+    )
+    generation_id = str(getattr(reconcile_state, "reconcile_generation", None) or "")
+    if not generation_id:
+        raise RuntimeError("Gmail bootstrap did not acquire a reconciliation generation")
+    state = start_gmail_sync_progress(
+        database_url,
+        user_id=user_id,
+        generation_id=generation_id,
+    )
+    if state is None:
+        return 0
+
+    if state.initial_target_count == 0 and not state.initial_window_complete:
+        listed = _list_initial_window_threads(settings, user_id=user_id)
+        raw_threads = listed.get("threads") if isinstance(listed.get("threads"), list) else []
+        thread_ids = list(
+            dict.fromkeys(
+                str(item["id"])
+                for item in raw_threads
+                if isinstance(item, dict) and item.get("id")
+            )
+        )[:GMAIL_INITIAL_WINDOW_MAX_THREADS]
+        estimate = _provider_result_size_estimate(listed)
+        has_continuation = bool(str(listed.get("nextPageToken") or ""))
+        if not thread_ids and (raw_threads or has_continuation or estimate > 0):
+            raise RuntimeError(
+                "Gmail returned an inconclusive initial thread window"
+            )
+        progress = initialize_gmail_initial_window(
+            database_url,
+            user_id=user_id,
+            generation_id=generation_id,
+            gmail_thread_ids=thread_ids,
+            estimated_total_count=estimate,
+        )
+        if progress is None:
+            return 0
+        _emit_sync_progress(settings, user_id=user_id, progress=progress, source="initial_discovery")
+        state = get_import_state(database_url, user_id=user_id) or state
+
+    # Metadata commits and queue inserts cannot share one transaction. Rebuild
+    # the small (max 100) idempotent body-job set on every bootstrap attempt so
+    # a process death between those operations cannot strand setup forever.
+    _ensure_initial_window_body_jobs(
+        settings,
+        user_id=user_id,
+        generation_id=generation_id,
+    )
+
+    pending = list_pending_gmail_initial_window_entries(
+        database_url,
+        user_id=user_id,
+        generation_id=generation_id,
+        limit=GMAIL_INITIAL_METADATA_BATCH_SIZE,
+    )
+    if not pending:
+        mark_import_completed(
+            database_url,
+            user_id=user_id,
+            first_batch=True,
+            groups_ready=False,
+            dashboard_ready=False,
+        )
+        enqueue_gmail_full_reconciliation(settings, user_id=user_id)
+        progress = gmail_sync_progress(get_import_state(database_url, user_id=user_id))
+        if progress.initial_body_ready_count >= progress.initial_body_target_count:
+            enqueue_gmail_body_backfill(settings, user_id=user_id)
+        _emit_sync_progress(settings, user_id=user_id, progress=progress, source="initial_metadata")
+        return 0
+
+    thread_ids = [entry.gmail_thread_id for entry in pending]
+    successful_thread_ids: set[str] = set()
+    terminal_missing_thread_ids: set[str] = set()
+    messages = _hydrate_gmail_thread_ids_metadata(
+        settings,
+        user_id=user_id,
+        gmail_thread_ids=thread_ids,
+        successful_thread_ids=successful_thread_ids,
+        terminal_missing_thread_ids=terminal_missing_thread_ids,
+    )
+    successful_thread_ids.update(
+        message.gmail_thread_id
+        for message in messages
+        if message.gmail_thread_id
+    )
+    if not (successful_thread_ids or terminal_missing_thread_ids):
+        raise RuntimeError("Gmail returned no terminal outcomes for the metadata batch")
+    progress = commit_gmail_initial_window_metadata_batch(
+        database_url,
+        user_id=user_id,
+        generation_id=generation_id,
+        gmail_thread_ids=[
+            thread_id for thread_id in thread_ids if thread_id in successful_thread_ids
+        ],
+        terminal_missing_thread_ids=[
+            thread_id for thread_id in thread_ids if thread_id in terminal_missing_thread_ids
+        ],
+        messages=messages,
+    )
+    if progress is None:
+        return 0
+
+    if messages:
+        try:
+            rebuild_touched_mail_groups(
+                settings,
+                user_id=user_id,
+                message_ids=[message.message_id for message in messages],
+                use_ai=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Initial Gmail metadata group refresh failed user_id=%s error=%s",
+                user_id,
+                type(exc).__name__,
+            )
+    _ensure_initial_window_body_jobs(
+        settings,
+        user_id=user_id,
+        generation_id=generation_id,
+    )
+    _emit_sync_progress(settings, user_id=user_id, progress=progress, source="initial_metadata")
+    return _finish_progressive_gmail_metadata_batch(
+        settings,
+        user_id=user_id,
+        generation_id=generation_id,
+        progress=progress,
+        messages=messages,
+        thread_ids=thread_ids,
+    )
+
+
+def _ensure_initial_window_body_jobs(
+    settings: Settings,
+    *,
+    user_id: str,
+    generation_id: str,
+) -> None:
+    database_url = str(settings.database_path)
+    entries = list_gmail_initial_window_entries_needing_body_fetch(
+        database_url,
+        user_id=user_id,
+        generation_id=generation_id,
+        limit=GMAIL_INITIAL_WINDOW_MAX_THREADS,
+    )
+    for entry in entries:
+        enqueue_job(
+            database_url,
+            kind="gmail_body_fetch",
+            queue="reader",
+            user_id=user_id,
+            dedupe_key=f"gmail-body-fetch-thread:{user_id}:{entry.gmail_thread_id}",
+            priority=90 if entry.position < 25 else 60,
+            payload={
+                "user_id": user_id,
+                "gmail_thread_id": entry.gmail_thread_id,
+                "sync_generation": generation_id,
+            },
+            wake_existing=False,
+        )
+
+
+def _finish_progressive_gmail_metadata_batch(
+    settings: Settings,
+    *,
+    user_id: str,
+    generation_id: str,
+    progress: GmailSyncProgress,
+    messages: list[GmailMessageRecord],
+    thread_ids: list[str],
+) -> int:
+    """Publish invalidation and schedule the next durable bootstrap step."""
+    database_url = str(settings.database_path)
+    if messages:
+        emit_mailbox_event(
+            settings,
+            user_id=user_id,
+            event_type=MAILBOX_CHANGED,
+            mailbox_label="all",
+            payload={
+                "source": "initial_metadata",
+                "message_count": len(messages),
+                "thread_count": len(thread_ids),
+                "sync_generation": generation_id,
+            },
+        )
+
+    if progress.initial_window_complete:
+        mark_import_completed(
+            database_url,
+            user_id=user_id,
+            first_batch=True,
+            groups_ready=False,
+            dashboard_ready=False,
+        )
+        enqueue_gmail_full_reconciliation(settings, user_id=user_id)
+        if progress.initial_body_ready_count >= progress.initial_body_target_count:
+            enqueue_gmail_body_backfill(settings, user_id=user_id)
+    else:
+        enqueue_job(
+            database_url,
+            kind="gmail_import_batch",
+            queue="critical",
+            user_id=user_id,
+            dedupe_key=(
+                f"first-run:{user_id}:{generation_id}:"
+                f"metadata:{progress.initial_metadata_count}:"
+                f"target:{progress.initial_target_count}"
+            ),
+            priority=100,
+            payload={"user_id": user_id, "batch_size": FIRST_BATCH_SIZE, "first_run": True},
+        )
+    return len(messages)
+
+
+def _list_initial_window_threads(
+    settings: Settings,
+    *,
+    user_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Collect up to 100 unique recent threads even when Gmail short-pages.
+
+    Gmail may legally return fewer than ``maxResults`` while still supplying a
+    continuation token. The bootstrap window is therefore complete only when
+    we have 100 unique IDs or Gmail ends pagination. An epoch cutoff also makes
+    the 90-day boundary precise instead of depending on Gmail's rounded
+    ``newer_than:90d`` search semantics.
+    """
+    credentials = create_authorized_credentials(settings, user_id=user_id)
+    if credentials is None:
+        raise GoogleCredentialsUnavailable("Google credentials are not connected")
+    service = build_google_service("gmail", "v1", credentials)
+    clock = now or datetime.now(timezone.utc)
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=timezone.utc)
+    cutoff_epoch = int((clock.astimezone(timezone.utc) - timedelta(days=FIRST_RUN_RECENT_DAYS)).timestamp())
+    page_token: str | None = None
+    seen_page_tokens: set[str] = set()
+    seen_thread_ids: set[str] = set()
+    threads: list[dict[str, Any]] = []
+    estimate: int | None = None
+    continuation: str | None = None
+
+    while len(threads) < GMAIL_INITIAL_WINDOW_MAX_THREADS:
+        request_args: dict[str, Any] = {
+            "userId": "me",
+            "q": f"after:{cutoff_epoch}",
+            "maxResults": GMAIL_INITIAL_WINDOW_MAX_THREADS - len(threads),
+            "includeSpamTrash": True,
+        }
+        if page_token:
+            request_args["pageToken"] = page_token
+        response = service.users().threads().list(**request_args).execute()
+        if not isinstance(response, dict):
+            raise RuntimeError("Gmail returned an invalid initial thread window")
+        raw_estimate = response.get("resultSizeEstimate")
+        if raw_estimate is not None:
+            try:
+                estimate = max(estimate or 0, max(0, int(raw_estimate)))
+            except (TypeError, ValueError):
+                pass
+        raw_threads = response.get("threads")
+        if isinstance(raw_threads, list):
+            for item in raw_threads:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                thread_id = str(item["id"])
+                if thread_id in seen_thread_ids:
+                    continue
+                seen_thread_ids.add(thread_id)
+                threads.append(item)
+                if len(threads) >= GMAIL_INITIAL_WINDOW_MAX_THREADS:
+                    break
+
+        next_page_token = str(response.get("nextPageToken") or "") or None
+        continuation = next_page_token
+        if len(threads) >= GMAIL_INITIAL_WINDOW_MAX_THREADS or next_page_token is None:
+            break
+        if next_page_token == page_token or next_page_token in seen_page_tokens:
+            raise RuntimeError("Gmail initial thread pagination repeated a page token")
+        seen_page_tokens.add(next_page_token)
+        page_token = next_page_token
+
+    result: dict[str, Any] = {"threads": threads}
+    if estimate is not None:
+        result["resultSizeEstimate"] = estimate
+    if continuation:
+        result["nextPageToken"] = continuation
+    return result
+
+
+def _hydrate_gmail_thread_ids_metadata(
+    settings: Settings,
+    *,
+    user_id: str,
+    gmail_thread_ids: list[str],
+    successful_thread_ids: set[str] | None = None,
+    terminal_missing_thread_ids: set[str] | None = None,
+) -> list[GmailMessageRecord]:
+    credentials = create_authorized_credentials(settings, user_id=user_id)
+    if credentials is None:
+        raise GoogleCredentialsUnavailable("Google credentials are not connected")
+    service = build_google_service("gmail", "v1", credentials)
+    provider_terminal_missing: set[str] = set()
+    payloads = _batch_get_thread_metadata_payloads(
+        service,
+        gmail_thread_ids,
+        terminal_missing_thread_ids=provider_terminal_missing,
+    )
+    messages: dict[str, GmailMessageRecord] = {}
+    for thread_id in list(dict.fromkeys(gmail_thread_ids)):
+        payload = payloads.get(thread_id)
+        if payload is None:
+            continue
+        raw_messages = payload.get("messages") if isinstance(payload, dict) else None
+        parsed_count = 0
+        for raw_message in raw_messages if isinstance(raw_messages, list) else []:
+            if not isinstance(raw_message, dict) or not raw_message.get("id"):
+                continue
+            parsed = parse_gmail_message(raw_message, user_id=user_id)
+            messages[str(raw_message["id"])] = GmailMessageRecord(
+                created_at="",
+                updated_at="",
+                **parsed,
+            )
+            parsed_count += 1
+        if parsed_count:
+            if successful_thread_ids is not None:
+                successful_thread_ids.add(thread_id)
+        else:
+            provider_terminal_missing.add(thread_id)
+    if terminal_missing_thread_ids is not None:
+        terminal_missing_thread_ids.update(provider_terminal_missing)
+    return list(messages.values())
+
+
+def _batch_get_thread_metadata_payloads(
+    service: Any,
+    gmail_thread_ids: list[str],
+    *,
+    terminal_missing_thread_ids: set[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Fetch thread metadata in 25-request batches with bounded fallback.
+
+    Gmail batch callbacks can occasionally omit a response without failing the
+    whole batch. Successful responses are retained and only those omitted IDs
+    are retried directly. Explicit per-request provider failures are never
+    hidden: a deleted thread is skipped, while auth, quota, server, and other
+    failures are propagated for durable worker retry/backoff.
+    """
+    thread_ids = list(dict.fromkeys(thread_id for thread_id in gmail_thread_ids if thread_id))
+    payloads: dict[str, dict[str, Any]] = {}
+    terminal_missing: set[str] = set()
+    for offset in range(0, len(thread_ids), GMAIL_THREAD_BATCH_GET_SIZE):
+        batch_ids = thread_ids[offset : offset + GMAIL_THREAD_BATCH_GET_SIZE]
+        callback_errors: dict[str, Exception] = {}
+
+        def callback(request_id: str, response: Any, exception: Exception | None) -> None:
+            if exception is None and isinstance(response, dict):
+                payloads[request_id] = response
+            elif exception is not None:
+                callback_errors[request_id] = exception
+
+        batch = service.new_batch_http_request(callback=callback)
+        for thread_id in batch_ids:
+            batch.add(
+                service.users()
+                .threads()
+                .get(
+                    userId="me",
+                    id=thread_id,
+                    format="metadata",
+                    metadataHeaders=GMAIL_METADATA_HEADERS,
+                ),
+                request_id=thread_id,
+            )
+        try:
+            batch.execute()
+        except (HttpError, TimeoutError, ConnectionError, OSError):
+            raise
+        except Exception:
+            # Some transports fail the outer batch after completing a subset.
+            # Retain those callbacks and retry only the omitted IDs below.
+            logger.warning("Gmail thread metadata batch fell back to direct requests")
+
+        for thread_id, exc in callback_errors.items():
+            if isinstance(exc, HttpError) and _is_history_cursor_expired(exc):
+                terminal_missing.add(thread_id)
+                continue
+            raise exc
+
+        for thread_id in batch_ids:
+            if thread_id in payloads or thread_id in terminal_missing:
+                continue
+            try:
+                payload = (
+                    service.users()
+                    .threads()
+                    .get(
+                        userId="me",
+                        id=thread_id,
+                        format="metadata",
+                        metadataHeaders=GMAIL_METADATA_HEADERS,
+                    )
+                    .execute()
+                )
+            except HttpError as exc:
+                if _is_history_cursor_expired(exc):
+                    terminal_missing.add(thread_id)
+                    continue
+                raise
+            if isinstance(payload, dict):
+                payloads[thread_id] = payload
+    if terminal_missing_thread_ids is not None:
+        terminal_missing_thread_ids.update(terminal_missing)
+    return payloads
+
+
+def _provider_result_size_estimate(response: dict[str, Any]) -> int:
+    try:
+        return max(0, int(response.get("resultSizeEstimate") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _emit_sync_progress(
+    settings: Settings,
+    *,
+    user_id: str,
+    progress: GmailSyncProgress,
+    source: str,
+) -> None:
+    logger.info(
+        "gmail.sync_progress",
+        extra={
+            "event_fields": {
+                "event": "gmail.sync_progress",
+                "user_id": user_id,
+                "source": source,
+                "sync_generation": progress.sync_generation,
+                "phase": progress.phase,
+                "initial_metadata_count": progress.initial_metadata_count,
+                "initial_target_count": progress.initial_target_count,
+                "initial_body_ready_count": progress.initial_body_ready_count,
+                "initial_body_target_count": progress.initial_body_target_count,
+                "history_metadata_count": progress.history_metadata_count,
+                "history_body_ready_count": progress.history_body_ready_count,
+                "initial_window_complete": progress.initial_window_complete,
+                "history_metadata_complete": progress.history_metadata_complete,
+                "history_body_complete": progress.history_body_complete,
+            }
+        },
+    )
+    try:
+        emit_mailbox_event(
+            settings,
+            user_id=user_id,
+            event_type=MAILBOX_SYNC_PROGRESS,
+            payload={"source": source, **asdict(progress)},
+        )
+    except Exception as exc:
+        logger.warning(
+            "Gmail sync progress event failed user_id=%s error=%s",
+            user_id,
+            type(exc).__name__,
+        )
 def run_gmail_backfill(settings: Settings, *, user_id: str, batch_size: int = BACKFILL_BATCH_SIZE) -> int:
     """Continue importing older Gmail using the independent full-backfill cursor."""
     batch_size = max(1, min(batch_size, BACKFILL_BATCH_SIZE))
@@ -446,19 +910,89 @@ def enqueue_gmail_full_reconciliation(settings: Settings, *, user_id: str) -> st
     return job.id
 
 
-def _ensure_gmail_reconciliation_started(settings: Settings, *, user_id: str):
+def enqueue_gmail_body_backfill(
+    settings: Settings,
+    *,
+    user_id: str,
+    continuation_key: str | None = None,
+    descriptor_after_message_id: str | None = None,
+    descriptor_backfill_complete: bool = False,
+) -> str:
+    """Coalesce a trigger or queue the next progress-scoped body page."""
+    normalized_continuation = str(continuation_key or "").strip()
+    if not normalized_continuation and count_active_jobs(
+        str(settings.database_path),
+        user_id=user_id,
+        kinds=["gmail_body_backfill"],
+    ):
+        return ""
+    dedupe_key = f"gmail-body-backfill:{user_id}"
+    if normalized_continuation:
+        dedupe_key = f"{dedupe_key}:resume:{normalized_continuation[:64]}"
+    job = enqueue_job(
+        str(settings.database_path),
+        kind="gmail_body_backfill",
+        queue="slow",
+        user_id=user_id,
+        dedupe_key=dedupe_key,
+        priority=40,
+        max_attempts=10,
+        payload={
+            "user_id": user_id,
+            "batch_size": GMAIL_BODY_BACKFILL_BATCH_SIZE,
+            **(
+                {"continuation_key": normalized_continuation[:64]}
+                if normalized_continuation
+                else {}
+            ),
+            **(
+                {"descriptor_after_message_id": descriptor_after_message_id}
+                if descriptor_after_message_id
+                else {}
+            ),
+            **(
+                {"descriptor_backfill_complete": True}
+                if descriptor_backfill_complete
+                else {}
+            ),
+        },
+        run_after_seconds=(
+            GMAIL_BODY_BACKFILL_RESUME_DELAY_SECONDS
+            if normalized_continuation
+            else 0
+        ),
+        wake_existing=False,
+    )
+    return job.id
+
+
+def _ensure_gmail_reconciliation_started(
+    settings: Settings,
+    *,
+    user_id: str,
+    use_thread_listing: bool = False,
+):
     """Capture a pre-listing Gmail baseline without publishing it as a cursor."""
     database_url = str(settings.database_path)
     state = get_import_state(database_url, user_id=user_id)
     if state is not None and getattr(state, "reconcile_generation", None):
         return state
+    progressive_generation = str(getattr(state, "sync_generation", None) or "")
+    progressive_history_pending = bool(
+        progressive_generation
+        and not bool(getattr(state, "history_metadata_complete", False))
+    )
     baseline_history_id = _current_gmail_history_id(settings, user_id=user_id)
     return start_gmail_reconciliation(
         database_url,
         user_id=user_id,
-        generation_id=str(uuid4()),
+        generation_id=(progressive_generation if progressive_history_pending else str(uuid4())),
         baseline_history_id=baseline_history_id,
-        initial_cursor=_encode_full_mailbox_cursor(),
+        initial_cursor=(
+            _encode_full_thread_mailbox_cursor()
+            if use_thread_listing or progressive_history_pending
+            else _encode_full_mailbox_cursor()
+        ),
     )
 
 
@@ -516,12 +1050,21 @@ def run_gmail_full_reconciliation(
     state = get_import_state(database_url, user_id=user_id)
     if state is None or not getattr(state, "reconcile_generation", None):
         baseline_history_id = _current_gmail_history_id(settings, user_id=user_id)
+        progressive_generation = str(getattr(state, "sync_generation", None) or "")
+        progressive_history_pending = bool(
+            progressive_generation
+            and not bool(getattr(state, "history_metadata_complete", False))
+        )
         state = start_gmail_reconciliation(
             database_url,
             user_id=user_id,
-            generation_id=str(uuid4()),
+            generation_id=(progressive_generation if progressive_history_pending else str(uuid4())),
             baseline_history_id=baseline_history_id,
-            initial_cursor=_encode_full_mailbox_cursor(),
+            initial_cursor=(
+                _encode_full_thread_mailbox_cursor()
+                if progressive_history_pending
+                else _encode_full_mailbox_cursor()
+            ),
         )
     generation_id = str(state.reconcile_generation or "")
     baseline_history_id = str(state.reconcile_baseline_history_id or "")
@@ -544,7 +1087,8 @@ def run_gmail_full_reconciliation(
                 baseline_history_id=baseline_history_id,
             )
         decoded_cursor = _decode_full_mailbox_cursor(cursor)
-        if decoded_cursor is None:
+        decoded_thread_cursor = _decode_full_thread_mailbox_cursor(cursor)
+        if decoded_cursor is None and decoded_thread_cursor is None:
             # A corrupt durable cursor must not poison every successor job.
             # Discard only this scan generation; canonical mail remains intact.
             _queue_clean_reconciliation_restart(
@@ -554,12 +1098,24 @@ def run_gmail_full_reconciliation(
             )
             return touched
         try:
-            messages, next_cursor = _hydrate_reconciliation_cursor_page(
-                settings,
-                user_id=user_id,
-                batch_size=batch_size,
-                cursor=decoded_cursor,
-            )
+            if decoded_thread_cursor is not None:
+                messages, next_cursor, conversation_count, estimated_total_count = (
+                    _hydrate_reconciliation_thread_cursor_page(
+                        settings,
+                        user_id=user_id,
+                        batch_size=batch_size,
+                        cursor=decoded_thread_cursor,
+                    )
+                )
+            else:
+                messages, next_cursor = _hydrate_reconciliation_cursor_page(
+                    settings,
+                    user_id=user_id,
+                    batch_size=batch_size,
+                    cursor=decoded_cursor or {},
+                )
+                conversation_count = 0
+                estimated_total_count = 0
         except GmailDurablePageTokenRejected:
             _queue_clean_reconciliation_restart(
                 settings,
@@ -574,16 +1130,49 @@ def run_gmail_full_reconciliation(
                 generation_id=generation_id,
             )
             return touched
-        if messages:
-            upsert_gmail_messages(database_url, messages)
-        advanced = record_gmail_reconciliation_page(
-            database_url,
-            user_id=user_id,
-            generation_id=generation_id,
-            expected_cursor=cursor,
-            next_cursor=next_cursor,
-            message_ids=[message.message_id for message in messages],
-        )
+        if decoded_thread_cursor is not None:
+            progress = commit_gmail_reconciliation_metadata_page(
+                database_url,
+                user_id=user_id,
+                generation_id=generation_id,
+                expected_cursor=cursor,
+                next_cursor=next_cursor,
+                messages=messages,
+                conversation_count=conversation_count,
+                estimated_total_count=estimated_total_count,
+            )
+            advanced = progress is not None
+            if progress is not None:
+                _emit_sync_progress(
+                    settings,
+                    user_id=user_id,
+                    progress=progress,
+                    source="history_metadata",
+                )
+                emit_mailbox_event(
+                    settings,
+                    user_id=user_id,
+                    event_type=MAILBOX_CHANGED,
+                    mailbox_label="all",
+                    payload={
+                        "source": "history_metadata",
+                        "message_count": len(messages),
+                        "thread_count": conversation_count,
+                        "history_metadata_count": progress.history_metadata_count,
+                        "sync_generation": generation_id,
+                    },
+                )
+        else:
+            if messages:
+                upsert_gmail_messages(database_url, messages)
+            advanced = record_gmail_reconciliation_page(
+                database_url,
+                user_id=user_id,
+                generation_id=generation_id,
+                expected_cursor=cursor,
+                next_cursor=next_cursor,
+                message_ids=[message.message_id for message in messages],
+            )
         if not advanced:
             # Another worker checkpointed this generation. Its successor owns
             # the next page; this duplicate can complete without mutating state.
@@ -675,6 +1264,73 @@ def _hydrate_reconciliation_cursor_page(
     return messages, next_cursor
 
 
+def _hydrate_reconciliation_thread_cursor_page(
+    settings: Settings,
+    *,
+    user_id: str,
+    batch_size: int,
+    cursor: dict[str, Any],
+) -> tuple[list[GmailMessageRecord], str | None, int, int]:
+    page_token = str(cursor.get("page_token") or "") or None
+    credentials = create_authorized_credentials(settings, user_id=user_id)
+    if credentials is None:
+        raise GoogleCredentialsUnavailable("Google credentials are not connected")
+    service = build_google_service("gmail", "v1", credentials)
+    list_args: dict[str, Any] = {
+        "userId": "me",
+        "maxResults": max(1, min(int(batch_size), 100)),
+        "includeSpamTrash": True,
+    }
+    if page_token:
+        list_args["pageToken"] = page_token
+    try:
+        listed = service.users().threads().list(**list_args).execute()
+    except HttpError as exc:
+        if page_token and _is_provider_page_token_rejected(exc):
+            raise GmailDurablePageTokenRejected(
+                "Gmail rejected a reconciliation thread continuation token"
+            ) from exc
+        raise
+    raw_threads = listed.get("threads") if isinstance(listed, dict) else None
+    thread_ids = list(
+        dict.fromkeys(
+            str(item["id"])
+            for item in (raw_threads if isinstance(raw_threads, list) else [])
+            if isinstance(item, dict) and item.get("id")
+        )
+    )[:100]
+    successful_thread_ids: set[str] = set()
+    terminal_missing_thread_ids: set[str] = set()
+    messages = _hydrate_gmail_thread_ids_metadata(
+        settings,
+        user_id=user_id,
+        gmail_thread_ids=thread_ids,
+        successful_thread_ids=successful_thread_ids,
+        terminal_missing_thread_ids=terminal_missing_thread_ids,
+    )
+    successful_thread_ids.update(
+        message.gmail_thread_id
+        for message in messages
+        if message.gmail_thread_id
+    )
+    next_page_token = (
+        str(listed.get("nextPageToken") or "")
+        if isinstance(listed, dict)
+        else ""
+    )
+    next_cursor = (
+        _encode_full_thread_mailbox_cursor(page_token=next_page_token)
+        if next_page_token
+        else None
+    )
+    return (
+        messages,
+        next_cursor,
+        len(successful_thread_ids),
+        _provider_result_size_estimate(listed if isinstance(listed, dict) else {}),
+    )
+
+
 def _finalize_gmail_full_reconciliation(
     settings: Settings,
     *,
@@ -762,6 +1418,16 @@ def _finalize_gmail_full_reconciliation(
     )
     if result is None:
         return 0
+    progress = result.progress
+    if progress is not None:
+        _emit_sync_progress(
+            settings,
+            user_id=user_id,
+            progress=progress,
+            source="history_metadata_complete",
+        )
+        if not progress.history_body_complete:
+            enqueue_gmail_body_backfill(settings, user_id=user_id)
     all_affected_group_ids = list(dict.fromkeys([*affected_group_ids, *result.affected_group_ids]))
     try:
         prune_empty_mail_groups(database_url, user_id=user_id, group_ids=all_affected_group_ids)
@@ -968,53 +1634,40 @@ def run_gmail_body_fetch(settings: Settings, *, user_id: str, group_id: str = ""
     if not missing:
         return 0
     mark_gmail_messages_body_fetch_state(database_url, user_id=user_id, message_ids=missing, status="pending")
+    terminal_not_found_ids: set[str] = set()
     try:
-        credentials = create_authorized_credentials(settings, user_id=user_id)
-        if credentials is None:
-            raise GoogleCredentialsUnavailable("Google credentials are not connected")
-        service = build_google_service("gmail", "v1", credentials)
-        payloads = _batch_get_message_payloads(
-            service,
-            missing,
-            format="full",
-            continue_on_error=True,
-        )
-    except Exception as exc:
-        mark_gmail_messages_body_fetch_state(
-            database_url,
+        hydrated_messages, unresolved_ids, terminal_ids, parse_error = _download_gmail_body_messages(
+            settings,
             user_id=user_id,
             message_ids=missing,
-            status="failed",
-            error=safe_google_error(exc, operation="message download"),
+            terminal_not_found_ids=terminal_not_found_ids,
         )
+    except Exception as exc:
+        if terminal_not_found_ids:
+            _delete_terminal_gmail_messages(
+                settings,
+                user_id=user_id,
+                message_ids=list(terminal_not_found_ids),
+                source="gmail_body_fetch",
+            )
+        retry_ids = [message_id for message_id in missing if message_id not in terminal_not_found_ids]
+        if retry_ids:
+            mark_gmail_messages_body_fetch_state(
+                database_url,
+                user_id=user_id,
+                message_ids=retry_ids,
+                status="missing",
+                error=safe_google_error(exc, operation="message download"),
+            )
         raise
 
-    attachment_resolver = _inline_attachment_resolver(service)
-    hydrated_messages: list[GmailMessageRecord] = []
-    unresolved_ids: list[str] = []
-    parse_error: Exception | None = None
-    for message_id in missing:
-        payload = payloads.get(message_id)
-        if payload is None:
-            unresolved_ids.append(message_id)
-            continue
-        try:
-            parsed = _mark_full_payload_body_fetch_status(
-                parse_gmail_message(
-                    payload,
-                    user_id=user_id,
-                    inline_attachment_resolver=attachment_resolver,
-                )
-            )
-            message = GmailMessageRecord(created_at="", updated_at="", **parsed)
-        except Exception as exc:
-            unresolved_ids.append(message_id)
-            parse_error = parse_error or exc
-            continue
-        if message.body_fetch_status == "fetched":
-            hydrated_messages.append(message)
-        else:
-            unresolved_ids.append(message_id)
+    if terminal_not_found_ids:
+        _delete_terminal_gmail_messages(
+            settings,
+            user_id=user_id,
+            message_ids=list(terminal_not_found_ids),
+            source="gmail_body_fetch",
+        )
 
     persisted_count = 0
     if hydrated_messages:
@@ -1024,13 +1677,31 @@ def run_gmail_body_fetch(settings: Settings, *, user_id: str, group_id: str = ""
             messages=hydrated_messages,
         )
 
+    if terminal_ids:
+        terminal_error = parse_error or RuntimeError(
+            "Gmail returned a message body that could not be parsed"
+        )
+        mark_gmail_messages_body_fetch_state(
+            database_url,
+            user_id=user_id,
+            message_ids=terminal_ids,
+            status="unavailable",
+            error=safe_google_error(terminal_error, operation="message download"),
+        )
+        _emit_terminal_body_states(
+            settings,
+            user_id=user_id,
+            message_ids=terminal_ids,
+            source="gmail_body_fetch",
+        )
+
     if unresolved_ids:
-        retry_error = parse_error or RuntimeError("Gmail returned a text body attachment that could not be downloaded")
+        retry_error = RuntimeError("Gmail returned a text body attachment that could not be downloaded")
         mark_gmail_messages_body_fetch_state(
             database_url,
             user_id=user_id,
             message_ids=unresolved_ids,
-            status="failed",
+            status="missing",
             error=safe_google_error(retry_error, operation="message download"),
         )
         raise retry_error
@@ -1038,14 +1709,431 @@ def run_gmail_body_fetch(settings: Settings, *, user_id: str, group_id: str = ""
     return persisted_count
 
 
+def run_gmail_body_backfill(
+    settings: Settings,
+    *,
+    user_id: str,
+    batch_size: int = GMAIL_BODY_BACKFILL_BATCH_SIZE,
+    descriptor_after_message_id: str | None = None,
+    descriptor_backfill_complete: bool = False,
+) -> int:
+    """Hydrate one newest-first page, then queue a progress-scoped successor."""
+    database_url = str(settings.database_path)
+    if not user_can_write_gmail(database_url, user_id=user_id):
+        return 0
+    batch_size = max(1, min(int(batch_size), GMAIL_BODY_BACKFILL_BATCH_SIZE))
+    if descriptor_backfill_complete:
+        descriptor_backfill_remaining = False
+        descriptor_page_cursor = descriptor_after_message_id
+    else:
+        (
+            _descriptor_count,
+            descriptor_backfill_remaining,
+            descriptor_page_cursor,
+        ) = backfill_gmail_attachment_descriptors_page(
+            database_url,
+            user_id=user_id,
+            limit=batch_size,
+            after_message_id=descriptor_after_message_id,
+        )
+    missing_messages = list_messages_needing_body_fetch(
+        database_url,
+        user_id=user_id,
+        limit=batch_size,
+    )
+    if not missing_messages:
+        progress = mark_gmail_history_body_complete_if_ready(
+            database_url,
+            user_id=user_id,
+        )
+        _emit_sync_progress(
+            settings,
+            user_id=user_id,
+            progress=progress,
+            source="history_body",
+        )
+        if descriptor_backfill_remaining:
+            continuation_material = json.dumps(
+                {
+                    "generation": progress.sync_generation,
+                    "descriptor_page_cursor": descriptor_page_cursor,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            enqueue_gmail_body_backfill(
+                settings,
+                user_id=user_id,
+                continuation_key=sha256(
+                    continuation_material.encode("utf-8")
+                ).hexdigest()[:24],
+                descriptor_after_message_id=descriptor_page_cursor,
+            )
+        return 0
+
+    message_ids = [message.message_id for message in missing_messages]
+    mark_gmail_messages_body_fetch_state(
+        database_url,
+        user_id=user_id,
+        message_ids=message_ids,
+        status="pending",
+    )
+    terminal_not_found_ids: set[str] = set()
+    try:
+        hydrated_messages, unresolved_ids, terminal_ids, parse_error = _download_gmail_body_messages(
+            settings,
+            user_id=user_id,
+            message_ids=message_ids,
+            terminal_not_found_ids=terminal_not_found_ids,
+        )
+    except Exception:
+        # A global quota/auth/transport failure is retryable. Put this
+        # transaction back in the durable selection set before re-raising.
+        if terminal_not_found_ids:
+            _delete_terminal_gmail_messages(
+                settings,
+                user_id=user_id,
+                message_ids=list(terminal_not_found_ids),
+                source="gmail_body_backfill",
+            )
+        retry_ids = [message_id for message_id in message_ids if message_id not in terminal_not_found_ids]
+        if retry_ids:
+            mark_gmail_messages_body_fetch_state(
+                database_url,
+                user_id=user_id,
+                message_ids=retry_ids,
+                status="missing",
+            )
+        raise
+
+    if terminal_not_found_ids:
+        _delete_terminal_gmail_messages(
+            settings,
+            user_id=user_id,
+            message_ids=list(terminal_not_found_ids),
+            source="gmail_body_backfill",
+        )
+
+    persisted_count = 0
+    if hydrated_messages:
+        persisted_count = _persist_hydrated_body_messages(
+            settings,
+            user_id=user_id,
+            messages=hydrated_messages,
+            source="gmail_body_backfill",
+        )
+    if terminal_ids:
+        terminal_error = parse_error or RuntimeError(
+            "Gmail returned a message body that could not be parsed"
+        )
+        mark_gmail_messages_body_fetch_state(
+            database_url,
+            user_id=user_id,
+            message_ids=terminal_ids,
+            status="unavailable",
+            error=safe_google_error(terminal_error, operation="message download"),
+        )
+        _emit_terminal_body_states(
+            settings,
+            user_id=user_id,
+            message_ids=terminal_ids,
+            source="gmail_body_backfill",
+        )
+    if unresolved_ids:
+        retry_error = RuntimeError(
+            "Gmail returned a text body attachment that could not be downloaded"
+        )
+        mark_gmail_messages_body_fetch_state(
+            database_url,
+            user_id=user_id,
+            message_ids=unresolved_ids,
+            status="missing",
+            error=safe_google_error(retry_error, operation="message download"),
+        )
+        raise retry_error
+
+    progress = mark_gmail_history_body_complete_if_ready(
+        database_url,
+        user_id=user_id,
+    )
+    _emit_sync_progress(
+        settings,
+        user_id=user_id,
+        progress=progress,
+        source="history_body",
+    )
+    remaining = list_messages_needing_body_fetch(
+        database_url,
+        user_id=user_id,
+        limit=1,
+    )
+    if remaining or descriptor_backfill_remaining:
+        continuation_material = json.dumps(
+            {
+                "generation": progress.sync_generation,
+                "ready": progress.history_body_ready_count,
+                "next_message_id": remaining[0].message_id if remaining else None,
+                "descriptor_page_cursor": descriptor_page_cursor,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        enqueue_gmail_body_backfill(
+            settings,
+            user_id=user_id,
+            continuation_key=sha256(continuation_material.encode("utf-8")).hexdigest()[:24],
+            descriptor_after_message_id=(
+                descriptor_page_cursor if descriptor_backfill_remaining else None
+            ),
+            descriptor_backfill_complete=not descriptor_backfill_remaining,
+        )
+    return persisted_count
+
+
+def _gmail_body_fetch_account_scope(settings: Settings, *, user_id: str):
+    """Serialize Gmail body traffic for one account across worker processes."""
+    return advisory_session_lock(
+        str(settings.database_path),
+        lock_key=gmail_body_fetch_lock_key(user_id),
+    )
+
+
+def _download_gmail_body_messages(
+    settings: Settings,
+    *,
+    user_id: str,
+    message_ids: list[str],
+    terminal_not_found_ids: set[str] | None = None,
+) -> tuple[list[GmailMessageRecord], list[str], list[str], Exception | None]:
+    """Download and parse one body page while holding the account throttle."""
+    hydrated_messages: list[GmailMessageRecord] = []
+    unresolved_ids: list[str] = []
+    terminal_ids: list[str] = []
+    parse_error: Exception | None = None
+    not_found_ids = terminal_not_found_ids if terminal_not_found_ids is not None else set()
+    with _gmail_body_fetch_account_scope(settings, user_id=user_id):
+        # Selection happens before this cross-process account lock. A faster
+        # reader/backfill waiter may have completed the same rows meanwhile,
+        # so re-read under the lock and never download already-fetched bodies.
+        current_messages = list_messages_by_ids(
+            str(settings.database_path),
+            user_id=user_id,
+            message_ids=message_ids,
+        )
+        current_by_id = {message.message_id: message for message in current_messages}
+        remaining_ids = [
+            message_id
+            for message_id in message_ids
+            if message_id in current_by_id
+            and (current_by_id[message_id].body_fetch_status or "").lower()
+            not in {"fetched", "unavailable"}
+        ]
+        if not remaining_ids:
+            return hydrated_messages, unresolved_ids, terminal_ids, parse_error
+        credentials = create_authorized_credentials(settings, user_id=user_id)
+        if credentials is None:
+            raise GoogleCredentialsUnavailable("Google credentials are not connected")
+        service = build_google_service("gmail", "v1", credentials)
+        payloads = _batch_get_message_payloads(
+            service,
+            remaining_ids,
+            format="full",
+            continue_on_error=True,
+            terminal_not_found_ids=not_found_ids,
+        )
+        attachment_resolver = _inline_attachment_resolver(service)
+        for message_id in remaining_ids:
+            if message_id in not_found_ids:
+                continue
+            payload = payloads.get(message_id)
+            if payload is None:
+                unresolved_ids.append(message_id)
+                continue
+
+            def parse_full_message() -> GmailMessageRecord:
+                parsed = _mark_full_payload_body_fetch_status(
+                    parse_gmail_message(
+                        payload,
+                        user_id=user_id,
+                        inline_attachment_resolver=attachment_resolver,
+                    )
+                )
+                return GmailMessageRecord(created_at="", updated_at="", **parsed)
+
+            try:
+                message = parse_full_message()
+            except GmailInlineAttachmentRetryable as exc:
+                # Inline/CID assets are part of the complete offline body.
+                # A transport/provider failure must leave the message
+                # retryable rather than silently committing incomplete HTML.
+                unresolved_ids.append(message_id)
+                parse_error = parse_error or exc
+                continue
+            except Exception as first_error:
+                # Parser faults can be transient (for example, a temporary
+                # decoder allocation failure). Retry the already-downloaded
+                # payload once before classifying deterministic malformed MIME
+                # as terminal so one exception never loses a message body.
+                try:
+                    message = parse_full_message()
+                except GmailInlineAttachmentRetryable as exc:
+                    unresolved_ids.append(message_id)
+                    parse_error = parse_error or exc
+                    continue
+                except Exception as second_error:
+                    terminal_ids.append(message_id)
+                    parse_error = parse_error or second_error or first_error
+                    continue
+            if message.body_fetch_status == "fetched":
+                hydrated_messages.append(message)
+            else:
+                unresolved_ids.append(message_id)
+    return hydrated_messages, unresolved_ids, terminal_ids, parse_error
+
+
+def _delete_terminal_gmail_messages(
+    settings: Settings,
+    *,
+    user_id: str,
+    message_ids: list[str],
+    source: str,
+) -> int:
+    """Remove provider-deleted messages and invalidate their local projections."""
+    unique_ids = list(dict.fromkeys(message_id for message_id in message_ids if message_id))
+    if not unique_ids:
+        return 0
+    database_url = str(settings.database_path)
+    affected_group_ids = delete_gmail_messages(
+        database_url,
+        user_id=user_id,
+        message_ids=unique_ids,
+    )
+    deleted_group_ids = prune_empty_mail_groups(
+        database_url,
+        user_id=user_id,
+        group_ids=affected_group_ids,
+    )
+    deleted_group_set = set(deleted_group_ids)
+    pending_group_ids = mark_mail_groups_pending(
+        database_url,
+        user_id=user_id,
+        group_ids=[
+            group_id for group_id in affected_group_ids if group_id not in deleted_group_set
+        ],
+    )
+    try:
+        emit_mailbox_event(
+            settings,
+            user_id=user_id,
+            event_type=MAILBOX_CHANGED,
+            mailbox_label="all",
+            payload={
+                "source": source,
+                "deleted_count": len(unique_ids),
+                "pending_group_count": len(pending_group_ids),
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "Deleted Gmail body rows could not emit invalidation user_id=%s error=%s",
+            user_id,
+            type(exc).__name__,
+        )
+    return len(unique_ids)
+
+
+def _emit_terminal_body_states(
+    settings: Settings,
+    *,
+    user_id: str,
+    message_ids: list[str],
+    source: str,
+) -> None:
+    """Publish permanently unreadable messages as terminal snippet snapshots.
+
+    A malformed provider payload must not remain the newest `missing` row
+    forever and starve the rest of an account's history. The metadata/snippet
+    remains readable, while `unavailable` records that a complete MIME body
+    could not be normalized.
+    """
+    database_url = str(settings.database_path)
+    messages = list_messages_by_ids(
+        database_url,
+        user_id=user_id,
+        message_ids=message_ids,
+    )
+    thread_ids = list(
+        dict.fromkeys(
+            (message.gmail_thread_id or message.message_id)
+            for message in messages
+            if message.gmail_thread_id or message.message_id
+        )
+    )
+    if not thread_ids:
+        return
+    progress = mark_gmail_history_body_complete_if_ready(
+        database_url,
+        user_id=user_id,
+    )
+    initial_positions = list_gmail_initial_window_positions(
+        database_url,
+        user_id=user_id,
+        gmail_thread_ids=thread_ids,
+    )
+    thread_states: list[dict[str, Any]] = []
+    for thread_id in thread_ids:
+        thread_messages = list_messages_for_gmail_thread(
+            database_url,
+            user_id=user_id,
+            gmail_thread_id=thread_id,
+        )
+        thread_states.append(
+            {
+                "thread_id": thread_id,
+                "body_ready": bool(thread_messages)
+                and all(_has_body_for_reader(message) for message in thread_messages),
+                "message_count": len(thread_messages),
+                "content_revision": _gmail_thread_content_revision(thread_messages),
+                "initial_window_position": initial_positions.get(thread_id),
+            }
+        )
+    try:
+        emit_mailbox_event(
+            settings,
+            user_id=user_id,
+            event_type=THREAD_CONTENT_HYDRATED,
+            payload={
+                "source": source,
+                "thread_ids": thread_ids,
+                "hydrated_message_count": 0,
+                "unavailable_message_count": len(message_ids),
+                "threads": thread_states,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "Terminal body state could not be emitted user_id=%s error=%s",
+            user_id,
+            type(exc).__name__,
+        )
+    _emit_sync_progress(
+        settings,
+        user_id=user_id,
+        progress=progress,
+        source=source,
+    )
+
+
 def _persist_hydrated_body_messages(
     settings: Settings,
     *,
     user_id: str,
     messages: list[GmailMessageRecord],
+    source: str = "gmail_body_fetch",
 ) -> int:
     database_url = str(settings.database_path)
-    updated_message_ids = set(update_gmail_message_bodies(database_url, messages))
+    update_result = update_gmail_message_bodies(database_url, messages)
+    updated_message_ids = set(update_result)
     updated_messages = [message for message in messages if message.message_id in updated_message_ids]
     if not updated_messages:
         return 0
@@ -1060,16 +2148,42 @@ def _persist_hydrated_body_messages(
         )
     )
     if hydrated_thread_ids:
+        event_payload: dict[str, Any] = {
+            "source": source,
+            "thread_ids": hydrated_thread_ids,
+            "hydrated_message_count": len(updated_messages),
+        }
+        progress = getattr(update_result, "progress", None)
+        if isinstance(progress, GmailSyncProgress):
+            initial_positions = list_gmail_initial_window_positions(
+                database_url,
+                user_id=user_id,
+                gmail_thread_ids=hydrated_thread_ids,
+            )
+            thread_states: list[dict[str, Any]] = []
+            for thread_id in hydrated_thread_ids:
+                thread_messages = list_messages_for_gmail_thread(
+                    database_url,
+                    user_id=user_id,
+                    gmail_thread_id=thread_id,
+                )
+                thread_states.append(
+                    {
+                        "thread_id": thread_id,
+                        "body_ready": bool(thread_messages)
+                        and all(_has_body_for_reader(message) for message in thread_messages),
+                        "message_count": len(thread_messages),
+                        "content_revision": _gmail_thread_content_revision(thread_messages),
+                        "initial_window_position": initial_positions.get(thread_id),
+                    }
+                )
+            event_payload["threads"] = thread_states
         try:
             emit_mailbox_event(
                 settings,
                 user_id=user_id,
                 event_type=THREAD_CONTENT_HYDRATED,
-                payload={
-                    "source": "gmail_body_fetch",
-                    "thread_ids": hydrated_thread_ids,
-                    "hydrated_message_count": len(updated_messages),
-                },
+                payload=event_payload,
             )
         except Exception as exc:
             logger.warning(
@@ -1077,6 +2191,20 @@ def _persist_hydrated_body_messages(
                 user_id,
                 type(exc).__name__,
             )
+        if isinstance(progress, GmailSyncProgress):
+            _emit_sync_progress(
+                settings,
+                user_id=user_id,
+                progress=progress,
+                source=source,
+            )
+            if (
+                source != "gmail_body_backfill"
+                and progress.initial_window_complete
+                and progress.initial_body_ready_count >= progress.initial_body_target_count
+                and not progress.history_body_complete
+            ):
+                enqueue_gmail_body_backfill(settings, user_id=user_id)
     return len(updated_messages)
 
 
@@ -1213,7 +2341,7 @@ def _hydrate_gmail_search_message_ids(
 
 
 def _has_body_for_reader(message: GmailMessageRecord) -> bool:
-    if (message.body_fetch_status or "").lower() == "fetched":
+    if (message.body_fetch_status or "").lower() in {"fetched", "unavailable"}:
         return True
     return has_persisted_renderable_body(
         text_body=message.text_body,
@@ -1358,6 +2486,15 @@ def _encode_full_mailbox_cursor(
     return _encode_cursor_payload(payload)
 
 
+def _encode_full_thread_mailbox_cursor(*, page_token: str | None = None) -> str:
+    return _encode_cursor_payload(
+        {
+            "type": "full_thread_mailbox",
+            "page_token": page_token,
+        }
+    )
+
+
 def _encode_cursor_payload(payload: dict[str, Any]) -> str:
     raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -1453,6 +2590,13 @@ def _decode_full_mailbox_cursor(cursor: str | None) -> dict[str, Any] | None:
         }
     payload = _decode_cursor_payload(cursor)
     if not isinstance(payload, dict) or payload.get("type") != "full_mailbox":
+        return None
+    return payload
+
+
+def _decode_full_thread_mailbox_cursor(cursor: str | None) -> dict[str, Any] | None:
+    payload = _decode_cursor_payload(cursor)
+    if not isinstance(payload, dict) or payload.get("type") != "full_thread_mailbox":
         return None
     return payload
 
@@ -1608,8 +2752,20 @@ def _inline_attachment_resolver(service: Any):
             ).execute()
             data = response.get("data") if isinstance(response, dict) else None
             cache[key] = data if isinstance(data, str) and data else None
-        except Exception:
-            cache[key] = None
+        except HttpError as exc:
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 404:
+                # Gmail has authoritatively removed this one MIME asset. Do
+                # not retain a stale local copy and do not retry it forever.
+                cache[key] = None
+            else:
+                raise GmailInlineAttachmentRetryable(
+                    "Gmail inline content is temporarily unavailable"
+                ) from exc
+        except Exception as exc:
+            raise GmailInlineAttachmentRetryable(
+                "Gmail inline content is temporarily unavailable"
+            ) from exc
         return cache[key]
 
     return resolve
@@ -1718,10 +2874,12 @@ def _batch_get_message_payloads(
     format: str,
     skip_not_found: bool = False,
     continue_on_error: bool = False,
+    terminal_not_found_ids: set[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not message_ids:
         return {}
     payloads: dict[str, dict[str, Any]] = {}
+    not_found_ids = terminal_not_found_ids if terminal_not_found_ids is not None else set()
     missing_ids = list(dict.fromkeys(message_ids))
     try:
         for offset in range(0, len(missing_ids), GMAIL_BATCH_GET_SIZE):
@@ -1730,6 +2888,14 @@ def _batch_get_message_payloads(
             def callback(request_id: str, response: Any, exception: Exception | None) -> None:
                 if exception is None and isinstance(response, dict):
                     payloads[request_id] = response
+                elif isinstance(exception, HttpError):
+                    raw_status = getattr(getattr(exception, "resp", None), "status", None)
+                    try:
+                        status = int(raw_status)
+                    except (TypeError, ValueError):
+                        status = None
+                    if status == 404 and (skip_not_found or continue_on_error):
+                        not_found_ids.add(request_id)
 
             batch = service.new_batch_http_request(callback=callback)
             for message_id in batch_ids:
@@ -1746,7 +2912,11 @@ def _batch_get_message_payloads(
         # fallback below retries only the IDs that are still missing.
         pass
 
-    missing = [message_id for message_id in missing_ids if message_id not in payloads]
+    missing = [
+        message_id
+        for message_id in missing_ids
+        if message_id not in payloads and message_id not in not_found_ids
+    ]
     for message_id in missing:
         request_args = {"userId": "me", "id": message_id, "format": format}
         if format == "metadata":
@@ -1755,6 +2925,7 @@ def _batch_get_message_payloads(
             payload = service.users().messages().get(**request_args).execute()
         except HttpError as exc:
             if skip_not_found and _is_history_cursor_expired(exc):
+                not_found_ids.add(message_id)
                 continue
             raw_status = getattr(getattr(exc, "resp", None), "status", None)
             try:
@@ -1767,6 +2938,7 @@ def _batch_get_message_payloads(
             # them immediately so the worker backs off instead of amplifying an
             # outage with one direct request per remaining message.
             if continue_on_error and status == 404:
+                not_found_ids.add(message_id)
                 continue
             raise
         except Exception:

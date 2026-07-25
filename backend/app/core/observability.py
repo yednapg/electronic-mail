@@ -23,6 +23,10 @@ _NO_STORE_AUTH_PATHS = {
     "/auth/mobile/complete",
     "/v1/auth/mobile/exchange",
 }
+_PRIVATE_CONTENT_CACHE_PATHS = (
+    re.compile(r"^/v1/mailbox/messages/[^/]+/attachments/[^/]+$"),
+    re.compile(r"^/v1/mailbox/remote-images/[^/]+$"),
+)
 
 
 def _must_not_store_response(path: str) -> bool:
@@ -35,6 +39,11 @@ def _must_not_store_response(path: str) -> bool:
         or path in _NO_STORE_AUTH_PATHS
         or path.startswith("/v1/auth/mobile/handoff/")
     )
+
+
+def _allows_private_content_cache(path: str) -> bool:
+    """Allow authenticated immutable bytes to use their route cache policy."""
+    return any(pattern.fullmatch(path) is not None for pattern in _PRIVATE_CONTENT_CACHE_PATHS)
 
 
 class JSONLogFormatter(logging.Formatter):
@@ -111,7 +120,9 @@ class RequestObservabilityMiddleware:
                 status_code = int(message.get("status", 500))
                 response_headers = list(message.get("headers", []))
                 path = str(scope.get("path") or "")
-                if _must_not_store_response(path):
+                if _must_not_store_response(path) and not (
+                    status_code in {200, 304} and _allows_private_content_cache(path)
+                ):
                     # Apply this at the ASGI boundary so validation errors and
                     # exception responses cannot accidentally become cacheable.
                     response_headers = [

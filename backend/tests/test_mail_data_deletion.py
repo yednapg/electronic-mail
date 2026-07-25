@@ -16,6 +16,7 @@ EXPECTED_MAIL_DATA_DELETE_ORDER = (
     "gmail_thread_order_entries",
     "gmail_thread_order_state",
     "gmail_reconcile_seen",
+    "gmail_initial_window_entries",
     "entity_outcomes",
     "grouping_decision_audit",
     "visible_mail_group_members",

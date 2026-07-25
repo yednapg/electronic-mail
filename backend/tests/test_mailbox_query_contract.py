@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
 from app.db import mail_groups
+from app.services.mail_groups import _gmail_row_from_canonical_thread
 
 
 class _Result:
@@ -30,6 +32,9 @@ class _Result:
         return self._first_row
 
     def scalar_one(self) -> int:
+        return self._scalar
+
+    def scalar_one_or_none(self):
         return self._scalar
 
 
@@ -59,6 +64,25 @@ class _QueuedConnection:
     def execute(self, statement, params: dict[str, object]) -> _Result:
         self.calls.append((str(statement), params))
         return self.results.pop(0)
+
+
+class _DescriptorConnection:
+    def __init__(self, *, row_count: int, has_more: bool) -> None:
+        self.rows = [
+            {"message_id": f"message-{index:03d}", "raw_payload_json": "{}"}
+            for index in range(1, row_count + 1)
+        ]
+        self.has_more = has_more
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def execute(self, statement, params: dict[str, object]) -> _Result:
+        sql = str(statement)
+        self.calls.append((sql, params))
+        if "SELECT message_id, raw_payload_json" in sql:
+            return _Result(rows=self.rows)
+        if "SELECT message_id" in sql and "raw_payload_json" not in sql:
+            return _Result(scalar="message-026" if self.has_more else None)
+        return _Result()
 
 
 def _message_row(
@@ -98,23 +122,197 @@ def _message_row(
         "render_doc_bytes": 0,
         "ai_title": None,
         "ai_title_generated_at": None,
+        "content_revision": 1,
+        "attachment_descriptors_json": "[]",
+        "mailbox_message_count": 1,
+        "mailbox_body_ready": True,
+        "mailbox_content_revision": f"revision-{thread_id}",
+        "mailbox_attachment_count": 0,
     }
 
 
 class MailboxQueryContractTests(unittest.TestCase):
+    def test_mailbox_list_transfers_one_aggregate_projection_for_ten_thousand_message_thread(self) -> None:
+        row = _message_row(
+            "newest-message",
+            "thread-with-ten-thousand-messages",
+            labels=["INBOX", "UNREAD"],
+            internal_date="2026-07-13T12:00:00+00:00",
+            mailbox_latest_at="2026-07-13T12:00:00+00:00",
+        )
+        row.update(
+            {
+                "mailbox_message_count": 10_000,
+                "mailbox_body_ready": False,
+                "mailbox_content_revision": "stable-thread-revision-12345678",
+                "mailbox_attachment_count": 237,
+            }
+        )
+        connection = _Connection(_Result(rows=[row]))
+
+        with patch.object(mail_groups, "get_engine", return_value=_Engine(connection)):
+            page = mail_groups.list_mailbox_thread_page(
+                "postgresql://example/db",
+                user_id="user-1",
+                label="inbox",
+                limit=10,
+            )
+
+        self.assertEqual(len(page.threads), 1)
+        thread_id, messages = page.threads[0]
+        self.assertEqual(thread_id, "thread-with-ten-thousand-messages")
+        # The DB must transfer one bounded projection row, not 10,000 member
+        # rows for Python to regroup.
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].message_id, "newest-message")
+        self.assertEqual(messages[0].raw_payload, {})
+        self.assertIsNone(messages[0].html_body_sanitized)
+        self.assertIsNone(messages[0].html_render_document)
+        self.assertIsNone(messages[0].text_body)
+        self.assertEqual(messages[0].mailbox_message_count, 10_000)
+        self.assertFalse(messages[0].mailbox_body_ready)
+        self.assertEqual(messages[0].mailbox_content_revision, "stable-thread-revision-12345678")
+        self.assertEqual(messages[0].mailbox_attachment_count, 237)
+
+        mailbox_row = _gmail_row_from_canonical_thread(thread_id, messages, "inbox", None)
+        self.assertEqual(mailbox_row.message_count, 10_000)
+        self.assertFalse(mailbox_row.body_ready)
+        self.assertEqual(mailbox_row.latest_subject, "Subject newest-message")
+        self.assertEqual(mailbox_row.latest_sender, "sender@example.com")
+        self.assertEqual(mailbox_row.sender, "sender@example.com")
+        self.assertEqual(mailbox_row.snippet, "body phrase")
+        self.assertEqual(mailbox_row.latest_message_at, "2026-07-13T12:00:00+00:00")
+        self.assertEqual(mailbox_row.label_ids, ["INBOX", "UNREAD"])
+        self.assertTrue(mailbox_row.unread)
+        self.assertTrue(mailbox_row.has_attachments)
+        self.assertEqual(mailbox_row.attachment_count, 237)
+        self.assertEqual(mailbox_row.content_revision, "stable-thread-revision-12345678")
+
+        sql, _params = connection.calls[-1]
+        self.assertNotIn("messages.*", sql)
+        for body_column in (
+            "messages.raw_payload_json",
+            "messages.html_body_sanitized",
+            "messages.html_render_document",
+            "messages.text_body",
+            "messages.body_fetch_error",
+        ):
+            self.assertNotIn(body_column, sql)
+        self.assertNotIn("raw_payload_json", sql)
+        self.assertNotIn("headers_json", sql)
+        self.assertNotIn("extracted_signals_json", sql)
+        self.assertIn("JOIN LATERAL", sql)
+        self.assertIn("COUNT(*)::INTEGER", sql)
+        self.assertIn("BOOL_AND", sql)
+        self.assertIn("STRING_AGG", sql)
+        self.assertIn("JSONB_ARRAY_LENGTH", sql.upper())
+
+    def test_attachment_descriptor_migration_is_schema_only_and_constant_default(self) -> None:
+        migration_path = (
+            Path(__file__).resolve().parents[1]
+            / "migrations"
+            / "versions"
+            / "20260725_0031_mailbox_attachment_descriptors.py"
+        )
+        migration_source = migration_path.read_text(encoding="utf-8")
+        upgrade_source = migration_source.split("def upgrade() -> None:", maxsplit=1)[1].split(
+            "def downgrade() -> None:", maxsplit=1
+        )[0]
+        normalized_upgrade = " ".join(upgrade_source.upper().split())
+
+        self.assertEqual(upgrade_source.count("op.execute("), 3)
+        self.assertIn("ADD COLUMN IF NOT EXISTS ATTACHMENT_DESCRIPTORS_JSON", normalized_upgrade)
+        self.assertIn("DEFAULT '[]'", normalized_upgrade)
+        self.assertIn("ADD COLUMN IF NOT EXISTS ATTACHMENT_DESCRIPTORS_READY", normalized_upgrade)
+        self.assertIn("DEFAULT FALSE", normalized_upgrade)
+        self.assertIn("ADD COLUMN IF NOT EXISTS ATTACHMENT_DESCRIPTORS_COMPLETE", normalized_upgrade)
+        self.assertNotIn("WITH RECURSIVE", normalized_upgrade)
+        self.assertNotIn("UPDATE GMAIL_MESSAGES", normalized_upgrade)
+        self.assertNotIn("SELECT ", normalized_upgrade)
+
+    def test_legacy_attachment_descriptor_convergence_is_cursor_bounded_to_25(self) -> None:
+        connection = _DescriptorConnection(row_count=25, has_more=True)
+        with patch.object(mail_groups, "get_engine", return_value=object()), patch.object(
+            mail_groups,
+            "user_mail_write_transaction",
+            return_value=nullcontext(connection),
+        ):
+            processed, has_more, cursor = (
+                mail_groups.backfill_gmail_attachment_descriptors_page(
+                    "postgresql://example/db",
+                    user_id="user-1",
+                    limit=10_000,
+                    after_message_id="message-000",
+                )
+            )
+
+        self.assertEqual(processed, 25)
+        self.assertTrue(has_more)
+        self.assertEqual(cursor, "message-025")
+        selection_sql, selection_params = connection.calls[0]
+        self.assertIn("LIMIT :limit", selection_sql)
+        self.assertIn("message_id > :after_message_id", selection_sql)
+        self.assertEqual(selection_params["limit"], 25)
+        self.assertEqual(selection_params["after_message_id"], "message-000")
+        self.assertEqual(
+            sum("UPDATE gmail_messages" in sql for sql, _params in connection.calls),
+            25,
+        )
+        self.assertFalse(
+            any("UPDATE gmail_import_state" in sql for sql, _params in connection.calls)
+        )
+
+    def test_ten_thousand_message_reader_thread_transfers_only_requested_page(self) -> None:
+        row = _message_row(
+            "message-9901",
+            "thread-huge",
+            labels=["INBOX"],
+            internal_date="2026-07-13T12:00:00+00:00",
+            mailbox_latest_at="2026-07-13T12:00:00+00:00",
+        )
+        row.update(
+            {
+                "thread_total_messages": 10_000,
+                "thread_incomplete_body_count": 0,
+                "thread_content_revision": "stable-revision-12345678",
+                "thread_latest_subject": "Newest subject",
+                "content_revision": 4,
+            }
+        )
+        connection = _Connection(_Result(rows=[row]))
+
+        with patch.object(mail_groups, "get_engine", return_value=_Engine(connection)):
+            page = mail_groups.get_gmail_thread_message_page(
+                "postgresql://example/db",
+                user_id="user-1",
+                gmail_thread_id="thread-huge",
+                limit=100,
+                offset=9_900,
+            )
+
+        self.assertIsNotNone(page)
+        assert page is not None
+        self.assertEqual(page.total_messages, 10_000)
+        self.assertEqual([message.message_id for message in page.messages], ["message-9901"])
+        self.assertEqual(page.latest_subject, "Newest subject")
+        self.assertEqual(page.content_revision, "stable-revision-12345678")
+        self.assertTrue(page.body_ready)
+        self.assertEqual(len(connection.calls), 1)
+        sql, params = connection.calls[0]
+        self.assertIn("LEFT JOIN LATERAL", sql)
+        self.assertIn("LIMIT :page_limit", sql)
+        self.assertIn("OFFSET :page_offset", sql)
+        self.assertIn("COUNT(*)::INTEGER AS thread_total_messages", sql)
+        self.assertIn("STRING_AGG", sql)
+        self.assertEqual(params["page_limit"], 100)
+        self.assertEqual(params["page_offset"], 9_900)
+
     def test_folder_page_uses_label_for_eligibility_but_whole_thread_for_order_and_render(self) -> None:
         rows = [
             _message_row(
-                "thread-a-inbox",
-                "thread-a",
-                labels=["INBOX", "UNREAD"],
-                internal_date="2026-07-13T09:00:00+00:00",
-                mailbox_latest_at="2026-07-13T12:00:00+00:00",
-            ),
-            _message_row(
                 "thread-a-sent",
                 "thread-a",
-                labels=["SENT"],
+                labels=["INBOX", "SENT", "UNREAD"],
                 internal_date="2026-07-13T12:00:00+00:00",
                 mailbox_latest_at="2026-07-13T12:00:00+00:00",
             ),
@@ -133,6 +331,7 @@ class MailboxQueryContractTests(unittest.TestCase):
                 mailbox_latest_at="2026-07-13T10:00:00+00:00",
             ),
         ]
+        rows[0]["mailbox_message_count"] = 2
         connection = _Connection(_Result(rows=rows))
 
         with patch.object(mail_groups, "get_engine", return_value=_Engine(connection)):
@@ -144,7 +343,9 @@ class MailboxQueryContractTests(unittest.TestCase):
             )
 
         self.assertEqual([thread_id for thread_id, _messages in page.threads], ["thread-a", "thread-b"])
-        self.assertEqual([message.message_id for message in page.threads[0][1]], ["thread-a-inbox", "thread-a-sent"])
+        self.assertEqual([message.message_id for message in page.threads[0][1]], ["thread-a-sent"])
+        self.assertEqual(page.threads[0][1][0].mailbox_message_count, 2)
+        self.assertEqual(page.threads[0][1][0].label_ids, ["INBOX", "SENT", "UNREAD"])
         self.assertEqual(page.loaded_threads, 2)
         self.assertIsNotNone(page.next_cursor)
         self.assertEqual(
@@ -156,7 +357,8 @@ class MailboxQueryContractTests(unittest.TestCase):
         self.assertIn("messages.label_ids_json::jsonb ? 'INBOX'", sql)
         self.assertIn("JOIN gmail_messages AS all_messages", sql)
         self.assertIn("MAX(COALESCE(all_messages.internal_date, all_messages.updated_at))", sql)
-        self.assertIn("JOIN gmail_messages AS messages", sql)
+        self.assertIn("JOIN LATERAL", sql)
+        self.assertIn("LIMIT 1", sql)
         self.assertEqual(params["limit"], 3)
 
     def test_complete_gmail_snapshot_controls_order_and_uses_stable_generation_cursor(self) -> None:

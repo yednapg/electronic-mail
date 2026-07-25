@@ -190,9 +190,10 @@ private struct ElectronicMailRootView: View {
                 SetupAnimationView(
                     startedAt: setupStartedAt,
                     readiness: store.currentReadiness,
+                    progress: store.setupProgress,
                     errorMessage: setupError
                 ) {
-                    Task { await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 60) }
+                    Task { await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 30) }
                 }
                 .transition(.opacity)
             case .app:
@@ -251,7 +252,14 @@ private struct ElectronicMailRootView: View {
         }
 
         store.setSessionToken(token)
-        await store.load()
+        if await store.restoreLocalCache() {
+            Task { await store.load() }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                stage = .app
+            }
+            return
+        }
+        Task { await store.load() }
 
         if case .failed(let message) = store.phase {
             if store.hasSessionToken {
@@ -271,7 +279,7 @@ private struct ElectronicMailRootView: View {
             return
         }
 
-        await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 60)
+        await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 30)
     }
 
     @MainActor
@@ -289,13 +297,8 @@ private struct ElectronicMailRootView: View {
             )
             let session = try await store.exchangeMobileSession(grant: grant)
             try tokenStore.save(session.sessionToken)
-            await store.load()
-
-            if case .failed(let message) = store.phase {
-                throw RuntimeError(message)
-            }
-
-            await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 60)
+            Task { await store.load() }
+            await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 30)
         } catch {
             tokenStore.clear()
             store.setSessionToken(nil)
@@ -366,7 +369,8 @@ private struct ElectronicMailRootView: View {
         )
 
         guard ready else {
-            setupError = store.currentReadiness?.errorMessage ?? "Still syncing Gmail. Try again in a moment."
+            setupError = store.currentReadiness?.errorMessage
+                ?? "Electronic Mail could not verify a saved batch within 30 seconds. Check your connection and retry."
             return
         }
 
@@ -382,19 +386,40 @@ private struct ElectronicMailRootView: View {
 @MainActor
 private struct PostLoginCoordinator {
     let store: InboxStore
+    let now: () -> Date
+
+    init(store: InboxStore, now: @escaping () -> Date = Date.init) {
+        self.store = store
+        self.now = now
+    }
 
     func waitForReadiness(minimumDisplaySeconds: TimeInterval, maximumWaitSeconds: TimeInterval) async -> Bool {
-        let startedAt = Date()
+        let policy = MailboxSetupDeadlinePolicy(
+            startedAt: now(),
+            minimumDisplaySeconds: minimumDisplaySeconds,
+            maximumWaitSeconds: maximumWaitSeconds
+        )
         while !Task.isCancelled {
-            await store.refreshForReadiness()
-            let elapsed = Date().timeIntervalSince(startedAt)
-            if elapsed >= minimumDisplaySeconds, store.isReadyForMainInterface {
+            let currentDate = now()
+            switch policy.decision(
+                now: currentDate,
+                initialWindowReady: store.isReadyForMainInterface,
+                committedBatchReady: store.canEnterWithBuildingDashboard
+            ) {
+            case .enter:
                 return true
+            case .retry:
+                return false
+            case .wait:
+                break
             }
-            if elapsed >= maximumWaitSeconds, store.canEnterWithBuildingDashboard {
-                return true
-            }
-            let sleepSeconds = max(0.25, min(2, minimumDisplaySeconds - elapsed > 0 ? minimumDisplaySeconds - elapsed : 2))
+            store.beginReadinessRefresh()
+            let elapsed = currentDate.timeIntervalSince(policy.startedAt)
+            let remaining = max(0.01, maximumWaitSeconds - elapsed)
+            let desired = minimumDisplaySeconds - elapsed > 0
+                ? minimumDisplaySeconds - elapsed
+                : 1
+            let sleepSeconds = min(remaining, max(0.05, min(1, desired)))
             try? await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
         }
         return false
@@ -531,69 +556,66 @@ private struct SetupAnimationView: View {
 
     let startedAt: Date
     let readiness: PostLoginReadinessResponse?
+    let progress: MailboxSetupProgressSnapshot
     let errorMessage: String?
     let onRetry: () -> Void
-
-    private let steps = [
-        "Importing emails ...",
-        "Indexing conversations ...",
-        "Syncing mailbox folders ...",
-        "Preparing your mailbox ...",
-        "Almost ready!"
-    ]
 
     var body: some View {
         ZStack {
             ElectronicMailDesign.background(for: colorScheme)
                 .ignoresSafeArea()
 
-            TimelineView(.periodic(from: startedAt, by: 0.25)) { timeline in
-                let elapsed = max(0, timeline.date.timeIntervalSince(startedAt))
-                let step = min(Int(elapsed / 5.0), steps.count - 1)
+            VStack(spacing: 20) {
+                WavyStatusText(text: statusText)
+                    .id(statusText)
+                    .transition(reduceMotion ? .identity : .opacity.combined(with: .scale(scale: 0.985)))
+                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: statusText)
 
-                VStack(spacing: 18) {
-                    WavyStatusText(text: statusText(fallbackStep: step))
-                        .id(statusText(fallbackStep: step))
-                        .transition(reduceMotion ? .identity : .opacity.combined(with: .scale(scale: 0.985)))
-                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: statusText(fallbackStep: step))
+                ProgressView(value: progress.progressFraction)
+                    .progressViewStyle(.linear)
+                    .frame(width: 360)
+                    .accessibilityLabel("Mailbox setup progress")
+                    .accessibilityValue("\(Int(progress.progressFraction * 100)) percent")
 
-                    if let errorMessage {
-                        VStack(spacing: 12) {
-                            Text(errorMessage)
-                                .font(ElectronicMailType.body())
-                                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                            Button("Retry") {
-                                onRetry()
-                            }
-                            .buttonStyle(.plain)
-                            .font(ElectronicMailType.small(weight: .semibold))
-                            .foregroundStyle(ElectronicMailDesign.appleBlue)
+                if let errorMessage {
+                    VStack(spacing: 12) {
+                        Text(errorMessage)
+                            .font(ElectronicMailType.body())
+                            .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                        Button("Retry") {
+                            onRetry()
                         }
+                        .buttonStyle(.plain)
+                        .font(ElectronicMailType.small(weight: .semibold))
+                        .foregroundStyle(ElectronicMailDesign.appleBlue)
                     }
                 }
             }
+            .id(startedAt)
         }
         .environment(\.font, .system(.body, design: .rounded))
     }
 
-    private func statusText(fallbackStep: Int) -> String {
-        guard let readiness else {
-            return steps[fallbackStep]
+    private var statusText: String {
+        if progress.initialTargetReady || progress.confirmedEmpty {
+            return "Opening your mailbox"
         }
-        switch readiness.stage {
-        case "starting_full_import", "importing_recent_gmail":
-            return "Importing 90 days of email ..."
-        case "grouping_threads":
-            return "Preparing your inbox ..."
-        case "writing_titles":
-            return "Preparing your inbox ..."
-        case "building_dashboard":
-            return "Preparing your inbox ..."
-        case "ready", "welcome_back":
-            return "Almost ready!"
-        default:
-            return steps[fallbackStep]
+        if progress.initialTargetCount > 0,
+           progress.initialMetadataCount < progress.initialTargetCount {
+            if progress.initialMetadataCount == 0,
+               ["starting", "connecting", "discovering_recent"].contains(progress.phase) {
+                return "Connecting to Gmail"
+            }
+            return "Preparing recent mail — \(progress.initialMetadataCount) conversations ready"
         }
+        if progress.initialBodyTargetCount > 0,
+           progress.initialBodyReadyCount < progress.initialBodyTargetCount {
+            return "Preparing message content — \(progress.initialBodyReadyCount) of \(progress.initialBodyTargetCount) ready"
+        }
+        if readiness?.mailboxReady == true {
+            return "Opening your mailbox"
+        }
+        return "Connecting to Gmail"
     }
 }
 

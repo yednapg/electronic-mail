@@ -390,9 +390,18 @@ def complete_job(database_url: str, job_id: str, *, worker_id: str) -> bool:
     return True
 
 
-def fail_job(database_url: str, job: BackgroundJob, error: str, *, worker_id: str) -> bool:
+def fail_job(
+    database_url: str,
+    job: BackgroundJob,
+    error: str,
+    *,
+    worker_id: str,
+    retry_delay_seconds: int | None = None,
+) -> bool:
     final = job.attempt_count >= job.max_attempts
-    delay_seconds = _backoff_seconds(job.attempt_count)
+    delay_seconds = retry_backoff_seconds(job.attempt_count)
+    if retry_delay_seconds is not None:
+        delay_seconds = max(delay_seconds, max(0, int(retry_delay_seconds)))
     with get_engine(database_url).begin() as connection:
         if final:
             failed_job_id = connection.execute(
@@ -668,6 +677,10 @@ def _iso(value: Any) -> str:
             value = value.replace(tzinfo=timezone.utc)
         return value.isoformat()
     return str(value)
+
+
+def retry_backoff_seconds(attempt_count: int) -> int:
+    return _backoff_seconds(attempt_count)
 
 
 def _backoff_seconds(attempt_count: int) -> int:

@@ -33,6 +33,7 @@ USER_MAIL_DATA_DELETE_ORDER = (
     "gmail_thread_order_entries",
     "gmail_thread_order_state",
     "gmail_reconcile_seen",
+    "gmail_initial_window_entries",
     "entity_outcomes",
     "grouping_decision_audit",
     "visible_mail_group_members",
@@ -72,6 +73,13 @@ class GmailMessageRecord:
     render_doc_bytes: int = 0
     ai_title: str | None = None
     ai_title_generated_at: str | None = None
+    content_revision: int = 1
+    attachment_descriptors: list[dict[str, Any]] = field(default_factory=list)
+    attachment_descriptors_ready: bool = False
+    mailbox_message_count: int | None = None
+    mailbox_body_ready: bool | None = None
+    mailbox_content_revision: str | None = None
+    mailbox_attachment_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +163,37 @@ class VisibleMailGroupUpsert:
 class MailGroupDetail:
     group: MailGroupRecord
     messages: list[GmailMessageRecord]
+
+
+@dataclass(frozen=True)
+class GmailThreadSnapshotStats:
+    """Lightweight sizing data used before building native offline snapshots."""
+
+    gmail_thread_id: str
+    message_count: int
+    stored_bytes: int
+    incomplete_body_count: int
+
+
+@dataclass(frozen=True)
+class GmailThreadMessagePage:
+    """One bounded reader page plus whole-thread metadata.
+
+    The message list is always limited in Postgres. The remaining fields are
+    calculated over the same MVCC statement so a caller never has to load an
+    oversized conversation merely to determine pagination or cache identity.
+    """
+
+    gmail_thread_id: str
+    messages: list[GmailMessageRecord]
+    total_messages: int
+    latest_subject: str | None
+    incomplete_body_count: int
+    content_revision: str
+
+    @property
+    def body_ready(self) -> bool:
+        return self.total_messages > 0 and self.incomplete_body_count == 0
 
 
 @dataclass(frozen=True)
@@ -308,12 +347,63 @@ class GmailImportState:
     reconcile_baseline_history_id: str | None
     reconcile_started_at: str | None
     updated_at: str
+    sync_generation: str | None = None
+    phase: str | None = None
+    initial_target_count: int = 0
+    initial_metadata_count: int = 0
+    initial_body_target_count: int = 0
+    initial_body_ready_count: int = 0
+    history_metadata_count: int = 0
+    history_body_ready_count: int = 0
+    estimated_total_count: int = 0
+    initial_window_complete: bool = False
+    history_metadata_complete: bool = False
+    history_body_complete: bool = False
+    last_progress_at: str | None = None
+    attachment_descriptors_complete: bool = False
+
+
+@dataclass(frozen=True)
+class GmailInitialWindowEntry:
+    user_id: str
+    generation_id: str
+    gmail_thread_id: str
+    position: int
+    message_count: int
+    metadata_ready_at: str | None
+    body_ready_at: str | None
+
+
+@dataclass(frozen=True)
+class GmailSyncProgress:
+    sync_generation: str | None = None
+    phase: str | None = None
+    initial_target_count: int = 0
+    initial_metadata_count: int = 0
+    initial_body_target_count: int = 0
+    initial_body_ready_count: int = 0
+    history_metadata_count: int = 0
+    history_body_ready_count: int = 0
+    estimated_total_count: int = 0
+    initial_window_complete: bool = False
+    history_metadata_complete: bool = False
+    history_body_complete: bool = False
+    last_progress_at: str | None = None
+
+
+class GmailBodyUpdateResult(list[str]):
+    """List-compatible body result carrying the same-transaction progress."""
+
+    def __init__(self, message_ids: Iterable[str], progress: GmailSyncProgress | None) -> None:
+        super().__init__(message_ids)
+        self.progress = progress
 
 
 @dataclass(frozen=True)
 class GmailReconcileFinalizeResult:
     deleted_message_count: int
     affected_group_ids: list[str]
+    progress: GmailSyncProgress | None = None
 
 
 def gmail_history_cursor_is_authoritative(state: Any) -> bool:
@@ -543,6 +633,16 @@ def mark_import_started(database_url: str, *, user_id: str) -> None:
                 VALUES (:user_id, now(), now())
                 ON CONFLICT (user_id) DO UPDATE SET
                   last_import_started_at = now(),
+                  phase = CASE
+                    WHEN gmail_import_state.sync_generation IS NOT NULL
+                      AND gmail_import_state.history_metadata_complete
+                      THEN 'syncing_recent'
+                    ELSE gmail_import_state.phase
+                  END,
+                  last_progress_at = CASE
+                    WHEN gmail_import_state.sync_generation IS NOT NULL THEN now()
+                    ELSE gmail_import_state.last_progress_at
+                  END,
                   last_sync_error = NULL,
                   updated_at = now()
                 """
@@ -646,6 +746,15 @@ def mark_history_delta_completed(
                   last_import_completed_at = now(),
                   last_delta_sync_at = now(),
                   history_cursor_authoritative = TRUE,
+                  phase = CASE
+                    WHEN gmail_import_state.sync_generation IS NULL THEN gmail_import_state.phase
+                    WHEN gmail_import_state.history_body_complete THEN 'complete'
+                    ELSE 'usable'
+                  END,
+                  last_progress_at = CASE
+                    WHEN gmail_import_state.sync_generation IS NOT NULL THEN now()
+                    ELSE gmail_import_state.last_progress_at
+                  END,
                   last_sync_error = NULL,
                   updated_at = now()
                 """
@@ -661,7 +770,17 @@ def mark_import_error(database_url: str, *, user_id: str, error: str) -> None:
                 """
                 INSERT INTO gmail_import_state (user_id, last_sync_error, updated_at)
                 VALUES (:user_id, :error, now())
-                ON CONFLICT (user_id) DO UPDATE SET last_sync_error = excluded.last_sync_error, updated_at = now()
+                ON CONFLICT (user_id) DO UPDATE SET
+                  last_sync_error = excluded.last_sync_error,
+                  phase = CASE
+                    WHEN gmail_import_state.sync_generation IS NOT NULL THEN 'failed'
+                    ELSE gmail_import_state.phase
+                  END,
+                  last_progress_at = CASE
+                    WHEN gmail_import_state.sync_generation IS NOT NULL THEN now()
+                    ELSE gmail_import_state.last_progress_at
+                  END,
+                  updated_at = now()
                 """
             ),
             {"user_id": user_id, "error": error[:4000]},
@@ -716,6 +835,628 @@ def get_import_state(database_url: str, *, user_id: str) -> GmailImportState | N
     with get_engine(database_url).connect() as connection:
         row = connection.execute(text("SELECT * FROM gmail_import_state WHERE user_id = :user_id"), {"user_id": user_id}).mappings().first()
     return _state_from_row(row) if row is not None else None
+
+
+def gmail_sync_progress(state: GmailImportState | None) -> GmailSyncProgress:
+    if state is None:
+        return GmailSyncProgress()
+    return GmailSyncProgress(
+        sync_generation=getattr(state, "sync_generation", None),
+        phase=getattr(state, "phase", None),
+        initial_target_count=int(getattr(state, "initial_target_count", 0) or 0),
+        initial_metadata_count=int(getattr(state, "initial_metadata_count", 0) or 0),
+        initial_body_target_count=int(getattr(state, "initial_body_target_count", 0) or 0),
+        initial_body_ready_count=int(getattr(state, "initial_body_ready_count", 0) or 0),
+        history_metadata_count=int(getattr(state, "history_metadata_count", 0) or 0),
+        history_body_ready_count=int(getattr(state, "history_body_ready_count", 0) or 0),
+        estimated_total_count=int(getattr(state, "estimated_total_count", 0) or 0),
+        initial_window_complete=bool(getattr(state, "initial_window_complete", False)),
+        history_metadata_complete=bool(getattr(state, "history_metadata_complete", False)),
+        history_body_complete=bool(getattr(state, "history_body_complete", False)),
+        last_progress_at=getattr(state, "last_progress_at", None),
+    )
+
+
+def activate_existing_gmail_progressive_sync(
+    database_url: str,
+    *,
+    user_id: str,
+    generation_id: str,
+    history_metadata_complete: bool,
+) -> GmailImportState | None:
+    """Adopt a pre-progressive mailbox without discarding durable import state.
+
+    Existing accounts already have useful Gmail rows (and may still own a
+    resumable legacy backfill cursor).  Activation therefore derives the
+    progressive counters and initial window from those rows in one guarded
+    transaction.  It deliberately never writes Gmail cursors, reconciliation
+    state, or legacy completion timestamps.
+    """
+    generation_id = generation_id.strip()
+    if not generation_id:
+        raise ValueError("Gmail sync generation is required")
+    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        state = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM gmail_import_state
+                WHERE user_id = :user_id
+                FOR UPDATE
+                """
+            ),
+            {"user_id": user_id},
+        ).mappings().first()
+        if state is None:
+            return None
+        if state["sync_generation"] is not None or state["first_batch_imported_at"] is None:
+            return _state_from_row(state)
+
+        activated = connection.execute(
+            text(
+                """
+                UPDATE gmail_import_state
+                SET sync_generation = :generation_id,
+                    phase = 'usable',
+                    last_progress_at = now(),
+                    updated_at = now()
+                WHERE user_id = :user_id
+                  AND sync_generation IS NULL
+                  AND first_batch_imported_at IS NOT NULL
+                RETURNING user_id
+                """
+            ),
+            {"user_id": user_id, "generation_id": generation_id},
+        ).scalar_one_or_none()
+        if activated is None:
+            current = connection.execute(
+                text("SELECT * FROM gmail_import_state WHERE user_id = :user_id"),
+                {"user_id": user_id},
+            ).mappings().first()
+            return _state_from_row(current) if current is not None else None
+
+        connection.execute(
+            text(
+                """
+                WITH ranked_threads AS (
+                  SELECT
+                    messages.gmail_thread_id,
+                    COUNT(*)::INTEGER AS message_count,
+                    BOOL_AND(
+                      COALESCE(messages.body_fetch_status, 'missing') IN ('fetched', 'unavailable')
+                    ) AS body_ready,
+                    ROW_NUMBER() OVER (
+                      ORDER BY MAX(messages.internal_date) DESC NULLS LAST,
+                               messages.gmail_thread_id DESC
+                    ) - 1 AS position
+                  FROM gmail_messages AS messages
+                  WHERE messages.user_id = :user_id
+                    AND NULLIF(messages.gmail_thread_id, '') IS NOT NULL
+                  GROUP BY messages.gmail_thread_id
+                )
+                INSERT INTO gmail_initial_window_entries (
+                  user_id, generation_id, gmail_thread_id, position,
+                  message_count, metadata_ready_at, body_ready_at,
+                  created_at, updated_at
+                )
+                SELECT
+                  :user_id, :generation_id, ranked.gmail_thread_id, ranked.position,
+                  ranked.message_count, now(),
+                  CASE WHEN ranked.body_ready THEN now() ELSE NULL END,
+                  now(), now()
+                FROM ranked_threads AS ranked
+                WHERE ranked.position < 100
+                ON CONFLICT (user_id, generation_id, gmail_thread_id) DO NOTHING
+                """
+            ),
+            {"user_id": user_id, "generation_id": generation_id},
+        )
+        counts = connection.execute(
+            text(
+                """
+                SELECT
+                  (
+                    SELECT COUNT(*)::INTEGER
+                    FROM gmail_initial_window_entries AS entries
+                    WHERE entries.user_id = :user_id
+                      AND entries.generation_id = :generation_id
+                  ) AS initial_count,
+                  (
+                    SELECT COUNT(*)::INTEGER
+                    FROM gmail_initial_window_entries AS entries
+                    WHERE entries.user_id = :user_id
+                      AND entries.generation_id = :generation_id
+                      AND entries.position < 25
+                      AND entries.body_ready_at IS NOT NULL
+                  ) AS initial_body_ready_count,
+                  (
+                    SELECT COUNT(DISTINCT COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id))::INTEGER
+                    FROM gmail_messages AS messages
+                    WHERE messages.user_id = :user_id
+                  ) AS history_count,
+                  (
+                    SELECT COUNT(*)::INTEGER
+                    FROM (
+                      SELECT COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) AS thread_key
+                      FROM gmail_messages AS messages
+                      WHERE messages.user_id = :user_id
+                      GROUP BY thread_key
+                      HAVING BOOL_AND(
+                        COALESCE(messages.body_fetch_status, 'missing') IN ('fetched', 'unavailable')
+                      )
+                    ) AS ready_threads
+                  ) AS history_body_ready_count,
+                  NOT EXISTS (
+                    SELECT 1
+                    FROM gmail_messages AS messages
+                    WHERE messages.user_id = :user_id
+                      AND COALESCE(messages.body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                  ) AS all_bodies_ready
+                """
+            ),
+            {"user_id": user_id, "generation_id": generation_id},
+        ).mappings().one()
+        initial_count = int(counts["initial_count"] or 0)
+        history_count = int(counts["history_count"] or 0)
+        # Re-read completion under the row lock: a reconciliation or legacy
+        # backfill may have completed after the caller's initial state read.
+        metadata_complete = bool(
+            history_metadata_complete or state.get("full_backfill_completed_at")
+        )
+        bodies_complete = metadata_complete and bool(counts["all_bodies_ready"])
+        row = connection.execute(
+            text(
+                """
+                UPDATE gmail_import_state
+                SET initial_target_count = :initial_count,
+                    initial_metadata_count = :initial_count,
+                    initial_body_target_count = LEAST(25, :initial_count),
+                    initial_body_ready_count = LEAST(
+                      LEAST(25, :initial_count),
+                      :initial_body_ready_count
+                    ),
+                    history_metadata_count = :history_count,
+                    history_body_ready_count = LEAST(:history_count, :history_body_ready_count),
+                    estimated_total_count = GREATEST(estimated_total_count, :history_count),
+                    initial_window_complete = TRUE,
+                    history_metadata_complete = :history_metadata_complete,
+                    history_body_complete = :history_body_complete,
+                    phase = CASE
+                      WHEN :history_body_complete THEN 'complete'
+                      WHEN :history_metadata_complete THEN 'syncing_history'
+                      ELSE 'usable'
+                    END,
+                    last_progress_at = now(),
+                    updated_at = now()
+                WHERE user_id = :user_id
+                  AND sync_generation = :generation_id
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": user_id,
+                "generation_id": generation_id,
+                "initial_count": initial_count,
+                "initial_body_ready_count": int(counts["initial_body_ready_count"] or 0),
+                "history_count": history_count,
+                "history_body_ready_count": int(counts["history_body_ready_count"] or 0),
+                "history_metadata_complete": metadata_complete,
+                "history_body_complete": bodies_complete,
+            },
+        ).mappings().first()
+    return _state_from_row(row) if row is not None else None
+
+
+def start_gmail_sync_progress(
+    database_url: str,
+    *,
+    user_id: str,
+    generation_id: str,
+) -> GmailImportState | None:
+    """Fence progressive bootstrap writes to the active reconciliation generation."""
+    generation_id = generation_id.strip()
+    if not generation_id:
+        raise ValueError("Gmail sync generation is required")
+    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        row = connection.execute(
+            text(
+                """
+                UPDATE gmail_import_state
+                SET sync_generation = :generation_id,
+                    phase = CASE
+                      WHEN sync_generation = :generation_id AND phase IS NOT NULL
+                        THEN phase
+                      ELSE 'discovering_recent'
+                    END,
+                    initial_target_count = CASE WHEN sync_generation = :generation_id THEN initial_target_count ELSE 0 END,
+                    initial_metadata_count = CASE WHEN sync_generation = :generation_id THEN initial_metadata_count ELSE 0 END,
+                    initial_body_target_count = CASE WHEN sync_generation = :generation_id THEN initial_body_target_count ELSE 0 END,
+                    initial_body_ready_count = CASE WHEN sync_generation = :generation_id THEN initial_body_ready_count ELSE 0 END,
+                    history_metadata_count = CASE WHEN sync_generation = :generation_id THEN history_metadata_count ELSE 0 END,
+                    history_body_ready_count = CASE WHEN sync_generation = :generation_id THEN history_body_ready_count ELSE 0 END,
+                    estimated_total_count = CASE WHEN sync_generation = :generation_id THEN estimated_total_count ELSE 0 END,
+                    initial_window_complete = CASE WHEN sync_generation = :generation_id THEN initial_window_complete ELSE FALSE END,
+                    history_metadata_complete = CASE WHEN sync_generation = :generation_id THEN history_metadata_complete ELSE FALSE END,
+                    history_body_complete = CASE WHEN sync_generation = :generation_id THEN history_body_complete ELSE FALSE END,
+                    last_progress_at = CASE
+                      WHEN sync_generation = :generation_id
+                        THEN COALESCE(last_progress_at, now())
+                      ELSE now()
+                    END,
+                    updated_at = now()
+                WHERE user_id = :user_id
+                  AND reconcile_generation = :generation_id
+                RETURNING *
+                """
+            ),
+            {"user_id": user_id, "generation_id": generation_id},
+        ).mappings().first()
+        if row is None:
+            return None
+        connection.execute(
+            text(
+                """
+                DELETE FROM gmail_initial_window_entries
+                WHERE user_id = :user_id
+                  AND generation_id <> :generation_id
+                """
+            ),
+            {"user_id": user_id, "generation_id": generation_id},
+        )
+    return _state_from_row(row)
+
+
+def initialize_gmail_initial_window(
+    database_url: str,
+    *,
+    user_id: str,
+    generation_id: str,
+    gmail_thread_ids: list[str],
+    estimated_total_count: int = 0,
+) -> GmailSyncProgress | None:
+    """Persist one capped provider discovery response exactly once."""
+    unique_thread_ids = list(dict.fromkeys(thread_id for thread_id in gmail_thread_ids if thread_id))[:100]
+    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        active = connection.execute(
+            text(
+                """
+                SELECT 1
+                FROM gmail_import_state
+                WHERE user_id = :user_id
+                  AND sync_generation = :generation_id
+                FOR UPDATE
+                """
+            ),
+            {"user_id": user_id, "generation_id": generation_id},
+        ).scalar_one_or_none()
+        if active is None:
+            return None
+        already_discovered = connection.execute(
+            text(
+                """
+                SELECT EXISTS (
+                  SELECT 1
+                  FROM gmail_initial_window_entries
+                  WHERE user_id = :user_id
+                    AND generation_id = :generation_id
+                ) OR EXISTS (
+                  SELECT 1
+                  FROM gmail_import_state
+                  WHERE user_id = :user_id
+                    AND sync_generation = :generation_id
+                    AND phase IS NOT NULL
+                    AND phase NOT IN ('discovering_recent', 'failed')
+                )
+                """
+            ),
+            {"user_id": user_id, "generation_id": generation_id},
+        ).scalar_one()
+        if not already_discovered:
+            for position, thread_id in enumerate(unique_thread_ids):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO gmail_initial_window_entries (
+                          user_id, generation_id, gmail_thread_id, position,
+                          created_at, updated_at
+                        ) VALUES (
+                          :user_id, :generation_id, :gmail_thread_id, :position,
+                          now(), now()
+                        )
+                        ON CONFLICT (user_id, generation_id, gmail_thread_id) DO NOTHING
+                        """
+                    ),
+                    {
+                        "user_id": user_id,
+                        "generation_id": generation_id,
+                        "gmail_thread_id": thread_id,
+                        "position": position,
+                    },
+                )
+            target_count = len(unique_thread_ids)
+            connection.execute(
+                text(
+                    """
+                    UPDATE gmail_import_state
+                    SET initial_target_count = :target_count,
+                        initial_body_target_count = LEAST(25, :target_count),
+                        estimated_total_count = GREATEST(estimated_total_count, :estimated_total_count),
+                        initial_window_complete = (:target_count = 0),
+                        first_batch_imported_at = CASE
+                          WHEN :target_count = 0 THEN COALESCE(first_batch_imported_at, now())
+                          ELSE first_batch_imported_at
+                        END,
+                        phase = CASE
+                          WHEN :target_count = 0 THEN 'syncing_history'
+                          ELSE 'importing_metadata'
+                        END,
+                        last_import_completed_at = CASE WHEN :target_count = 0 THEN now() ELSE last_import_completed_at END,
+                        last_progress_at = now(),
+                        last_sync_error = NULL,
+                        updated_at = now()
+                    WHERE user_id = :user_id
+                      AND sync_generation = :generation_id
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "generation_id": generation_id,
+                    "target_count": target_count,
+                    "estimated_total_count": max(0, int(estimated_total_count)),
+                },
+            )
+        row = connection.execute(
+            text("SELECT * FROM gmail_import_state WHERE user_id = :user_id"),
+            {"user_id": user_id},
+        ).mappings().one()
+    return gmail_sync_progress(_state_from_row(row))
+
+
+def list_pending_gmail_initial_window_entries(
+    database_url: str,
+    *,
+    user_id: str,
+    generation_id: str,
+    limit: int = 25,
+) -> list[GmailInitialWindowEntry]:
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM gmail_initial_window_entries
+                WHERE user_id = :user_id
+                  AND generation_id = :generation_id
+                  AND metadata_ready_at IS NULL
+                ORDER BY position ASC
+                LIMIT :limit
+                """
+            ),
+            {
+                "user_id": user_id,
+                "generation_id": generation_id,
+                "limit": max(1, min(int(limit), 25)),
+            },
+        ).mappings().all()
+    return [_initial_window_entry_from_row(row) for row in rows]
+
+
+def list_gmail_initial_window_entries_needing_body_fetch(
+    database_url: str,
+    *,
+    user_id: str,
+    generation_id: str,
+    limit: int = 100,
+) -> list[GmailInitialWindowEntry]:
+    """Recover committed initial metadata whose body job is not yet terminal."""
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM gmail_initial_window_entries
+                WHERE user_id = :user_id
+                  AND generation_id = :generation_id
+                  AND metadata_ready_at IS NOT NULL
+                  AND body_ready_at IS NULL
+                ORDER BY position ASC
+                LIMIT :limit
+                """
+            ),
+            {
+                "user_id": user_id,
+                "generation_id": generation_id,
+                "limit": max(1, min(int(limit), 100)),
+            },
+        ).mappings().all()
+    return [_initial_window_entry_from_row(row) for row in rows]
+
+
+def list_gmail_initial_window_positions(
+    database_url: str,
+    *,
+    user_id: str,
+    gmail_thread_ids: list[str],
+) -> dict[str, int]:
+    """Return ranks from only the account's active progressive generation."""
+    normalized = list(dict.fromkeys(thread_id for thread_id in gmail_thread_ids if thread_id))
+    if not normalized:
+        return {}
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT entries.gmail_thread_id, entries.position
+                FROM gmail_initial_window_entries AS entries
+                JOIN gmail_import_state AS state
+                  ON state.user_id = entries.user_id
+                 AND state.sync_generation = entries.generation_id
+                WHERE entries.user_id = :user_id
+                  AND entries.gmail_thread_id = ANY(:thread_ids)
+                """
+            ),
+            {"user_id": user_id, "thread_ids": normalized},
+        ).mappings().all()
+    return {str(row["gmail_thread_id"]): int(row["position"]) for row in rows}
+
+
+def commit_gmail_initial_window_metadata_batch(
+    database_url: str,
+    *,
+    user_id: str,
+    generation_id: str,
+    gmail_thread_ids: list[str],
+    messages: Iterable[GmailMessageRecord],
+    terminal_missing_thread_ids: list[str] | None = None,
+) -> GmailSyncProgress | None:
+    """Atomically publish at most 25 conversations and monotonic progress."""
+    unique_thread_ids = list(dict.fromkeys(thread_id for thread_id in gmail_thread_ids if thread_id))
+    terminal_thread_ids = list(
+        dict.fromkeys(
+            thread_id
+            for thread_id in (terminal_missing_thread_ids or [])
+            if thread_id
+        )
+    )
+    if set(unique_thread_ids) & set(terminal_thread_ids):
+        raise ValueError("A Gmail thread cannot be both hydrated and terminally missing")
+    if len(set(unique_thread_ids) | set(terminal_thread_ids)) > 25:
+        raise ValueError("An initial Gmail metadata commit is limited to 25 threads")
+    rows = list(messages)
+    if any(message.user_id != user_id for message in rows):
+        raise ValueError("Initial Gmail metadata belongs to a different user")
+    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        active = connection.execute(
+            text(
+                """
+                SELECT 1
+                FROM gmail_import_state
+                WHERE user_id = :user_id
+                  AND sync_generation = :generation_id
+                FOR UPDATE
+                """
+            ),
+            {"user_id": user_id, "generation_id": generation_id},
+        ).scalar_one_or_none()
+        if active is None:
+            return None
+        if terminal_thread_ids:
+            connection.execute(
+                text(
+                    """
+                    UPDATE gmail_initial_window_entries
+                    SET metadata_ready_at = COALESCE(metadata_ready_at, now()),
+                        body_ready_at = COALESCE(body_ready_at, now()),
+                        message_count = 0,
+                        updated_at = now()
+                    WHERE user_id = :user_id
+                      AND generation_id = :generation_id
+                      AND gmail_thread_id = ANY(:thread_ids)
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "generation_id": generation_id,
+                    "thread_ids": terminal_thread_ids,
+                },
+            )
+        _upsert_gmail_messages_on_connection(connection, rows)
+        if unique_thread_ids:
+            connection.execute(
+                text(
+                    """
+                    UPDATE gmail_initial_window_entries AS entries
+                    SET metadata_ready_at = COALESCE(entries.metadata_ready_at, now()),
+                        message_count = counts.message_count,
+                        body_ready_at = CASE
+                          WHEN counts.message_count > 0
+                            AND counts.missing_body_count = 0
+                            THEN COALESCE(entries.body_ready_at, now())
+                          ELSE entries.body_ready_at
+                        END,
+                        updated_at = now()
+                    FROM (
+                      SELECT listed.gmail_thread_id,
+                             COUNT(messages.message_id)::INTEGER AS message_count,
+                             COUNT(messages.message_id) FILTER (
+                               WHERE COALESCE(messages.body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                             )::INTEGER AS missing_body_count
+                      FROM unnest(CAST(:thread_ids AS TEXT[])) AS listed(gmail_thread_id)
+                      LEFT JOIN gmail_messages AS messages
+                        ON messages.user_id = :user_id
+                       AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = listed.gmail_thread_id
+                      GROUP BY listed.gmail_thread_id
+                    ) AS counts
+                    WHERE entries.user_id = :user_id
+                      AND entries.generation_id = :generation_id
+                      AND entries.gmail_thread_id = counts.gmail_thread_id
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "generation_id": generation_id,
+                    "thread_ids": unique_thread_ids,
+                },
+            )
+        counts = connection.execute(
+            text(
+                """
+                SELECT COUNT(*) FILTER (WHERE metadata_ready_at IS NOT NULL)::INTEGER AS metadata_count,
+                       COUNT(*) FILTER (
+                         WHERE body_ready_at IS NOT NULL
+                           AND position < 25
+                       )::INTEGER AS body_ready_count,
+                       COUNT(*)::INTEGER AS target_count
+                FROM gmail_initial_window_entries
+                WHERE user_id = :user_id
+                  AND generation_id = :generation_id
+                """
+            ),
+            {"user_id": user_id, "generation_id": generation_id},
+        ).mappings().one()
+        metadata_count = int(counts["metadata_count"] or 0)
+        body_ready_count = int(counts["body_ready_count"] or 0)
+        target_count = int(counts["target_count"] or 0)
+        complete = metadata_count >= target_count
+        row = connection.execute(
+            text(
+                """
+                UPDATE gmail_import_state
+                SET initial_target_count = GREATEST(initial_target_count, :target_count),
+                    initial_metadata_count = GREATEST(initial_metadata_count, :metadata_count),
+                    initial_body_target_count = GREATEST(initial_body_target_count, LEAST(25, :target_count)),
+                    initial_body_ready_count = GREATEST(initial_body_ready_count, :body_ready_count),
+                    initial_window_complete = initial_window_complete OR :complete,
+                    first_batch_imported_at = CASE
+                      WHEN :metadata_count > 0 OR :target_count = 0
+                        THEN COALESCE(first_batch_imported_at, now())
+                      ELSE first_batch_imported_at
+                    END,
+                    phase = CASE
+                      WHEN :complete AND :body_ready_count >= LEAST(25, :target_count)
+                        THEN 'usable'
+                      WHEN :complete THEN 'hydrating_priority_content'
+                      ELSE 'importing_metadata'
+                    END,
+                    last_import_completed_at = now(),
+                    last_progress_at = now(),
+                    last_sync_error = NULL,
+                    updated_at = now()
+                WHERE user_id = :user_id
+                  AND sync_generation = :generation_id
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": user_id,
+                "generation_id": generation_id,
+                "target_count": target_count,
+                "metadata_count": metadata_count,
+                "body_ready_count": body_ready_count,
+                "complete": complete,
+            },
+        ).mappings().first()
+    return gmail_sync_progress(_state_from_row(row)) if row is not None else None
 
 
 def start_gmail_reconciliation(
@@ -839,6 +1580,112 @@ def record_gmail_reconciliation_page(
                 },
             )
     return True
+
+
+def commit_gmail_reconciliation_metadata_page(
+    database_url: str,
+    *,
+    user_id: str,
+    generation_id: str,
+    expected_cursor: str,
+    next_cursor: str | None,
+    messages: Iterable[GmailMessageRecord],
+    conversation_count: int,
+    estimated_total_count: int = 0,
+) -> GmailSyncProgress | None:
+    """Commit one independently retryable 100-conversation history page."""
+    conversation_count = max(0, int(conversation_count))
+    if conversation_count > 100:
+        raise ValueError("A Gmail history metadata page is limited to 100 conversations")
+    rows = list(messages)
+    if any(message.user_id != user_id for message in rows):
+        raise ValueError("Gmail reconciliation metadata belongs to a different user")
+    message_ids = list(dict.fromkeys(message.message_id for message in rows if message.message_id))
+    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        advanced = connection.execute(
+            text(
+                """
+                UPDATE gmail_import_state
+                SET reconcile_cursor = :next_cursor,
+                    phase = CASE
+                      WHEN phase IN ('complete', 'failed') THEN phase
+                      WHEN initial_window_complete
+                        AND initial_body_ready_count >= LEAST(25, initial_body_target_count)
+                        THEN 'syncing_history'
+                      ELSE phase
+                    END,
+                    estimated_total_count = GREATEST(estimated_total_count, :estimated_total_count),
+                    last_import_completed_at = now(),
+                    last_progress_at = now(),
+                    last_sync_error = NULL,
+                    updated_at = now()
+                WHERE user_id = :user_id
+                  AND reconcile_generation = :generation_id
+                  AND sync_generation = :generation_id
+                  AND reconcile_cursor IS NOT DISTINCT FROM :expected_cursor
+                RETURNING user_id
+                """
+            ),
+            {
+                "user_id": user_id,
+                "generation_id": generation_id,
+                "expected_cursor": expected_cursor,
+                "next_cursor": next_cursor,
+                "estimated_total_count": max(0, int(estimated_total_count)),
+            },
+        ).scalar_one_or_none()
+        if advanced is None:
+            return None
+        _upsert_gmail_messages_on_connection(connection, rows)
+        if message_ids:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO gmail_reconcile_seen (user_id, generation_id, message_id, seen_at)
+                    SELECT :user_id, :generation_id, listed.message_id, now()
+                    FROM unnest(CAST(:message_ids AS TEXT[])) AS listed(message_id)
+                    ON CONFLICT (user_id, generation_id, message_id) DO NOTHING
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "generation_id": generation_id,
+                    "message_ids": message_ids,
+                },
+            )
+        metadata_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(DISTINCT COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id))::INTEGER
+                FROM gmail_reconcile_seen AS seen
+                JOIN gmail_messages AS messages
+                  ON messages.user_id = seen.user_id
+                 AND messages.message_id = seen.message_id
+                WHERE seen.user_id = :user_id
+                  AND seen.generation_id = :generation_id
+                """
+            ),
+            {"user_id": user_id, "generation_id": generation_id},
+        ).scalar_one()
+        row = connection.execute(
+            text(
+                """
+                UPDATE gmail_import_state
+                SET history_metadata_count = GREATEST(history_metadata_count, :metadata_count),
+                    last_progress_at = now(),
+                    updated_at = now()
+                WHERE user_id = :user_id
+                  AND sync_generation = :generation_id
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": user_id,
+                "generation_id": generation_id,
+                "metadata_count": max(int(metadata_count or 0), conversation_count),
+            },
+        ).mappings().first()
+    return gmail_sync_progress(_state_from_row(row)) if row is not None else None
 
 
 def record_gmail_reconciliation_seen(
@@ -971,7 +1818,7 @@ def finalize_gmail_reconciliation(
             ),
             params,
         )
-        connection.execute(
+        completed_state = connection.execute(
             text(
                 """
                 UPDATE gmail_import_state
@@ -988,13 +1835,65 @@ def finalize_gmail_reconciliation(
                     reconcile_cursor = NULL,
                     reconcile_baseline_history_id = NULL,
                     reconcile_started_at = NULL,
+                    history_metadata_count = GREATEST(
+                      history_metadata_count,
+                      (
+                        SELECT COUNT(DISTINCT COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id))::INTEGER
+                        FROM gmail_messages AS messages
+                        WHERE messages.user_id = :user_id
+                      )
+                    ),
+                    history_body_ready_count = GREATEST(
+                      history_body_ready_count,
+                      (
+                        SELECT COUNT(*)::INTEGER
+                        FROM (
+                          SELECT COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) AS thread_key
+                          FROM gmail_messages AS messages
+                          WHERE messages.user_id = :user_id
+                          GROUP BY thread_key
+                          HAVING BOOL_AND(COALESCE(messages.body_fetch_status, 'missing') IN ('fetched', 'unavailable'))
+                        ) AS ready_threads
+                      )
+                    ),
+                    estimated_total_count = GREATEST(
+                      estimated_total_count,
+                      (
+                        SELECT COUNT(DISTINCT COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id))::INTEGER
+                        FROM gmail_messages AS messages
+                        WHERE messages.user_id = :user_id
+                      )
+                    ),
+                    history_metadata_complete = TRUE,
+                    history_body_complete = NOT EXISTS (
+                      SELECT 1
+                      FROM gmail_messages AS messages
+                      WHERE messages.user_id = :user_id
+                        AND COALESCE(messages.body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                    ),
+                    phase = CASE
+                      WHEN NOT EXISTS (
+                        SELECT 1
+                        FROM gmail_messages AS messages
+                        WHERE messages.user_id = :user_id
+                          AND COALESCE(messages.body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                      ) THEN 'complete'
+                      WHEN initial_window_complete
+                        AND initial_body_ready_count >= LEAST(25, initial_body_target_count)
+                        THEN 'syncing_history'
+                      ELSE phase
+                    END,
+                    full_backfill_started_at = COALESCE(full_backfill_started_at, reconcile_started_at),
+                    full_backfill_completed_at = COALESCE(full_backfill_completed_at, now()),
                     last_import_completed_at = now(),
                     last_delta_sync_at = now(),
                     history_cursor_authoritative = TRUE,
                     last_sync_error = NULL,
+                    last_progress_at = now(),
                     updated_at = now()
                 WHERE user_id = :user_id
                   AND reconcile_generation = :generation_id
+                RETURNING *
                 """
             ),
             {
@@ -1002,7 +1901,7 @@ def finalize_gmail_reconciliation(
                 "generation_id": generation_id,
                 "final_history_id": final_history_id,
             },
-        )
+        ).mappings().first()
         connection.execute(
             text(
                 """
@@ -1016,6 +1915,11 @@ def finalize_gmail_reconciliation(
     return GmailReconcileFinalizeResult(
         deleted_message_count=max(0, int(deleted.rowcount or 0)),
         affected_group_ids=[str(row["group_id"]) for row in affected_rows],
+        progress=(
+            gmail_sync_progress(_state_from_row(completed_state))
+            if completed_state is not None and completed_state.get("sync_generation") is not None
+            else None
+        ),
     )
 
 
@@ -1239,22 +2143,31 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
         raise ValueError("A Gmail message write must contain exactly one user")
     user_id = next(iter(user_ids))
     with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
-        for message in rows:
-            connection.execute(
-                text(
-                    """
+        _upsert_gmail_messages_on_connection(connection, rows)
+    return len(rows)
+
+
+def _upsert_gmail_messages_on_connection(connection, rows: list[GmailMessageRecord]) -> None:
+    for message in rows:
+        connection.execute(
+            text(
+                """
                     INSERT INTO gmail_messages (
                       user_id, message_id, gmail_thread_id, history_id, label_ids_json, internal_date,
                       subject, sender, recipients_json, headers_json, snippet, raw_payload_json,
                       html_body_sanitized, html_render_document, text_body, extracted_signals_json, body_hash,
                       body_fetch_status, body_fetched_at, body_fetch_error, render_doc_bytes,
-                      ai_title, ai_title_generated_at, created_at, updated_at
+                      ai_title, ai_title_generated_at, content_revision, attachment_descriptors_json,
+                      attachment_descriptors_ready,
+                      created_at, updated_at
                     ) VALUES (
                       :user_id, :message_id, :gmail_thread_id, :history_id, :label_ids_json, :internal_date,
                       :subject, :sender, :recipients_json, :headers_json, :snippet, :raw_payload_json,
                       :html_body_sanitized, :html_render_document, :text_body, :extracted_signals_json, :body_hash,
                       :body_fetch_status, :body_fetched_at, :body_fetch_error, :render_doc_bytes,
-                      :ai_title, :ai_title_generated_at, now(), now()
+                      :ai_title, :ai_title_generated_at, :content_revision, :attachment_descriptors_json,
+                      :attachment_descriptors_ready,
+                      now(), now()
                     )
                     ON CONFLICT (user_id, message_id) DO UPDATE SET
                       gmail_thread_id = excluded.gmail_thread_id,
@@ -1297,11 +2210,21 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                       html_body_sanitized = COALESCE(excluded.html_body_sanitized, gmail_messages.html_body_sanitized),
                       html_render_document = COALESCE(excluded.html_render_document, gmail_messages.html_render_document),
                       text_body = COALESCE(excluded.text_body, gmail_messages.text_body),
+                      attachment_descriptors_json = CASE
+                        WHEN excluded.attachment_descriptors_ready
+                          THEN excluded.attachment_descriptors_json
+                        ELSE gmail_messages.attachment_descriptors_json
+                      END,
+                      attachment_descriptors_ready = (
+                        gmail_messages.attachment_descriptors_ready
+                        OR excluded.attachment_descriptors_ready
+                      ),
                       extracted_signals_json = excluded.extracted_signals_json,
                       body_hash = excluded.body_hash,
                       body_fetch_status = CASE
                         WHEN excluded.body_fetch_status = 'fetched' THEN 'fetched'
-                        WHEN gmail_messages.body_fetch_status = 'fetched' THEN gmail_messages.body_fetch_status
+                        WHEN gmail_messages.body_fetch_status IN ('fetched', 'unavailable')
+                          THEN gmail_messages.body_fetch_status
                         ELSE excluded.body_fetch_status
                       END,
                       body_fetched_at = CASE
@@ -1316,12 +2239,114 @@ def upsert_gmail_messages(database_url: str, messages: Iterable[GmailMessageReco
                       render_doc_bytes = GREATEST(gmail_messages.render_doc_bytes, excluded.render_doc_bytes),
                       ai_title = COALESCE(gmail_messages.ai_title, excluded.ai_title),
                       ai_title_generated_at = COALESCE(gmail_messages.ai_title_generated_at, excluded.ai_title_generated_at),
+                      content_revision = CASE
+                        WHEN excluded.gmail_thread_id IS DISTINCT FROM gmail_messages.gmail_thread_id
+                          OR excluded.internal_date IS DISTINCT FROM gmail_messages.internal_date
+                          OR excluded.subject IS DISTINCT FROM gmail_messages.subject
+                          OR excluded.sender IS DISTINCT FROM gmail_messages.sender
+                          OR excluded.recipients_json IS DISTINCT FROM gmail_messages.recipients_json
+                          OR excluded.headers_json IS DISTINCT FROM gmail_messages.headers_json
+                          OR excluded.snippet IS DISTINCT FROM gmail_messages.snippet
+                          OR excluded.body_hash IS DISTINCT FROM gmail_messages.body_hash
+                          OR (
+                            CASE
+                              WHEN excluded.history_id IS NULL
+                                OR excluded.history_id !~ '^[0-9]+$'
+                                THEN gmail_messages.history_id
+                              WHEN gmail_messages.history_id IS NULL
+                                OR gmail_messages.history_id !~ '^[0-9]+$'
+                                THEN excluded.history_id
+                              WHEN excluded.history_id::NUMERIC > gmail_messages.history_id::NUMERIC
+                                THEN excluded.history_id
+                              ELSE gmail_messages.history_id
+                            END
+                          ) IS DISTINCT FROM gmail_messages.history_id
+                          OR (
+                            CASE
+                              WHEN excluded.history_id IS NULL
+                                OR excluded.history_id !~ '^[0-9]+$'
+                                THEN gmail_messages.label_ids_json
+                              WHEN gmail_messages.history_id IS NULL
+                                OR gmail_messages.history_id !~ '^[0-9]+$'
+                                THEN excluded.label_ids_json
+                              WHEN excluded.history_id::NUMERIC > gmail_messages.history_id::NUMERIC
+                                THEN excluded.label_ids_json
+                              ELSE gmail_messages.label_ids_json
+                            END
+                          ) IS DISTINCT FROM gmail_messages.label_ids_json
+                          OR (
+                            CASE
+                              WHEN excluded.body_fetch_status = 'fetched'
+                                OR excluded.html_render_document IS NOT NULL
+                                OR excluded.html_body_sanitized IS NOT NULL
+                                OR excluded.text_body IS NOT NULL
+                                THEN excluded.raw_payload_json
+                              ELSE gmail_messages.raw_payload_json
+                            END
+                          ) IS DISTINCT FROM gmail_messages.raw_payload_json
+                          OR COALESCE(excluded.html_render_document, gmail_messages.html_render_document)
+                            IS DISTINCT FROM gmail_messages.html_render_document
+                          OR COALESCE(excluded.html_body_sanitized, gmail_messages.html_body_sanitized)
+                            IS DISTINCT FROM gmail_messages.html_body_sanitized
+                          OR COALESCE(excluded.text_body, gmail_messages.text_body)
+                            IS DISTINCT FROM gmail_messages.text_body
+                          OR (
+                            CASE
+                              WHEN excluded.attachment_descriptors_ready
+                                THEN excluded.attachment_descriptors_json
+                              ELSE gmail_messages.attachment_descriptors_json
+                            END
+                          ) IS DISTINCT FROM gmail_messages.attachment_descriptors_json
+                          OR (
+                            CASE
+                              WHEN excluded.body_fetch_status = 'fetched' THEN 'fetched'
+                              WHEN gmail_messages.body_fetch_status IN ('fetched', 'unavailable')
+                                THEN gmail_messages.body_fetch_status
+                              ELSE excluded.body_fetch_status
+                            END
+                          ) IS DISTINCT FROM gmail_messages.body_fetch_status
+                          OR (
+                          excluded.body_fetch_status = 'fetched'
+                          AND gmail_messages.body_fetch_status IS DISTINCT FROM 'fetched'
+                        ) OR (
+                          excluded.html_render_document IS NOT NULL
+                          AND excluded.html_render_document IS DISTINCT FROM gmail_messages.html_render_document
+                        ) OR (
+                          excluded.html_body_sanitized IS NOT NULL
+                          AND excluded.html_body_sanitized IS DISTINCT FROM gmail_messages.html_body_sanitized
+                        ) OR (
+                          excluded.text_body IS NOT NULL
+                          AND excluded.text_body IS DISTINCT FROM gmail_messages.text_body
+                        )
+                        THEN gmail_messages.content_revision + 1
+                        ELSE gmail_messages.content_revision
+                      END,
                       updated_at = now()
-                    """
-                ),
-                _message_params(message),
-            )
-    return len(rows)
+                """
+            ),
+            _message_params(message),
+        )
+    if rows:
+        connection.execute(
+            text(
+                """
+                UPDATE gmail_import_state
+                SET history_body_complete = FALSE,
+                    phase = CASE WHEN phase = 'complete' THEN 'syncing_recent' ELSE phase END,
+                    updated_at = now()
+                WHERE user_id = :user_id
+                  AND sync_generation IS NOT NULL
+                  AND history_metadata_complete
+                  AND EXISTS (
+                    SELECT 1
+                    FROM gmail_messages
+                    WHERE user_id = :user_id
+                      AND COALESCE(body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                  )
+                """
+            ),
+            {"user_id": rows[0].user_id},
+        )
 
 
 def force_update_gmail_message_labels(
@@ -1349,6 +2374,11 @@ def force_update_gmail_message_labels(
                     """
                     UPDATE gmail_messages
                     SET label_ids_json = :label_ids_json,
+                        content_revision = CASE
+                          WHEN label_ids_json IS DISTINCT FROM :label_ids_json
+                            THEN content_revision + 1
+                          ELSE content_revision
+                        END,
                         updated_at = now()
                     WHERE user_id = :user_id
                       AND message_id = :message_id
@@ -1363,7 +2393,7 @@ def update_gmail_message_bodies(database_url: str, messages: Iterable[GmailMessa
     """Persist full body data without allowing a stale body GET to overwrite mailbox metadata."""
     rows = list(messages)
     if not rows:
-        return []
+        return GmailBodyUpdateResult([], None)
     user_ids = {message.user_id for message in rows}
     if len(user_ids) != 1:
         raise ValueError("A Gmail body write must contain exactly one user")
@@ -1382,12 +2412,15 @@ def update_gmail_message_bodies(database_url: str, messages: Iterable[GmailMessa
                         html_body_sanitized = :html_body_sanitized,
                         html_render_document = :html_render_document,
                         text_body = :text_body,
+                        attachment_descriptors_json = :attachment_descriptors_json,
+                        attachment_descriptors_ready = TRUE,
                         extracted_signals_json = :extracted_signals_json,
                         body_hash = :body_hash,
                         body_fetch_status = 'fetched',
                         body_fetched_at = now(),
                         body_fetch_error = NULL,
-                        render_doc_bytes = GREATEST(render_doc_bytes, :render_doc_bytes)
+                        render_doc_bytes = GREATEST(render_doc_bytes, :render_doc_bytes),
+                        content_revision = content_revision + 1
                     WHERE user_id = :user_id
                       AND message_id = :message_id
                       AND body_fetch_status IS DISTINCT FROM 'fetched'
@@ -1399,7 +2432,268 @@ def update_gmail_message_bodies(database_url: str, messages: Iterable[GmailMessa
             updated_message_id = result.scalar_one_or_none()
             if updated_message_id is not None:
                 updated_message_ids.append(str(updated_message_id))
-    return updated_message_ids
+        affected_thread_ids = list(
+            dict.fromkeys(
+                message.gmail_thread_id or message.message_id
+                for message in rows
+                if message.gmail_thread_id or message.message_id
+            )
+        )
+        if affected_thread_ids:
+            connection.execute(
+                text(
+                    """
+                    UPDATE gmail_initial_window_entries AS entries
+                    SET body_ready_at = COALESCE(entries.body_ready_at, now()),
+                        updated_at = now()
+                    WHERE entries.user_id = :user_id
+                      AND entries.gmail_thread_id = ANY(:thread_ids)
+                      AND entries.generation_id = (
+                        SELECT state.sync_generation
+                        FROM gmail_import_state AS state
+                        WHERE state.user_id = :user_id
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM gmail_messages AS messages
+                        WHERE messages.user_id = entries.user_id
+                          AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = entries.gmail_thread_id
+                          AND COALESCE(messages.body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                      )
+                    """
+                ),
+                {"user_id": user_id, "thread_ids": affected_thread_ids},
+            )
+        _update_gmail_body_progress_on_connection(connection, user_id=user_id)
+        state_row = connection.execute(
+            text("SELECT * FROM gmail_import_state WHERE user_id = :user_id"),
+            {"user_id": user_id},
+        ).mappings().first()
+        progress = (
+            gmail_sync_progress(_state_from_row(state_row))
+            if state_row is not None and state_row.get("sync_generation") is not None
+            else None
+        )
+    return GmailBodyUpdateResult(updated_message_ids, progress)
+
+
+def _update_gmail_body_progress_on_connection(connection, *, user_id: str) -> None:
+    counts = connection.execute(
+        text(
+            """
+            SELECT
+              (
+                SELECT COUNT(*)::INTEGER
+                FROM gmail_initial_window_entries AS entries
+                JOIN gmail_import_state AS state
+                  ON state.user_id = entries.user_id
+                 AND state.sync_generation = entries.generation_id
+                WHERE entries.user_id = :user_id
+                  AND entries.body_ready_at IS NOT NULL
+                  AND entries.position < state.initial_body_target_count
+              ) AS initial_body_ready_count,
+              (
+                SELECT COUNT(*)::INTEGER
+                FROM (
+                  SELECT COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) AS thread_key
+                  FROM gmail_messages AS messages
+                  WHERE messages.user_id = :user_id
+                  GROUP BY thread_key
+                  HAVING BOOL_AND(COALESCE(messages.body_fetch_status, 'missing') IN ('fetched', 'unavailable'))
+                ) AS ready_threads
+              ) AS ready_thread_count
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().one()
+    initial_ready = int(counts["initial_body_ready_count"] or 0)
+    ready_threads = int(counts["ready_thread_count"] or 0)
+    connection.execute(
+        text(
+            """
+            UPDATE gmail_import_state
+            SET initial_body_ready_count = GREATEST(initial_body_ready_count, :initial_ready),
+                history_body_ready_count = GREATEST(
+                  history_body_ready_count,
+                  LEAST(history_metadata_count, :ready_threads)
+                ),
+                phase = CASE
+                  WHEN history_metadata_complete
+                    AND NOT EXISTS (
+                      SELECT 1 FROM gmail_messages
+                      WHERE user_id = :user_id
+                        AND COALESCE(body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                    )
+                    THEN 'complete'
+                  WHEN initial_window_complete
+                    AND :initial_ready >= initial_body_target_count
+                    AND phase IN ('discovering_recent', 'importing_metadata', 'hydrating_priority_content')
+                    THEN 'usable'
+                  ELSE phase
+                END,
+                history_body_complete = history_body_complete OR (
+                  history_metadata_complete
+                  AND NOT EXISTS (
+                    SELECT 1 FROM gmail_messages
+                    WHERE user_id = :user_id
+                      AND COALESCE(body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                  )
+                ),
+                last_progress_at = now(),
+                updated_at = now()
+            WHERE user_id = :user_id
+              AND sync_generation IS NOT NULL
+            """
+        ),
+        {
+            "user_id": user_id,
+            "initial_ready": initial_ready,
+            "ready_threads": ready_threads,
+        },
+    )
+
+
+def list_messages_needing_body_fetch(
+    database_url: str,
+    *,
+    user_id: str,
+    limit: int = 25,
+) -> list[GmailMessageRecord]:
+    """Return the next durable body-backfill transaction, newest first."""
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM gmail_messages
+                WHERE user_id = :user_id
+                  AND (
+                    body_fetch_status = 'missing'
+                    OR (
+                      body_fetch_status = 'pending'
+                      AND COALESCE(body_fetch_updated_at, updated_at) < now() - interval '15 minutes'
+                    )
+                  )
+                ORDER BY internal_date DESC NULLS LAST, message_id DESC
+                LIMIT :limit
+                """
+            ),
+            {"user_id": user_id, "limit": max(1, min(int(limit), 25))},
+        ).mappings().all()
+    return [_message_from_row(row) for row in rows]
+
+
+def backfill_gmail_attachment_descriptors_page(
+    database_url: str,
+    *,
+    user_id: str,
+    limit: int = 25,
+    after_message_id: str | None = None,
+) -> tuple[int, bool, str | None]:
+    """Converge one fixed-size legacy MIME page to attachment descriptors.
+
+    Migration 0031 deliberately performs no table scan or data rewrite. This
+    resumable worker step reads at most 25 raw payloads and commits that page,
+    so existing accounts converge without a release-time lock amplification.
+    """
+
+    bounded_limit = max(1, min(int(limit), 25))
+    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT message_id, raw_payload_json
+                FROM gmail_messages
+                WHERE user_id = :user_id
+                  AND NOT attachment_descriptors_ready
+                  AND (:after_message_id IS NULL OR message_id > :after_message_id)
+                ORDER BY message_id ASC
+                LIMIT :limit
+                FOR UPDATE SKIP LOCKED
+                """
+            ),
+            {
+                "user_id": user_id,
+                "limit": bounded_limit,
+                "after_message_id": after_message_id,
+            },
+        ).mappings().all()
+        processed = 0
+        for row in rows:
+            try:
+                raw_payload = json.loads(row["raw_payload_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw_payload = {}
+            descriptors = _gmail_attachment_descriptors(raw_payload)
+            connection.execute(
+                text(
+                    """
+                    UPDATE gmail_messages
+                    SET attachment_descriptors_json = :attachment_descriptors_json,
+                        attachment_descriptors_ready = TRUE,
+                        content_revision = CASE
+                          WHEN attachment_descriptors_json IS DISTINCT FROM :attachment_descriptors_json
+                            THEN content_revision + 1
+                          ELSE content_revision
+                        END,
+                        updated_at = now()
+                    WHERE user_id = :user_id
+                      AND message_id = :message_id
+                      AND NOT attachment_descriptors_ready
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "message_id": str(row["message_id"]),
+                    "attachment_descriptors_json": json.dumps(
+                        descriptors,
+                        ensure_ascii=True,
+                    ),
+                },
+            )
+            processed += 1
+        page_cursor = str(rows[-1]["message_id"]) if rows else after_message_id
+        next_message_id = connection.execute(
+            text(
+                """
+                SELECT message_id
+                FROM gmail_messages
+                WHERE user_id = :user_id
+                  AND NOT attachment_descriptors_ready
+                  AND (:page_cursor IS NULL OR message_id > :page_cursor)
+                ORDER BY message_id ASC
+                LIMIT 1
+                """
+            ),
+            {"user_id": user_id, "page_cursor": page_cursor},
+        ).scalar_one_or_none()
+        if next_message_id is None:
+            connection.execute(
+                text(
+                    """
+                    UPDATE gmail_import_state
+                    SET attachment_descriptors_complete = TRUE,
+                        updated_at = now()
+                    WHERE user_id = :user_id
+                    """
+                ),
+                {"user_id": user_id},
+            )
+    return processed, next_message_id is not None, page_cursor
+
+
+def mark_gmail_history_body_complete_if_ready(
+    database_url: str,
+    *,
+    user_id: str,
+) -> GmailSyncProgress:
+    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        _update_gmail_body_progress_on_connection(connection, user_id=user_id)
+        row = connection.execute(
+            text("SELECT * FROM gmail_import_state WHERE user_id = :user_id"),
+            {"user_id": user_id},
+        ).mappings().first()
+    return gmail_sync_progress(_state_from_row(row) if row is not None else None)
 
 
 def update_gmail_message_ai_titles(database_url: str, *, user_id: str, titles: dict[str, str], generated_at: str) -> int:
@@ -1453,11 +2747,24 @@ def mark_gmail_messages_body_fetch_state(
                 UPDATE gmail_messages
                 SET
                   body_fetch_status = :status,
-                  body_fetched_at = CASE WHEN :status = 'fetched' THEN now() ELSE body_fetched_at END,
-                  body_fetch_error = :error
+                  body_fetch_updated_at = now(),
+                  body_fetched_at = CASE
+                    WHEN :status IN ('fetched', 'unavailable') THEN now()
+                    ELSE body_fetched_at
+                  END,
+                  body_fetch_error = :error,
+                  content_revision = CASE
+                    WHEN :status = 'unavailable'
+                      AND COALESCE(body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                      THEN content_revision + 1
+                    ELSE content_revision
+                  END
                 WHERE user_id = :user_id
                   AND message_id = ANY(:message_ids)
-                  AND (:status = 'fetched' OR body_fetch_status IS DISTINCT FROM 'fetched')
+                  AND (
+                    :status = 'fetched'
+                    OR COALESCE(body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                  )
                 """
             ),
             {
@@ -1467,7 +2774,39 @@ def mark_gmail_messages_body_fetch_state(
                 "error": error[:4000] if error else None,
             },
         )
-    return int(result.rowcount or 0)
+        updated_count = int(result.rowcount or 0)
+        if updated_count > 0 and status in {"fetched", "unavailable"}:
+            connection.execute(
+                text(
+                    """
+                    UPDATE gmail_initial_window_entries AS entries
+                    SET body_ready_at = COALESCE(entries.body_ready_at, now()),
+                        updated_at = now()
+                    WHERE entries.user_id = :user_id
+                      AND entries.generation_id = (
+                        SELECT state.sync_generation
+                        FROM gmail_import_state AS state
+                        WHERE state.user_id = :user_id
+                      )
+                      AND entries.gmail_thread_id IN (
+                        SELECT DISTINCT COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id)
+                        FROM gmail_messages AS messages
+                        WHERE messages.user_id = :user_id
+                          AND messages.message_id = ANY(:message_ids)
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM gmail_messages AS messages
+                        WHERE messages.user_id = entries.user_id
+                          AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = entries.gmail_thread_id
+                          AND COALESCE(messages.body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                      )
+                    """
+                ),
+                {"user_id": user_id, "message_ids": unique_message_ids},
+            )
+            _update_gmail_body_progress_on_connection(connection, user_id=user_id)
+    return updated_count
 
 
 def upsert_pending_thread_action(
@@ -2175,6 +3514,18 @@ def delete_gmail_messages(database_url: str, *, user_id: str, message_ids: list[
     if not unique_message_ids:
         return []
     with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+        thread_rows = connection.execute(
+            text(
+                """
+                SELECT DISTINCT COALESCE(NULLIF(gmail_thread_id, ''), message_id) AS thread_id
+                FROM gmail_messages
+                WHERE user_id = :user_id
+                  AND message_id = ANY(:message_ids)
+                """
+            ),
+            {"user_id": user_id, "message_ids": unique_message_ids},
+        ).mappings().all()
+        affected_thread_ids = [str(row["thread_id"]) for row in thread_rows]
         rows = connection.execute(
             text(
                 """
@@ -2206,6 +3557,100 @@ def delete_gmail_messages(database_url: str, *, user_id: str, message_ids: list[
             ),
             {"user_id": user_id, "message_ids": unique_message_ids},
         )
+        terminal_initial_entries = None
+        resolved_initial_entries = None
+        if affected_thread_ids:
+            terminal_initial_entries = connection.execute(
+                text(
+                    """
+                    UPDATE gmail_initial_window_entries AS entries
+                    SET metadata_ready_at = COALESCE(entries.metadata_ready_at, now()),
+                        body_ready_at = COALESCE(entries.body_ready_at, now()),
+                        message_count = 0,
+                        updated_at = now()
+                    WHERE entries.user_id = :user_id
+                      AND entries.generation_id = (
+                        SELECT state.sync_generation
+                        FROM gmail_import_state AS state
+                        WHERE state.user_id = :user_id
+                      )
+                      AND entries.gmail_thread_id = ANY(:thread_ids)
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM gmail_messages AS messages
+                        WHERE messages.user_id = entries.user_id
+                          AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = entries.gmail_thread_id
+                      )
+                    """
+                ),
+                {"user_id": user_id, "thread_ids": affected_thread_ids},
+            )
+            resolved_initial_entries = connection.execute(
+                text(
+                    """
+                    UPDATE gmail_initial_window_entries AS entries
+                    SET body_ready_at = COALESCE(entries.body_ready_at, now()),
+                        updated_at = now()
+                    WHERE entries.user_id = :user_id
+                      AND entries.generation_id = (
+                        SELECT state.sync_generation
+                        FROM gmail_import_state AS state
+                        WHERE state.user_id = :user_id
+                      )
+                      AND entries.gmail_thread_id = ANY(:thread_ids)
+                      AND EXISTS (
+                        SELECT 1
+                        FROM gmail_messages AS messages
+                        WHERE messages.user_id = entries.user_id
+                          AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = entries.gmail_thread_id
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM gmail_messages AS messages
+                        WHERE messages.user_id = entries.user_id
+                          AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = entries.gmail_thread_id
+                          AND COALESCE(messages.body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                      )
+                    """
+                ),
+                {"user_id": user_id, "thread_ids": affected_thread_ids},
+            )
+        terminal_initial_count = int(getattr(terminal_initial_entries, "rowcount", 0) or 0)
+        resolved_initial_count = int(getattr(resolved_initial_entries, "rowcount", 0) or 0)
+        if terminal_initial_count > 0 or resolved_initial_count > 0:
+            connection.execute(
+                text(
+                    """
+                    WITH counts AS (
+                      SELECT
+                        COUNT(*)::INTEGER AS target_count,
+                        COUNT(*) FILTER (WHERE entries.metadata_ready_at IS NOT NULL)::INTEGER AS metadata_count,
+                        COUNT(*) FILTER (
+                          WHERE entries.body_ready_at IS NOT NULL
+                            AND entries.position < 25
+                        )::INTEGER AS body_ready_count
+                      FROM gmail_initial_window_entries AS entries
+                      JOIN gmail_import_state AS active_state
+                        ON active_state.user_id = entries.user_id
+                       AND active_state.sync_generation = entries.generation_id
+                      WHERE entries.user_id = :user_id
+                    )
+                    UPDATE gmail_import_state AS state
+                    SET initial_target_count = GREATEST(state.initial_target_count, counts.target_count),
+                        initial_metadata_count = GREATEST(state.initial_metadata_count, counts.metadata_count),
+                        initial_body_target_count = GREATEST(state.initial_body_target_count, LEAST(25, counts.target_count)),
+                        initial_body_ready_count = GREATEST(state.initial_body_ready_count, counts.body_ready_count),
+                        initial_window_complete = state.initial_window_complete OR counts.metadata_count >= counts.target_count,
+                        last_progress_at = now(),
+                        updated_at = now()
+                    FROM counts
+                    WHERE state.user_id = :user_id
+                      AND state.sync_generation IS NOT NULL
+                    """
+                ),
+                {"user_id": user_id},
+            )
+            _update_gmail_body_progress_on_connection(connection, user_id=user_id)
     return [str(row["group_id"]) for row in rows]
 
 
@@ -2347,10 +3792,88 @@ def list_group_messages(database_url: str, *, user_id: str, group_id: str) -> li
     return [_message_from_row(row) for row in rows]
 
 
-def list_messages_for_gmail_thread(database_url: str, *, user_id: str, gmail_thread_id: str) -> list[GmailMessageRecord]:
+def _gmail_message_stored_bytes_sql(table_alias: str) -> str:
+    """Conservative stored-body byte expression for a trusted SQL alias."""
+
+    columns = (
+        "message_id",
+        "gmail_thread_id",
+        "history_id",
+        "label_ids_json",
+        "subject",
+        "sender",
+        "recipients_json",
+        "headers_json",
+        "snippet",
+        "raw_payload_json",
+        "html_body_sanitized",
+        "html_render_document",
+        "text_body",
+        "extracted_signals_json",
+        "body_hash",
+        "body_fetch_error",
+        "ai_title",
+        "attachment_descriptors_json",
+    )
+    return " + ".join(
+        f"octet_length(COALESCE({table_alias}.{column}, ''))"
+        for column in columns
+    )
+
+
+def list_messages_for_gmail_thread(
+    database_url: str,
+    *,
+    user_id: str,
+    gmail_thread_id: str,
+    maximum_messages: int | None = None,
+    maximum_stored_bytes: int | None = None,
+) -> list[GmailMessageRecord]:
     thread_id = gmail_thread_id.strip()
     if not thread_id:
         return []
+    if maximum_messages is not None and maximum_messages < 1:
+        return []
+    if maximum_stored_bytes is not None and maximum_stored_bytes < 1:
+        return []
+
+    if maximum_messages is not None or maximum_stored_bytes is not None:
+        # Keep oversized conversations inside Postgres instead of materializing
+        # their complete body columns in the API process. The window aggregates
+        # and eligibility predicate are evaluated in one statement, so a thread
+        # that grows between the route preflight and this read still cannot
+        # escape either bound.
+        message_limit = maximum_messages or 2_147_483_647
+        byte_limit = maximum_stored_bytes or 9_223_372_036_854_775_807
+        with get_engine(database_url).connect() as connection:
+            rows = connection.execute(
+                text(
+                    f"""
+                    SELECT bounded.*
+                    FROM (
+                      SELECT
+                        messages.*,
+                        COUNT(*) OVER () AS snapshot_message_count,
+                        SUM({_gmail_message_stored_bytes_sql('messages')}) OVER () AS snapshot_stored_bytes
+                      FROM gmail_messages AS messages
+                      WHERE messages.user_id = :user_id
+                        AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = :gmail_thread_id
+                    ) AS bounded
+                    WHERE bounded.snapshot_message_count <= :maximum_messages
+                      AND bounded.snapshot_stored_bytes <= :maximum_stored_bytes
+                    ORDER BY bounded.internal_date ASC NULLS LAST, bounded.created_at ASC
+                    LIMIT :maximum_messages
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "gmail_thread_id": thread_id,
+                    "maximum_messages": message_limit,
+                    "maximum_stored_bytes": byte_limit,
+                },
+            ).mappings().all()
+        return [_message_from_row(row) for row in rows]
+
     with get_engine(database_url).connect() as connection:
         rows = connection.execute(
             text(
@@ -2365,6 +3888,167 @@ def list_messages_for_gmail_thread(database_url: str, *, user_id: str, gmail_thr
             {"user_id": user_id, "gmail_thread_id": thread_id},
         ).mappings().all()
     return [_message_from_row(row) for row in rows]
+
+
+def get_gmail_thread_message_page(
+    database_url: str,
+    *,
+    user_id: str,
+    gmail_thread_id: str,
+    limit: int,
+    offset: int,
+) -> GmailThreadMessagePage | None:
+    """Return a DB-bounded reader page and stable whole-thread metadata.
+
+    Only ``limit`` complete message rows cross the database boundary. Count,
+    hydration state, latest subject, and the revision token are scalar
+    aggregates produced by the same statement. This is intentionally separate
+    from ``list_messages_for_gmail_thread`` because several mutation paths need
+    a complete thread, while the public reader endpoint must remain bounded for
+    conversations with thousands of messages.
+    """
+
+    thread_id = gmail_thread_id.strip()
+    if not thread_id:
+        return None
+    if limit < 1:
+        raise ValueError("Gmail thread page limit must be positive")
+    if offset < 0:
+        raise ValueError("Gmail thread page offset cannot be negative")
+
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                WITH thread_stats AS (
+                  SELECT
+                    COUNT(*)::INTEGER AS thread_total_messages,
+                    COUNT(*) FILTER (
+                      WHERE COALESCE(messages.body_fetch_status, 'missing')
+                        NOT IN ('fetched', 'unavailable')
+                    )::INTEGER AS thread_incomplete_body_count,
+                    SUBSTRING(
+                      MD5(
+                        COALESCE(
+                          STRING_AGG(
+                            CHAR_LENGTH(messages.message_id)::TEXT
+                              || ':' || messages.message_id
+                              || ':' || GREATEST(messages.content_revision, 1)::TEXT,
+                            '' ORDER BY messages.message_id
+                          ),
+                          ''
+                        )
+                      ),
+                      1,
+                      24
+                    ) AS thread_content_revision
+                  FROM gmail_messages AS messages
+                  WHERE messages.user_id = :user_id
+                    AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = :gmail_thread_id
+                )
+                SELECT
+                  page_messages.*,
+                  thread_stats.thread_total_messages,
+                  thread_stats.thread_incomplete_body_count,
+                  thread_stats.thread_content_revision,
+                  latest_message.subject AS thread_latest_subject
+                FROM thread_stats
+                LEFT JOIN LATERAL (
+                  SELECT messages.*
+                  FROM gmail_messages AS messages
+                  WHERE messages.user_id = :user_id
+                    AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = :gmail_thread_id
+                  ORDER BY
+                    messages.internal_date ASC NULLS LAST,
+                    messages.created_at ASC,
+                    messages.message_id ASC
+                  LIMIT :page_limit
+                  OFFSET :page_offset
+                ) AS page_messages ON TRUE
+                LEFT JOIN LATERAL (
+                  SELECT messages.subject
+                  FROM gmail_messages AS messages
+                  WHERE messages.user_id = :user_id
+                    AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = :gmail_thread_id
+                  ORDER BY
+                    COALESCE(messages.internal_date, messages.updated_at) DESC,
+                    messages.created_at ASC,
+                    messages.message_id ASC
+                  LIMIT 1
+                ) AS latest_message ON TRUE
+                """
+            ),
+            {
+                "user_id": user_id,
+                "gmail_thread_id": thread_id,
+                "page_limit": limit,
+                "page_offset": offset,
+            },
+        ).mappings().all()
+
+    if not rows:
+        return None
+    total_messages = max(0, int(rows[0]["thread_total_messages"] or 0))
+    if total_messages == 0:
+        return None
+    messages = [
+        _message_from_row(row)
+        for row in rows
+        if row.get("message_id") is not None
+    ]
+    return GmailThreadMessagePage(
+        gmail_thread_id=thread_id,
+        messages=messages,
+        total_messages=total_messages,
+        latest_subject=(
+            str(rows[0]["thread_latest_subject"])
+            if rows[0].get("thread_latest_subject") is not None
+            else None
+        ),
+        incomplete_body_count=max(0, int(rows[0]["thread_incomplete_body_count"] or 0)),
+        content_revision=str(rows[0]["thread_content_revision"] or ""),
+    )
+
+
+def get_gmail_thread_snapshot_stats(
+    database_url: str,
+    *,
+    user_id: str,
+    gmail_thread_ids: list[str],
+) -> dict[str, GmailThreadSnapshotStats]:
+    """Return sizing/hydration facts without transferring complete bodies."""
+
+    thread_ids = list(dict.fromkeys(thread_id.strip() for thread_id in gmail_thread_ids if thread_id.strip()))
+    if not thread_ids:
+        return {}
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                f"""
+                SELECT
+                  COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) AS gmail_thread_id,
+                  COUNT(*)::INTEGER AS message_count,
+                  COALESCE(SUM({_gmail_message_stored_bytes_sql('messages')}), 0)::BIGINT AS stored_bytes,
+                  COUNT(*) FILTER (
+                    WHERE COALESCE(messages.body_fetch_status, 'missing') NOT IN ('fetched', 'unavailable')
+                  )::INTEGER AS incomplete_body_count
+                FROM gmail_messages AS messages
+                WHERE messages.user_id = :user_id
+                  AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = ANY(:gmail_thread_ids)
+                GROUP BY COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id)
+                """
+            ),
+            {"user_id": user_id, "gmail_thread_ids": thread_ids},
+        ).mappings().all()
+    return {
+        str(row["gmail_thread_id"]): GmailThreadSnapshotStats(
+            gmail_thread_id=str(row["gmail_thread_id"]),
+            message_count=max(0, int(row["message_count"] or 0)),
+            stored_bytes=max(0, int(row["stored_bytes"] or 0)),
+            incomplete_body_count=max(0, int(row["incomplete_body_count"] or 0)),
+        )
+        for row in rows
+    }
 
 
 def list_mailbox_thread_messages(
@@ -2518,14 +4202,97 @@ def list_mailbox_thread_page(
                   page_threads.thread_key AS mailbox_thread_id,
                   page_threads.latest_matching_at AS mailbox_latest_matching_at,
                   page_threads.mailbox_order_position,
-                  messages.*
+                  latest_message.user_id,
+                  latest_message.message_id,
+                  latest_message.gmail_thread_id,
+                  latest_message.history_id,
+                  thread_labels.label_ids_json,
+                  latest_message.internal_date,
+                  latest_message.subject,
+                  latest_message.ai_title,
+                  latest_message.ai_title_generated_at,
+                  latest_message.sender,
+                  latest_message.recipients_json,
+                  latest_message.snippet,
+                  latest_message.created_at,
+                  latest_message.updated_at,
+                  thread_stats.mailbox_message_count,
+                  thread_stats.mailbox_body_ready,
+                  thread_stats.mailbox_content_revision,
+                  thread_stats.mailbox_attachment_count
                 FROM page_threads
-                JOIN gmail_messages AS messages
-                  ON messages.user_id = :user_id
-                 AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = page_threads.thread_key
+                JOIN LATERAL (
+                  SELECT
+                    messages.user_id,
+                    messages.message_id,
+                    messages.gmail_thread_id,
+                    messages.history_id,
+                    messages.internal_date,
+                    messages.subject,
+                    messages.ai_title,
+                    messages.ai_title_generated_at,
+                    messages.sender,
+                    messages.recipients_json,
+                    messages.snippet,
+                    messages.created_at,
+                    messages.updated_at
+                  FROM gmail_messages AS messages
+                  WHERE messages.user_id = :user_id
+                    AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = page_threads.thread_key
+                  ORDER BY COALESCE(messages.internal_date, messages.updated_at) DESC,
+                           messages.created_at ASC,
+                           messages.message_id ASC
+                  LIMIT 1
+                ) AS latest_message ON TRUE
+                JOIN LATERAL (
+                  SELECT
+                    COUNT(*)::INTEGER AS mailbox_message_count,
+                    BOOL_AND(
+                      COALESCE(messages.body_fetch_status, 'missing') IN ('fetched', 'unavailable')
+                    ) AS mailbox_body_ready,
+                    SUBSTRING(
+                      MD5(
+                        COALESCE(
+                          STRING_AGG(
+                            CHAR_LENGTH(messages.message_id)::TEXT || ':' ||
+                            messages.message_id || ':' ||
+                            GREATEST(messages.content_revision, 1)::TEXT,
+                            '' ORDER BY messages.message_id
+                          ),
+                          ''
+                        )
+                      ),
+                      1,
+                      24
+                    ) AS mailbox_content_revision,
+                    COALESCE(
+                      SUM(JSONB_ARRAY_LENGTH(messages.attachment_descriptors_json::jsonb)),
+                      0
+                    )::INTEGER AS mailbox_attachment_count
+                  FROM gmail_messages AS messages
+                  WHERE messages.user_id = :user_id
+                    AND COALESCE(NULLIF(messages.gmail_thread_id, ''), messages.message_id) = page_threads.thread_key
+                ) AS thread_stats ON TRUE
+                LEFT JOIN LATERAL (
+                  SELECT COALESCE(
+                    JSONB_AGG(distinct_labels.label ORDER BY distinct_labels.label),
+                    '[]'::jsonb
+                  )::TEXT AS label_ids_json
+                  FROM (
+                    SELECT DISTINCT expanded_labels.label
+                    FROM gmail_messages AS label_messages
+                    CROSS JOIN LATERAL JSONB_ARRAY_ELEMENTS_TEXT(
+                      label_messages.label_ids_json::jsonb
+                    ) AS expanded_labels(label)
+                    WHERE label_messages.user_id = :user_id
+                      AND COALESCE(
+                        NULLIF(label_messages.gmail_thread_id, ''),
+                        label_messages.message_id
+                      ) = page_threads.thread_key
+                  ) AS distinct_labels
+                ) AS thread_labels ON TRUE
                 ORDER BY {final_order_sql}
-                         messages.internal_date ASC NULLS LAST,
-                         messages.created_at ASC
+                         latest_message.message_id ASC
                 """
             ),
             params,
@@ -2542,7 +4309,7 @@ def list_mailbox_thread_page(
             latest_by_thread[thread_key] = _iso(row["mailbox_latest_matching_at"])
             if row["mailbox_order_position"] is not None:
                 position_by_thread[thread_key] = int(row["mailbox_order_position"])
-        grouped[thread_key].append(_message_from_row(row))
+        grouped[thread_key].append(_mailbox_message_from_row(row))
     page_size = max(1, limit)
     visible_order = order[:page_size]
     next_cursor = None
@@ -2780,6 +4547,8 @@ def list_messages_for_groups(database_url: str, *, user_id: str, group_ids: list
                   messages.body_fetched_at,
                   messages.body_fetch_error,
                   messages.render_doc_bytes,
+                  messages.content_revision,
+                  messages.attachment_descriptors_json,
                   messages.created_at,
                   messages.updated_at
                 FROM mail_group_members members
@@ -2984,6 +4753,8 @@ def list_messages_for_visible_groups(database_url: str, *, user_id: str, visible
                   messages.body_fetched_at,
                   messages.body_fetch_error,
                   messages.render_doc_bytes,
+                  messages.content_revision,
+                  messages.attachment_descriptors_json,
                   messages.created_at,
                   messages.updated_at
                 FROM visible_mail_group_members members
@@ -3668,11 +5439,70 @@ def _mailbox_label_clause(alias: str, label: str) -> str:
     return "TRUE"
 
 
+def _gmail_attachment_descriptors(raw_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract only reader-visible attachment metadata from a Gmail payload."""
+
+    payload = raw_payload.get("payload") if isinstance(raw_payload, dict) else None
+    if not isinstance(payload, dict):
+        return []
+
+    descriptors: list[dict[str, Any]] = []
+
+    def visit(part: dict[str, Any], path: tuple[int, ...]) -> None:
+        body = part.get("body") if isinstance(part.get("body"), dict) else {}
+        attachment_id = body.get("attachmentId") if isinstance(body, dict) else None
+        if isinstance(attachment_id, str) and attachment_id:
+            headers: dict[str, str] = {}
+            for header in part.get("headers", []) if isinstance(part.get("headers"), list) else []:
+                if not isinstance(header, dict):
+                    continue
+                name = str(header.get("name") or "").strip().lower()
+                value = str(header.get("value") or "").strip()
+                if name and value:
+                    headers[name] = value
+            disposition = headers.get("content-disposition", "").lower()
+            filename = str(part.get("filename") or "").strip()
+            is_inline = disposition.startswith("inline") or (
+                not filename and bool(headers.get("content-id"))
+            )
+            is_downloadable = bool(filename) or disposition.startswith("attachment")
+            if not is_inline and is_downloadable:
+                raw_size = body.get("size") if isinstance(body, dict) else 0
+                try:
+                    size = max(0, int(raw_size or 0))
+                except (TypeError, ValueError):
+                    size = 0
+                descriptors.append(
+                    {
+                        "filename": filename or f"attachment-{len(descriptors) + 1}",
+                        "mime_type": str(part.get("mimeType") or "application/octet-stream"),
+                        "size": size,
+                        "attachment_id": attachment_id,
+                        "part_id": str(part.get("partId") or ".".join(str(index) for index in path)),
+                    }
+                )
+        children = part.get("parts")
+        if isinstance(children, list):
+            for index, child in enumerate(children):
+                if isinstance(child, dict):
+                    visit(child, (*path, index))
+
+    visit(payload, (0,))
+    return descriptors
+
+
 def _message_params(message: GmailMessageRecord) -> dict[str, Any]:
     body_fetch_status = message.body_fetch_status or _body_fetch_status_for_message(message)
     body_fetched_at = message.body_fetched_at
     if body_fetch_status == "fetched" and body_fetched_at is None:
         body_fetched_at = datetime.now(timezone.utc).isoformat()
+    attachment_descriptors = list(message.attachment_descriptors)
+    if not attachment_descriptors and message.raw_payload:
+        attachment_descriptors = _gmail_attachment_descriptors(message.raw_payload)
+    descriptors_ready = bool(
+        message.attachment_descriptors_ready
+        or body_fetch_status == "fetched"
+    )
     return {
         "user_id": message.user_id,
         "message_id": message.message_id,
@@ -3697,6 +5527,12 @@ def _message_params(message: GmailMessageRecord) -> dict[str, Any]:
         "render_doc_bytes": message.render_doc_bytes or len(message.html_render_document or ""),
         "ai_title": message.ai_title,
         "ai_title_generated_at": message.ai_title_generated_at,
+        "content_revision": max(1, int(message.content_revision or 1)),
+        "attachment_descriptors_json": json.dumps(
+            attachment_descriptors,
+            ensure_ascii=True,
+        ),
+        "attachment_descriptors_ready": descriptors_ready,
     }
 
 
@@ -3727,6 +5563,63 @@ def _message_from_row(row) -> GmailMessageRecord:
         body_fetched_at=_iso(row["body_fetched_at"]) if row.get("body_fetched_at") is not None else None,
         body_fetch_error=str(row["body_fetch_error"]) if row.get("body_fetch_error") is not None else None,
         render_doc_bytes=int(row["render_doc_bytes"] or 0) if row.get("render_doc_bytes") is not None else 0,
+        content_revision=(
+            max(1, int(row["content_revision"] or 1))
+            if row.get("content_revision") is not None
+            else 1
+        ),
+        attachment_descriptors=_attachment_descriptors_from_json(
+            row.get("attachment_descriptors_json")
+        ),
+        attachment_descriptors_ready=bool(
+            row.get("attachment_descriptors_ready", False)
+        ),
+    )
+
+
+def _mailbox_message_from_row(row) -> GmailMessageRecord:
+    """Decode one constant-width aggregate projection for one Gmail thread."""
+
+    mailbox_body_ready = bool(row["mailbox_body_ready"])
+    mailbox_content_revision = str(row["mailbox_content_revision"])
+
+    return GmailMessageRecord(
+        user_id=str(row["user_id"]),
+        message_id=str(row["message_id"]),
+        gmail_thread_id=str(row["gmail_thread_id"]) if row["gmail_thread_id"] is not None else None,
+        history_id=str(row["history_id"]) if row["history_id"] is not None else None,
+        label_ids=json.loads(row["label_ids_json"] or "[]"),
+        internal_date=_iso(row["internal_date"]) if row["internal_date"] is not None else None,
+        subject=str(row["subject"]) if row["subject"] is not None else None,
+        sender=str(row["sender"]) if row["sender"] is not None else None,
+        recipients=json.loads(row["recipients_json"] or "{}"),
+        headers={},
+        snippet=str(row["snippet"]) if row["snippet"] is not None else None,
+        raw_payload={},
+        html_body_sanitized=None,
+        html_render_document=None,
+        text_body=None,
+        extracted_signals={},
+        body_hash=mailbox_content_revision,
+        created_at=_iso(row["created_at"]),
+        updated_at=_iso(row["updated_at"]),
+        body_fetch_status="fetched" if mailbox_body_ready else "missing",
+        body_fetched_at=None,
+        body_fetch_error=None,
+        render_doc_bytes=0,
+        ai_title=str(row["ai_title"]) if row.get("ai_title") is not None else None,
+        ai_title_generated_at=(
+            _iso(row["ai_title_generated_at"])
+            if row.get("ai_title_generated_at") is not None
+            else None
+        ),
+        content_revision=1,
+        attachment_descriptors=[],
+        attachment_descriptors_ready=True,
+        mailbox_message_count=max(1, int(row["mailbox_message_count"] or 1)),
+        mailbox_body_ready=mailbox_body_ready,
+        mailbox_content_revision=mailbox_content_revision,
+        mailbox_attachment_count=max(0, int(row["mailbox_attachment_count"] or 0)),
     )
 
 
@@ -3845,6 +5738,39 @@ def _json_list_of_dicts(value: Any) -> list[dict[str, str]]:
         for item in parsed
         if isinstance(item, dict)
     ]
+
+
+def _attachment_descriptors_from_json(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        parsed = value
+    else:
+        try:
+            parsed = json.loads(value or "[]")
+        except (TypeError, json.JSONDecodeError):
+            return []
+    if not isinstance(parsed, list):
+        return []
+    descriptors: list[dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        attachment_id = str(item.get("attachment_id") or "").strip()
+        if not attachment_id:
+            continue
+        try:
+            size = max(0, int(item.get("size") or 0))
+        except (TypeError, ValueError):
+            size = 0
+        descriptors.append(
+            {
+                "filename": str(item.get("filename") or "").strip(),
+                "mime_type": str(item.get("mime_type") or "application/octet-stream"),
+                "size": size,
+                "attachment_id": attachment_id,
+                "part_id": str(item.get("part_id") or "").strip(),
+            }
+        )
+    return descriptors
 
 
 def _json_dict(value: Any) -> dict[str, Any]:
@@ -4010,6 +5936,36 @@ def _state_from_row(row) -> GmailImportState:
         ),
         reconcile_started_at=_iso(row["reconcile_started_at"]) if "reconcile_started_at" in row and row["reconcile_started_at"] is not None else None,
         updated_at=_iso(row["updated_at"]),
+        sync_generation=str(row["sync_generation"]) if "sync_generation" in row and row["sync_generation"] is not None else None,
+        phase=str(row["phase"]) if "phase" in row and row["phase"] is not None else None,
+        initial_target_count=int(row["initial_target_count"] or 0) if "initial_target_count" in row else 0,
+        initial_metadata_count=int(row["initial_metadata_count"] or 0) if "initial_metadata_count" in row else 0,
+        initial_body_target_count=int(row["initial_body_target_count"] or 0) if "initial_body_target_count" in row else 0,
+        initial_body_ready_count=int(row["initial_body_ready_count"] or 0) if "initial_body_ready_count" in row else 0,
+        history_metadata_count=int(row["history_metadata_count"] or 0) if "history_metadata_count" in row else 0,
+        history_body_ready_count=int(row["history_body_ready_count"] or 0) if "history_body_ready_count" in row else 0,
+        estimated_total_count=int(row["estimated_total_count"] or 0) if "estimated_total_count" in row else 0,
+        initial_window_complete=bool(row["initial_window_complete"]) if "initial_window_complete" in row else False,
+        history_metadata_complete=bool(row["history_metadata_complete"]) if "history_metadata_complete" in row else False,
+        history_body_complete=bool(row["history_body_complete"]) if "history_body_complete" in row else False,
+        last_progress_at=_iso(row["last_progress_at"]) if "last_progress_at" in row and row["last_progress_at"] is not None else None,
+        attachment_descriptors_complete=(
+            bool(row["attachment_descriptors_complete"])
+            if "attachment_descriptors_complete" in row
+            else True
+        ),
+    )
+
+
+def _initial_window_entry_from_row(row) -> GmailInitialWindowEntry:
+    return GmailInitialWindowEntry(
+        user_id=str(row["user_id"]),
+        generation_id=str(row["generation_id"]),
+        gmail_thread_id=str(row["gmail_thread_id"]),
+        position=int(row["position"]),
+        message_count=int(row["message_count"] or 0),
+        metadata_ready_at=_iso(row["metadata_ready_at"]) if row["metadata_ready_at"] is not None else None,
+        body_ready_at=_iso(row["body_ready_at"]) if row["body_ready_at"] is not None else None,
     )
 
 

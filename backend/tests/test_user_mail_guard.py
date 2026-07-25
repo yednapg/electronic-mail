@@ -349,6 +349,11 @@ class UserMailGuardUnitTests(unittest.TestCase):
                 "check_user_google_credentials",
                 return_value=SimpleNamespace(connected=True),
             ),
+            patch.object(
+                gmail_poller,
+                "ensure_background_import_work",
+                side_effect=UserMailWorkBlocked("disconnected"),
+            ),
             patch.object(gmail_poller, "get_import_state", return_value=None),
             patch.object(
                 gmail_poller,
@@ -454,6 +459,7 @@ class GmailRecoveryPollerTests(unittest.TestCase):
                 return_value=["user-1"],
             ),
             patch.object(gmail_poller, "_credentials_available", return_value=True),
+            patch.object(gmail_poller, "ensure_background_import_work"),
             patch.object(gmail_poller, "get_import_state", return_value=state),
             patch.object(gmail_poller, "enqueue_job") as enqueue,
         ):
