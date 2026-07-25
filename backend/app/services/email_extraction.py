@@ -294,8 +294,64 @@ def mark_full_gmail_payload_body_fetch_status(parsed: dict[str, Any]) -> dict[st
         for field in ("text_body", "html_body_sanitized", "html_render_document")
     )
     unresolved_body = gmail_payload_has_unresolved_text_body(parsed.get("raw_payload") or {})
+    # Only the full Gmail representation proves that an empty attachment list
+    # is complete. Metadata responses intentionally leave this false so they
+    # cannot erase descriptors learned by an earlier body hydration.
+    parsed["attachment_descriptors_ready"] = True
     parsed["body_fetch_status"] = "missing" if unresolved_body and not has_resolved_body else "fetched"
+    if parsed["body_fetch_status"] == "fetched":
+        parsed["raw_payload"] = normalized_gmail_payload_projection(parsed.get("raw_payload") or {})
     return parsed
+
+
+def normalized_gmail_payload_projection(payload: dict[str, Any]) -> dict[str, Any]:
+    """Retain MIME structure and attachment descriptors without body bytes.
+
+    Reader text, sanitized HTML, CID assets, and headers are persisted in their
+    normalized columns. Keeping Gmail's base64 body data again in raw JSON
+    doubles storage and leaves an unnecessary second rendering source.
+    """
+
+    def project_part(part: dict[str, Any]) -> dict[str, Any]:
+        projected: dict[str, Any] = {}
+        for key in ("partId", "mimeType", "filename"):
+            value = part.get(key)
+            if value is not None:
+                projected[key] = value
+        headers = part.get("headers")
+        if isinstance(headers, list):
+            projected["headers"] = [
+                {"name": item.get("name"), "value": item.get("value")}
+                for item in headers
+                if isinstance(item, dict) and item.get("name") is not None
+            ]
+        body = part.get("body")
+        if isinstance(body, dict):
+            descriptor = {
+                key: body[key]
+                for key in ("attachmentId", "size")
+                if body.get(key) is not None
+            }
+            if descriptor:
+                projected["body"] = descriptor
+        children = part.get("parts")
+        if isinstance(children, list):
+            projected["parts"] = [
+                project_part(child)
+                for child in children
+                if isinstance(child, dict)
+            ]
+        return projected
+
+    projected_payload = {
+        key: payload[key]
+        for key in ("id", "threadId", "historyId", "labelIds", "internalDate", "snippet")
+        if payload.get(key) is not None
+    }
+    root = payload.get("payload")
+    if isinstance(root, dict):
+        projected_payload["payload"] = project_part(root)
+    return projected_payload
 
 
 def compact_text(value: str | None) -> str:

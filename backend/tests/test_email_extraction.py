@@ -143,7 +143,11 @@ class EmailExtractionTests(unittest.TestCase):
 
         self.assertTrue(gmail_payload_has_unresolved_text_body(parsed["raw_payload"]))
         self.assertIn("Complete HTML alternative", parsed["html_render_document"] or "")
-        self.assertEqual(_mark_full_payload_body_fetch_status(parsed)["body_fetch_status"], "fetched")
+        marked = _mark_full_payload_body_fetch_status(parsed)
+        self.assertEqual(marked["body_fetch_status"], "fetched")
+        parts = marked["raw_payload"]["payload"]["parts"]
+        self.assertNotIn("data", parts[1].get("body", {}))
+        self.assertEqual(parts[0]["body"]["attachmentId"], "large-plain")
 
     def test_large_text_body_is_resolved_from_gmail_attachment(self) -> None:
         payload = {

@@ -12,6 +12,10 @@
 		A44444444444444444444444 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A55555555555555555555555 /* Assets.xcassets */; };
 		043C55ECC28A6165147139CD /* ElectronicMailShared.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 12A865E23955430580FFD02C /* ElectronicMailShared.framework */; };
 		0603554E13C11B17E013197A /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 3D3D61B9C225A66A5F6D9FAF /* libsqlite3.tbd */; };
+		0C0A77C95EA34E90A5300001 /* AttachmentPrefetchCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0A77C95EA34E90A5200001 /* AttachmentPrefetchCoordinator.swift */; };
+		0C0A77C95EA34E90A5300002 /* EncryptedMediaCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0A77C95EA34E90A5200002 /* EncryptedMediaCache.swift */; };
+		0C0A77C95EA34E90A5300003 /* OfflineContentSyncCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0A77C95EA34E90A5200003 /* OfflineContentSyncCoordinator.swift */; };
+		0C0A77C95EA34E90A5300004 /* RemoteImageLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0A77C95EA34E90A5200004 /* RemoteImageLoader.swift */; };
 		0767FCCA198DEB06D906F8E4 /* ElectronicMailShared.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 12A865E23955430580FFD02C /* ElectronicMailShared.framework */; };
 		0906C070D57C3F9538FDD697 /* ElectronicMailiOSRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3E279E99C5A2401814A085C /* ElectronicMailiOSRootView.swift */; };
 		099D4835441FACE42D1B3A9F /* InboxStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D17382F2DECC14A57EC0403 /* InboxStore.swift */; };
@@ -162,6 +166,10 @@
 		A33333333333333333333333 /* ElectronicMail.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ElectronicMail.entitlements; sourceTree = "<group>"; };
 		A55555555555555555555555 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		02859D68EE1494543F23A5CD /* DashboardScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardScreen.swift; sourceTree = "<group>"; };
+		0C0A77C95EA34E90A5200001 /* AttachmentPrefetchCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentPrefetchCoordinator.swift; sourceTree = "<group>"; };
+		0C0A77C95EA34E90A5200002 /* EncryptedMediaCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EncryptedMediaCache.swift; sourceTree = "<group>"; };
+		0C0A77C95EA34E90A5200003 /* OfflineContentSyncCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineContentSyncCoordinator.swift; sourceTree = "<group>"; };
+		0C0A77C95EA34E90A5200004 /* RemoteImageLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteImageLoader.swift; sourceTree = "<group>"; };
 		08B383FFABFBC62AA3421FAC /* ElectronicMailDesign.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElectronicMailDesign.swift; sourceTree = "<group>"; };
 		0BF632318F4994F17ADAD299 /* ElectronicMailTests-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMailTests-Info.plist"; sourceTree = "<group>"; };
 		1248366AFBD8E041955962EB /* DashboardStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardStore.swift; sourceTree = "<group>"; };
@@ -387,6 +395,7 @@
 		F7A710C78824B1D98666B4BC /* Core */ = {
 			isa = PBXGroup;
 			children = (
+				0C0A77C95EA34E90A5200001 /* AttachmentPrefetchCoordinator.swift */,
 				D1139801E4AE9E09FEFCADE0 /* AppClient.swift */,
 				51A82E6E83CB2F01653310C9 /* AppConfiguration.swift */,
 				C9A1D426A580DEF065947EE2 /* AppSessionCache.swift */,
@@ -394,12 +403,15 @@
 				73C32468817FF1F83CFB3464 /* DemoAppClient.swift */,
 				08B383FFABFBC62AA3421FAC /* ElectronicMailDesign.swift */,
 				83E10CE3510246DF51DBD5AE /* EmailReaderView.swift */,
+				0C0A77C95EA34E90A5200002 /* EncryptedMediaCache.swift */,
 				6D17382F2DECC14A57EC0403 /* InboxStore.swift */,
 				98E41167B98D870A2F18DC05 /* InboxView.swift */,
 				312841A2440897390E5606AE /* LocalMailStore.swift */,
 				C4B0DA2215CE7CF473AE431B /* Models.swift */,
 				95F1402204821AD28FD21C68 /* OAuthService.swift */,
 				9A855B4C53D956DB6F002D1E /* OfflineFirstAppClient.swift */,
+				0C0A77C95EA34E90A5200003 /* OfflineContentSyncCoordinator.swift */,
+				0C0A77C95EA34E90A5200004 /* RemoteImageLoader.swift */,
 				86C22B47DC30CD35E982D179 /* SessionTokenStore.swift */,
 				54F56B91356DB66565F5138F /* SignedInShellView.swift */,
 				66C3D0D7E0829B5401C6DF4A /* SQLiteLocalMailStore.swift */,
@@ -661,6 +673,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				0C0A77C95EA34E90A5300001 /* AttachmentPrefetchCoordinator.swift in Sources */,
 				BE1F6B1BE413185277F42DA7 /* AppClient.swift in Sources */,
 				4A90C425C83E253DE4697898 /* AppConfiguration.swift in Sources */,
 				C98D334B8B820CCACD131F38 /* AppSessionCache.swift in Sources */,
@@ -668,12 +681,15 @@
 				A241E5F8B9718F4773A019D9 /* DemoAppClient.swift in Sources */,
 				83355D735E886188024D7239 /* ElectronicMailDesign.swift in Sources */,
 				66486AF9E5CDA9EC58FABB98 /* EmailReaderView.swift in Sources */,
+				0C0A77C95EA34E90A5300002 /* EncryptedMediaCache.swift in Sources */,
 				9CE3077210497D6B468695F8 /* InboxStore.swift in Sources */,
 				986F65AF29012E65ECBD6FD1 /* InboxView.swift in Sources */,
 				A9AFF2D31F81A3CD0EBABD2C /* LocalMailStore.swift in Sources */,
 				85C4B68C65C7EFD1F92F2CA0 /* Models.swift in Sources */,
 				1D98A43F420A4A228816E31E /* OAuthService.swift in Sources */,
 				C3DF33FD21568EF121376DC6 /* OfflineFirstAppClient.swift in Sources */,
+				0C0A77C95EA34E90A5300003 /* OfflineContentSyncCoordinator.swift in Sources */,
+				0C0A77C95EA34E90A5300004 /* RemoteImageLoader.swift in Sources */,
 				D2FD3733F80614E5E6BE2650 /* SQLiteLocalMailStore.swift in Sources */,
 				F844A9085964F93CD2953825 /* SessionTokenStore.swift in Sources */,
 				5B9CB4C7A88FF38FC9BA197A /* SignedInShellView.swift in Sources */,

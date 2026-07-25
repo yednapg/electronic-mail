@@ -20,6 +20,7 @@ from app.db.mail_groups import (
 )
 from app.db.user_mail_guard import UserMailWorkBlocked
 from app.services.integrations.google import check_user_google_credentials
+from app.services.mail_groups import ensure_background_import_work
 
 STOP = False
 logger = logging.getLogger(__name__)
@@ -87,6 +88,10 @@ def poll_once(settings, *, worker_id: str = "gmail-poller") -> int:
     queued = 0
     for user_id in list_connected_gmail_user_ids(database_url):
         if not _credentials_available(settings, user_id=user_id):
+            continue
+        try:
+            ensure_background_import_work(settings, user_id=user_id)
+        except UserMailWorkBlocked:
             continue
         state = get_import_state(database_url, user_id=user_id)
         if state is not None and getattr(state, "reconcile_generation", None):

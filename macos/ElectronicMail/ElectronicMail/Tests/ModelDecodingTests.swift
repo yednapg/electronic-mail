@@ -189,7 +189,10 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertNotNil(store.readMailbox(userID: userID, label: DemoAppFixtures.appSession.mailbox.label))
         XCTAssertEqual(store.readThread(userID: userID, threadID: thread.entityID), thread)
         XCTAssertEqual(store.pendingThreadActions().count, 1)
-        XCTAssertNotNil(sqliteArtifactData(databaseURL: databaseURL).range(of: Data(bodyMarker.utf8)))
+        XCTAssertNil(
+            sqliteArtifactData(databaseURL: databaseURL).range(of: Data(bodyMarker.utf8)),
+            "Cached thread content must never be stored as plaintext"
+        )
 
         store.clearAll()
 
@@ -257,13 +260,500 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(cachedMailbox.nextCursor, "generation-cursor-2")
     }
 
+    func testSQLiteReauthenticationSessionClearPreservesEncryptedBodiesAcrossRelaunch() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailReauthCacheTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let databaseURL = directory.appendingPathComponent("LocalMail.sqlite3")
+        let session = DemoAppFixtures.appSession
+        let userID = session.user.id
+        let threadID = "demo-google-today"
+        let thread = try XCTUnwrap(DemoAppFixtures.threads[threadID])
+        do {
+            let store = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: databaseURL))
+            store.writeSession(session)
+            store.writeMailbox(session.mailbox, userID: userID, label: .inbox)
+            store.writeThread(thread, userID: userID, threadID: threadID)
+
+            store.clearSession()
+
+            XCTAssertNil(store.readSession())
+            XCTAssertEqual(store.readMailbox(userID: userID, label: .inbox), session.mailbox)
+            XCTAssertEqual(store.readThread(userID: userID, threadID: threadID), thread)
+        }
+
+        let relaunched = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: databaseURL))
+        XCTAssertNil(relaunched.readSession())
+        XCTAssertEqual(relaunched.readMailbox(userID: userID, label: .inbox), session.mailbox)
+        XCTAssertEqual(relaunched.readThread(userID: userID, threadID: threadID), thread)
+        relaunched.purgeAccount(userID: userID)
+    }
+
+    func testSQLiteRelaunchKeepsLargerSameGenerationMailboxAfterFirstPageSessionWrite() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailRelaunchCacheTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let databaseURL = directory.appendingPathComponent("LocalMail.sqlite3")
+        let base = DemoAppFixtures.appSession
+        let rows = Array(base.mailbox.sections.flatMap(\.rows).prefix(3))
+        let completeMailbox = MailboxResponse(
+            label: .inbox,
+            totalThreads: 3,
+            loadedThreads: 3,
+            sections: [GmailThreadSection(id: "cached", title: "Cached", rows: rows)],
+            fullImportRunning: false,
+            fullImportCompleted: true,
+            syncGeneration: "generation-relaunch-1",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let refreshedFirstPage = MailboxResponse(
+            label: .inbox,
+            totalThreads: 3,
+            nextCursor: "cursor-2",
+            loadedThreads: 1,
+            sections: [GmailThreadSection(id: "cached", title: "Cached", rows: [rows[0]])],
+            fullImportRunning: false,
+            fullImportCompleted: true,
+            syncGeneration: "generation-relaunch-1",
+            lastProgressAt: "2026-07-25T12:01:00Z"
+        )
+        let completeSession = AppSessionResponse(
+            user: base.user,
+            readiness: base.readiness,
+            dashboard: base.dashboard,
+            mailbox: completeMailbox,
+            sync: base.sync
+        )
+        let firstPageSession = AppSessionResponse(
+            user: base.user,
+            readiness: base.readiness,
+            dashboard: base.dashboard,
+            mailbox: refreshedFirstPage,
+            sync: base.sync
+        )
+
+        do {
+            let store = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: databaseURL))
+            store.writeSession(completeSession)
+            store.writeMailbox(completeMailbox, userID: base.user.id, label: .inbox)
+            store.writeSession(firstPageSession)
+            store.writeMailbox(refreshedFirstPage, userID: base.user.id, label: .inbox)
+        }
+
+        let relaunched = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: databaseURL))
+        XCTAssertEqual(relaunched.readSession()?.mailbox.sections.flatMap(\.rows).count, 3)
+        XCTAssertEqual(
+            relaunched.readMailbox(userID: base.user.id, label: .inbox)?.sections.flatMap(\.rows).count,
+            3
+        )
+        XCTAssertNil(relaunched.readSession()?.mailbox.nextCursor)
+        XCTAssertNil(relaunched.readMailbox(userID: base.user.id, label: .inbox)?.nextCursor)
+    }
+
+    func testSQLiteAuthoritativeSameGenerationSnapshotPrunesDeletedRows() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailAuthoritativePruneTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3")))
+        let userID = DemoAppFixtures.appSession.user.id
+        let rows = Array(DemoAppFixtures.sections.flatMap(\.rows).prefix(3))
+        let initial = makeCacheMailbox(
+            label: .inbox,
+            rows: rows,
+            generation: "generation-prune",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let afterDelete = makeCacheMailbox(
+            label: .inbox,
+            rows: Array(rows.dropFirst()),
+            generation: "generation-prune",
+            lastProgressAt: "2026-07-25T12:01:00Z"
+        )
+
+        store.writeMailbox(initial, userID: userID, label: .inbox)
+        store.writeMailbox(afterDelete, userID: userID, label: .inbox)
+
+        let cached = try XCTUnwrap(store.readMailbox(userID: userID, label: .inbox))
+        XCTAssertEqual(cached.sections.flatMap(\.rows).map(\.threadID), Array(rows.dropFirst()).map(\.threadID))
+        XCTAssertEqual(cached.totalThreads, 2)
+        XCTAssertEqual(cached.syncGeneration, "generation-prune")
+    }
+
+    func testSQLiteProgressivePartialAppendPreservesUnseenSameGenerationRows() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailProgressiveAppendTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3")))
+        let userID = DemoAppFixtures.appSession.user.id
+        let rows = Array(DemoAppFixtures.sections.flatMap(\.rows).prefix(3))
+        let accumulated = makeCacheMailbox(
+            label: .inbox,
+            rows: rows,
+            generation: "generation-progressive",
+            nextCursor: "cursor-4",
+            totalThreads: 4,
+            fullImportRunning: true,
+            fullImportCompleted: false,
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let refreshedFirstBatch = makeCacheMailbox(
+            label: .inbox,
+            rows: [rows[0]],
+            generation: "generation-progressive",
+            nextCursor: "cursor-2",
+            totalThreads: 4,
+            fullImportRunning: true,
+            fullImportCompleted: false,
+            lastProgressAt: "2026-07-25T12:01:00Z"
+        )
+
+        store.writeMailbox(accumulated, userID: userID, label: .inbox)
+        store.writeMailbox(refreshedFirstBatch, userID: userID, label: .inbox)
+
+        let cached = try XCTUnwrap(store.readMailbox(userID: userID, label: .inbox))
+        XCTAssertEqual(cached.sections.flatMap(\.rows).map(\.threadID), rows.map(\.threadID))
+        XCTAssertEqual(cached.loadedThreads, 3)
+        XCTAssertEqual(cached.nextCursor, "cursor-4")
+    }
+
+    func testSQLiteOptimisticMoveTombstoneIsLabelScopedAndSurvivesRelaunch() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailMailboxTombstoneTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let databaseURL = directory.appendingPathComponent("LocalMail.sqlite3")
+        let userID = DemoAppFixtures.appSession.user.id
+        let rows = Array(DemoAppFixtures.sections.flatMap(\.rows).prefix(2))
+        let inbox = makeCacheMailbox(
+            label: .inbox,
+            rows: rows,
+            generation: "generation-move",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let trash = makeCacheMailbox(
+            label: .trash,
+            rows: [rows[0]],
+            generation: "generation-move",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let optimisticInbox = makeCacheMailbox(
+            label: .inbox,
+            rows: [rows[1]],
+            generation: "generation-move",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+
+        do {
+            let store = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: databaseURL))
+            store.writeMailbox(inbox, userID: userID, label: .inbox)
+            store.writeMailbox(trash, userID: userID, label: .trash)
+            store.writeMailbox(
+                optimisticInbox,
+                userID: userID,
+                label: .inbox,
+                removingThreadIDs: [rows[0].threadID],
+                reenteringThreadIDs: [],
+                reentryLabels: []
+            )
+        }
+
+        let relaunched = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: databaseURL))
+        let staleInbox = makeCacheMailbox(
+            label: .inbox,
+            rows: rows,
+            generation: "generation-move",
+            nextCursor: "stale-page-cursor",
+            totalThreads: rows.count + 1,
+            fullImportRunning: true,
+            fullImportCompleted: false,
+            lastProgressAt: "2026-07-25T12:01:00Z"
+        )
+        relaunched.writeMailbox(staleInbox, userID: userID, label: .inbox)
+
+        XCTAssertEqual(
+            relaunched.readMailbox(userID: userID, label: .inbox)?.sections.flatMap(\.rows).map(\.threadID),
+            [rows[1].threadID]
+        )
+        XCTAssertEqual(
+            relaunched.readMailbox(userID: userID, label: .trash)?.sections.flatMap(\.rows).map(\.threadID),
+            [rows[0].threadID]
+        )
+        XCTAssertEqual(relaunched.readMailbox(userID: userID, label: .inbox)?.syncGeneration, "generation-move")
+    }
+
+    func testSQLiteExplicitInverseMoveClearsOnlyDestinationTombstone() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailMailboxInverseMoveTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3")))
+        let userID = DemoAppFixtures.appSession.user.id
+        let row = try XCTUnwrap(DemoAppFixtures.sections.flatMap(\.rows).first)
+        let inbox = makeCacheMailbox(
+            label: .inbox,
+            rows: [row],
+            generation: "generation-inverse-move",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let emptyInbox = makeCacheMailbox(
+            label: .inbox,
+            rows: [],
+            generation: "generation-inverse-move",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let archive = makeCacheMailbox(
+            label: .archive,
+            rows: [row],
+            generation: "generation-inverse-move",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let emptyArchive = makeCacheMailbox(
+            label: .archive,
+            rows: [],
+            generation: "generation-inverse-move",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+
+        store.writeMailbox(inbox, userID: userID, label: .inbox)
+        store.writeMailbox(
+            emptyInbox,
+            userID: userID,
+            label: .inbox,
+            removingThreadIDs: [row.threadID],
+            reenteringThreadIDs: [row.threadID],
+            reentryLabels: [.archive]
+        )
+        store.writeMailbox(archive, userID: userID, label: .archive)
+
+        // Unarchive is the explicit inverse: the Archive removal remains
+        // tombstoned, while Inbox is allowed to accept the row again even at
+        // the same server progress timestamp.
+        store.writeMailbox(
+            emptyArchive,
+            userID: userID,
+            label: .archive,
+            removingThreadIDs: [row.threadID],
+            reenteringThreadIDs: [row.threadID],
+            reentryLabels: [.inbox]
+        )
+        store.writeMailbox(inbox, userID: userID, label: .inbox)
+        store.writeMailbox(archive, userID: userID, label: .archive)
+
+        XCTAssertEqual(
+            store.readMailbox(userID: userID, label: .inbox)?.sections.flatMap(\.rows).map(\.threadID),
+            [row.threadID]
+        )
+        XCTAssertTrue(
+            store.readMailbox(userID: userID, label: .archive)?.sections.flatMap(\.rows).isEmpty == true
+        )
+    }
+
+    func testSQLiteOnlyNewerAuthoritativeInclusionClearsSameGenerationTombstone() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailMailboxAuthoritativeReentryTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3")))
+        let userID = DemoAppFixtures.appSession.user.id
+        let rows = Array(DemoAppFixtures.sections.flatMap(\.rows).prefix(2))
+        let initial = makeCacheMailbox(
+            label: .inbox,
+            rows: rows,
+            generation: "generation-authoritative-reentry",
+            mailboxRevision: "revision-before-action",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let optimisticRemoval = makeCacheMailbox(
+            label: .inbox,
+            rows: [rows[1]],
+            generation: "generation-authoritative-reentry",
+            mailboxRevision: "revision-before-action",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let stalePartialPage = makeCacheMailbox(
+            label: .inbox,
+            rows: rows,
+            generation: "generation-authoritative-reentry",
+            nextCursor: "stale-page-cursor",
+            totalThreads: rows.count + 1,
+            fullImportRunning: true,
+            fullImportCompleted: false,
+            mailboxRevision: "revision-before-action",
+            lastProgressAt: "2026-07-25T12:01:00Z"
+        )
+        let staleAuthoritativeInFlight = makeCacheMailbox(
+            label: .inbox,
+            rows: rows,
+            generation: "generation-authoritative-reentry",
+            mailboxRevision: "revision-before-action",
+            lastProgressAt: "2026-07-25T12:01:30Z"
+        )
+        let authoritativeInclusion = makeCacheMailbox(
+            label: .inbox,
+            rows: rows,
+            generation: "generation-authoritative-reentry",
+            mailboxRevision: "revision-after-action",
+            lastProgressAt: "2026-07-25T12:02:00Z"
+        )
+
+        store.writeMailbox(initial, userID: userID, label: .inbox)
+        store.writeMailbox(
+            optimisticRemoval,
+            userID: userID,
+            label: .inbox,
+            removingThreadIDs: [rows[0].threadID],
+            reenteringThreadIDs: [],
+            reentryLabels: []
+        )
+        store.writeMailbox(stalePartialPage, userID: userID, label: .inbox)
+
+        XCTAssertEqual(
+            store.readMailbox(userID: userID, label: .inbox)?.sections.flatMap(\.rows).map(\.threadID),
+            [rows[1].threadID]
+        )
+
+        // A full response that was already in flight carries the pre-action
+        // revision and cannot resurrect the removed row merely because its
+        // response timestamp is newer.
+        store.writeMailbox(staleAuthoritativeInFlight, userID: userID, label: .inbox)
+
+        XCTAssertEqual(
+            store.readMailbox(userID: userID, label: .inbox)?.sections.flatMap(\.rows).map(\.threadID),
+            [rows[1].threadID]
+        )
+
+        store.writeMailbox(authoritativeInclusion, userID: userID, label: .inbox)
+
+        XCTAssertEqual(
+            store.readMailbox(userID: userID, label: .inbox)?.sections.flatMap(\.rows).map(\.threadID),
+            rows.map(\.threadID)
+        )
+    }
+
+    func testSQLiteNewGenerationCanRestorePreviouslyTombstonedThread() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailTombstoneGenerationTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3")))
+        let userID = DemoAppFixtures.appSession.user.id
+        let row = try XCTUnwrap(DemoAppFixtures.sections.flatMap(\.rows).first)
+        let firstGeneration = makeCacheMailbox(
+            label: .inbox,
+            rows: [row],
+            generation: "generation-tombstone-A",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let removed = makeCacheMailbox(
+            label: .inbox,
+            rows: [],
+            generation: "generation-tombstone-A",
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let nextGeneration = makeCacheMailbox(
+            label: .inbox,
+            rows: [row],
+            generation: "generation-tombstone-B",
+            lastProgressAt: "2026-07-25T12:02:00Z"
+        )
+
+        store.writeMailbox(firstGeneration, userID: userID, label: .inbox)
+        store.writeMailbox(
+            removed,
+            userID: userID,
+            label: .inbox,
+            removingThreadIDs: [row.threadID],
+            reenteringThreadIDs: [],
+            reentryLabels: []
+        )
+        store.writeMailbox(nextGeneration, userID: userID, label: .inbox)
+
+        XCTAssertEqual(
+            store.readMailbox(userID: userID, label: .inbox)?.sections.flatMap(\.rows).map(\.threadID),
+            [row.threadID]
+        )
+    }
+
+    func testSQLiteGenerationFenceRejectsLateRetiredSnapshotAcrossRelaunch() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailGenerationFenceTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let databaseURL = directory.appendingPathComponent("LocalMail.sqlite3")
+        let base = DemoAppFixtures.appSession
+        let rows = base.mailbox.sections.flatMap(\.rows)
+        let mailbox: (MailboxLabel, String, GmailThreadRow) -> MailboxResponse = { label, generation, row in
+            MailboxResponse(
+                label: label,
+                totalThreads: 1,
+                loadedThreads: 1,
+                sections: [GmailThreadSection(id: generation, title: generation, rows: [row])],
+                fullImportRunning: true,
+                fullImportCompleted: false,
+                syncGeneration: generation
+            )
+        }
+        let inboxA = mailbox(.inbox, "generation-A", rows[0])
+        let inboxB = mailbox(.inbox, "generation-B", rows[1])
+        let sentA = mailbox(.sent, "generation-A", rows[0])
+        let sentB = mailbox(.sent, "generation-B", rows[1])
+        let sessionA = AppSessionResponse(
+            user: base.user,
+            readiness: base.readiness,
+            dashboard: base.dashboard,
+            mailbox: inboxA,
+            sync: base.sync
+        )
+        let sessionB = AppSessionResponse(
+            user: base.user,
+            readiness: base.readiness,
+            dashboard: base.dashboard,
+            mailbox: inboxB,
+            sync: base.sync
+        )
+
+        do {
+            let store = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: databaseURL))
+            store.writeSession(sessionA)
+            store.writeSession(sessionB)
+            store.writeMailbox(sentA, userID: base.user.id, label: .sent)
+            store.writeMailbox(sentB, userID: base.user.id, label: .sent)
+        }
+
+        let relaunched = try XCTUnwrap(SQLiteLocalMailStore(databaseURL: databaseURL))
+        relaunched.writeSession(sessionA)
+        relaunched.writeMailbox(sentA, userID: base.user.id, label: .sent)
+
+        XCTAssertEqual(relaunched.readSession()?.mailbox.syncGeneration, "generation-B")
+        XCTAssertEqual(relaunched.readSession()?.mailbox.sections.flatMap(\.rows).map(\.threadID), [rows[1].threadID])
+        XCTAssertEqual(relaunched.readMailbox(userID: base.user.id, label: .sent)?.syncGeneration, "generation-B")
+        XCTAssertEqual(
+            relaunched.readMailbox(userID: base.user.id, label: .sent)?.sections.flatMap(\.rows).map(\.threadID),
+            [rows[1].threadID]
+        )
+    }
+
     func testRemoteImagesLoadAutomatically() {
         let html = #"<html><head></head><body><img src="https://tracker.example/pixel.png"><img src="data:image/png;base64,AA=="></body></html>"#
 
         let rendered = EmailRemoteImagePolicy.renderDocument(from: html)
 
         XCTAssertTrue(rendered.contains("Content-Security-Policy"))
-        XCTAssertTrue(rendered.contains("img-src https: data: cid:"))
+        XCTAssertTrue(rendered.contains("img-src electronicmail-image: data: cid:"))
+        XCTAssertFalse(rendered.contains("img-src https:"))
         XCTAssertTrue(rendered.contains("script-src 'none'"))
     }
 
@@ -271,7 +761,8 @@ final class ModelDecodingTests: XCTestCase {
         let html = #"<html><body style="background-image:url('https://images.example/background.png')"></body></html>"#
 
         let allowed = EmailRemoteImagePolicy.renderDocument(from: html)
-        XCTAssertTrue(allowed.contains("img-src https: data: cid:"))
+        XCTAssertTrue(allowed.contains("img-src electronicmail-image: data: cid:"))
+        XCTAssertFalse(allowed.contains("img-src https:"))
         XCTAssertTrue(allowed.contains("script-src 'none'"))
         XCTAssertTrue(allowed.contains("frame-src 'none'"))
     }
@@ -302,6 +793,205 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(thread.gmailThreadID, "thread-1")
         XCTAssertEqual(thread.messages.first?.id, "source-1")
         XCTAssertEqual(thread.messages.first?.bodyComplete, true)
+    }
+
+    func testProgressiveReadinessFieldsDecodeWithExactSnakeCaseContract() throws {
+        let data = """
+        {
+          "mode": "progressive",
+          "stage": "hydrating_priority_content",
+          "ready_to_enter": false,
+          "dashboard_ready": true,
+          "mailbox_ready": false,
+          "ready_dashboard_count": 0,
+          "ready_mail_group_count": 21,
+          "full_import_running": true,
+          "full_import_completed": false,
+          "user_display_name": "TestUser",
+          "error_message": null,
+          "sync_generation": "generation-7",
+          "phase": "hydrating_priority_content",
+          "initial_target_count": 100,
+          "initial_metadata_count": 87,
+          "initial_body_target_count": 25,
+          "initial_body_ready_count": 21,
+          "history_metadata_count": 230,
+          "history_body_ready_count": 180,
+          "estimated_total_count": 640,
+          "initial_window_complete": false,
+          "history_metadata_complete": false,
+          "history_body_complete": false,
+          "last_progress_at": "2026-07-25T12:30:00Z"
+        }
+        """.data(using: .utf8)!
+
+        let readiness = try JSONDecoder.backend.decode(PostLoginReadinessResponse.self, from: data)
+        let progress = readiness.mailboxSyncProgress
+
+        XCTAssertEqual(progress.syncGeneration, "generation-7")
+        XCTAssertEqual(progress.phase, "hydrating_priority_content")
+        XCTAssertEqual(progress.initialTargetCount, 100)
+        XCTAssertEqual(progress.initialMetadataCount, 87)
+        XCTAssertEqual(progress.initialBodyTargetCount, 25)
+        XCTAssertEqual(progress.initialBodyReadyCount, 21)
+        XCTAssertEqual(progress.historyMetadataCount, 230)
+        XCTAssertEqual(progress.historyBodyReadyCount, 180)
+        XCTAssertEqual(progress.estimatedTotalCount, 640)
+        XCTAssertEqual(progress.initialWindowComplete, false)
+        XCTAssertEqual(progress.historyMetadataComplete, false)
+        XCTAssertEqual(progress.historyBodyComplete, false)
+        XCTAssertEqual(progress.lastProgressAt, "2026-07-25T12:30:00Z")
+        XCTAssertTrue(progress.hasReportedProgress)
+    }
+
+    func testLegacyReadinessPayloadKeepsProgressFieldsOptional() throws {
+        let data = """
+        {
+          "mode": "returning",
+          "stage": "welcome_back",
+          "ready_to_enter": true,
+          "dashboard_ready": true,
+          "mailbox_ready": true,
+          "ready_dashboard_count": 0,
+          "ready_mail_group_count": 12,
+          "full_import_running": false,
+          "full_import_completed": true,
+          "user_display_name": null,
+          "error_message": null
+        }
+        """.data(using: .utf8)!
+
+        let readiness = try JSONDecoder.backend.decode(PostLoginReadinessResponse.self, from: data)
+
+        XCTAssertFalse(readiness.mailboxSyncProgress.hasReportedProgress)
+        XCTAssertNil(readiness.initialBodyReadyCount)
+        XCTAssertNil(readiness.lastProgressAt)
+    }
+
+    func testProgressSelectionUsesNewestTimestampAndNeverMergesAcrossGenerations() {
+        let staleReadiness = MailboxSyncProgress(
+            syncGeneration: "generation-1",
+            phase: "importing_metadata",
+            initialTargetCount: 100,
+            initialMetadataCount: 25,
+            initialBodyTargetCount: 25,
+            initialBodyReadyCount: 5,
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let freshSyncState = MailboxSyncProgress(
+            syncGeneration: "generation-1",
+            phase: "hydrating_priority_content",
+            initialTargetCount: 100,
+            initialMetadataCount: 100,
+            initialBodyTargetCount: 25,
+            initialBodyReadyCount: 21,
+            lastProgressAt: "2026-07-25T12:01:00Z"
+        )
+
+        let merged = MailboxSyncProgress.newestMerged([staleReadiness, freshSyncState])
+
+        XCTAssertEqual(merged.phase, "hydrating_priority_content")
+        XCTAssertEqual(merged.initialMetadataCount, 100)
+        XCTAssertEqual(merged.initialBodyReadyCount, 21)
+        XCTAssertEqual(merged.lastProgressAt, "2026-07-25T12:01:00Z")
+
+        let nextGeneration = MailboxSyncProgress(
+            syncGeneration: "generation-2",
+            phase: "discovering_recent",
+            initialTargetCount: 100,
+            initialMetadataCount: 3,
+            initialBodyTargetCount: 25,
+            initialBodyReadyCount: 0,
+            lastProgressAt: "2026-07-25T12:02:00Z"
+        )
+        let replaced = MailboxSyncProgress.newestMerged([freshSyncState, nextGeneration])
+
+        XCTAssertEqual(replaced.syncGeneration, "generation-2")
+        XCTAssertEqual(replaced.initialMetadataCount, 3)
+        XCTAssertEqual(replaced.initialBodyReadyCount, 0)
+    }
+
+    func testBodyReadinessAndContentRevisionRemainOpaqueAcrossRowAndReaderModels() throws {
+        let revision = "sha256:v2:09af-not-an-integer"
+        let row = makeMailboxPresentationRow(
+            sender: "Sender <sender@example.com>",
+            bodyReady: true,
+            contentRevision: revision
+        )
+        let decodedRow = try JSONDecoder.backend.decode(
+            GmailThreadRow.self,
+            from: JSONEncoder.backend.encode(row)
+        )
+        XCTAssertEqual(decodedRow.bodyReady, true)
+        XCTAssertEqual(decodedRow.contentRevision, revision)
+
+        let reader = ThreadReaderResponse(
+            entityID: "thread-1",
+            userID: "user-1",
+            source: .gmail,
+            gmailThreadID: "gmail-thread-1",
+            subject: "Subject",
+            totalMessages: 0,
+            messages: [],
+            contentRevision: revision
+        )
+        let encodedReader = try JSONEncoder.backend.encode(reader)
+        let encodedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encodedReader) as? [String: Any]
+        )
+        XCTAssertEqual(encodedObject["content_revision"] as? String, revision)
+        XCTAssertNil(encodedObject["thread_revision"])
+        XCTAssertEqual(
+            try JSONDecoder.backend.decode(ThreadReaderResponse.self, from: encodedReader).contentRevision,
+            revision
+        )
+    }
+
+    func testGlobalInitialWindowPositionAndHydrationStateDecodeFromSnakeCase() throws {
+        let baseRow = makeMailboxPresentationRow(sender: "Sender <sender@example.com>")
+        var rowObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.backend.encode(baseRow)) as? [String: Any]
+        )
+        rowObject["initial_window_position"] = 7
+        let rowData = try JSONSerialization.data(withJSONObject: rowObject)
+        let decodedRow = try JSONDecoder.backend.decode(GmailThreadRow.self, from: rowData)
+
+        let eventData = #"[{"thread_id":"thread-7","body_ready":true,"content_revision":"sha256:7","initial_window_position":7}]"#.data(using: .utf8)!
+        let eventStates = try JSONDecoder.backend.decode([MailboxHydratedThreadState].self, from: eventData)
+
+        XCTAssertEqual(decodedRow.initialWindowPosition, 7)
+        XCTAssertEqual(
+            eventStates,
+            [
+                MailboxHydratedThreadState(
+                    threadID: "thread-7",
+                    bodyReady: true,
+                    contentRevision: "sha256:7",
+                    initialWindowPosition: 7
+                )
+            ]
+        )
+    }
+
+    func testMailboxThreadBatchUsesSnakeCaseIDsAndDefaultsLegacyArrays() throws {
+        let currentData = """
+        {
+          "threads": [],
+          "pending_thread_ids": ["pending-1"],
+          "missing_thread_ids": ["missing-1"]
+        }
+        """.data(using: .utf8)!
+        let legacyData = """
+        { "threads": [] }
+        """.data(using: .utf8)!
+
+        let current = try JSONDecoder.backend.decode(MailboxThreadBatchResponse.self, from: currentData)
+        let legacy = try JSONDecoder.backend.decode(MailboxThreadBatchResponse.self, from: legacyData)
+
+        XCTAssertEqual(current.pendingThreadIDs, ["pending-1"])
+        XCTAssertEqual(current.missingThreadIDs, ["missing-1"])
+        XCTAssertTrue(legacy.pendingThreadIDs.isEmpty)
+        XCTAssertTrue(legacy.missingThreadIDs.isEmpty)
     }
 
     func testLegacyPlainTextMessageInfersCompleteWhenBodyDiffersFromSnippet() throws {
@@ -1799,7 +2489,9 @@ final class ModelDecodingTests: XCTestCase {
     private func makeMailboxPresentationRow(
         sender: String?,
         latestSender: String? = "Sender <sender@example.com>",
-        participants: [String] = ["Sender"]
+        participants: [String] = ["Sender"],
+        bodyReady: Bool? = nil,
+        contentRevision: String? = nil
     ) -> GmailThreadRow {
         GmailThreadRow(
             threadID: "group-1",
@@ -1814,6 +2506,8 @@ final class ModelDecodingTests: XCTestCase {
             sender: sender,
             participants: participants,
             messageCount: 1,
+            bodyReady: bodyReady,
+            contentRevision: contentRevision,
             summary: "Raw Gmail snippet",
             aiGroupID: "group-1",
             aiTitle: nil,
@@ -1891,6 +2585,41 @@ final class ModelDecodingTests: XCTestCase {
             subject: "Private subject",
             totalMessages: 1,
             messages: [makeThreadMessage(id: "private-message", body: body)]
+        )
+    }
+
+    private func makeCacheMailbox(
+        label: MailboxLabel,
+        rows: [GmailThreadRow],
+        generation: String,
+        nextCursor: String? = nil,
+        totalThreads: Int? = nil,
+        fullImportRunning: Bool = false,
+        fullImportCompleted: Bool = true,
+        mailboxRevision: String? = nil,
+        lastProgressAt: String
+    ) -> MailboxResponse {
+        MailboxResponse(
+            label: label,
+            totalThreads: totalThreads ?? rows.count,
+            unreadThreads: rows.filter(\.isUnread).count,
+            nextCursor: nextCursor,
+            loadedThreads: rows.count,
+            sections: rows.isEmpty
+                ? []
+                : [GmailThreadSection(id: "cache", title: "Cache", rows: rows)],
+            mailboxRevision: mailboxRevision,
+            fullImportRunning: fullImportRunning,
+            fullImportCompleted: fullImportCompleted,
+            syncGeneration: generation,
+            phase: fullImportCompleted ? "complete" : "syncing_history",
+            initialTargetCount: min(100, totalThreads ?? rows.count),
+            initialMetadataCount: min(100, totalThreads ?? rows.count),
+            historyMetadataCount: rows.count,
+            estimatedTotalCount: totalThreads ?? rows.count,
+            initialWindowComplete: true,
+            historyMetadataComplete: fullImportCompleted,
+            lastProgressAt: lastProgressAt
         )
     }
 

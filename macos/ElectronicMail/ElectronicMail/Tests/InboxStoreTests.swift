@@ -1051,7 +1051,36 @@ final class InboxStoreTests: XCTestCase {
     }
 
     func testOfflineQueuedArchiveDoesNotReappearFromStaleMailboxCache() async {
-        let mailbox = makeSingleRowMailbox(threadID: "offline-thread", title: "Offline mail")
+        let baseMailbox = makeSingleRowMailbox(threadID: "offline-thread", title: "Offline mail")
+        let mailbox = MailboxResponse(
+            label: baseMailbox.label,
+            totalThreads: baseMailbox.totalThreads,
+            unreadThreads: baseMailbox.unreadThreads,
+            nextCursor: baseMailbox.nextCursor,
+            loadedThreads: baseMailbox.loadedThreads,
+            windowDays: baseMailbox.windowDays,
+            sections: baseMailbox.sections,
+            readyCount: baseMailbox.readyCount,
+            pendingCount: baseMailbox.pendingCount,
+            mailboxRevision: "revision-offline-action",
+            generatedAt: "2026-07-25T12:00:00Z",
+            oldestImportedAt: baseMailbox.oldestImportedAt,
+            fullImportRunning: true,
+            fullImportCompleted: false,
+            syncGeneration: "generation-offline-action",
+            phase: "syncing_history",
+            initialTargetCount: 100,
+            initialMetadataCount: 25,
+            initialBodyTargetCount: 25,
+            initialBodyReadyCount: 10,
+            historyMetadataCount: 25,
+            historyBodyReadyCount: 10,
+            estimatedTotalCount: 358,
+            initialWindowComplete: false,
+            historyMetadataComplete: false,
+            historyBodyComplete: false,
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
         let backend = ActionMailboxAppClient(mailbox: mailbox)
         let localStore = MemoryLocalMailStore()
         let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
@@ -1080,6 +1109,11 @@ final class InboxStoreTests: XCTestCase {
                 .flatMap(\.rows)
                 .isEmpty == true
         )
+        let cachedMailbox = localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)
+        XCTAssertEqual(cachedMailbox?.syncGeneration, "generation-offline-action")
+        XCTAssertEqual(cachedMailbox?.initialMetadataCount, 25)
+        XCTAssertEqual(cachedMailbox?.historyMetadataCount, 25)
+        XCTAssertEqual(cachedMailbox?.estimatedTotalCount, 358)
     }
 
     func testReaderCardTargetsMessageActionsButKeepsArchiveThreadWide() async {
@@ -1846,6 +1880,9 @@ final class InboxStoreTests: XCTestCase {
         let session = DemoAppFixtures.appSession
         cache.write(session)
         localStore.writeSession(session)
+        localStore.writeMailbox(session.mailbox, userID: session.user.id, label: .inbox)
+        let cachedThread = DemoAppFixtures.threads["demo-google-today"]!
+        localStore.writeThread(cachedThread, userID: session.user.id, threadID: "demo-google-today")
         let pendingAction = LocalPendingThreadAction(
             clientActionID: "pending-after-auth-expiry",
             userID: session.user.id,
@@ -1873,6 +1910,11 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertNil(localStore.readSession())
         XCTAssertNil(client.sessionToken)
         XCTAssertEqual(localStore.pendingThreadActions(), [pendingAction])
+        XCTAssertEqual(localStore.readMailbox(userID: session.user.id, label: .inbox), session.mailbox)
+        XCTAssertEqual(
+            localStore.readThread(userID: session.user.id, threadID: "demo-google-today"),
+            cachedThread
+        )
 
         // The app root may clear an already-expired token while returning to sign-in.
         // That idempotent cleanup must not discard the action preserved for reauth.
@@ -2386,6 +2428,690 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(localStore.pendingThreadActions().count, 1)
     }
 
+    func testProgressiveInitialWindowEntersAfter100MetadataAnd25BodiesAndPersistsIt() async {
+        let mailbox = makeProgressiveMailbox(
+            metadataCount: 100,
+            bodyReadyCount: 25,
+            estimatedTotalCount: 640
+        )
+        let session = makeProgressiveSession(mailbox: mailbox)
+        let localStore = MemoryLocalMailStore()
+        let store = InboxStore(
+            client: FixedMailboxAppClient(mailbox: mailbox, session: session),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertEqual(store.flatRows.count, 100)
+        XCTAssertEqual(store.setupProgress.initialMetadataCount, 100)
+        XCTAssertEqual(store.setupProgress.initialBodyReadyCount, 25)
+        XCTAssertTrue(store.setupProgress.initialTargetReady)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertTrue(store.isReadyForMainInterface)
+        XCTAssertEqual(store.setupProgress.progressFraction, 1)
+        XCTAssertEqual(
+            localStore.readMailbox(userID: session.user.id, label: .inbox)?.sections.flatMap(\.rows).count,
+            100
+        )
+    }
+
+    func testSetupDeadlineUsesInjectedTimeAndStopsAtExactly30Seconds() {
+        let startedAt = Date(timeIntervalSinceReferenceDate: 10_000)
+        let policy = MailboxSetupDeadlinePolicy(
+            startedAt: startedAt,
+            minimumDisplaySeconds: 0,
+            maximumWaitSeconds: 30
+        )
+
+        XCTAssertEqual(
+            policy.decision(
+                now: startedAt.addingTimeInterval(29.999),
+                initialWindowReady: false,
+                committedBatchReady: false
+            ),
+            .wait
+        )
+        XCTAssertEqual(
+            policy.decision(
+                now: startedAt.addingTimeInterval(30),
+                initialWindowReady: false,
+                committedBatchReady: false
+            ),
+            .retry
+        )
+        XCTAssertEqual(
+            policy.decision(
+                now: startedAt.addingTimeInterval(30),
+                initialWindowReady: false,
+                committedBatchReady: true
+            ),
+            .enter
+        )
+        XCTAssertEqual(
+            policy.decision(
+                now: startedAt.addingTimeInterval(2),
+                initialWindowReady: true,
+                committedBatchReady: false
+            ),
+            .enter
+        )
+    }
+
+    func testDeadlineFallbackRequiresOneCommitted25MetadataBatch() async {
+        let verifiedMailbox = makeProgressiveMailbox(
+            metadataCount: 25,
+            bodyReadyCount: 25,
+            estimatedTotalCount: 640
+        )
+        let verifiedSession = makeProgressiveSession(mailbox: verifiedMailbox)
+        let verifiedLocalStore = MemoryLocalMailStore()
+        let verifiedStore = InboxStore(
+            client: FixedMailboxAppClient(mailbox: verifiedMailbox, session: verifiedSession),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: verifiedLocalStore,
+            automaticallyPrefetchThreads: false
+        )
+        verifiedStore.setSessionToken("live-session-token")
+
+        await verifiedStore.load()
+
+        XCTAssertFalse(verifiedStore.isReadyForMainInterface)
+        XCTAssertTrue(verifiedStore.canEnterWithBuildingDashboard)
+        XCTAssertTrue(verifiedStore.mailboxPresentationReady)
+        XCTAssertEqual(
+            verifiedLocalStore.readMailbox(userID: verifiedSession.user.id, label: .inbox)?.sections.flatMap(\.rows).count,
+            25
+        )
+
+        let unverifiedMailbox = makeProgressiveMailbox(
+            metadataCount: 24,
+            bodyReadyCount: 24,
+            estimatedTotalCount: 640
+        )
+        let unverifiedSession = makeProgressiveSession(mailbox: unverifiedMailbox)
+        let unverifiedLocalStore = MemoryLocalMailStore()
+        let unverifiedStore = InboxStore(
+            client: FixedMailboxAppClient(mailbox: unverifiedMailbox, session: unverifiedSession),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: unverifiedLocalStore,
+            automaticallyPrefetchThreads: false
+        )
+        unverifiedStore.setSessionToken("live-session-token")
+
+        await unverifiedStore.load()
+
+        XCTAssertFalse(unverifiedStore.mailboxPresentationReady)
+        XCTAssertFalse(unverifiedStore.canEnterWithBuildingDashboard)
+        XCTAssertNil(unverifiedLocalStore.readMailbox(userID: unverifiedSession.user.id, label: .inbox))
+    }
+
+    func testInitialWindowDoesNotEnterBeforeNewest25BodiesAreReady() async {
+        let mailbox = makeProgressiveMailbox(
+            metadataCount: 100,
+            bodyReadyCount: 24,
+            estimatedTotalCount: 640,
+            initialWindowComplete: true
+        )
+        let session = makeProgressiveSession(mailbox: mailbox)
+        let store = InboxStore(
+            client: FixedMailboxAppClient(mailbox: mailbox, session: session),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertTrue(store.canEnterWithBuildingDashboard)
+        XCTAssertFalse(store.setupProgress.initialTargetReady)
+        XCTAssertFalse(store.isReadyForMainInterface)
+    }
+
+    func testCommittedGlobalMetadataBatchAllowsSparseInboxFallback() async {
+        let mailbox = makeProgressiveMailbox(
+            metadataCount: 25,
+            bodyReadyCount: 0,
+            estimatedTotalCount: 640,
+            visibleRowCount: 0
+        )
+        let session = makeProgressiveSession(mailbox: mailbox)
+        let localStore = MemoryLocalMailStore()
+        let store = InboxStore(
+            client: FixedMailboxAppClient(mailbox: mailbox, session: session),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertTrue(store.canEnterWithBuildingDashboard)
+        XCTAssertFalse(store.isReadyForMainInterface)
+        XCTAssertTrue(store.flatRows.isEmpty)
+        XCTAssertNotNil(localStore.readMailbox(userID: session.user.id, label: .inbox))
+    }
+
+    func testProgressiveInitialWindowCanExplicitlyConfirmAnEmptyMailbox() async {
+        let mailbox = makeProgressiveMailbox(
+            metadataCount: 0,
+            bodyReadyCount: 0,
+            estimatedTotalCount: 0,
+            initialWindowComplete: true
+        )
+        let session = makeProgressiveSession(mailbox: mailbox)
+        let store = InboxStore(
+            client: FixedMailboxAppClient(mailbox: mailbox, session: session),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertTrue(store.setupProgress.confirmedEmpty)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertTrue(store.isReadyForMainInterface)
+        XCTAssertTrue(store.canEnterWithBuildingDashboard)
+        XCTAssertTrue(store.flatRows.isEmpty)
+    }
+
+    func testLaterRefreshFailureKeepsVerifiedProgressiveRowsCacheAndSelection() async {
+        let mailbox = makeProgressiveMailbox(
+            metadataCount: 100,
+            bodyReadyCount: 25,
+            estimatedTotalCount: 640
+        )
+        let session = makeProgressiveSession(mailbox: mailbox)
+        let localStore = MemoryLocalMailStore()
+        let client = FixedMailboxAppClient(
+            mailbox: mailbox,
+            session: session,
+            successfulMailboxCallsBeforeFailure: 1
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+        store.select(threadID: "progressive-10", prefetch: false)
+
+        await store.syncNow()
+
+        XCTAssertTrue(store.refreshFailed)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.count, 100)
+        XCTAssertEqual(store.selectedThreadID, "progressive-10")
+        XCTAssertEqual(
+            localStore.readMailbox(userID: session.user.id, label: .inbox)?.sections.flatMap(\.rows).count,
+            100
+        )
+    }
+
+    func testHistoryFooterUsesReliableEstimateWithoutSummingInitialAndHistoryCounts() async {
+        let mailbox = MailboxResponse(
+            label: .inbox,
+            totalThreads: 1_200,
+            loadedThreads: 300,
+            sections: [
+                GmailThreadSection(
+                    id: "progressive",
+                    title: "Recent",
+                    rows: (0..<300).map { index in
+                        makeMailboxRow(
+                            threadID: "footer-\(index)",
+                            latestSourceRecordID: "footer-message-\(index)",
+                            receivedAt: "2026-07-25T12:00:00Z",
+                            title: "Footer message \(index)",
+                            bodyReady: index < 25,
+                            contentRevision: "sha256:footer-\(index)"
+                        )
+                    }
+                )
+            ],
+            fullImportRunning: true,
+            fullImportCompleted: false,
+            syncGeneration: "footer-generation-1",
+            phase: "importing_history_metadata",
+            initialTargetCount: 100,
+            initialMetadataCount: 100,
+            initialBodyTargetCount: 25,
+            initialBodyReadyCount: 25,
+            historyMetadataCount: 300,
+            historyBodyReadyCount: 25,
+            estimatedTotalCount: 1_200,
+            initialWindowComplete: true,
+            historyMetadataComplete: false,
+            historyBodyComplete: false,
+            lastProgressAt: "2026-07-25T12:00:00Z"
+        )
+        let session = makeProgressiveSession(mailbox: mailbox)
+        let store = InboxStore(
+            client: FixedMailboxAppClient(mailbox: mailbox, session: session),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertEqual(store.mailboxFooterProgressText, "Loading older mail… 300 of 1,200")
+    }
+
+    func testHistoryFooterWithoutEstimateReportsOnlyReadyConversationCount() async {
+        let mailbox = makeProgressiveMailbox(
+            metadataCount: 100,
+            bodyReadyCount: 25,
+            estimatedTotalCount: 640,
+            reportsEstimatedTotal: false
+        )
+        let session = makeProgressiveSession(mailbox: mailbox)
+        let store = InboxStore(
+            client: FixedMailboxAppClient(mailbox: mailbox, session: session),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertEqual(store.mailboxFooterProgressText, "100 conversations ready")
+    }
+
+    func testOfflineGlobalMetadataCrawlsFetchOnlyReadyBodiesAndResumeTheirTails() async throws {
+        let backend = GlobalOfflineMetadataAppClient()
+        let localStore = MemoryLocalMailStore()
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+        client.sessionToken = "live-session-token"
+
+        _ = try await client.appSession()
+        for _ in 0..<2_000 {
+            if localStore.readThread(userID: DemoAppFixtures.userID, threadID: "global-ready-1") != nil,
+               localStore.readThread(userID: DemoAppFixtures.userID, threadID: "global-ready-2") != nil,
+               backend.mailboxCalls.count >= 4 {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        XCTAssertEqual(
+            backend.mailboxCalls.filter { $0.label == .all }.map(\.cursor),
+            [nil, "all-cursor-2"]
+        )
+        XCTAssertEqual(backend.mailboxCalls.filter { $0.label == .spam }.map(\.cursor), [nil])
+        XCTAssertEqual(backend.mailboxCalls.filter { $0.label == .trash }.map(\.cursor), [nil])
+        XCTAssertNotNil(localStore.readThread(userID: DemoAppFixtures.userID, threadID: "global-ready-1"))
+        XCTAssertNotNil(localStore.readThread(userID: DemoAppFixtures.userID, threadID: "global-ready-2"))
+        XCTAssertNil(localStore.readThread(userID: DemoAppFixtures.userID, threadID: "global-cold-1"))
+        XCTAssertNil(localStore.readThread(userID: DemoAppFixtures.userID, threadID: "global-cold-2"))
+        XCTAssertFalse(backend.batchedThreadIDs.contains("inbox-cold"))
+        XCTAssertFalse(backend.batchedThreadIDs.contains("global-cold-1"))
+        XCTAssertFalse(backend.batchedThreadIDs.contains("global-cold-2"))
+
+        let callsBeforeHydrationEvent = backend.mailboxCalls.count
+        await client.observeHydratedThreads(
+            [
+                MailboxHydratedThreadState(
+                    threadID: "global-cold-1",
+                    bodyReady: true,
+                    contentRevision: "sha256:global-cold-1",
+                    initialWindowPosition: 30
+                ),
+                MailboxHydratedThreadState(
+                    threadID: "global-cold-2",
+                    bodyReady: true,
+                    contentRevision: "sha256:global-cold-2",
+                    initialWindowPosition: 3
+                ),
+            ],
+            userID: DemoAppFixtures.userID
+        )
+        for _ in 0..<2_000 {
+            if localStore.readThread(userID: DemoAppFixtures.userID, threadID: "global-cold-1") != nil,
+               localStore.readThread(userID: DemoAppFixtures.userID, threadID: "global-cold-2") != nil {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        XCTAssertEqual(backend.mailboxCalls.count, callsBeforeHydrationEvent)
+        XCTAssertNotNil(localStore.readThread(userID: DemoAppFixtures.userID, threadID: "global-cold-1"))
+        XCTAssertNotNil(localStore.readThread(userID: DemoAppFixtures.userID, threadID: "global-cold-2"))
+        XCTAssertTrue(backend.batchedThreadIDs.contains("global-cold-1"))
+        XCTAssertTrue(backend.batchedThreadIDs.contains("global-cold-2"))
+
+        backend.advanceProgress()
+        _ = try await client.mailboxSyncState()
+        for _ in 0..<2_000 {
+            if localStore.readThread(userID: DemoAppFixtures.userID, threadID: "global-new-tail") != nil,
+               backend.mailboxCalls.count >= 7 {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        XCTAssertEqual(
+            backend.mailboxCalls.filter { $0.label == .all }.map(\.cursor),
+            [nil, "all-cursor-2", "all-cursor-2"]
+        )
+        XCTAssertEqual(backend.mailboxCalls.filter { $0.label == .spam }.map(\.cursor), [nil, nil])
+        XCTAssertEqual(backend.mailboxCalls.filter { $0.label == .trash }.map(\.cursor), [nil, nil])
+        XCTAssertNotNil(localStore.readThread(userID: DemoAppFixtures.userID, threadID: "global-new-tail"))
+    }
+
+    func testOfflineBodyPriorityUsesServerGlobalInitialWindowPositionOnly() {
+        XCTAssertNil(
+            OfflineContentPriorityPolicy.priority(
+                bodyReady: false,
+                initialWindowPosition: 0
+            )
+        )
+        XCTAssertEqual(
+            OfflineContentPriorityPolicy.priority(bodyReady: true, initialWindowPosition: 0),
+            90
+        )
+        XCTAssertEqual(
+            OfflineContentPriorityPolicy.priority(bodyReady: true, initialWindowPosition: 24),
+            90
+        )
+        XCTAssertEqual(
+            OfflineContentPriorityPolicy.priority(bodyReady: true, initialWindowPosition: 25),
+            10
+        )
+        XCTAssertEqual(
+            OfflineContentPriorityPolicy.priority(
+                bodyReady: false,
+                initialWindowPosition: nil,
+                selected: true
+            ),
+            100
+        )
+    }
+
+    func testOversizedOfflineThreadFallsBackToBoundedPagesAndPersistsOnlyCompleteSnapshot() async throws {
+        let userID = DemoAppFixtures.userID
+        let threadID = "oversized-offline-thread"
+        let finalPageGate = ReaderActionRequestGate()
+        let backend = OversizedOfflineThreadAppClient(
+            mode: .stable(totalMessages: 250),
+            gatedOffset: 200,
+            pageGate: finalPageGate
+        )
+        let localStore = MemoryLocalMailStore()
+        let coordinator = OfflineContentSyncCoordinator(
+            backend: backend,
+            localMailStore: localStore,
+            pendingResponsesBeforePaginatedFallback: 2,
+            retryDelayOverride: .milliseconds(1)
+        )
+
+        await coordinator.observe(
+            mailbox: makeOversizedOfflineMailbox(threadID: threadID),
+            userID: userID
+        )
+        await finalPageGate.waitUntilRequestStarts()
+
+        XCTAssertNil(
+            localStore.readThread(userID: userID, threadID: threadID),
+            "No prefix of a large conversation may be committed as an offline snapshot."
+        )
+
+        await finalPageGate.releaseRequest()
+        for _ in 0..<2_000 {
+            if localStore.readThread(userID: userID, threadID: threadID) != nil {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        let cached = try XCTUnwrap(localStore.readThread(userID: userID, threadID: threadID))
+        XCTAssertFalse(cached.hasMore)
+        XCTAssertEqual(cached.messages.count, 250)
+        XCTAssertEqual(Set(cached.messages.map(\.id)).count, 250)
+        XCTAssertEqual(backend.batchCallCount, 2)
+        XCTAssertEqual(
+            backend.threadCalls,
+            [
+                OversizedThreadPageCall(limit: 100, offset: 0),
+                OversizedThreadPageCall(limit: 100, offset: 100),
+                OversizedThreadPageCall(limit: 100, offset: 200),
+            ]
+        )
+    }
+
+    func testOversizedOfflineThreadRejectsRepeatedPagesAndRevisionChanges() async {
+        for mode in [
+            OversizedOfflineThreadAppClient.Mode.repeatedPage,
+            OversizedOfflineThreadAppClient.Mode.revisionChange,
+        ] {
+            let userID = DemoAppFixtures.userID
+            let threadID = "unstable-oversized-thread"
+            let backend = OversizedOfflineThreadAppClient(mode: mode)
+            let localStore = MemoryLocalMailStore()
+            let coordinator = OfflineContentSyncCoordinator(
+                backend: backend,
+                localMailStore: localStore,
+                pendingResponsesBeforePaginatedFallback: 1,
+                retryDelayOverride: .seconds(60)
+            )
+
+            await coordinator.observe(
+                mailbox: makeOversizedOfflineMailbox(threadID: threadID),
+                userID: userID
+            )
+            for _ in 0..<2_000 {
+                if backend.threadCalls.count >= 2 {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+
+            XCTAssertNil(
+                localStore.readThread(userID: userID, threadID: threadID),
+                "An unstable page sequence must never replace the last complete offline snapshot."
+            )
+            await coordinator.reset(userID: userID)
+        }
+    }
+
+    func testLogoutResetCancelsOversizedThreadFallbackBeforeLatePageCanWrite() async {
+        let userID = DemoAppFixtures.userID
+        let threadID = "logout-oversized-thread"
+        let pageGate = ReaderActionRequestGate()
+        let backend = OversizedOfflineThreadAppClient(
+            mode: .stable(totalMessages: 250),
+            gatedOffset: 100,
+            pageGate: pageGate
+        )
+        let localStore = MemoryLocalMailStore()
+        let coordinator = OfflineContentSyncCoordinator(
+            backend: backend,
+            localMailStore: localStore,
+            pendingResponsesBeforePaginatedFallback: 1,
+            retryDelayOverride: .milliseconds(1)
+        )
+
+        await coordinator.observe(
+            mailbox: makeOversizedOfflineMailbox(threadID: threadID),
+            userID: userID
+        )
+        await pageGate.waitUntilRequestStarts()
+
+        await coordinator.reset(userID: userID)
+        await pageGate.releaseRequest()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertNil(localStore.readThread(userID: userID, threadID: threadID))
+    }
+
+    func testExplicitLogoutFencesLateOfflineBodyBatchBeforeEncryptedPurge() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailOfflinePurgeRace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let userID = "purge-race-\(UUID().uuidString)"
+        let keyStore = AccountContentKeyStore.shared
+        keyStore.removeKey(userID: userID)
+        let localStore = try XCTUnwrap(
+            SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3"))
+        )
+        let batchGate = ReaderActionRequestGate()
+        let backend = GlobalOfflineMetadataAppClient(userID: userID, batchGate: batchGate)
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+        client.sessionToken = "live-session-token"
+
+        _ = try await client.appSession()
+        await batchGate.waitUntilRequestStarts()
+
+        try await client.logout()
+        XCTAssertNil(localStore.readSession())
+        XCTAssertNil(keyStore.loadKey(userID: userID))
+
+        await batchGate.releaseRequest()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertNil(localStore.readThread(userID: userID, threadID: "global-ready-1"))
+        XCTAssertNil(localStore.readThread(userID: userID, threadID: "global-ready-2"))
+        XCTAssertNil(keyStore.loadKey(userID: userID))
+    }
+
+    func testAccountPurgeDrainsActiveInboxThreadWriterBeforeDeletingRowsAndKey() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailThreadWriterPurgeRace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let userID = "thread-writer-purge-\(UUID().uuidString)"
+        let threadID = "demo-google-today"
+        let keyStore = AccountContentKeyStore.shared
+        keyStore.removeKey(userID: userID)
+        defer { keyStore.removeKey(userID: userID) }
+        let sqliteStore = try XCTUnwrap(
+            SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3"))
+        )
+        let blockingStore = BlockingThreadWriteLocalMailStore(
+            blockOnThreadWriteCall: 1,
+            base: sqliteStore
+        )
+        defer { blockingStore.releaseBlockedThreadWrite() }
+        let client = PurgingAccountActionAppClient(
+            localMailStore: blockingStore,
+            userID: userID
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: blockingStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+
+        let prefetchTask = Task {
+            await store.prefetchThread(threadID: threadID, force: true, silent: false)
+        }
+        for _ in 0..<2_000 where !blockingStore.hasBlockedThreadWrite {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertTrue(blockingStore.hasBlockedThreadWrite)
+
+        let purgeTask = Task {
+            try await store.disconnectGoogleAndDeleteData()
+        }
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+        XCTAssertEqual(
+            client.purgeCallCount,
+            0,
+            "The destructive client purge must wait for the active writer drain barrier."
+        )
+
+        blockingStore.releaseBlockedThreadWrite()
+        await prefetchTask.value
+        try await purgeTask.value
+
+        XCTAssertEqual(client.purgeCallCount, 1)
+        XCTAssertNil(sqliteStore.readSession())
+        XCTAssertNil(sqliteStore.readThread(userID: userID, threadID: threadID))
+        XCTAssertNil(keyStore.loadKey(userID: userID))
+    }
+
+    func testAccountPurgeDrainsActiveInboxMailboxWriterBeforeDeletingRows() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailMailboxWriterPurgeRace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let userID = "mailbox-writer-purge-\(UUID().uuidString)"
+        let sqliteStore = try XCTUnwrap(
+            SQLiteLocalMailStore(databaseURL: directory.appendingPathComponent("LocalMail.sqlite3"))
+        )
+        let blockingStore = BlockingMailboxWriteLocalMailStore(base: sqliteStore)
+        defer { blockingStore.releaseBlockedMailboxWrite() }
+        let client = PurgingAccountActionAppClient(
+            localMailStore: blockingStore,
+            userID: userID
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: blockingStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        let loadTask = Task {
+            await store.load()
+        }
+        for _ in 0..<2_000 where !blockingStore.hasBlockedMailboxWrite {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertTrue(blockingStore.hasBlockedMailboxWrite)
+
+        let purgeTask = Task {
+            try await store.disconnectGoogleAndDeleteData()
+        }
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+        XCTAssertEqual(
+            client.purgeCallCount,
+            0,
+            "The destructive client purge must not overtake an active mailbox commit."
+        )
+
+        blockingStore.releaseBlockedMailboxWrite()
+        await loadTask.value
+        try await purgeTask.value
+
+        XCTAssertEqual(client.purgeCallCount, 1)
+        XCTAssertNil(sqliteStore.readSession())
+        XCTAssertNil(sqliteStore.readMailbox(userID: userID, label: .inbox))
+    }
+
     func testMailboxAutomaticallyAccumulatesEveryPageBeforePresentation() async {
         let client = PaginatedMailboxAppClient()
         let store = InboxStore(client: client, sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
@@ -2454,14 +3180,14 @@ final class InboxStoreTests: XCTestCase {
         )
         XCTAssertEqual(backend.mailboxCursors, [nil, "bulk-cursor-100", "bulk-cursor-200", "bulk-cursor-300"])
 
-        // This refresh updates the app session but is inside the mailbox
-        // throttle window. Its embedded 100-row first page must not replace
-        // the independently persisted complete snapshot.
+        // This refresh is inside the mailbox throttle window. Its embedded
+        // 100-row first page must not replace the complete snapshot in either
+        // cache table; session and per-label mailbox are committed together.
         await store.refresh()
 
         XCTAssertEqual(
             localStore.readSession()?.mailbox.sections.flatMap(\.rows).count,
-            100
+            357
         )
         XCTAssertEqual(
             localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)?.sections.flatMap(\.rows).count,
@@ -2523,8 +3249,8 @@ final class InboxStoreTests: XCTestCase {
 
         XCTAssertTrue(store.mailboxPresentationReady)
         XCTAssertEqual(store.flatRows.count, 357)
-        XCTAssertTrue(store.refreshFailed)
-        XCTAssertEqual(backend.mailboxCursors, [nil, "bulk-cursor-100", "bulk-cursor-200"])
+        XCTAssertFalse(store.refreshFailed)
+        XCTAssertEqual(backend.mailboxCursors, [nil])
         let cached = try XCTUnwrap(localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox))
         XCTAssertEqual(cached.sections.flatMap(\.rows).count, 357)
         XCTAssertEqual(cached.loadedThreads, 357)
@@ -2569,18 +3295,47 @@ final class InboxStoreTests: XCTestCase {
         )
         store.setSessionToken("live-session-token")
 
-        let loadingInbox = Task { await store.load() }
-        for _ in 0..<200 where !backend.mailboxCursors.contains("bulk-cursor-100") {
-            try? await Task.sleep(nanoseconds: 1_000_000)
-        }
-        XCTAssertTrue(backend.mailboxCursors.contains("bulk-cursor-100"))
-
+        await store.load()
         await store.setMailboxLabel(.sent)
-        await loadingInbox.value
 
         let cached = try XCTUnwrap(localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox))
         XCTAssertEqual(cached.sections.flatMap(\.rows).count, 357)
         XCTAssertEqual(cached.loadedThreads, 357)
+        XCTAssertNil(cached.nextCursor)
+        XCTAssertEqual(backend.mailboxCursors, [nil, nil])
+    }
+
+    func testFolderSwitchKeepsInboxHistoryPaginationAliveAndPersistsOffscreen() async throws {
+        let localStore = MemoryLocalMailStore()
+        let client = BulkPaginatedMailboxAppClient()
+        client.delayedCursor = "bulk-cursor-100"
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        let loadingInbox = Task { await store.load() }
+        for _ in 0..<400 where !client.mailboxCursors.contains("bulk-cursor-100") {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertTrue(client.mailboxCursors.contains("bulk-cursor-100"))
+
+        await store.setMailboxLabel(.sent)
+        await loadingInbox.value
+
+        XCTAssertEqual(store.activeMailboxLabel, .sent)
+        XCTAssertEqual(
+            client.mailboxCursors.filter { $0 == "bulk-cursor-100" }.count,
+            1
+        )
+        XCTAssertTrue(client.mailboxCursors.contains("bulk-cursor-200"))
+        XCTAssertTrue(client.mailboxCursors.contains("bulk-cursor-300"))
+        let cached = try XCTUnwrap(localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox))
+        XCTAssertEqual(cached.sections.flatMap(\.rows).count, 357)
         XCTAssertNil(cached.nextCursor)
     }
 
@@ -2651,7 +3406,7 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertTrue(restoredStore.refreshFailed)
     }
 
-    func testForcedRefreshRetainsCompleteSnapshotAndSelectionUntilAtomicReplacement() async {
+    func testForcedRefreshRetainsCompleteSameGenerationSnapshotAndSelection() async {
         let client = BulkPaginatedMailboxAppClient()
         let store = InboxStore(
             client: client,
@@ -2664,24 +3419,133 @@ final class InboxStoreTests: XCTestCase {
         store.select(threadID: "bulk-150", prefetch: false)
         client.delayedCursor = "bulk-cursor-100"
 
+        await store.syncNow()
+
+        XCTAssertFalse(store.mailboxPageLoading)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(store.selectedThreadID, "bulk-150")
+        XCTAssertEqual(
+            client.mailboxCursors,
+            [nil, "bulk-cursor-100", "bulk-cursor-200", "bulk-cursor-300", nil]
+        )
+    }
+
+    func testChangedRevisionKeepsVerifiedRowsVisibleUntilFreshCursorChainAtomicallyReplacesThem() async throws {
+        let localStore = MemoryLocalMailStore()
+        let client = BulkPaginatedMailboxAppClient(
+            authoritativeGeneration: "authoritative-generation-1",
+            mailboxTitlePrefix: "Old message"
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+        store.select(threadID: "bulk-150", prefetch: false)
+
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(store.flatRows.first?.title, "Old message 0")
+
+        let pageGate = ReaderActionRequestGate()
+        client.stageAuthoritativeRefresh(
+            revision: "bulk-revision-2",
+            titlePrefix: "Fresh message",
+            totalThreads: 257,
+            gateAtCursor: "bulk-cursor-100",
+            gate: pageGate
+        )
+
         let refresh = Task { await store.syncNow() }
-        for _ in 0..<200 where client.mailboxCursors.count < 6 {
-            try? await Task.sleep(nanoseconds: 1_000_000)
-        }
+        await pageGate.waitUntilRequestStarts()
 
         XCTAssertTrue(store.mailboxPageLoading)
         XCTAssertTrue(store.mailboxPresentationReady)
         XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(store.flatRows.first?.title, "Old message 0")
         XCTAssertEqual(store.selectedThreadID, "bulk-150")
+        XCTAssertEqual(
+            localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)?
+                .sections.flatMap(\.rows).count,
+            357
+        )
 
+        await pageGate.releaseRequest()
         await refresh.value
 
+        XCTAssertFalse(store.mailboxPageLoading)
+        XCTAssertFalse(store.refreshFailed)
         XCTAssertTrue(store.mailboxPresentationReady)
-        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(store.flatRows.count, 257)
+        XCTAssertEqual(store.flatRows.first?.title, "Fresh message 0")
+        XCTAssertEqual(store.flatRows.last?.threadID, "bulk-256")
         XCTAssertEqual(store.selectedThreadID, "bulk-150")
+        let cached = try XCTUnwrap(
+            localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)
+        )
+        XCTAssertEqual(cached.sections.flatMap(\.rows).count, 257)
+        XCTAssertEqual(cached.sections.flatMap(\.rows).first?.displayTitle, "Fresh message 0")
+        XCTAssertNil(cached.nextCursor)
     }
 
-    func testOverlappingRefreshCannotConsumeOrClearOwnedPaginationChain() async {
+    func testChangedRevisionLaterPageFailureRetainsVerifiedRowsSelectionAndRetryState() async throws {
+        let localStore = MemoryLocalMailStore()
+        let client = BulkPaginatedMailboxAppClient(
+            authoritativeGeneration: "authoritative-generation-1",
+            mailboxTitlePrefix: "Old message"
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+        store.select(threadID: "bulk-150", prefetch: false)
+
+        let pageGate = ReaderActionRequestGate()
+        client.stageAuthoritativeRefresh(
+            revision: "bulk-revision-2",
+            titlePrefix: "Fresh message",
+            totalThreads: 257,
+            gateAtCursor: "bulk-cursor-100",
+            gate: pageGate,
+            failOnceAtCursor: "bulk-cursor-200"
+        )
+
+        let refresh = Task { await store.syncNow() }
+        await pageGate.waitUntilRequestStarts()
+
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(store.flatRows.first?.title, "Old message 0")
+        XCTAssertEqual(store.selectedThreadID, "bulk-150")
+
+        await pageGate.releaseRequest()
+        await refresh.value
+
+        XCTAssertFalse(store.mailboxPageLoading)
+        XCTAssertTrue(store.refreshFailed)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertTrue(store.mailboxFooterShowsRetry)
+        XCTAssertFalse(store.mailboxFooterShowsProgress)
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(store.flatRows.first?.title, "Old message 0")
+        XCTAssertEqual(store.selectedThreadID, "bulk-150")
+        let cached = try XCTUnwrap(
+            localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)
+        )
+        XCTAssertEqual(cached.sections.flatMap(\.rows).count, 357)
+        XCTAssertEqual(cached.sections.flatMap(\.rows).first?.displayTitle, "Old message 0")
+        XCTAssertNil(cached.nextCursor)
+    }
+
+    func testOverlappingRefreshCannotClearCompleteSameGenerationSnapshot() async {
         let client = BulkPaginatedMailboxAppClient()
         let store = InboxStore(
             client: client,
@@ -2694,18 +3558,9 @@ final class InboxStoreTests: XCTestCase {
         client.delayedCursor = "bulk-cursor-100"
 
         let ownerRefresh = Task { await store.syncNow() }
-        for _ in 0..<200 where client.mailboxCursors.count < 6 {
-            try? await Task.sleep(nanoseconds: 1_000_000)
-        }
-        XCTAssertTrue(store.mailboxPageLoading)
-
-        await store.refresh()
-
-        XCTAssertTrue(store.mailboxPageLoading)
-        XCTAssertTrue(store.mailboxPresentationReady)
-        XCTAssertEqual(store.flatRows.count, 357)
-
+        let overlappingRefresh = Task { await store.refresh() }
         await ownerRefresh.value
+        await overlappingRefresh.value
 
         XCTAssertFalse(store.mailboxPageLoading)
         XCTAssertTrue(store.mailboxPresentationReady)
@@ -2717,10 +3572,7 @@ final class InboxStoreTests: XCTestCase {
                 "bulk-cursor-100",
                 "bulk-cursor-200",
                 "bulk-cursor-300",
-                nil,
-                "bulk-cursor-100",
-                "bulk-cursor-200",
-                "bulk-cursor-300"
+                nil
             ]
         )
     }
@@ -2881,29 +3733,91 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(store.flatRows.count, 357)
     }
 
-    func testImportInProgressDoesNotPaginateAcrossChangingRevisionsOrShowFailure() async {
+    func testImportRunningPaginationAllowsGrowingRevisionAndPersistsAcrossLabelSwitch() async throws {
+        let localStore = MemoryLocalMailStore()
         let client = BulkPaginatedMailboxAppClient(
             revisionMismatchOnceAtCursor: "bulk-cursor-100",
-            importInProgress: true
+            importInProgress: true,
+            growingImportTotals: true
+        )
+        client.delayedCursor = "bulk-cursor-100"
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        let loadingInbox = Task { await store.load() }
+        for _ in 0..<400 where !client.mailboxCursors.contains("bulk-cursor-100") {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        XCTAssertTrue(client.mailboxCursors.contains("bulk-cursor-100"))
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.count, 100)
+        XCTAssertEqual(store.mailboxFooterProgressText, "Loading older mail… 100 of 357")
+
+        await store.setMailboxLabel(.sent)
+        await loadingInbox.value
+
+        XCTAssertEqual(store.activeMailboxLabel, .sent)
+        XCTAssertEqual(
+            client.mailboxCursors.compactMap { $0 },
+            ["bulk-cursor-100", "bulk-cursor-200", "bulk-cursor-300"]
+        )
+        XCTAssertEqual(client.mailboxCursors.filter { $0 == nil }.count, 2)
+        XCTAssertFalse(store.refreshFailed)
+        let cached = try XCTUnwrap(localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox))
+        XCTAssertEqual(cached.sections.flatMap(\.rows).count, 357)
+        XCTAssertEqual(cached.totalThreads, 357)
+        XCTAssertEqual(cached.loadedThreads, 357)
+        XCTAssertEqual(cached.syncGeneration, "bulk-import-generation-1")
+        XCTAssertNil(cached.nextCursor)
+    }
+
+    func testImportContinuationFailureRetainsCommittedRowsAndShowsCompactRetry() async throws {
+        let localStore = MemoryLocalMailStore()
+        let client = BulkPaginatedMailboxAppClient(
+            failOnceAtCursor: "bulk-cursor-200",
+            importInProgress: true,
+            growingImportTotals: true
         )
         let store = InboxStore(
             client: client,
             sessionCache: AppSessionCache(defaults: .ephemeral()),
             threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
             automaticallyPrefetchThreads: false
         )
         store.setSessionToken("live-session-token")
 
         await store.load()
 
-        XCTAssertEqual(client.mailboxCursors, [nil])
-        XCTAssertFalse(store.mailboxPresentationReady)
-        XCTAssertTrue(store.flatRows.isEmpty)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertTrue(store.refreshFailed)
+        XCTAssertEqual(store.flatRows.count, 200)
+        XCTAssertEqual(store.mailboxFooterProgressText, "Sync paused. Your saved email is still available.")
+        XCTAssertTrue(store.mailboxFooterShowsRetry)
+        XCTAssertFalse(store.mailboxFooterShowsProgress)
+        XCTAssertEqual(
+            localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)?.sections.flatMap(\.rows).count,
+            200
+        )
+
+        await store.syncNow()
+
         XCTAssertFalse(store.refreshFailed)
-        XCTAssertEqual(store.mailboxLoadingProgressText, "Loading 100 of 357 emails...")
+        XCTAssertEqual(store.flatRows.count, 357)
+        XCTAssertEqual(
+            localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)?.sections.flatMap(\.rows).count,
+            357
+        )
     }
 
-    func testFreshIncompleteImportHidesPriorCompleteSnapshotWithoutDegradingCache() async {
+    func testFreshProgressiveGenerationAtomicallyReplacesPriorLegacySnapshotAfterVerifiedBatch() async {
         let localStore = MemoryLocalMailStore()
         do {
             let primingStore = InboxStore(
@@ -2930,13 +3844,13 @@ final class InboxStoreTests: XCTestCase {
 
         await store.load()
 
-        XCTAssertFalse(store.mailboxPresentationReady)
-        XCTAssertTrue(store.flatRows.isEmpty)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertEqual(store.flatRows.count, 357)
         XCTAssertFalse(store.refreshFailed)
-        XCTAssertEqual(
-            localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)?.sections.flatMap(\.rows).count,
-            357
-        )
+        let cached = localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)
+        XCTAssertEqual(cached?.sections.flatMap(\.rows).count, 357)
+        XCTAssertEqual(cached?.syncGeneration, "bulk-import-generation-1")
+        XCTAssertEqual(cached?.fullImportRunning, true)
     }
 
     func testMailboxPageMergePreservesServerRankAndOrderedDateRuns() {
@@ -3137,7 +4051,7 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(client.searchQueries, ["invoice"])
     }
 
-    func testSwitchingMailboxesCancelsAndIsolatesOldPagination() async {
+    func testSwitchingMailboxesKeepsAndIsolatesOldPagination() async {
         let client = MailboxPaginationRaceAppClient()
         let store = InboxStore(
             client: client,
@@ -3185,7 +4099,8 @@ final class InboxStoreTests: XCTestCase {
                 MailboxPageCall(label: .inbox, cursor: nil),
                 MailboxPageCall(label: .inbox, cursor: "inbox-cursor-2"),
                 MailboxPageCall(label: .sent, cursor: nil),
-                MailboxPageCall(label: .sent, cursor: "sent-cursor-2")
+                MailboxPageCall(label: .sent, cursor: "sent-cursor-2"),
+                MailboxPageCall(label: .inbox, cursor: "inbox-cursor-3")
             ]
         )
     }
@@ -3323,7 +4238,7 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(merged.sections.flatMap(\.rows).map(\.threadID), ["mail-group-1", "gmail-thread-older"])
     }
 
-    func testMailboxRevisionChangeDiscardsStaleLaterPageRows() {
+    func testMailboxRevisionChangeReplacesWithCompleteAuthoritativeSnapshot() {
         let firstRow = makeMailboxRow(
             threadID: "first-page",
             latestSourceRecordID: "first-message",
@@ -3355,9 +4270,54 @@ final class InboxStoreTests: XCTestCase {
 
         let merged = current.preservingLoadedPages(afterRefreshingFirstPage: refreshedFirstPage)
 
-        XCTAssertEqual(merged.sections.flatMap(\.rows).map(\.threadID), ["first-page"])
+        XCTAssertEqual(
+            merged.sections.flatMap(\.rows).map(\.threadID),
+            ["first-page"]
+        )
         XCTAssertEqual(merged.loadedThreads, 1)
         XCTAssertNil(merged.nextCursor)
+    }
+
+    func testMailboxGenerationChangeAtomicallyReplacesPriorRows() {
+        let oldLead = makeMailboxRow(
+            threadID: "old-lead",
+            latestSourceRecordID: "old-lead-message",
+            receivedAt: "2026-05-29T10:00:00+05:30",
+            title: "Old lead"
+        )
+        let oldTail = makeMailboxRow(
+            threadID: "old-tail",
+            latestSourceRecordID: "old-tail-message",
+            receivedAt: "2026-05-20T10:00:00+05:30",
+            title: "Old tail"
+        )
+        let newLead = makeMailboxRow(
+            threadID: "new-lead",
+            latestSourceRecordID: "new-lead-message",
+            receivedAt: "2026-07-25T10:00:00Z",
+            title: "New lead"
+        )
+        let current = MailboxResponse(
+            label: .inbox,
+            totalThreads: 2,
+            nextCursor: "old-cursor",
+            loadedThreads: 2,
+            sections: [GmailThreadSection(id: "today", title: "Today", rows: [oldLead, oldTail])],
+            syncGeneration: "generation-1"
+        )
+        let nextGeneration = MailboxResponse(
+            label: .inbox,
+            totalThreads: 1,
+            loadedThreads: 1,
+            sections: [GmailThreadSection(id: "today", title: "Today", rows: [newLead])],
+            syncGeneration: "generation-2"
+        )
+
+        let replaced = current.preservingLoadedPages(afterRefreshingFirstPage: nextGeneration)
+
+        XCTAssertEqual(replaced.sections.flatMap(\.rows).map(\.threadID), ["new-lead"])
+        XCTAssertEqual(replaced.loadedThreads, 1)
+        XCTAssertNil(replaced.nextCursor)
     }
 
     func testComposeAndReplyDoNotCallBackendWhenSendScopeIsMissing() async throws {
@@ -3405,8 +4365,16 @@ final class InboxStoreTests: XCTestCase {
     }
 
     func testMailboxChangedSSEForcesActiveMailboxRefresh() async {
-        let initialMailbox = makeSingleRowMailbox(threadID: "old-thread", title: "Old mailbox row", receivedAt: "2026-05-29T09:30:00+05:30")
-        let refreshedMailbox = makeSingleRowMailbox(threadID: "new-thread", title: "Fresh mailbox row", receivedAt: "2026-05-29T10:30:00+05:30")
+        let initialMailbox = makeSingleRowMailbox(
+            threadID: "old-thread",
+            title: "Old mailbox row",
+            receivedAt: "2026-05-29T09:30:00+05:30"
+        ).withTestMailboxRevision("rev-1")
+        let refreshedMailbox = makeSingleRowMailbox(
+            threadID: "new-thread",
+            title: "Fresh mailbox row",
+            receivedAt: "2026-05-29T10:30:00+05:30"
+        ).withTestMailboxRevision("rev-2")
         let client = RealtimeEventAppClient(sessionMailbox: initialMailbox, mailboxResponses: [initialMailbox, refreshedMailbox])
         let store = InboxStore(client: client, sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
 
@@ -3504,6 +4472,117 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(store.readerThread?.messages.first?.body, "Complete Gmail message body")
         XCTAssertEqual(store.readerThread?.messages.first?.attachments.map(\.filename), ["statement.pdf"])
         XCTAssertEqual(store.readerThread?.messages.first?.bodyComplete, true)
+    }
+
+    func testNonselectedHydrationEventRefreshesAndPersistsMailboxRowObservations() async {
+        let initialRow = makeMailboxRow(
+            threadID: "background-hydration",
+            latestSourceRecordID: "background-message",
+            receivedAt: "2026-07-25T12:00:00Z",
+            title: "Background hydration",
+            bodyReady: false,
+            contentRevision: "revision-1"
+        )
+        let hydratedRow = makeMailboxRow(
+            threadID: "background-hydration",
+            latestSourceRecordID: "background-message",
+            receivedAt: "2026-07-25T12:00:00Z",
+            title: "Background hydration",
+            bodyReady: true,
+            contentRevision: "revision-2"
+        )
+        let initialMailbox = MailboxResponse(
+            label: .inbox,
+            totalThreads: 1,
+            loadedThreads: 1,
+            sections: [GmailThreadSection(id: "today", title: "Today", rows: [initialRow])],
+            fullImportRunning: false,
+            fullImportCompleted: true
+        )
+        let hydratedMailbox = MailboxResponse(
+            label: .inbox,
+            totalThreads: 1,
+            loadedThreads: 1,
+            sections: [GmailThreadSection(id: "today", title: "Today", rows: [hydratedRow])],
+            fullImportRunning: false,
+            fullImportCompleted: true
+        )
+        let client = RealtimeEventAppClient(
+            sessionMailbox: initialMailbox,
+            mailboxResponses: [initialMailbox, hydratedMailbox]
+        )
+        let localStore = MemoryLocalMailStore()
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        XCTAssertNil(store.readerThreadID)
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: "hydrate-background-1",
+                event: "thread-content-hydrated",
+                data: #"{"payload":{"threads":[{"thread_id":"background-hydration","body_ready":true,"content_revision":"revision-2","initial_window_position":7}],"hydrated_message_count":1}}"#
+            )
+        )
+        for _ in 0..<300 {
+            let cachedBodyReady = localStore
+                .readMailbox(userID: DemoAppFixtures.userID, label: .inbox)?
+                .sections.flatMap(\.rows).first?.bodyReady
+            if client.mailboxCallCount >= 2,
+               !client.observedHydratedThreads.isEmpty,
+               cachedBodyReady == true {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        XCTAssertEqual(client.mailboxCallCount, 2)
+        XCTAssertEqual(
+            client.observedHydratedThreads,
+            [
+                MailboxHydratedThreadState(
+                    threadID: "background-hydration",
+                    bodyReady: true,
+                    contentRevision: "revision-2",
+                    initialWindowPosition: 7
+                )
+            ]
+        )
+        let cachedRow = localStore
+            .readMailbox(userID: DemoAppFixtures.userID, label: .inbox)?
+            .sections.flatMap(\.rows).first
+        XCTAssertEqual(cachedRow?.bodyReady, true)
+        XCTAssertEqual(cachedRow?.contentRevision, "revision-2")
+    }
+
+    func testReadinessPollingNeverStartsAnotherMailboxTraversal() async {
+        let mailbox = makeProgressiveMailbox(
+            metadataCount: 25,
+            bodyReadyCount: 0,
+            estimatedTotalCount: 640
+        )
+        let client = RealtimeEventAppClient(sessionMailbox: mailbox, mailboxResponses: [mailbox])
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        XCTAssertEqual(client.mailboxCallCount, 1)
+
+        for _ in 0..<30 {
+            await store.refreshForReadiness()
+        }
+
+        XCTAssertEqual(client.mailboxCallCount, 1)
     }
 
     func testHydrationEventDuringInFlightStaleReaderFetchStartsOneImmediateFollowUp() async {
@@ -4387,6 +5466,49 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertNil(store.attachmentErrorMessage)
     }
 
+    func testOpenAttachmentPublishesProgressAndDeduplicatesRepeatedClicks() async {
+        let gate = ReaderActionRequestGate()
+        let client = AttachmentDownloadingAppClient(
+            downloadedAttachment: DownloadedAttachment(
+                filename: "report.pdf",
+                mimeType: "application/pdf",
+                data: Data("attachment".utf8)
+            ),
+            downloadGate: gate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+        let attachment = makeThreadAttachment(filename: "report.pdf")
+        let handler = AttachmentFileHandler(
+            chooseDestination: { _ in nil },
+            startAccessingSecurityScope: { _ in false },
+            stopAccessingSecurityScope: { _ in },
+            writeData: { _, _ in },
+            quarantineFile: { _ in },
+            openFile: { _ in true }
+        )
+
+        let first = Task {
+            await store.openAttachment(attachment, messageID: "message-42", fileHandler: handler)
+        }
+        await gate.waitUntilRequestStarts()
+
+        XCTAssertTrue(store.isAttachmentDownloading(attachment, messageID: "message-42"))
+        XCTAssertEqual(store.downloadingAttachmentIDs.count, 1)
+
+        await store.openAttachment(attachment, messageID: "message-42", fileHandler: handler)
+        XCTAssertEqual(client.downloadCallCount, 1)
+
+        await gate.releaseRequest()
+        await first.value
+
+        XCTAssertFalse(store.isAttachmentDownloading(attachment, messageID: "message-42"))
+        XCTAssertTrue(store.downloadingAttachmentIDs.isEmpty)
+    }
+
     func testOpenAttachmentReportsDownloadFailureBeforeShowingSaveDestination() async {
         let store = InboxStore(
             client: FailingAppClient(statusCode: 503),
@@ -4414,6 +5536,613 @@ final class InboxStoreTests: XCTestCase {
 
         XCTAssertFalse(didChooseDestination)
         XCTAssertTrue(store.attachmentErrorMessage?.contains("could not be downloaded") == true)
+    }
+
+    func testAttachmentForegroundDownloadCoalescesWithActivePrefetch() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailAttachmentCoalescing-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gate = ReaderActionRequestGate()
+        let downloaded = DownloadedAttachment(
+            filename: "report.pdf",
+            mimeType: "application/pdf",
+            data: Data("coalesced attachment".utf8),
+            etag: "etag-1"
+        )
+        let backend = AttachmentDownloadingAppClient(downloadedAttachment: downloaded, downloadGate: gate)
+        let cache = EncryptedAttachmentCache(rootURL: directory)
+        let coordinator = AttachmentPrefetchCoordinator(backend: backend, cache: cache)
+        let attachment = makeThreadAttachment(filename: "report.pdf")
+        let thread = makeHydrationThread(body: "Body", bodyComplete: true, attachments: [attachment])
+
+        await coordinator.enqueue(thread: thread, userID: DemoAppFixtures.userID, selected: false)
+        await gate.waitUntilRequestStarts()
+        let foreground = Task {
+            try await coordinator.download(
+                messageID: "message-1",
+                attachment: attachment,
+                userID: DemoAppFixtures.userID
+            )
+        }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        await gate.releaseRequest()
+
+        let foregroundResult = try await foreground.value
+        XCTAssertEqual(foregroundResult, downloaded)
+        XCTAssertEqual(backend.downloadCallCount, 1)
+        let cached = await cache.read(
+            userID: DemoAppFixtures.userID,
+            messageID: "message-1",
+            attachmentID: attachment.attachmentID
+        )
+        XCTAssertEqual(cached, downloaded)
+        await coordinator.reset(userID: DemoAppFixtures.userID)
+        await cache.purge(userID: DemoAppFixtures.userID)
+    }
+
+    func testAutomaticAttachmentPrefetchRejectsActualBytesAboveFiveMegabytes() async {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailAttachmentLimit-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let downloaded = DownloadedAttachment(
+            filename: "deceptive.pdf",
+            mimeType: "application/pdf",
+            data: Data(count: EncryptedAttachmentCache.automaticFileLimit + 1),
+            etag: "etag-large"
+        )
+        let backend = AttachmentDownloadingAppClient(downloadedAttachment: downloaded)
+        let cache = EncryptedAttachmentCache(rootURL: directory)
+        let coordinator = AttachmentPrefetchCoordinator(backend: backend, cache: cache)
+        let attachment = makeThreadAttachment(filename: "deceptive.pdf")
+        let thread = makeHydrationThread(body: "Body", bodyComplete: true, attachments: [attachment])
+
+        await coordinator.enqueue(thread: thread, userID: DemoAppFixtures.userID, selected: false)
+        for _ in 0..<100 where backend.downloadCallCount == 0 {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(backend.downloadCallCount, 1)
+        let cached = await cache.read(
+            userID: DemoAppFixtures.userID,
+            messageID: "message-1",
+            attachmentID: attachment.attachmentID
+        )
+        XCTAssertNil(cached)
+        await coordinator.reset(userID: DemoAppFixtures.userID)
+        await cache.purge(userID: DemoAppFixtures.userID)
+    }
+
+    func testAttachmentResetAwaitsLateResponseAndPreventsCacheRecreation() async {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailAttachmentReset-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gate = ReaderActionRequestGate()
+        let backend = AttachmentDownloadingAppClient(
+            downloadedAttachment: DownloadedAttachment(
+                filename: "late.pdf",
+                mimeType: "application/pdf",
+                data: Data("late bytes".utf8)
+            ),
+            downloadGate: gate
+        )
+        let cache = EncryptedAttachmentCache(rootURL: directory)
+        let coordinator = AttachmentPrefetchCoordinator(backend: backend, cache: cache)
+        let attachment = makeThreadAttachment(filename: "late.pdf")
+        let thread = makeHydrationThread(body: "Body", bodyComplete: true, attachments: [attachment])
+
+        await coordinator.enqueue(thread: thread, userID: DemoAppFixtures.userID, selected: false)
+        await gate.waitUntilRequestStarts()
+        let reset = Task {
+            await coordinator.reset(userID: DemoAppFixtures.userID)
+        }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        await gate.releaseRequest()
+        await reset.value
+        await cache.purge(userID: DemoAppFixtures.userID)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        let cached = await cache.read(
+            userID: DemoAppFixtures.userID,
+            messageID: "message-1",
+            attachmentID: attachment.attachmentID
+        )
+        XCTAssertNil(cached)
+    }
+
+    func testForegroundAttachmentStillReturnsWhenCacheWriteFailsAndWarns() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailAttachmentWarning-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let downloaded = DownloadedAttachment(
+            filename: "report.pdf",
+            mimeType: "application/pdf",
+            data: Data("online bytes".utf8)
+        )
+        let backend = AttachmentDownloadingAppClient(downloadedAttachment: downloaded)
+        let cache = EncryptedAttachmentCache(rootURL: directory, byteLimit: 0)
+        let coordinator = AttachmentPrefetchCoordinator(backend: backend, cache: cache)
+        let attachment = makeThreadAttachment(filename: "report.pdf")
+        let warned = expectation(description: "Nonblocking attachment storage warning")
+        let observer = NotificationCenter.default.addObserver(
+            forName: .offlineContentSyncStorageWarning,
+            object: nil,
+            queue: .main
+        ) { notification in
+            if notification.userInfo?["user_id"] as? String == DemoAppFixtures.userID {
+                warned.fulfill()
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        let result = try await coordinator.download(
+            messageID: "message-1",
+            attachment: attachment,
+            userID: DemoAppFixtures.userID
+        )
+
+        XCTAssertEqual(result, downloaded)
+        await fulfillment(of: [warned], timeout: 1)
+        await coordinator.reset(userID: DemoAppFixtures.userID)
+    }
+
+    func testAttachmentDownloadCapIncludesForegroundPriority() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailAttachmentConcurrency-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let backend = AttachmentDownloadingAppClient(
+            downloadedAttachment: DownloadedAttachment(
+                filename: "download.pdf",
+                mimeType: "application/pdf",
+                data: Data("downloaded".utf8)
+            ),
+            downloadDelayNanoseconds: 150_000_000
+        )
+        let cache = EncryptedAttachmentCache(rootURL: directory)
+        let coordinator = AttachmentPrefetchCoordinator(
+            backend: backend,
+            cache: cache,
+            maximumConcurrentDownloads: 2
+        )
+        let attachments = (1...3).map {
+            makeThreadAttachment(filename: "report-\($0).pdf", index: $0)
+        }
+        let thread = makeHydrationThread(
+            body: "Body",
+            bodyComplete: true,
+            attachments: attachments
+        )
+
+        await coordinator.enqueue(thread: thread, userID: DemoAppFixtures.userID, selected: false)
+        for _ in 0..<300 where backend.currentDownloadCount < 2 {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertEqual(backend.currentDownloadCount, 2)
+
+        _ = try await coordinator.download(
+            messageID: "message-1",
+            attachment: attachments[2],
+            userID: DemoAppFixtures.userID
+        )
+
+        XCTAssertEqual(backend.maximumObservedDownloadCount, 2)
+        await coordinator.reset(userID: DemoAppFixtures.userID)
+        await cache.purge(userID: DemoAppFixtures.userID)
+    }
+
+    func testOfflineRemoteImageCacheSurvivesRelaunchBeforeBackendVerification() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailRemoteImageRelaunch-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let userID = DemoAppFixtures.userID
+        let keyStore = AccountContentKeyStore(service: "app.electronicmail.tests.remote-relaunch.\(UUID().uuidString)")
+        defer { keyStore.removeAllKeys() }
+        let cache = EncryptedRemoteImageCache(rootURL: directory, keyStore: keyStore)
+        let expected = Data("offline image".utf8)
+        try await cache.write(
+            CachedMediaPayload(data: expected, mimeType: "image/png", filename: nil, etag: "image-v1"),
+            userID: userID,
+            assetID: "asset-1"
+        )
+        let encryptedFiles = (FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey]
+        )?.allObjects as? [URL] ?? []).filter {
+            (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        }
+        XCTAssertFalse(encryptedFiles.isEmpty)
+        for fileURL in encryptedFiles {
+            let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+            let permissions = try XCTUnwrap(attributes[.posixPermissions] as? NSNumber)
+            XCTAssertEqual(permissions.intValue & 0o777, 0o600, fileURL.path)
+        }
+        let loader = EmailRemoteImageLoader(cache: cache)
+        let localStore = MemoryLocalMailStore()
+        localStore.writeSession(DemoAppFixtures.appSession)
+        let client = OfflineFirstAppClient(
+            backend: DemoAppClient(),
+            localMailStore: localStore,
+            remoteImageLoader: loader
+        )
+        client.sessionToken = "restored-session-token"
+
+        var loaded: LoadedRemoteImage?
+        for _ in 0..<100 where loaded == nil {
+            loaded = try? await loader.load(assetID: "asset-1")
+            if loaded == nil {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+        }
+        XCTAssertEqual(loaded?.data, expected)
+        XCTAssertEqual(loaded?.mimeType, "image/png")
+
+        do {
+            _ = try await loader.load(assetID: "uncached-asset")
+            XCTFail("A cache miss must wait for a backend-verified account")
+        } catch let error as URLError {
+            XCTAssertEqual(error.code, .userAuthenticationRequired)
+        }
+        await loader.purge(userID: userID)
+    }
+
+    func testRemoteImageConfigurationRevisionRejectsLateStaleConfiguration() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailRemoteImageOrdering-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let recorder = RemoteImageRequestRecorder()
+        RemoteImageURLProtocol.requestHandler = { request in
+            recorder.record(request)
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "image/png", "ETag": "image-v2"]
+                )!,
+                Data("network image".utf8)
+            )
+        }
+        defer { RemoteImageURLProtocol.requestHandler = nil }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RemoteImageURLProtocol.self]
+        let loader = EmailRemoteImageLoader(
+            session: URLSession(configuration: configuration),
+            cache: EncryptedRemoteImageCache(rootURL: directory)
+        )
+        await loader.configure(
+            baseURL: URL(string: "https://mail.test")!,
+            sessionToken: "verified-token",
+            cacheUserID: "user-1",
+            networkUserID: "user-1",
+            configurationRevision: 2
+        )
+        await loader.configure(
+            baseURL: URL(string: "https://stale.test")!,
+            sessionToken: nil,
+            cacheUserID: "user-1",
+            networkUserID: nil,
+            configurationRevision: 1
+        )
+
+        let loaded = try await loader.load(assetID: "asset-ordered")
+
+        XCTAssertEqual(loaded.data, Data("network image".utf8))
+        XCTAssertEqual(recorder.authorization, "Bearer verified-token")
+        XCTAssertEqual(recorder.host, "mail.test")
+        await loader.purge(userID: "user-1")
+    }
+
+    func testRemoteImageCacheHitIsCancelledWhenPurgeInterleavesWithRead() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailRemoteImageReadRace-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gate = ReaderActionRequestGate()
+        let userID = "remote-race-\(UUID().uuidString)"
+        let keyStore = AccountContentKeyStore(service: "app.electronicmail.tests.remote-race.\(UUID().uuidString)")
+        defer { keyStore.removeAllKeys() }
+        let cache = EncryptedRemoteImageCache(
+            rootURL: directory,
+            keyStore: keyStore,
+            beforeReturningRead: { await gate.suspendRequest() }
+        )
+        try await cache.write(
+            CachedMediaPayload(data: Data("secret".utf8), mimeType: "image/png", filename: nil, etag: nil),
+            userID: userID,
+            assetID: "asset-race"
+        )
+        let loader = EmailRemoteImageLoader(cache: cache)
+        await loader.configure(
+            baseURL: URL(string: "https://mail.test")!,
+            sessionToken: nil,
+            cacheUserID: userID,
+            networkUserID: nil,
+            configurationRevision: 1
+        )
+
+        let load = Task { try await loader.load(assetID: "asset-race") }
+        await gate.waitUntilRequestStarts()
+        await loader.purge(userID: userID)
+        await gate.releaseRequest()
+
+        do {
+            _ = try await load.value
+            XCTFail("Purged decrypted bytes must not escape to the reader")
+        } catch is CancellationError {
+            // Expected.
+        }
+    }
+
+    func testAttachmentCacheHitIsCancelledWhenResetInterleavesWithRead() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailAttachmentReadRace-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gate = ReaderActionRequestGate()
+        let userID = "attachment-race-\(UUID().uuidString)"
+        let keyStore = AccountContentKeyStore(service: "app.electronicmail.tests.attachment-race.\(UUID().uuidString)")
+        defer { keyStore.removeAllKeys() }
+        let cache = EncryptedAttachmentCache(
+            rootURL: directory,
+            keyStore: keyStore,
+            beforeReturningRead: { await gate.suspendRequest() }
+        )
+        let attachment = makeThreadAttachment(filename: "secret.pdf")
+        try await cache.write(
+            DownloadedAttachment(filename: "secret.pdf", mimeType: "application/pdf", data: Data("secret".utf8)),
+            userID: userID,
+            messageID: "message-race",
+            attachmentID: attachment.attachmentID
+        )
+        let coordinator = AttachmentPrefetchCoordinator(
+            backend: AttachmentDownloadingAppClient(
+                downloadedAttachment: DownloadedAttachment(
+                    filename: "network.pdf",
+                    mimeType: "application/pdf",
+                    data: Data("network".utf8)
+                )
+            ),
+            cache: cache
+        )
+
+        let download = Task {
+            try await coordinator.download(
+                messageID: "message-race",
+                attachment: attachment,
+                userID: userID
+            )
+        }
+        await gate.waitUntilRequestStarts()
+        await coordinator.reset(userID: userID)
+        await gate.releaseRequest()
+
+        do {
+            _ = try await download.value
+            XCTFail("Reset must fence a decrypted cache hit")
+        } catch is CancellationError {
+            // Expected.
+        }
+        await cache.purge(userID: userID)
+    }
+
+    func testOpenAttachmentDoesNotPromptOrOpenAfterAccountInvalidation() async {
+        let gate = ReaderActionRequestGate()
+        let client = AttachmentDownloadingAppClient(
+            downloadedAttachment: DownloadedAttachment(
+                filename: "late.pdf",
+                mimeType: "application/pdf",
+                data: Data("late".utf8)
+            ),
+            downloadGate: gate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+        store.setSessionToken("live-session-token")
+        let recorder = AttachmentOperationRecorder()
+        var didChooseDestination = false
+        let handler = AttachmentFileHandler(
+            chooseDestination: { _ in
+                didChooseDestination = true
+                return URL(fileURLWithPath: "/tmp/late.pdf")
+            },
+            startAccessingSecurityScope: { _ in false },
+            stopAccessingSecurityScope: { _ in },
+            writeData: { data, url in recorder.recordWrite(data: data, url: url) },
+            quarantineFile: { _ in recorder.recordFileOperation("quarantine") },
+            openFile: { url in
+                recorder.recordOpenedURL(url)
+                return true
+            }
+        )
+        let open = Task {
+            await store.openAttachment(
+                makeThreadAttachment(filename: "late.pdf"),
+                messageID: "message-late",
+                fileHandler: handler
+            )
+        }
+        await gate.waitUntilRequestStarts()
+        store.setSessionToken(nil)
+        await gate.releaseRequest()
+        await open.value
+
+        XCTAssertFalse(didChooseDestination)
+        XCTAssertTrue(recorder.events.isEmpty)
+        XCTAssertNil(store.attachmentErrorMessage)
+    }
+
+    func testMailboxPageAccumulatorProcessesTenThousandRowsOnce() async {
+        let total = 10_000
+        let pageSize = 100
+        let initial = makeLargeHistoryPage(offset: 0, total: total, pageSize: pageSize)
+        let accumulator = MailboxPageAccumulator(initial)
+        for offset in stride(from: pageSize, to: total, by: pageSize) {
+            await accumulator.append(
+                makeLargeHistoryPage(offset: offset, total: total, pageSize: pageSize)
+            )
+        }
+
+        let snapshot = await accumulator.snapshot()
+        let diagnostics = await accumulator.diagnostics()
+        let rows = snapshot.sections.flatMap(\.rows)
+        XCTAssertEqual(rows.count, total)
+        XCTAssertEqual(Set(rows.map(\.threadID)).count, total)
+        XCTAssertEqual(rows.first?.threadID, "large-0")
+        XCTAssertEqual(rows.last?.threadID, "large-9999")
+        XCTAssertEqual(diagnostics.processedRowCount, total)
+        XCTAssertEqual(diagnostics.snapshotBuildCount, 1)
+    }
+
+    func testInterruptedGenerationRestorePrefersNewerSessionMailbox() async {
+        let oldMailbox = makeGenerationMailbox(
+            generation: "generation-a",
+            revision: "revision-a",
+            threadIDs: ["old-1", "old-2"],
+            lastProgressAt: "2026-07-25T10:00:00Z"
+        )
+        let newMailbox = makeGenerationMailbox(
+            generation: "generation-b",
+            revision: "revision-b",
+            threadIDs: ["new-1"],
+            lastProgressAt: "2026-07-25T10:01:00Z"
+        )
+        let localStore = MemoryLocalMailStore()
+        localStore.writeSession(makeProgressiveSession(mailbox: newMailbox))
+        // Simulates process death after the session commit but before the
+        // per-label mailbox row was replaced.
+        localStore.writeMailbox(oldMailbox, userID: DemoAppFixtures.userID, label: .inbox)
+        let store = InboxStore(
+            client: FailingAppClient(statusCode: 503),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+
+        let restored = await store.restoreLocalCache()
+        XCTAssertTrue(restored)
+        XCTAssertEqual(store.flatRows.map(\.threadID), ["new-1"])
+    }
+
+    func testAppSessionMergeAcceptsNewGenerationConfirmedEmptyMailbox() {
+        let currentMailbox = makeGenerationMailbox(
+            generation: "generation-a",
+            revision: "revision-a",
+            threadIDs: ["old-1"],
+            lastProgressAt: "2026-07-25T10:00:00Z"
+        )
+        let emptyMailbox = makeGenerationMailbox(
+            generation: "generation-b",
+            revision: "revision-b",
+            threadIDs: [],
+            lastProgressAt: "2026-07-25T10:01:00Z"
+        )
+        let cache = AppSessionCache(defaults: .ephemeral())
+
+        let merged = cache.merge(
+            current: makeProgressiveSession(mailbox: currentMailbox),
+            next: makeProgressiveSession(mailbox: emptyMailbox)
+        )
+
+        XCTAssertEqual(merged.mailbox.syncGeneration, "generation-b")
+        XCTAssertTrue(merged.mailbox.isEmpty)
+    }
+
+    func testOfflineFirstThreadResponseCannotRecreateBodyAfterTokenTransition() async throws {
+        let threadGate = ReaderActionRequestGate()
+        let backend = GatedThreadBatchAppClient(threadGate: threadGate)
+        let localStore = MemoryLocalMailStore()
+        localStore.writeSession(DemoAppFixtures.appSession)
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+        client.sessionToken = "live-session-token"
+
+        let request = Task {
+            try await client.thread(threadID: "demo-google-today", limit: 50, offset: 0)
+        }
+        await threadGate.waitUntilRequestStarts()
+        client.sessionToken = nil
+        await threadGate.releaseRequest()
+
+        do {
+            _ = try await request.value
+            XCTFail("A prior-account thread response must be cancelled")
+        } catch is CancellationError {
+            // Expected.
+        }
+        XCTAssertNil(
+            localStore.readThread(userID: DemoAppFixtures.userID, threadID: "demo-google-today")
+        )
+    }
+
+    func testOfflineFirstBatchResponseCannotRecreateBodiesAfterTokenTransition() async throws {
+        let batchGate = ReaderActionRequestGate()
+        let backend = GatedThreadBatchAppClient(batchGate: batchGate)
+        let localStore = MemoryLocalMailStore()
+        localStore.writeSession(DemoAppFixtures.appSession)
+        let client = OfflineFirstAppClient(backend: backend, localMailStore: localStore)
+        client.sessionToken = "live-session-token"
+
+        let request = Task {
+            try await client.batchThreads(threadIDs: ["demo-google-today"])
+        }
+        await batchGate.waitUntilRequestStarts()
+        client.sessionToken = nil
+        await batchGate.releaseRequest()
+
+        do {
+            _ = try await request.value
+            XCTFail("A prior-account body batch must be cancelled")
+        } catch is CancellationError {
+            // Expected.
+        }
+        XCTAssertNil(
+            localStore.readThread(userID: DemoAppFixtures.userID, threadID: "demo-google-today")
+        )
+    }
+
+    func testMailboxChangedSSEPrunesSameGenerationLabelMove() async {
+        let initial = makeGenerationMailbox(
+            generation: "generation-shared",
+            revision: "revision-1",
+            threadIDs: ["remaining", "moved-out"],
+            lastProgressAt: "2026-07-25T10:00:00Z"
+        )
+        let refreshed = makeGenerationMailbox(
+            generation: "generation-shared",
+            revision: "revision-2",
+            threadIDs: ["remaining"],
+            lastProgressAt: "2026-07-25T10:01:00Z"
+        )
+        let localStore = MemoryLocalMailStore()
+        let client = RealtimeEventAppClient(
+            sessionMailbox: initial,
+            mailboxResponses: [initial, refreshed]
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        await store.load()
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: "label-move",
+                event: "mailbox-changed",
+                data: #"{"mailbox_label":"inbox","payload":{"mailbox_revision":"revision-2","mailbox_labels":["inbox"]}}"#
+            )
+        )
+        try? await Task.sleep(nanoseconds: 1_250_000_000)
+
+        XCTAssertEqual(store.flatRows.map(\.threadID), ["remaining"])
+        XCTAssertEqual(
+            localStore.readMailbox(userID: DemoAppFixtures.userID, label: .inbox)?
+                .sections.flatMap(\.rows).map(\.threadID),
+            ["remaining"]
+        )
     }
 }
 
@@ -4497,14 +6226,14 @@ private final class AttachmentOperationRecorder: @unchecked Sendable {
     }
 }
 
-private func makeThreadAttachment(filename: String) -> ThreadAttachment {
+private func makeThreadAttachment(filename: String, index: Int = 1) -> ThreadAttachment {
     ThreadAttachment(
-        id: "attachment-1",
+        id: "attachment-\(index)",
         filename: filename,
         mimeType: "application/pdf",
         size: 42,
-        attachmentID: "gmail-attachment-1",
-        partID: "part-1",
+        attachmentID: "gmail-attachment-\(index)",
+        partID: "part-\(index)",
         downloadURL: nil
     )
 }
@@ -4515,6 +6244,9 @@ private func makeMailboxRow(
     latestSourceRecordID: String,
     receivedAt: String,
     title: String,
+    bodyReady: Bool? = nil,
+    contentRevision: String? = nil,
+    initialWindowPosition: Int? = nil,
     lifecycleSourceIDs: [String]? = nil,
     children: [GmailThreadChildRow]? = nil,
     labelIDs: [String] = ["INBOX"],
@@ -4536,6 +6268,9 @@ private func makeMailboxRow(
         sender: "Sender",
         participants: ["Sender"],
         messageCount: updates.count,
+        bodyReady: bodyReady,
+        contentRevision: contentRevision,
+        initialWindowPosition: initialWindowPosition,
         summary: title,
         snippet: title,
         labelIDs: labelIDs,
@@ -4555,6 +6290,191 @@ private func makeMailboxRow(
     )
 }
 
+private func makeOversizedOfflineMailbox(threadID: String) -> MailboxResponse {
+    MailboxResponse(
+        label: .all,
+        totalThreads: 1,
+        loadedThreads: 1,
+        sections: [
+            GmailThreadSection(
+                id: "all",
+                title: "All Mail",
+                rows: [
+                    makeMailboxRow(
+                        threadID: threadID,
+                        latestSourceRecordID: "\(threadID)-message",
+                        receivedAt: "2026-07-25T12:00:00Z",
+                        title: "Oversized offline thread",
+                        bodyReady: true,
+                        contentRevision: "sha256:stable",
+                        initialWindowPosition: 30
+                    )
+                ]
+            )
+        ],
+        fullImportRunning: true,
+        fullImportCompleted: false
+    )
+}
+
+private func makeProgressiveMailbox(
+    metadataCount: Int,
+    bodyReadyCount: Int,
+    estimatedTotalCount: Int,
+    initialWindowComplete: Bool = false,
+    visibleRowCount: Int? = nil,
+    reportsEstimatedTotal: Bool = true
+) -> MailboxResponse {
+    let safeMetadataCount = max(0, metadataCount)
+    let safeBodyReadyCount = max(0, min(bodyReadyCount, safeMetadataCount))
+    let safeVisibleRowCount = max(0, min(visibleRowCount ?? safeMetadataCount, safeMetadataCount))
+    let rows = (0..<safeVisibleRowCount).map { index in
+        makeMailboxRow(
+            threadID: "progressive-\(index)",
+            latestSourceRecordID: "progressive-message-\(index)",
+            receivedAt: "2026-07-25T12:00:00Z",
+            title: "Progressive message \(index)",
+            bodyReady: index < safeBodyReadyCount,
+            contentRevision: "sha256:progressive-\(index)"
+        )
+    }
+    let initialTarget = min(100, max(0, estimatedTotalCount))
+    let bodyTarget = min(25, max(0, estimatedTotalCount))
+    return MailboxResponse(
+        label: .inbox,
+        totalThreads: max(0, estimatedTotalCount),
+        loadedThreads: safeMetadataCount,
+        sections: [GmailThreadSection(id: "progressive", title: "Recent", rows: rows)],
+        readyCount: safeBodyReadyCount,
+        pendingCount: max(0, bodyTarget - safeBodyReadyCount),
+        mailboxRevision: "progressive-revision-1",
+        fullImportRunning: true,
+        fullImportCompleted: false,
+        syncGeneration: "progressive-generation-1",
+        phase: initialWindowComplete ? "usable" : "hydrating_priority_content",
+        initialTargetCount: initialTarget,
+        initialMetadataCount: safeMetadataCount,
+        initialBodyTargetCount: bodyTarget,
+        initialBodyReadyCount: safeBodyReadyCount,
+        historyMetadataCount: 0,
+        historyBodyReadyCount: 0,
+        estimatedTotalCount: reportsEstimatedTotal ? max(0, estimatedTotalCount) : nil,
+        initialWindowComplete: initialWindowComplete,
+        historyMetadataComplete: false,
+        historyBodyComplete: false,
+        lastProgressAt: "2026-07-25T12:00:00Z"
+    )
+}
+
+private func makeProgressiveSession(mailbox: MailboxResponse) -> AppSessionResponse {
+    let base = DemoAppFixtures.appSession
+    let readiness = PostLoginReadinessResponse(
+        mode: "progressive",
+        stage: mailbox.phase ?? "starting",
+        readyToEnter: false,
+        dashboardReady: true,
+        mailboxReady: false,
+        readyDashboardCount: 0,
+        readyMailGroupCount: mailbox.initialBodyReadyCount ?? 0,
+        fullImportRunning: true,
+        fullImportCompleted: false,
+        userDisplayName: base.user.displayName,
+        errorMessage: nil,
+        syncGeneration: mailbox.syncGeneration,
+        phase: mailbox.phase,
+        initialTargetCount: mailbox.initialTargetCount,
+        initialMetadataCount: mailbox.initialMetadataCount,
+        initialBodyTargetCount: mailbox.initialBodyTargetCount,
+        initialBodyReadyCount: mailbox.initialBodyReadyCount,
+        historyMetadataCount: mailbox.historyMetadataCount,
+        historyBodyReadyCount: mailbox.historyBodyReadyCount,
+        estimatedTotalCount: mailbox.estimatedTotalCount,
+        initialWindowComplete: mailbox.initialWindowComplete,
+        historyMetadataComplete: mailbox.historyMetadataComplete,
+        historyBodyComplete: mailbox.historyBodyComplete,
+        lastProgressAt: mailbox.lastProgressAt
+    )
+    return AppSessionResponse(
+        user: base.user,
+        readiness: readiness,
+        dashboard: base.dashboard,
+        mailbox: mailbox,
+        sync: base.sync
+    )
+}
+
+private func makeGenerationMailbox(
+    generation: String,
+    revision: String,
+    threadIDs: [String],
+    lastProgressAt: String
+) -> MailboxResponse {
+    let rows = threadIDs.enumerated().map { index, threadID in
+        makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: "\(threadID)-message",
+            receivedAt: "2026-07-25T10:00:\(String(format: "%02d", index))Z",
+            title: threadID,
+            bodyReady: true,
+            contentRevision: "sha256:\(threadID)"
+        )
+    }
+    let initialTarget = min(100, rows.count)
+    let bodyTarget = min(25, rows.count)
+    return MailboxResponse(
+        label: .inbox,
+        totalThreads: rows.count,
+        loadedThreads: rows.count,
+        sections: rows.isEmpty ? [] : [GmailThreadSection(id: "history", title: "History", rows: rows)],
+        readyCount: rows.count,
+        pendingCount: 0,
+        mailboxRevision: revision,
+        fullImportRunning: false,
+        fullImportCompleted: true,
+        syncGeneration: generation,
+        phase: "complete",
+        initialTargetCount: initialTarget,
+        initialMetadataCount: initialTarget,
+        initialBodyTargetCount: bodyTarget,
+        initialBodyReadyCount: bodyTarget,
+        historyMetadataCount: rows.count,
+        historyBodyReadyCount: rows.count,
+        estimatedTotalCount: rows.count,
+        initialWindowComplete: true,
+        historyMetadataComplete: true,
+        historyBodyComplete: true,
+        lastProgressAt: lastProgressAt
+    )
+}
+
+private func makeLargeHistoryPage(offset: Int, total: Int, pageSize: Int) -> MailboxResponse {
+    let count = min(pageSize, total - offset)
+    let rows = (offset..<(offset + count)).map { index in
+        makeMailboxRow(
+            threadID: "large-\(index)",
+            latestSourceRecordID: "large-message-\(index)",
+            receivedAt: "2026-07-25T10:00:00Z",
+            title: "Large history \(index)"
+        )
+    }
+    let nextOffset = offset + count
+    return MailboxResponse(
+        label: .all,
+        totalThreads: total,
+        nextCursor: nextOffset < total ? "large-cursor-\(nextOffset)" : nil,
+        loadedThreads: count,
+        sections: [GmailThreadSection(id: "history", title: "History", rows: rows)],
+        mailboxRevision: "large-revision",
+        fullImportRunning: nextOffset < total,
+        fullImportCompleted: nextOffset >= total,
+        syncGeneration: "large-generation",
+        historyMetadataCount: nextOffset,
+        estimatedTotalCount: total,
+        historyMetadataComplete: nextOffset >= total,
+        lastProgressAt: "2026-07-25T10:00:00Z"
+    )
+}
+
 private func makeSingleRowMailbox(threadID: String, title: String, receivedAt: String = "2026-05-29T09:30:00+05:30") -> MailboxResponse {
     let row = makeMailboxRow(
         threadID: threadID,
@@ -4570,6 +6490,40 @@ private func makeSingleRowMailbox(threadID: String, title: String, receivedAt: S
         fullImportRunning: false,
         fullImportCompleted: true
     )
+}
+
+private extension MailboxResponse {
+    func withTestMailboxRevision(_ revision: String) -> MailboxResponse {
+        MailboxResponse(
+            label: label,
+            totalThreads: totalThreads,
+            unreadThreads: unreadThreads,
+            nextCursor: nextCursor,
+            loadedThreads: loadedThreads,
+            windowDays: windowDays,
+            sections: sections,
+            readyCount: readyCount,
+            pendingCount: pendingCount,
+            mailboxRevision: revision,
+            generatedAt: generatedAt,
+            oldestImportedAt: oldestImportedAt,
+            fullImportRunning: fullImportRunning,
+            fullImportCompleted: fullImportCompleted,
+            syncGeneration: syncGeneration,
+            phase: phase,
+            initialTargetCount: initialTargetCount,
+            initialMetadataCount: initialMetadataCount,
+            initialBodyTargetCount: initialBodyTargetCount,
+            initialBodyReadyCount: initialBodyReadyCount,
+            historyMetadataCount: historyMetadataCount,
+            historyBodyReadyCount: historyBodyReadyCount,
+            estimatedTotalCount: estimatedTotalCount,
+            initialWindowComplete: initialWindowComplete,
+            historyMetadataComplete: historyMetadataComplete,
+            historyBodyComplete: historyBodyComplete,
+            lastProgressAt: lastProgressAt
+        )
+    }
 }
 
 private func makeSearchPaginationPage(
@@ -4734,16 +6688,181 @@ private actor ReaderActionRequestGate {
     }
 }
 
+private final class RemoteImageRequestRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedAuthorization: String?
+    private var storedHost: String?
+
+    var authorization: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedAuthorization
+    }
+
+    var host: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedHost
+    }
+
+    func record(_ request: URLRequest) {
+        lock.lock()
+        storedAuthorization = request.value(forHTTPHeaderField: "Authorization")
+        storedHost = request.url?.host
+        lock.unlock()
+    }
+}
+
+private final class RemoteImageURLProtocol: URLProtocol {
+    private static let lock = NSLock()
+    private static var storedRequestHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    static var requestHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedRequestHandler
+        }
+        set {
+            lock.lock()
+            storedRequestHandler = newValue
+            lock.unlock()
+        }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let handler = Self.requestHandler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private final class GatedThreadBatchAppClient: AppClient {
+    var baseURL = AppConfiguration.defaultBackendURL
+    var sessionToken: String?
+    let mode: AppRunMode = .demo
+
+    private let demo = DemoAppClient()
+    private let threadGate: ReaderActionRequestGate?
+    private let batchGate: ReaderActionRequestGate?
+
+    init(
+        threadGate: ReaderActionRequestGate? = nil,
+        batchGate: ReaderActionRequestGate? = nil
+    ) {
+        self.threadGate = threadGate
+        self.batchGate = batchGate
+    }
+
+    func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
+        try await demo.exchangeMobileSession(loginCode: loginCode)
+    }
+
+    func appSession() async throws -> AppSessionResponse {
+        try await demo.appSession()
+    }
+
+    func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
+        try await demo.mailbox(label: label, limit: limit, cursor: cursor)
+    }
+
+    func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
+        if let threadGate {
+            await threadGate.suspendRequest()
+        }
+        return try await demo.thread(threadID: threadID, limit: limit, offset: offset)
+    }
+
+    func batchThreads(threadIDs: [String]) async throws -> MailboxThreadBatchResponse {
+        guard let batchGate else {
+            return MailboxThreadBatchResponse(threads: [], pendingThreadIDs: threadIDs)
+        }
+        await batchGate.suspendRequest()
+        let threads = try await withThrowingTaskGroup(of: ThreadReaderResponse.self) { group in
+            for threadID in threadIDs {
+                group.addTask { [demo] in
+                    try await demo.thread(threadID: threadID, limit: 100, offset: 0)
+                }
+            }
+            var results: [ThreadReaderResponse] = []
+            for try await thread in group {
+                results.append(thread)
+            }
+            return results
+        }
+        return MailboxThreadBatchResponse(threads: threads)
+    }
+
+    func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
+        try await demo.triggerMailboxSync()
+    }
+
+    func syncMailboxNow() async throws -> MailboxSyncTriggerResponse {
+        try await demo.syncMailboxNow()
+    }
+
+    func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        try await demo.archiveThread(threadID)
+    }
+
+    func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        try await demo.unarchiveThread(threadID)
+    }
+
+    func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        try await demo.markThreadRead(threadID)
+    }
+
+    func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
+        try await demo.enqueueThreadAction(request)
+    }
+
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        try await demo.createTask(request)
+    }
+
+    func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse {
+        try await demo.updateTask(taskID, request: request)
+    }
+
+    func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
+        try await demo.completeEntity(entityID, request: request)
+    }
+}
+
 private final class BlockingThreadWriteLocalMailStore: LocalMailStore {
-    private let base = MemoryLocalMailStore()
+    private let base: LocalMailStore
     private let lock = NSLock()
     private let releaseSemaphore = DispatchSemaphore(value: 0)
     private let blockOnThreadWriteCall: Int
     private var threadWriteCallCount = 0
     private var blockedThreadWrite = false
 
-    init(blockOnThreadWriteCall: Int) {
+    init(
+        blockOnThreadWriteCall: Int,
+        base: LocalMailStore = MemoryLocalMailStore()
+    ) {
         self.blockOnThreadWriteCall = blockOnThreadWriteCall
+        self.base = base
     }
 
     var hasBlockedThreadWrite: Bool {
@@ -4772,6 +6891,24 @@ private final class BlockingThreadWriteLocalMailStore: LocalMailStore {
         base.writeMailbox(mailbox, userID: userID, label: label)
     }
 
+    func writeMailbox(
+        _ mailbox: MailboxResponse,
+        userID: String,
+        label: MailboxLabel,
+        removingThreadIDs: [String],
+        reenteringThreadIDs: [String],
+        reentryLabels: [MailboxLabel]
+    ) {
+        base.writeMailbox(
+            mailbox,
+            userID: userID,
+            label: label,
+            removingThreadIDs: removingThreadIDs,
+            reenteringThreadIDs: reenteringThreadIDs,
+            reentryLabels: reentryLabels
+        )
+    }
+
     func readThread(userID: String, threadID: String) -> ThreadReaderResponse? {
         base.readThread(userID: userID, threadID: threadID)
     }
@@ -4795,6 +6932,14 @@ private final class BlockingThreadWriteLocalMailStore: LocalMailStore {
         base.writePendingThreadAction(action)
     }
 
+    func removeThread(userID: String, threadID: String) {
+        base.removeThread(userID: userID, threadID: threadID)
+    }
+
+    func purgeAccount(userID: String) {
+        base.purgeAccount(userID: userID)
+    }
+
     func pendingThreadActions() -> [LocalPendingThreadAction] {
         base.pendingThreadActions()
     }
@@ -4807,8 +6952,236 @@ private final class BlockingThreadWriteLocalMailStore: LocalMailStore {
         base.markPendingThreadActionFailed(clientActionID: clientActionID, error: error)
     }
 
+    func clearSession() {
+        base.clearSession()
+    }
+
     func clearAll() {
         base.clearAll()
+    }
+}
+
+private final class BlockingMailboxWriteLocalMailStore: LocalMailStore {
+    private let base: LocalMailStore
+    private let lock = NSLock()
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
+    private var blockedMailboxWrite = false
+    private var didBlockMailboxWrite = false
+
+    init(base: LocalMailStore) {
+        self.base = base
+    }
+
+    var hasBlockedMailboxWrite: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return blockedMailboxWrite
+    }
+
+    func releaseBlockedMailboxWrite() {
+        releaseSemaphore.signal()
+    }
+
+    func readSession() -> AppSessionResponse? {
+        base.readSession()
+    }
+
+    func writeSession(_ session: AppSessionResponse) {
+        base.writeSession(session)
+    }
+
+    func readMailbox(userID: String, label: MailboxLabel) -> MailboxResponse? {
+        base.readMailbox(userID: userID, label: label)
+    }
+
+    func writeMailbox(_ mailbox: MailboxResponse, userID: String, label: MailboxLabel) {
+        lock.lock()
+        let shouldBlock = !didBlockMailboxWrite
+        if shouldBlock {
+            didBlockMailboxWrite = true
+            blockedMailboxWrite = true
+        }
+        lock.unlock()
+        if shouldBlock {
+            releaseSemaphore.wait()
+        }
+        base.writeMailbox(mailbox, userID: userID, label: label)
+    }
+
+    func writeMailbox(
+        _ mailbox: MailboxResponse,
+        userID: String,
+        label: MailboxLabel,
+        removingThreadIDs: [String],
+        reenteringThreadIDs: [String],
+        reentryLabels: [MailboxLabel]
+    ) {
+        writeMailbox(mailbox, userID: userID, label: label)
+    }
+
+    func readThread(userID: String, threadID: String) -> ThreadReaderResponse? {
+        base.readThread(userID: userID, threadID: threadID)
+    }
+
+    func writeThread(_ thread: ThreadReaderResponse, userID: String, threadID: String) {
+        base.writeThread(thread, userID: userID, threadID: threadID)
+    }
+
+    func removeThread(userID: String, threadID: String) {
+        base.removeThread(userID: userID, threadID: threadID)
+    }
+
+    func purgeAccount(userID: String) {
+        base.purgeAccount(userID: userID)
+    }
+
+    func writePendingThreadAction(_ action: LocalPendingThreadAction) {
+        base.writePendingThreadAction(action)
+    }
+
+    func pendingThreadActions() -> [LocalPendingThreadAction] {
+        base.pendingThreadActions()
+    }
+
+    func removePendingThreadAction(clientActionID: String) {
+        base.removePendingThreadAction(clientActionID: clientActionID)
+    }
+
+    func markPendingThreadActionFailed(clientActionID: String, error: String) {
+        base.markPendingThreadActionFailed(clientActionID: clientActionID, error: error)
+    }
+
+    func clearSession() {
+        base.clearSession()
+    }
+
+    func clearAll() {
+        base.clearAll()
+    }
+}
+
+private final class PurgingAccountActionAppClient: AppClient {
+    var baseURL = AppConfiguration.defaultBackendURL
+    var sessionToken: String?
+    let mode: AppRunMode = .localBackend
+
+    private let demo = DemoAppClient()
+    private let localMailStore: LocalMailStore
+    private let userID: String
+    private let lock = NSLock()
+    private var storedPurgeCallCount = 0
+
+    init(localMailStore: LocalMailStore, userID: String = DemoAppFixtures.userID) {
+        self.localMailStore = localMailStore
+        self.userID = userID
+    }
+
+    var purgeCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedPurgeCallCount
+    }
+
+    func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
+        try await demo.exchangeMobileSession(loginCode: loginCode)
+    }
+
+    func appSession() async throws -> AppSessionResponse {
+        let session = DemoAppFixtures.appSession
+        return AppSessionResponse(
+            user: AppSessionUser(
+                id: userID,
+                email: session.user.email,
+                firstName: session.user.firstName,
+                displayName: session.user.displayName
+            ),
+            readiness: session.readiness,
+            dashboard: session.dashboard,
+            mailbox: session.mailbox,
+            sync: session.sync
+        )
+    }
+
+    func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
+        try await demo.mailbox(label: label, limit: limit, cursor: cursor)
+    }
+
+    func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
+        let thread = try await demo.thread(threadID: threadID, limit: limit, offset: offset)
+        return ThreadReaderResponse(
+            entityID: thread.entityID,
+            userID: userID,
+            source: thread.source,
+            gmailThreadID: thread.gmailThreadID,
+            subject: thread.subject,
+            title: thread.title,
+            summary: thread.summary,
+            totalMessages: thread.totalMessages,
+            limit: thread.limit,
+            offset: thread.offset,
+            hasMore: thread.hasMore,
+            messages: thread.messages,
+            contentRevision: thread.contentRevision
+        )
+    }
+
+    func logout() async throws {
+        purgeAccount()
+    }
+
+    func disconnectGoogle(deleteData: Bool, revokeSessions: Bool) async throws {
+        purgeAccount()
+    }
+
+    func deleteGoogleData() async throws {
+        purgeAccount()
+    }
+
+    func deleteAccount() async throws {
+        purgeAccount()
+    }
+
+    func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
+        try await demo.triggerMailboxSync()
+    }
+
+    func syncMailboxNow() async throws -> MailboxSyncTriggerResponse {
+        try await demo.syncMailboxNow()
+    }
+
+    func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        try await demo.archiveThread(threadID)
+    }
+
+    func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        try await demo.unarchiveThread(threadID)
+    }
+
+    func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        try await demo.markThreadRead(threadID)
+    }
+
+    func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
+        try await demo.enqueueThreadAction(request)
+    }
+
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        try await demo.createTask(request)
+    }
+
+    func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse {
+        try await demo.updateTask(taskID, request: request)
+    }
+
+    func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
+        try await demo.completeEntity(entityID, request: request)
+    }
+
+    private func purgeAccount() {
+        lock.lock()
+        storedPurgeCallCount += 1
+        lock.unlock()
+        localMailStore.purgeAccount(userID: userID)
     }
 }
 
@@ -4819,11 +7192,43 @@ private final class AttachmentDownloadingAppClient: AppClient {
 
     private let demo = DemoAppClient()
     private let downloadedAttachment: DownloadedAttachment
-    private(set) var requestedMessageID: String?
-    private(set) var requestedAttachment: ThreadAttachment?
+    private let downloadGate: ReaderActionRequestGate?
+    private let downloadDelayNanoseconds: UInt64?
+    private let lock = NSLock()
+    private var storedRequestedMessageID: String?
+    private var storedRequestedAttachment: ThreadAttachment?
+    private var storedDownloadCallCount = 0
+    private var storedCurrentDownloadCount = 0
+    private var storedMaximumObservedDownloadCount = 0
 
-    init(downloadedAttachment: DownloadedAttachment) {
+    init(
+        downloadedAttachment: DownloadedAttachment,
+        downloadGate: ReaderActionRequestGate? = nil,
+        downloadDelayNanoseconds: UInt64? = nil
+    ) {
         self.downloadedAttachment = downloadedAttachment
+        self.downloadGate = downloadGate
+        self.downloadDelayNanoseconds = downloadDelayNanoseconds
+    }
+
+    var requestedMessageID: String? {
+        withLock { storedRequestedMessageID }
+    }
+
+    var requestedAttachment: ThreadAttachment? {
+        withLock { storedRequestedAttachment }
+    }
+
+    var downloadCallCount: Int {
+        withLock { storedDownloadCallCount }
+    }
+
+    var currentDownloadCount: Int {
+        withLock { storedCurrentDownloadCount }
+    }
+
+    var maximumObservedDownloadCount: Int {
+        withLock { storedMaximumObservedDownloadCount }
     }
 
     func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
@@ -4867,9 +7272,32 @@ private final class AttachmentDownloadingAppClient: AppClient {
     }
 
     func downloadAttachment(messageID: String, attachment: ThreadAttachment) async throws -> DownloadedAttachment {
-        requestedMessageID = messageID
-        requestedAttachment = attachment
+        withLock {
+            storedDownloadCallCount += 1
+            storedCurrentDownloadCount += 1
+            storedMaximumObservedDownloadCount = max(
+                storedMaximumObservedDownloadCount,
+                storedCurrentDownloadCount
+            )
+            storedRequestedMessageID = messageID
+            storedRequestedAttachment = attachment
+        }
+        defer {
+            withLock { storedCurrentDownloadCount -= 1 }
+        }
+        if let downloadGate {
+            await downloadGate.suspendRequest()
+        } else if let downloadDelayNanoseconds {
+            try await Task.sleep(nanoseconds: downloadDelayNanoseconds)
+        }
         return downloadedAttachment
+    }
+
+    @discardableResult
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
     }
 
     func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
@@ -4882,6 +7310,412 @@ private final class AttachmentDownloadingAppClient: AppClient {
 
     func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
         try await demo.completeEntity(entityID, request: request)
+    }
+}
+
+private struct OversizedThreadPageCall: Equatable {
+    let limit: Int
+    let offset: Int
+}
+
+private final class OversizedOfflineThreadAppClient: AppClient {
+    enum Mode {
+        case stable(totalMessages: Int)
+        case repeatedPage
+        case revisionChange
+    }
+
+    var baseURL = AppConfiguration.defaultBackendURL
+    var sessionToken: String?
+    let mode: AppRunMode = .localBackend
+
+    private let demo = DemoAppClient()
+    private let pageMode: Mode
+    private let gatedOffset: Int?
+    private let pageGate: ReaderActionRequestGate?
+    private let lock = NSLock()
+    private var recordedBatchCallCount = 0
+    private var recordedThreadCalls: [OversizedThreadPageCall] = []
+
+    init(
+        mode: Mode,
+        gatedOffset: Int? = nil,
+        pageGate: ReaderActionRequestGate? = nil
+    ) {
+        pageMode = mode
+        self.gatedOffset = gatedOffset
+        self.pageGate = pageGate
+    }
+
+    var batchCallCount: Int {
+        withLock { recordedBatchCallCount }
+    }
+
+    var threadCalls: [OversizedThreadPageCall] {
+        withLock { recordedThreadCalls }
+    }
+
+    func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
+        try await demo.exchangeMobileSession(loginCode: loginCode)
+    }
+
+    func logout() async throws {}
+
+    func appSession() async throws -> AppSessionResponse {
+        try await demo.appSession()
+    }
+
+    func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
+        try await demo.mailbox(label: label, limit: limit, cursor: cursor)
+    }
+
+    func batchThreads(threadIDs: [String]) async throws -> MailboxThreadBatchResponse {
+        withLock { recordedBatchCallCount += 1 }
+        return MailboxThreadBatchResponse(threads: [], pendingThreadIDs: threadIDs)
+    }
+
+    func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
+        withLock { recordedThreadCalls.append(OversizedThreadPageCall(limit: limit, offset: offset)) }
+        if gatedOffset == offset, let pageGate {
+            await pageGate.suspendRequest()
+        }
+        let totalMessages: Int
+        let messageIndexes: [Int]
+        let hasMore: Bool
+        let revision: String
+        switch pageMode {
+        case .stable(let total):
+            totalMessages = total
+            let end = min(total, offset + limit)
+            messageIndexes = offset < end ? Array(offset..<end) : []
+            hasMore = end < total
+            revision = "sha256:stable"
+        case .revisionChange:
+            totalMessages = 200
+            let end = min(totalMessages, offset + limit)
+            messageIndexes = offset < end ? Array(offset..<end) : []
+            hasMore = end < totalMessages
+            revision = offset == 0 ? "sha256:first" : "sha256:changed"
+        case .repeatedPage:
+            totalMessages = 201
+            messageIndexes = Array(0..<min(100, limit))
+            hasMore = true
+            revision = "sha256:stable"
+        }
+        return ThreadReaderResponse(
+            entityID: threadID,
+            userID: DemoAppFixtures.userID,
+            source: .gmail,
+            gmailThreadID: threadID,
+            subject: "Oversized offline thread",
+            totalMessages: totalMessages,
+            limit: limit,
+            offset: offset,
+            hasMore: hasMore,
+            messages: messageIndexes.map { index in
+                ThreadMessage(
+                    id: "oversized-message-\(index)",
+                    source: .gmail,
+                    threadID: threadID,
+                    fromAddress: "sender@example.com",
+                    to: "reader@example.com",
+                    cc: nil,
+                    bcc: nil,
+                    subject: "Oversized offline thread",
+                    body: "Complete body \(index)",
+                    bodyComplete: true,
+                    htmlBody: nil,
+                    htmlRenderDocument: nil,
+                    snippet: "Complete body \(index)",
+                    labelIDs: ["INBOX"],
+                    receivedAt: "2026-07-25T12:00:00Z"
+                )
+            },
+            contentRevision: revision
+        )
+    }
+
+    func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
+        try await demo.triggerMailboxSync()
+    }
+
+    func syncMailboxNow() async throws -> MailboxSyncTriggerResponse {
+        try await demo.syncMailboxNow()
+    }
+
+    func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        try await demo.archiveThread(threadID)
+    }
+
+    func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        try await demo.unarchiveThread(threadID)
+    }
+
+    func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        try await demo.markThreadRead(threadID)
+    }
+
+    func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
+        try await demo.enqueueThreadAction(request)
+    }
+
+    func downloadAttachment(messageID: String, attachment: ThreadAttachment) async throws -> DownloadedAttachment {
+        try await demo.downloadAttachment(messageID: messageID, attachment: attachment)
+    }
+
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        try await demo.createTask(request)
+    }
+
+    func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse {
+        try await demo.updateTask(taskID, request: request)
+    }
+
+    func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
+        try await demo.completeEntity(entityID, request: request)
+    }
+
+    @discardableResult
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+}
+
+private final class GlobalOfflineMetadataAppClient: AppClient {
+    var baseURL = AppConfiguration.defaultBackendURL
+    var sessionToken: String?
+    let mode: AppRunMode = .localBackend
+
+    private let demo = DemoAppClient()
+    private let userID: String
+    private let batchGate: ReaderActionRequestGate?
+    private let lock = NSLock()
+    private var progressRevision = 1
+    private var recordedMailboxCalls: [MailboxPageCall] = []
+    private var recordedBatchedThreadIDs: Set<String> = []
+
+    init(
+        userID: String = DemoAppFixtures.userID,
+        batchGate: ReaderActionRequestGate? = nil
+    ) {
+        self.userID = userID
+        self.batchGate = batchGate
+    }
+
+    var mailboxCalls: [MailboxPageCall] {
+        withLock { recordedMailboxCalls }
+    }
+
+    var batchedThreadIDs: Set<String> {
+        withLock { recordedBatchedThreadIDs }
+    }
+
+    func advanceProgress() {
+        withLock { progressRevision += 1 }
+    }
+
+    func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
+        try await demo.exchangeMobileSession(loginCode: loginCode)
+    }
+
+    func appSession() async throws -> AppSessionResponse {
+        let revision = withLock { progressRevision }
+        let coldInboxRow = makeMailboxRow(
+            threadID: "inbox-cold",
+            latestSourceRecordID: "inbox-cold-message",
+            receivedAt: "2026-07-25T12:00:00Z",
+            title: "Cold Inbox body",
+            bodyReady: false,
+            contentRevision: "sha256:inbox-cold"
+        )
+        let mailbox = MailboxResponse(
+            label: .inbox,
+            totalThreads: 5,
+            loadedThreads: 1,
+            sections: [GmailThreadSection(id: "inbox", title: "Inbox", rows: [coldInboxRow])],
+            fullImportRunning: true,
+            fullImportCompleted: false,
+            syncGeneration: "global-generation-1",
+            phase: "hydrating_history_content",
+            initialTargetCount: 5,
+            initialMetadataCount: revision > 1 ? 5 : 4,
+            initialBodyTargetCount: 5,
+            initialBodyReadyCount: revision > 1 ? 5 : 2,
+            historyMetadataCount: revision > 1 ? 5 : 4,
+            historyBodyReadyCount: revision > 1 ? 5 : 2,
+            estimatedTotalCount: 5,
+            initialWindowComplete: true,
+            historyMetadataComplete: true,
+            historyBodyComplete: revision > 1,
+            lastProgressAt: "2026-07-25T12:00:0\(revision)Z"
+        )
+        let base = makeProgressiveSession(mailbox: mailbox)
+        let baseUser = base.user
+        return AppSessionResponse(
+            user: AppSessionUser(
+                id: userID,
+                email: baseUser.email,
+                firstName: baseUser.firstName,
+                displayName: baseUser.displayName
+            ),
+            readiness: base.readiness,
+            dashboard: base.dashboard,
+            mailbox: base.mailbox,
+            sync: base.sync
+        )
+    }
+
+    func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
+        withLock {
+            recordedMailboxCalls.append(MailboxPageCall(label: label, cursor: cursor))
+        }
+        guard label == .all else {
+            return makeEmptyMailbox(label: label)
+        }
+        let revision = withLock { progressRevision }
+        var identifiers: [(String, Bool, Int?)]
+        let nextCursor: String?
+        switch cursor {
+        case nil:
+            identifiers = [("global-ready-1", true, 0), ("global-cold-1", false, 30)]
+            nextCursor = "all-cursor-2"
+        case "all-cursor-2":
+            identifiers = [
+                ("global-ready-2", true, 1),
+                ("global-cold-2", false, 3),
+            ]
+            if revision > 1 {
+                identifiers.append(("global-new-tail", true, nil))
+            }
+            nextCursor = nil
+        default:
+            throw APIError.httpStatus(400)
+        }
+        let rows = identifiers.map { identifier, bodyReady, initialWindowPosition in
+            makeMailboxRow(
+                threadID: identifier,
+                latestSourceRecordID: "\(identifier)-message",
+                receivedAt: "2026-07-25T12:00:00Z",
+                title: identifier,
+                bodyReady: bodyReady,
+                contentRevision: "sha256:\(identifier)",
+                initialWindowPosition: initialWindowPosition
+            )
+        }
+        return MailboxResponse(
+            label: .all,
+            totalThreads: revision > 1 ? 5 : 4,
+            nextCursor: nextCursor,
+            loadedThreads: rows.count,
+            sections: [GmailThreadSection(id: "all", title: "All Mail", rows: rows)],
+            fullImportRunning: true,
+            fullImportCompleted: false,
+            syncGeneration: "global-generation-1",
+            phase: "hydrating_history_content",
+            initialTargetCount: revision > 1 ? 5 : 4,
+            initialMetadataCount: revision > 1 ? 5 : 4,
+            initialBodyTargetCount: revision > 1 ? 5 : 4,
+            initialBodyReadyCount: revision > 1 ? 3 : 2,
+            historyMetadataCount: revision > 1 ? 5 : 4,
+            historyBodyReadyCount: revision > 1 ? 3 : 2,
+            estimatedTotalCount: revision > 1 ? 5 : 4,
+            initialWindowComplete: true,
+            historyMetadataComplete: true,
+            historyBodyComplete: false,
+            lastProgressAt: "2026-07-25T12:00:0\(revision)Z"
+        )
+    }
+
+    func batchThreads(threadIDs: [String]) async throws -> MailboxThreadBatchResponse {
+        withLock {
+            recordedBatchedThreadIDs.formUnion(threadIDs)
+        }
+        if let batchGate {
+            await batchGate.suspendRequest()
+        }
+        return MailboxThreadBatchResponse(
+            threads: threadIDs.map { threadID in
+                ThreadReaderResponse(
+                    entityID: threadID,
+                    userID: userID,
+                    source: .gmail,
+                    gmailThreadID: threadID,
+                    subject: threadID,
+                    totalMessages: 0,
+                    messages: [],
+                    contentRevision: "sha256:\(threadID)"
+                )
+            }
+        )
+    }
+
+    func mailboxSyncState() async throws -> MailboxSyncStateResponse {
+        let revision = withLock { progressRevision }
+        var state = makeMailboxSyncStateResponse(connected: true, mailboxRevision: "global-revision-\(revision)")
+        state.syncGeneration = "global-generation-1"
+        state.phase = "hydrating_history_content"
+        state.initialTargetCount = 5
+        state.initialMetadataCount = revision > 1 ? 5 : 4
+        state.initialBodyTargetCount = 5
+        state.initialBodyReadyCount = revision > 1 ? 5 : 2
+        state.historyMetadataCount = revision > 1 ? 5 : 4
+        state.historyBodyReadyCount = revision > 1 ? 5 : 2
+        state.estimatedTotalCount = 5
+        state.initialWindowComplete = true
+        state.historyMetadataComplete = true
+        state.historyBodyComplete = revision > 1
+        state.lastProgressAt = "2026-07-25T12:00:0\(revision)Z"
+        return state
+    }
+
+    func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
+        DemoAppFixtures.threads[threadID] ?? DemoAppFixtures.threads["demo-google-today"]!
+    }
+
+    func logout() async throws {}
+
+    func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
+        try await demo.triggerMailboxSync()
+    }
+
+    func syncMailboxNow() async throws -> MailboxSyncTriggerResponse {
+        try await demo.syncMailboxNow()
+    }
+
+    func archiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .archive)
+    }
+
+    func unarchiveThread(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .unarchive)
+    }
+
+    func markThreadRead(_ threadID: String) async throws -> GmailThreadMutationResponse {
+        GmailThreadMutationResponse(threadID: threadID, action: .markRead)
+    }
+
+    func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
+        try await demo.enqueueThreadAction(request)
+    }
+
+    func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse {
+        try await demo.createTask(request)
+    }
+
+    func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse {
+        try await demo.updateTask(taskID, request: request)
+    }
+
+    func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
+        try await demo.completeEntity(entityID, request: request)
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
     }
 }
 
@@ -4915,9 +7749,18 @@ private final class FixedMailboxAppClient: AppClient {
     var sessionToken: String?
     let mode: AppRunMode = .localBackend
     private let fixedMailbox: MailboxResponse
+    private let fixedSession: AppSessionResponse?
+    private let successfulMailboxCallsBeforeFailure: Int?
+    private var mailboxCallCount = 0
 
-    init(mailbox: MailboxResponse) {
+    init(
+        mailbox: MailboxResponse,
+        session: AppSessionResponse? = nil,
+        successfulMailboxCallsBeforeFailure: Int? = nil
+    ) {
         self.fixedMailbox = mailbox
+        self.fixedSession = session
+        self.successfulMailboxCallsBeforeFailure = successfulMailboxCallsBeforeFailure
     }
 
     func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
@@ -4925,6 +7768,9 @@ private final class FixedMailboxAppClient: AppClient {
     }
 
     func appSession() async throws -> AppSessionResponse {
+        if let fixedSession {
+            return fixedSession
+        }
         let current = DemoAppFixtures.appSession
         return AppSessionResponse(
             user: current.user,
@@ -4936,7 +7782,12 @@ private final class FixedMailboxAppClient: AppClient {
     }
 
     func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
-        fixedMailbox
+        if let successfulMailboxCallsBeforeFailure,
+           mailboxCallCount >= successfulMailboxCallsBeforeFailure {
+            throw APIError.httpStatus(503)
+        }
+        mailboxCallCount += 1
+        return fixedMailbox
     }
 
     func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
@@ -5116,6 +7967,7 @@ private final class RealtimeEventAppClient: AppClient {
     private(set) var mailboxLimits: [Int] = []
     private(set) var mailboxCursors: [String?] = []
     private(set) var threadCallCount = 0
+    private(set) var observedHydratedThreads: [MailboxHydratedThreadState] = []
 
     init(
         sessionMailbox: MailboxResponse,
@@ -5147,6 +7999,14 @@ private final class RealtimeEventAppClient: AppClient {
 
     func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
         try await DemoAppClient().exchangeMobileSession(loginCode: loginCode)
+    }
+
+    func observeHydratedThreads(
+        _ threads: [MailboxHydratedThreadState],
+        userID: String
+    ) async {
+        guard userID == DemoAppFixtures.userID else { return }
+        observedHydratedThreads.append(contentsOf: threads)
     }
 
     func appSession() async throws -> AppSessionResponse {
@@ -5824,6 +8684,8 @@ private final class BulkPaginatedMailboxAppClient: AppClient {
     var sessionToken: String?
     let mode: AppRunMode = .demo
     var delayedCursor: String?
+    var gatedCursor: String?
+    var mailboxRequestGate: ReaderActionRequestGate?
     private(set) var mailboxCursors: [String?] = []
     private(set) var searchQueries: [String] = []
 
@@ -5832,10 +8694,15 @@ private final class BulkPaginatedMailboxAppClient: AppClient {
     private let revisionMismatchCursor: String?
     private let repeatCursorOnceAtCursor: String?
     private let importInProgress: Bool
+    private let growingImportTotals: Bool
+    private let authoritativeGeneration: String?
     private var didFailRequestedCursor = false
+    private var stagedFailureCursor: String?
     private var remainingRevisionChurns: Int
     private var didRepeatRequestedCursor = false
-    private let totalThreads = 357
+    private var totalThreads = 357
+    private var mailboxRevision = "bulk-revision-1"
+    private var mailboxTitlePrefix = "Bulk message"
     private let pageSize = 100
 
     init(
@@ -5843,14 +8710,37 @@ private final class BulkPaginatedMailboxAppClient: AppClient {
         revisionMismatchOnceAtCursor: String? = nil,
         repeatCursorOnceAtCursor: String? = nil,
         importInProgress: Bool = false,
-        revisionChurnCount: Int? = nil
+        growingImportTotals: Bool = false,
+        revisionChurnCount: Int? = nil,
+        authoritativeGeneration: String? = nil,
+        mailboxTitlePrefix: String = "Bulk message"
     ) {
         self.failOnceAtCursor = failOnceAtCursor
         self.revisionMismatchCursor = revisionMismatchOnceAtCursor
         self.repeatCursorOnceAtCursor = repeatCursorOnceAtCursor
         self.importInProgress = importInProgress
+        self.growingImportTotals = growingImportTotals
+        self.authoritativeGeneration = authoritativeGeneration
+        self.mailboxTitlePrefix = mailboxTitlePrefix
         self.remainingRevisionChurns = revisionChurnCount
             ?? (revisionMismatchOnceAtCursor == nil ? 0 : 1)
+    }
+
+    func stageAuthoritativeRefresh(
+        revision: String,
+        titlePrefix: String,
+        totalThreads: Int,
+        gateAtCursor: String,
+        gate: ReaderActionRequestGate,
+        failOnceAtCursor: String? = nil
+    ) {
+        mailboxRevision = revision
+        mailboxTitlePrefix = titlePrefix
+        self.totalThreads = totalThreads
+        gatedCursor = gateAtCursor
+        mailboxRequestGate = gate
+        stagedFailureCursor = failOnceAtCursor
+        didFailRequestedCursor = false
     }
 
     func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
@@ -5877,7 +8767,15 @@ private final class BulkPaginatedMailboxAppClient: AppClient {
         if let delayedCursor, cursor == delayedCursor {
             try await Task.sleep(nanoseconds: 250_000_000)
         }
-        if let failOnceAtCursor, cursor == failOnceAtCursor, !didFailRequestedCursor {
+        if let gatedCursor,
+           cursor == gatedCursor,
+           let mailboxRequestGate {
+            await mailboxRequestGate.suspendRequest()
+        }
+        let requestedFailureCursor = stagedFailureCursor ?? failOnceAtCursor
+        if let requestedFailureCursor,
+           cursor == requestedFailureCursor,
+           !didFailRequestedCursor {
             didFailRequestedCursor = true
             throw APIError.httpStatus(503)
         }
@@ -5964,7 +8862,7 @@ private final class BulkPaginatedMailboxAppClient: AppClient {
 
     private func page(
         offset: Int,
-        revision: String = "bulk-revision-1",
+        revision: String? = nil,
         forcedNextCursor: String? = nil
     ) -> MailboxResponse {
         let count = min(pageSize, totalThreads - offset)
@@ -5973,22 +8871,43 @@ private final class BulkPaginatedMailboxAppClient: AppClient {
                 threadID: "bulk-\(index)",
                 latestSourceRecordID: "bulk-message-\(index)",
                 receivedAt: "2026-07-24T12:00:00Z",
-                title: "Bulk message \(index)"
+                title: "\(mailboxTitlePrefix) \(index)"
             )
         }
         let nextOffset = offset + count
+        let reportedTotal = growingImportTotals && importInProgress
+            ? min(totalThreads, nextOffset)
+            : totalThreads
+        let reportsAuthoritativeProgress = authoritativeGeneration != nil
+        let progressiveGeneration = authoritativeGeneration
+            ?? (importInProgress ? "bulk-import-generation-1" : nil)
         return MailboxResponse(
             label: .inbox,
-            totalThreads: totalThreads,
+            totalThreads: reportedTotal,
             nextCursor: forcedNextCursor ?? (nextOffset < totalThreads ? "bulk-cursor-\(nextOffset)" : nil),
             loadedThreads: count,
             windowDays: 90,
             sections: [GmailThreadSection(id: "bulk", title: "Bulk", rows: rows)],
             readyCount: totalThreads,
             pendingCount: 0,
-            mailboxRevision: revision,
+            mailboxRevision: revision ?? mailboxRevision,
             fullImportRunning: importInProgress,
-            fullImportCompleted: !importInProgress
+            fullImportCompleted: !importInProgress,
+            syncGeneration: progressiveGeneration,
+            phase: reportsAuthoritativeProgress ? "complete" : (importInProgress ? "importing_history_metadata" : nil),
+            initialTargetCount: reportsAuthoritativeProgress || importInProgress ? min(100, totalThreads) : nil,
+            initialMetadataCount: reportsAuthoritativeProgress || importInProgress ? min(100, totalThreads) : nil,
+            initialBodyTargetCount: reportsAuthoritativeProgress || importInProgress ? min(25, totalThreads) : nil,
+            initialBodyReadyCount: reportsAuthoritativeProgress || importInProgress ? min(25, totalThreads) : nil,
+            historyMetadataCount: reportsAuthoritativeProgress ? totalThreads : (importInProgress ? nextOffset : nil),
+            historyBodyReadyCount: reportsAuthoritativeProgress ? totalThreads : (importInProgress ? 25 : nil),
+            estimatedTotalCount: reportsAuthoritativeProgress || importInProgress ? totalThreads : nil,
+            initialWindowComplete: reportsAuthoritativeProgress || importInProgress ? true : nil,
+            historyMetadataComplete: reportsAuthoritativeProgress ? true : (importInProgress ? false : nil),
+            historyBodyComplete: reportsAuthoritativeProgress ? true : (importInProgress ? false : nil),
+            lastProgressAt: reportsAuthoritativeProgress || importInProgress
+                ? "2026-07-25T12:00:\(String(format: "%02d", min(59, offset / 10)))Z"
+                : nil
         )
     }
 }

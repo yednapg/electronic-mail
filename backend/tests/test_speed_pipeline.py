@@ -4,14 +4,14 @@ from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from googleapiclient.errors import HttpError
 from httplib2 import Response
 
 from app.core.error_safety import GoogleCredentialsUnavailable
 from app.db.jobs import renew_heartbeat
-from app.db.mail_groups import AppSessionSnapshotRecord, GmailMessageRecord, MailboxCursorError, MailboxThreadPage, MailGroupRecord, VisibleMailGroupRecord, decode_mailbox_cursor, encode_mailbox_cursor
+from app.db.mail_groups import AppSessionSnapshotRecord, GmailInitialWindowEntry, GmailMessageRecord, GmailSyncProgress, MailboxCursorError, MailboxThreadPage, MailGroupRecord, VisibleMailGroupRecord, decode_mailbox_cursor, encode_mailbox_cursor
 from app.schemas.domain import GoogleAuthState
 from app.services.auth import CurrentUser
 from app.services.gmail_importer import GmailHistoryTraversalLimit, _encode_full_mailbox_cursor, _list_history_delta, run_gmail_backfill, run_gmail_delta_sync, run_gmail_import_batch
@@ -188,33 +188,7 @@ class SpeedPipelineTests(unittest.TestCase):
         self.mock_importer_order.assert_not_called()
         mock_projection.assert_not_called()
 
-    @patch("app.services.gmail_importer._hydrate_thread_metadata_for_messages")
-    @patch("app.services.gmail_importer._ensure_gmail_reconciliation_started")
-    @patch("app.services.gmail_importer.enqueue_gmail_full_reconciliation")
-    @patch("app.services.gmail_importer.enqueue_job")
-    @patch("app.services.gmail_importer.mark_import_completed")
-    @patch("app.services.gmail_importer.upsert_gmail_messages")
-    @patch("app.services.gmail_importer._hydrate_messages")
-    @patch("app.services.gmail_importer._list_draft_messages")
-    @patch("app.services.gmail_importer._list_messages")
-    @patch("app.services.gmail_importer.mark_import_started")
-    @patch("app.services.gmail_importer.user_can_write_gmail", return_value=True)
-    def test_first_run_import_uses_90_day_mailbox_seeds_and_thread_history(
-        self,
-        _mock_can_write: Mock,
-        _mock_started: Mock,
-        mock_list: Mock,
-        mock_draft_list: Mock,
-        mock_hydrate: Mock,
-        mock_upsert: Mock,
-        mock_completed: Mock,
-        mock_enqueue: Mock,
-        mock_reconcile_enqueue: Mock,
-        mock_reconcile_start: Mock,
-        mock_thread_history: Mock,
-    ) -> None:
-        self.settings.ai_grouping_enabled = True
-        self.settings.openai_configured = True
+    def test_first_run_import_uses_one_global_recent_window_and_no_legacy_backfill(self) -> None:
         inbox = sample_message("inbox-1")
         sent = replace(sample_message("sent-1"), gmail_thread_id="thread-2", label_ids=["SENT"])
         draft = replace(sample_message("draft-1"), gmail_thread_id="thread-3", label_ids=["DRAFT"])
@@ -222,33 +196,99 @@ class SpeedPipelineTests(unittest.TestCase):
         trash = replace(sample_message("trash-1"), gmail_thread_id="thread-5", label_ids=["TRASH"])
         archived = replace(sample_message("archived-1"), gmail_thread_id="thread-6", label_ids=["IMPORTANT"])
         history = replace(sample_message("history-1"), gmail_thread_id="thread-1", label_ids=["SENT"])
-        mock_list.side_effect = [
-            {"messages": [{"id": "inbox-1"}]},
-            {"messages": [{"id": "sent-1"}]},
-            {"messages": [{"id": "spam-1"}]},
-            {"messages": [{"id": "trash-1"}]},
-            {"messages": [{"id": "archived-1"}]},
+        messages = [inbox, sent, draft, spam, trash, archived, history]
+        thread_ids = [f"thread-{index}" for index in range(1, 7)]
+        entries = [
+            GmailInitialWindowEntry(
+                user_id="user-1",
+                generation_id="generation-1",
+                gmail_thread_id=thread_id,
+                position=index,
+                message_count=0,
+                metadata_ready_at=None,
+                body_ready_at=None,
+            )
+            for index, thread_id in enumerate(thread_ids)
         ]
-        mock_draft_list.return_value = {"messages": [{"id": "draft-1"}]}
-        mock_hydrate.side_effect = [([inbox], "10"), ([sent], "11"), ([draft], "12"), ([spam], "13"), ([trash], "14"), ([archived], "15")]
-        mock_thread_history.return_value = ([history], "12")
-
-        imported = run_gmail_import_batch(self.settings, user_id="user-1", batch_size=500, first_run=True)
+        state = SimpleNamespace(
+            reconcile_generation="generation-1",
+            initial_target_count=0,
+            initial_window_complete=False,
+        )
+        discovered = GmailSyncProgress(
+            sync_generation="generation-1",
+            phase="importing_metadata",
+            initial_target_count=6,
+            initial_body_target_count=6,
+            estimated_total_count=6,
+        )
+        committed = GmailSyncProgress(
+            sync_generation="generation-1",
+            phase="hydrating_priority_content",
+            initial_target_count=6,
+            initial_metadata_count=6,
+            initial_body_target_count=6,
+            initial_window_complete=True,
+        )
+        with patch("app.services.gmail_importer.user_can_write_gmail", return_value=True), patch(
+            "app.services.gmail_importer.mark_import_started"
+        ), patch("app.services.gmail_importer.mark_import_error") as mark_error, patch(
+            "app.services.gmail_importer._ensure_gmail_reconciliation_started",
+            return_value=state,
+        ) as reconcile_start, patch(
+            "app.services.gmail_importer.start_gmail_sync_progress",
+            return_value=state,
+        ), patch(
+            "app.services.gmail_importer._list_initial_window_threads",
+            return_value={"threads": [{"id": item} for item in thread_ids], "resultSizeEstimate": 6},
+        ) as list_recent, patch(
+            "app.services.gmail_importer.initialize_gmail_initial_window",
+            return_value=discovered,
+        ) as initialize, patch(
+            "app.services.gmail_importer.get_import_state",
+            return_value=state,
+        ), patch(
+            "app.services.gmail_importer.list_pending_gmail_initial_window_entries",
+            return_value=entries,
+        ), patch(
+            "app.services.gmail_importer.list_gmail_initial_window_entries_needing_body_fetch",
+            side_effect=[[], entries],
+        ), patch(
+            "app.services.gmail_importer._hydrate_gmail_thread_ids_metadata",
+            return_value=messages,
+        ) as hydrate, patch(
+            "app.services.gmail_importer.commit_gmail_initial_window_metadata_batch",
+            return_value=committed,
+        ) as commit, patch(
+            "app.services.gmail_importer.rebuild_touched_mail_groups"
+        ), patch(
+            "app.services.gmail_importer.mark_import_completed"
+        ) as completed, patch(
+            "app.services.gmail_importer.enqueue_job"
+        ) as enqueue, patch(
+            "app.services.gmail_importer.enqueue_gmail_full_reconciliation"
+        ) as enqueue_reconcile:
+            imported = run_gmail_import_batch(self.settings, user_id="user-1", batch_size=500, first_run=True)
 
         self.assertEqual(imported, 7)
-        self.assertEqual([call.kwargs["label_ids"] for call in mock_list.call_args_list], [["INBOX"], ["SENT"], ["SPAM"], ["TRASH"], None])
-        mock_draft_list.assert_called_once_with(self.settings, user_id="user-1", batch_size=500, page_token=None)
-        mock_thread_history.assert_called_once()
-        self.assertEqual(mock_upsert.call_args.args[1], [inbox, sent, draft, spam, trash, archived, history])
-        self.assertIsNotNone(mock_completed.call_args.kwargs["full_backfill_cursor"])
-        self.assertFalse(mock_completed.call_args.kwargs["clear_full_backfill_cursor"])
-        self.assertTrue(mock_completed.call_args.kwargs["full_backfill_started"])
-        self.mock_importer_order.assert_not_called()
-        self.assertTrue(any(call.kwargs.get("kind") == "gmail_backfill" for call in mock_enqueue.call_args_list))
-        self.assertFalse(any(call.kwargs.get("kind") == "first_run_ai_grouping" for call in mock_enqueue.call_args_list))
-        mock_reconcile_start.assert_called_once_with(self.settings, user_id="user-1")
-        mock_reconcile_enqueue.assert_called_once_with(self.settings, user_id="user-1")
-        self.assertNotIn("last_history_id", mock_completed.call_args.kwargs)
+        list_recent.assert_called_once_with(self.settings, user_id="user-1")
+        initialize.assert_called_once()
+        hydrate.assert_called_once_with(
+            self.settings,
+            user_id="user-1",
+            gmail_thread_ids=thread_ids,
+            successful_thread_ids=ANY,
+            terminal_missing_thread_ids=ANY,
+        )
+        self.assertEqual(commit.call_args.kwargs["gmail_thread_ids"], thread_ids)
+        self.assertEqual(commit.call_args.kwargs["messages"], messages)
+        self.assertTrue(all(call.kwargs["kind"] == "gmail_body_fetch" for call in enqueue.call_args_list))
+        self.assertTrue(all(call.kwargs["priority"] == 90 for call in enqueue.call_args_list))
+        self.assertFalse(any(call.kwargs["kind"] == "gmail_backfill" for call in enqueue.call_args_list))
+        reconcile_start.assert_called_once_with(self.settings, user_id="user-1", use_thread_listing=True)
+        enqueue_reconcile.assert_called_once_with(self.settings, user_id="user-1")
+        completed.assert_called_once()
+        mark_error.assert_not_called()
 
     @patch("app.services.gmail_importer._list_messages")
     @patch("app.services.gmail_importer.enqueue_projection_refresh")
@@ -1996,10 +2036,12 @@ class SpeedPipelineTests(unittest.TestCase):
     @patch("app.services.mail_groups.count_active_jobs", return_value=0)
     @patch("app.services.mail_groups.enqueue_job")
     @patch("app.services.mail_groups.get_import_state")
+    @patch("app.services.mail_groups.activate_existing_gmail_progressive_sync")
     @patch("app.services.mail_groups.user_can_write_gmail", return_value=True)
     def test_recovery_queues_reconciliation_for_completed_backfill_with_untrusted_cursor(
         self,
         _can_write: Mock,
+        activate_progressive: Mock,
         get_state: Mock,
         enqueue: Mock,
         _active_jobs: Mock,
@@ -2014,6 +2056,17 @@ class SpeedPipelineTests(unittest.TestCase):
             last_history_id="102",
             history_cursor_authoritative=False,
             reconcile_generation=None,
+        )
+        activate_progressive.return_value = SimpleNamespace(
+            **{
+                **get_state.return_value.__dict__,
+                "sync_generation": "upgrade-generation",
+                "initial_body_target_count": 0,
+                "initial_body_ready_count": 0,
+                "initial_window_complete": True,
+                "history_metadata_complete": True,
+                "history_body_complete": True,
+            }
         )
 
         ensure_background_import_work(self.settings, user_id="user-1")

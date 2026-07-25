@@ -76,7 +76,20 @@ extension MailboxResponse {
             generatedAt: generatedAt,
             oldestImportedAt: oldestImportedAt,
             fullImportRunning: fullImportRunning,
-            fullImportCompleted: fullImportCompleted
+            fullImportCompleted: fullImportCompleted,
+            syncGeneration: syncGeneration,
+            phase: phase,
+            initialTargetCount: initialTargetCount,
+            initialMetadataCount: initialMetadataCount,
+            initialBodyTargetCount: initialBodyTargetCount,
+            initialBodyReadyCount: initialBodyReadyCount,
+            historyMetadataCount: historyMetadataCount,
+            historyBodyReadyCount: historyBodyReadyCount,
+            estimatedTotalCount: estimatedTotalCount,
+            initialWindowComplete: initialWindowComplete,
+            historyMetadataComplete: historyMetadataComplete,
+            historyBodyComplete: historyBodyComplete,
+            lastProgressAt: lastProgressAt
         )
     }
 
@@ -103,16 +116,20 @@ extension MailboxResponse {
         let visibleRows = nextSections.reduce(0) { $0 + $1.rows.count }
         let currentVisibleRows = sections.reduce(0) { $0 + $1.rows.count }
         let pageVisibleRows = page.sections.reduce(0) { $0 + $1.rows.count }
+        let total = max(visibleRows, max(totalThreads, page.totalThreads))
         let loaded = min(
-            page.totalThreads,
+            total,
             max(
                 visibleRows,
-                (loadedThreads ?? currentVisibleRows) + (page.loadedThreads ?? pageVisibleRows)
+                max(loadedThreads ?? currentVisibleRows, page.loadedThreads ?? pageVisibleRows)
             )
         )
+        let useOnlyPageProgress = syncGeneration != nil
+            && page.syncGeneration != nil
+            && syncGeneration != page.syncGeneration
         return MailboxResponse(
             label: label,
-            totalThreads: page.totalThreads,
+            totalThreads: total,
             unreadThreads: page.unreadThreads ?? unreadThreads,
             nextCursor: page.nextCursor,
             loadedThreads: loaded,
@@ -124,7 +141,20 @@ extension MailboxResponse {
             generatedAt: page.generatedAt ?? generatedAt,
             oldestImportedAt: page.oldestImportedAt ?? oldestImportedAt,
             fullImportRunning: page.fullImportRunning ?? fullImportRunning,
-            fullImportCompleted: page.fullImportCompleted ?? fullImportCompleted
+            fullImportCompleted: page.fullImportCompleted ?? fullImportCompleted,
+            syncGeneration: page.syncGeneration ?? syncGeneration,
+            phase: page.phase ?? phase,
+            initialTargetCount: useOnlyPageProgress ? page.initialTargetCount : Self.monotonicMax(initialTargetCount, page.initialTargetCount),
+            initialMetadataCount: useOnlyPageProgress ? page.initialMetadataCount : Self.monotonicMax(initialMetadataCount, page.initialMetadataCount),
+            initialBodyTargetCount: useOnlyPageProgress ? page.initialBodyTargetCount : Self.monotonicMax(initialBodyTargetCount, page.initialBodyTargetCount),
+            initialBodyReadyCount: useOnlyPageProgress ? page.initialBodyReadyCount : Self.monotonicMax(initialBodyReadyCount, page.initialBodyReadyCount),
+            historyMetadataCount: useOnlyPageProgress ? page.historyMetadataCount : Self.monotonicMax(historyMetadataCount, page.historyMetadataCount),
+            historyBodyReadyCount: useOnlyPageProgress ? page.historyBodyReadyCount : Self.monotonicMax(historyBodyReadyCount, page.historyBodyReadyCount),
+            estimatedTotalCount: useOnlyPageProgress ? page.estimatedTotalCount : Self.monotonicMax(estimatedTotalCount, page.estimatedTotalCount),
+            initialWindowComplete: useOnlyPageProgress ? page.initialWindowComplete : Self.monotonicCompletion(initialWindowComplete, page.initialWindowComplete),
+            historyMetadataComplete: useOnlyPageProgress ? page.historyMetadataComplete : Self.monotonicCompletion(historyMetadataComplete, page.historyMetadataComplete),
+            historyBodyComplete: useOnlyPageProgress ? page.historyBodyComplete : Self.monotonicCompletion(historyBodyComplete, page.historyBodyComplete),
+            lastProgressAt: page.lastProgressAt ?? lastProgressAt
         )
     }
 
@@ -132,10 +162,25 @@ extension MailboxResponse {
         afterRefreshingFirstPage firstPage: MailboxResponse,
         discardStalePages: Bool = false
     ) -> MailboxResponse {
-        let revisionChanged = mailboxRevision?.isEmpty == false
-            && firstPage.mailboxRevision?.isEmpty == false
-            && mailboxRevision != firstPage.mailboxRevision
-        if discardStalePages || revisionChanged {
+        let generationChanged = firstPage.syncGeneration != nil
+            && syncGeneration != firstPage.syncGeneration
+        if discardStalePages || generationChanged {
+            return firstPage
+        }
+        let currentRevision = mailboxRevision?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let firstPageRevision = firstPage.mailboxRevision?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let revisionChanged = currentRevision?.isEmpty == false
+            && firstPageRevision?.isEmpty == false
+            && currentRevision != firstPageRevision
+        let firstPageVisibleRows = firstPage.sections.reduce(0) { $0 + $1.rows.count }
+        let firstPageLoadedRows = max(firstPage.loadedThreads ?? firstPageVisibleRows, firstPageVisibleRows)
+        let firstPageIsAuthoritative = firstPage.nextCursor?.isEmpty != false
+            && firstPage.fullImportRunning != true
+            && firstPage.fullImportCompleted != false
+            && firstPageVisibleRows >= firstPage.totalThreads
+            && firstPageLoadedRows >= firstPage.totalThreads
+            && (firstPage.syncGeneration == nil || firstPage.historyMetadataComplete == true)
+        if revisionChanged, firstPageIsAuthoritative {
             return firstPage
         }
         var sectionOrder = firstPage.sections.map(\.id)
@@ -187,8 +232,35 @@ extension MailboxResponse {
             generatedAt: firstPage.generatedAt ?? generatedAt,
             oldestImportedAt: firstPage.oldestImportedAt ?? oldestImportedAt,
             fullImportRunning: firstPage.fullImportRunning ?? fullImportRunning,
-            fullImportCompleted: mergedImportCompleted
+            fullImportCompleted: mergedImportCompleted,
+            syncGeneration: firstPage.syncGeneration ?? syncGeneration,
+            phase: firstPage.phase ?? phase,
+            initialTargetCount: Self.monotonicMax(initialTargetCount, firstPage.initialTargetCount),
+            initialMetadataCount: Self.monotonicMax(initialMetadataCount, firstPage.initialMetadataCount),
+            initialBodyTargetCount: Self.monotonicMax(initialBodyTargetCount, firstPage.initialBodyTargetCount),
+            initialBodyReadyCount: Self.monotonicMax(initialBodyReadyCount, firstPage.initialBodyReadyCount),
+            historyMetadataCount: Self.monotonicMax(historyMetadataCount, firstPage.historyMetadataCount),
+            historyBodyReadyCount: Self.monotonicMax(historyBodyReadyCount, firstPage.historyBodyReadyCount),
+            estimatedTotalCount: Self.monotonicMax(estimatedTotalCount, firstPage.estimatedTotalCount),
+            initialWindowComplete: Self.monotonicCompletion(initialWindowComplete, firstPage.initialWindowComplete),
+            historyMetadataComplete: Self.monotonicCompletion(historyMetadataComplete, firstPage.historyMetadataComplete),
+            historyBodyComplete: Self.monotonicCompletion(historyBodyComplete, firstPage.historyBodyComplete),
+            lastProgressAt: firstPage.lastProgressAt ?? lastProgressAt
         )
+    }
+
+    private static func monotonicMax(_ lhs: Int?, _ rhs: Int?) -> Int? {
+        switch (lhs, rhs) {
+        case let (lhs?, rhs?): max(lhs, rhs)
+        case let (lhs?, nil): lhs
+        case let (nil, rhs?): rhs
+        case (nil, nil): nil
+        }
+    }
+
+    private static func monotonicCompletion(_ lhs: Bool?, _ rhs: Bool?) -> Bool? {
+        if lhs == true || rhs == true { return true }
+        return rhs ?? lhs
     }
 
     private static func insertMergeKeysIfUnique(for row: GmailThreadRow, into seen: inout Set<String>) -> Bool {
@@ -218,6 +290,223 @@ extension MailboxResponse {
         return keys
     }
 
+}
+
+/// Incremental cursor-chain merge state. The set/dictionary index is built
+/// once and each page only inspects its own rows. Keeping this state behind a
+/// dedicated actor moves the large-history preparation off the main actor.
+actor MailboxPageAccumulator {
+    struct Diagnostics: Equatable, Sendable {
+        let processedRowCount: Int
+        let snapshotBuildCount: Int
+    }
+
+    private var sectionOrder: [String] = []
+    private var rowsBySection: [String: [GmailThreadRow]] = [:]
+    private var titlesBySection: [String: String] = [:]
+    private var seenRowKeys: Set<String> = []
+    private var metadata: MailboxResponse
+    private var visibleRowCount = 0
+    private var processedRowCount = 0
+    private var snapshotBuildCount = 0
+
+    init(_ initial: MailboxResponse) {
+        metadata = Self.copy(initial, sections: [])
+        sectionOrder = initial.sections.map(\.id)
+        rowsBySection = Dictionary(uniqueKeysWithValues: initial.sections.map { ($0.id, $0.rows) })
+        titlesBySection = Dictionary(uniqueKeysWithValues: initial.sections.map { ($0.id, $0.title) })
+        for row in initial.sections.flatMap(\.rows) {
+            Self.insertMergeKeys(for: row, into: &seenRowKeys)
+        }
+        visibleRowCount = initial.sections.reduce(0) { $0 + $1.rows.count }
+        processedRowCount = visibleRowCount
+    }
+
+    func reset(to response: MailboxResponse) {
+        metadata = Self.copy(response, sections: [])
+        resetStorage(to: response)
+    }
+
+    func identitySnapshot() -> MailboxResponse {
+        metadata
+    }
+
+    func nextCursor() -> String? {
+        metadata.nextCursor
+    }
+
+    @discardableResult
+    func append(_ page: MailboxResponse) -> Int {
+        let currentVisibleRows = visibleRowCount
+        let pageVisibleRows = page.sections.reduce(0) { $0 + $1.rows.count }
+        processedRowCount += pageVisibleRows
+        var appendedRows = 0
+
+        for section in page.sections {
+            if rowsBySection[section.id] == nil {
+                sectionOrder.append(section.id)
+                rowsBySection[section.id] = []
+                titlesBySection[section.id] = section.title
+            }
+            for row in section.rows where Self.insertMergeKeysIfUnique(for: row, into: &seenRowKeys) {
+                rowsBySection[section.id, default: []].append(row)
+                appendedRows += 1
+            }
+        }
+        visibleRowCount += appendedRows
+
+        let total = max(visibleRowCount, max(metadata.totalThreads, page.totalThreads))
+        let loaded = min(
+            total,
+            max(
+                visibleRowCount,
+                max(metadata.loadedThreads ?? currentVisibleRows, page.loadedThreads ?? pageVisibleRows)
+            )
+        )
+        let useOnlyPageProgress = metadata.syncGeneration != nil
+            && page.syncGeneration != nil
+            && metadata.syncGeneration != page.syncGeneration
+        metadata = MailboxResponse(
+            label: metadata.label,
+            totalThreads: total,
+            unreadThreads: page.unreadThreads ?? metadata.unreadThreads,
+            nextCursor: page.nextCursor,
+            loadedThreads: loaded,
+            windowDays: page.windowDays ?? metadata.windowDays,
+            sections: [],
+            readyCount: page.readyCount ?? metadata.readyCount,
+            pendingCount: page.pendingCount ?? metadata.pendingCount,
+            mailboxRevision: page.mailboxRevision ?? metadata.mailboxRevision,
+            generatedAt: page.generatedAt ?? metadata.generatedAt,
+            oldestImportedAt: page.oldestImportedAt ?? metadata.oldestImportedAt,
+            fullImportRunning: page.fullImportRunning ?? metadata.fullImportRunning,
+            fullImportCompleted: page.fullImportCompleted ?? metadata.fullImportCompleted,
+            syncGeneration: page.syncGeneration ?? metadata.syncGeneration,
+            phase: page.phase ?? metadata.phase,
+            initialTargetCount: useOnlyPageProgress ? page.initialTargetCount : Self.monotonicMax(metadata.initialTargetCount, page.initialTargetCount),
+            initialMetadataCount: useOnlyPageProgress ? page.initialMetadataCount : Self.monotonicMax(metadata.initialMetadataCount, page.initialMetadataCount),
+            initialBodyTargetCount: useOnlyPageProgress ? page.initialBodyTargetCount : Self.monotonicMax(metadata.initialBodyTargetCount, page.initialBodyTargetCount),
+            initialBodyReadyCount: useOnlyPageProgress ? page.initialBodyReadyCount : Self.monotonicMax(metadata.initialBodyReadyCount, page.initialBodyReadyCount),
+            historyMetadataCount: useOnlyPageProgress ? page.historyMetadataCount : Self.monotonicMax(metadata.historyMetadataCount, page.historyMetadataCount),
+            historyBodyReadyCount: useOnlyPageProgress ? page.historyBodyReadyCount : Self.monotonicMax(metadata.historyBodyReadyCount, page.historyBodyReadyCount),
+            estimatedTotalCount: useOnlyPageProgress ? page.estimatedTotalCount : Self.monotonicMax(metadata.estimatedTotalCount, page.estimatedTotalCount),
+            initialWindowComplete: useOnlyPageProgress ? page.initialWindowComplete : Self.monotonicCompletion(metadata.initialWindowComplete, page.initialWindowComplete),
+            historyMetadataComplete: useOnlyPageProgress ? page.historyMetadataComplete : Self.monotonicCompletion(metadata.historyMetadataComplete, page.historyMetadataComplete),
+            historyBodyComplete: useOnlyPageProgress ? page.historyBodyComplete : Self.monotonicCompletion(metadata.historyBodyComplete, page.historyBodyComplete),
+            lastProgressAt: page.lastProgressAt ?? metadata.lastProgressAt
+        )
+        return appendedRows
+    }
+
+    func snapshot() -> MailboxResponse {
+        snapshotBuildCount += 1
+        let sections = sectionOrder.map { sectionID in
+            GmailThreadSection(
+                id: sectionID,
+                title: titlesBySection[sectionID] ?? "",
+                rows: rowsBySection[sectionID] ?? []
+            )
+        }
+        return Self.copy(metadata, sections: sections)
+    }
+
+    func diagnostics() -> Diagnostics {
+        Diagnostics(
+            processedRowCount: processedRowCount,
+            snapshotBuildCount: snapshotBuildCount
+        )
+    }
+
+    private func resetStorage(to response: MailboxResponse) {
+        sectionOrder = response.sections.map(\.id)
+        rowsBySection = Dictionary(uniqueKeysWithValues: response.sections.map { ($0.id, $0.rows) })
+        titlesBySection = Dictionary(uniqueKeysWithValues: response.sections.map { ($0.id, $0.title) })
+        seenRowKeys = []
+        for row in response.sections.flatMap(\.rows) {
+            Self.insertMergeKeys(for: row, into: &seenRowKeys)
+        }
+        visibleRowCount = response.sections.reduce(0) { $0 + $1.rows.count }
+        processedRowCount = visibleRowCount
+    }
+
+    private static func copy(
+        _ response: MailboxResponse,
+        sections: [GmailThreadSection]
+    ) -> MailboxResponse {
+        MailboxResponse(
+            label: response.label,
+            totalThreads: response.totalThreads,
+            unreadThreads: response.unreadThreads,
+            nextCursor: response.nextCursor,
+            loadedThreads: response.loadedThreads,
+            windowDays: response.windowDays,
+            sections: sections,
+            readyCount: response.readyCount,
+            pendingCount: response.pendingCount,
+            mailboxRevision: response.mailboxRevision,
+            generatedAt: response.generatedAt,
+            oldestImportedAt: response.oldestImportedAt,
+            fullImportRunning: response.fullImportRunning,
+            fullImportCompleted: response.fullImportCompleted,
+            syncGeneration: response.syncGeneration,
+            phase: response.phase,
+            initialTargetCount: response.initialTargetCount,
+            initialMetadataCount: response.initialMetadataCount,
+            initialBodyTargetCount: response.initialBodyTargetCount,
+            initialBodyReadyCount: response.initialBodyReadyCount,
+            historyMetadataCount: response.historyMetadataCount,
+            historyBodyReadyCount: response.historyBodyReadyCount,
+            estimatedTotalCount: response.estimatedTotalCount,
+            initialWindowComplete: response.initialWindowComplete,
+            historyMetadataComplete: response.historyMetadataComplete,
+            historyBodyComplete: response.historyBodyComplete,
+            lastProgressAt: response.lastProgressAt
+        )
+    }
+
+    private static func monotonicMax(_ lhs: Int?, _ rhs: Int?) -> Int? {
+        switch (lhs, rhs) {
+        case let (lhs?, rhs?): max(lhs, rhs)
+        case let (lhs?, nil): lhs
+        case let (nil, rhs?): rhs
+        case (nil, nil): nil
+        }
+    }
+
+    private static func monotonicCompletion(_ lhs: Bool?, _ rhs: Bool?) -> Bool? {
+        if lhs == true || rhs == true { return true }
+        return rhs ?? lhs
+    }
+
+    private static func insertMergeKeysIfUnique(
+        for row: GmailThreadRow,
+        into seen: inout Set<String>
+    ) -> Bool {
+        let keys = mergeKeys(for: row)
+        if keys.contains(where: seen.contains) {
+            return false
+        }
+        seen.formUnion(keys)
+        return true
+    }
+
+    private static func insertMergeKeys(for row: GmailThreadRow, into seen: inout Set<String>) {
+        seen.formUnion(mergeKeys(for: row))
+    }
+
+    private static func mergeKeys(for row: GmailThreadRow) -> Set<String> {
+        var keys: Set<String> = ["thread:\(row.threadID)", "source:\(row.latestSourceRecordID)"]
+        if let entityID = row.entityID, !entityID.isEmpty {
+            keys.insert("entity:\(entityID)")
+        }
+        if let aiGroupID = row.aiGroupID, !aiGroupID.isEmpty {
+            keys.insert("group:\(aiGroupID)")
+        }
+        for update in row.lifecycleUpdates {
+            keys.insert("source:\(update.sourceRecordID)")
+        }
+        return keys
+    }
 }
 
 extension GmailThreadRow {
@@ -285,6 +574,8 @@ extension GmailThreadRow {
             sender: sender,
             participants: participants,
             messageCount: messageCount,
+            bodyReady: bodyReady,
+            contentRevision: contentRevision,
             summary: summary,
             aiGroupID: aiGroupID,
             aiTitle: aiTitle,
@@ -371,7 +662,8 @@ extension ThreadReaderResponse {
             limit: max(limit, page.limit),
             offset: 0,
             hasMore: page.hasMore,
-            messages: appendedMessages
+            messages: appendedMessages,
+            contentRevision: page.contentRevision ?? contentRevision
         )
     }
 }

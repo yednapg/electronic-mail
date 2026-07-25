@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import replace
 import json
 import os
 import unittest
@@ -13,6 +14,7 @@ from sqlalchemy import text
 from app.db import repository
 from app.db.mail_groups import (
     GmailMessageRecord,
+    _message_params,
     force_update_gmail_message_labels,
     list_messages_by_ids,
     upsert_gmail_messages,
@@ -49,6 +51,51 @@ def _message(
 
 
 class GmailMessageMetadataOrderingUnitTests(unittest.TestCase):
+    def test_attachment_descriptor_projection_does_not_retain_huge_body_bytes(self) -> None:
+        huge_body = "A" * 2_000_000
+        message = replace(
+            _message(),
+            raw_payload={
+                "payload": {
+                    "mimeType": "multipart/mixed",
+                    "parts": [
+                        {
+                            "partId": "1",
+                            "mimeType": "text/html",
+                            "body": {"data": huge_body},
+                        },
+                        {
+                            "partId": "2",
+                            "mimeType": "application/pdf",
+                            "filename": "statement.pdf",
+                            "headers": [
+                                {"name": "Content-Disposition", "value": "attachment"}
+                            ],
+                            "body": {"attachmentId": "attachment-1", "size": 4096},
+                        },
+                    ],
+                }
+            },
+        )
+
+        params = _message_params(message)
+        descriptors = json.loads(str(params["attachment_descriptors_json"]))
+
+        self.assertGreater(len(str(params["raw_payload_json"])), len(huge_body))
+        self.assertLess(len(str(params["attachment_descriptors_json"])), 500)
+        self.assertEqual(
+            descriptors,
+            [
+                {
+                    "filename": "statement.pdf",
+                    "mime_type": "application/pdf",
+                    "size": 4096,
+                    "attachment_id": "attachment-1",
+                    "part_id": "2",
+                }
+            ],
+        )
+
     def test_provider_upsert_only_replaces_labels_at_a_strictly_newer_numeric_history(self) -> None:
         connection = _RecordingConnection()
         with (
@@ -61,7 +108,9 @@ class GmailMessageMetadataOrderingUnitTests(unittest.TestCase):
             upsert_gmail_messages("postgresql://example/db", [_message()])
 
         sql = connection.calls[0][0]
-        self.assertEqual(sql.count("excluded.history_id::NUMERIC > gmail_messages.history_id::NUMERIC"), 2)
+        # The same strict-history predicate governs both the stored provider
+        # fields and the reader content-revision clock.
+        self.assertEqual(sql.count("excluded.history_id::NUMERIC > gmail_messages.history_id::NUMERIC"), 4)
         self.assertIn("excluded.history_id !~ '^[0-9]+$'", sql)
         self.assertIn("ELSE gmail_messages.label_ids_json", sql)
 

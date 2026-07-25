@@ -7,10 +7,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import getaddresses, parseaddr
 import hashlib
+import json
 import logging
 import re
 from typing import Any
 from urllib.parse import quote
+from uuid import uuid4
 
 from app.core.config import Settings
 from app.db.jobs import count_active_jobs, enqueue_job, get_queue_health
@@ -20,6 +22,7 @@ from app.db.mail_groups import (
     MailGroupRecord,
     ManualTaskRecord,
     VisibleMailGroupRecord,
+    activate_existing_gmail_progressive_sync,
     count_mailbox_threads,
     count_mail_groups,
     count_mail_groups_by_enrichment_status,
@@ -29,6 +32,7 @@ from app.db.mail_groups import (
     get_app_session_snapshot,
     get_import_state,
     gmail_history_cursor_is_authoritative,
+    get_gmail_thread_message_page,
     get_latest_entity_outcomes,
     latest_mail_group_ai_error,
     latest_gmail_mailbox_revision,
@@ -36,6 +40,8 @@ from app.db.mail_groups import (
     get_mail_group_detail,
     list_dashboard_mail_groups,
     list_group_messages,
+    list_gmail_initial_window_positions,
+    list_gmail_initial_window_entries_needing_body_fetch,
     list_mailbox_thread_page,
     list_mail_groups_for_gmail_threads,
     list_mail_groups,
@@ -98,14 +104,14 @@ from app.services.attention_classifier import (
 )
 from app.services.integrations.google import GMAIL_FULL_SCOPE, check_user_google_credentials, missing_google_scopes
 from app.services.mailbox_events import GMAIL_PUBSUB_RECEIVED, latest_event
+from app.services.remote_images import rewrite_external_image_sources
 
-FIRST_BATCH_SIZE = 50
+FIRST_BATCH_SIZE = 25
 BACKFILL_BATCH_SIZE = 30
 MAILBOX_REBUILD_LIMIT = 5000
 MAIL_GROUP_ENRICH_BATCH_SIZE = 25
 DASHBOARD_DAYS = 14
 RECENT_VISIBLE_DAYS = 90
-BODY_WARMUP_GROUP_LIMIT = 24
 APP_SESSION_PROJECTION_VERSION = "20260609_visible_group_projection_v1"
 GENERIC_SENDER_SLUGS = {"alert", "alerts", "info", "mail", "no-reply", "noreply", "notification", "notifications", "support", "team"}
 MAILBOX_DISPLAY_CLUSTER_WORKFLOW_TYPES = {
@@ -149,6 +155,42 @@ def _full_import_status(
         completed,
         str(backfill_completed_at) if completed else None,
     )
+
+
+def _sync_progress_kwargs(state: Any) -> dict[str, Any]:
+    """Project additive progress fields from old or new import-state rows."""
+    generation = getattr(state, "sync_generation", None) if state else None
+    if not generation:
+        return {
+            "sync_generation": None,
+            "phase": None,
+            "initial_target_count": None,
+            "initial_metadata_count": None,
+            "initial_body_target_count": None,
+            "initial_body_ready_count": None,
+            "history_metadata_count": None,
+            "history_body_ready_count": None,
+            "estimated_total_count": None,
+            "initial_window_complete": None,
+            "history_metadata_complete": None,
+            "history_body_complete": None,
+            "last_progress_at": None,
+        }
+    return {
+        "sync_generation": str(generation),
+        "phase": getattr(state, "phase", None),
+        "initial_target_count": int(getattr(state, "initial_target_count", 0) or 0),
+        "initial_metadata_count": int(getattr(state, "initial_metadata_count", 0) or 0),
+        "initial_body_target_count": int(getattr(state, "initial_body_target_count", 0) or 0),
+        "initial_body_ready_count": int(getattr(state, "initial_body_ready_count", 0) or 0),
+        "history_metadata_count": int(getattr(state, "history_metadata_count", 0) or 0),
+        "history_body_ready_count": int(getattr(state, "history_body_ready_count", 0) or 0),
+        "estimated_total_count": int(getattr(state, "estimated_total_count", 0) or 0),
+        "initial_window_complete": bool(getattr(state, "initial_window_complete", False)),
+        "history_metadata_complete": bool(getattr(state, "history_metadata_complete", False)),
+        "history_body_complete": bool(getattr(state, "history_body_complete", False)),
+        "last_progress_at": getattr(state, "last_progress_at", None),
+    }
 
 
 MAILBOX_DISPLAY_CLUSTER_PREFIX = "mailbox-cluster:"
@@ -305,7 +347,73 @@ def ensure_background_import_work(settings: Settings, *, user_id: str) -> None:
     if not user_can_write_gmail(database_url, user_id=user_id):
         return
     state = get_import_state(database_url, user_id=user_id)
+    if (
+        state is not None
+        and state.first_batch_imported_at
+        and not getattr(state, "sync_generation", None)
+    ):
+        generation_id = str(getattr(state, "reconcile_generation", None) or uuid4())
+        state = activate_existing_gmail_progressive_sync(
+            database_url,
+            user_id=user_id,
+            generation_id=generation_id,
+            history_metadata_complete=bool(
+                getattr(state, "full_backfill_completed_at", None)
+            ),
+        ) or state
     reconcile_generation = str(getattr(state, "reconcile_generation", None) or "")
+    sync_generation = str(getattr(state, "sync_generation", None) or "")
+    if (
+        state
+        and sync_generation
+        and not bool(getattr(state, "history_body_complete", False))
+        and not count_active_jobs(
+            database_url,
+            user_id=user_id,
+            kinds=["gmail_body_fetch"],
+        )
+    ):
+        for entry in list_gmail_initial_window_entries_needing_body_fetch(
+            database_url,
+            user_id=user_id,
+            generation_id=sync_generation,
+            limit=100,
+        ):
+            enqueue_job(
+                database_url,
+                kind="gmail_body_fetch",
+                queue="reader",
+                user_id=user_id,
+                dedupe_key=f"gmail-body-fetch-thread:{user_id}:{entry.gmail_thread_id}",
+                priority=90 if entry.position < 25 else 60,
+                payload={
+                    "user_id": user_id,
+                    "gmail_thread_id": entry.gmail_thread_id,
+                    "sync_generation": sync_generation,
+                },
+                wake_existing=False,
+            )
+    if (
+        reconcile_generation
+        and sync_generation == reconcile_generation
+        and not bool(getattr(state, "initial_window_complete", False))
+    ):
+        active_initial_jobs = count_active_jobs(
+            database_url,
+            user_id=user_id,
+            kinds=["gmail_import_batch"],
+        )
+        if not active_initial_jobs:
+            enqueue_job(
+                database_url,
+                kind="gmail_import_batch",
+                queue="critical",
+                user_id=user_id,
+                dedupe_key=f"first-run:{user_id}:{sync_generation}:resume",
+                priority=100,
+                payload={"user_id": user_id, "batch_size": FIRST_BATCH_SIZE, "first_run": True},
+            )
+        return
     active_reconciliations = count_active_jobs(
         database_url,
         user_id=user_id,
@@ -319,11 +427,27 @@ def ensure_background_import_work(settings: Settings, *, user_id: str) -> None:
                 queue="slow",
                 user_id=user_id,
                 dedupe_key=f"gmail-full-reconcile:{user_id}:resume:{reconcile_generation}",
-                priority=90,
+                priority=100,
                 payload={"user_id": user_id, "batch_size": 250},
             )
-        return
     if (
+        state is not None
+        and sync_generation
+        and not bool(getattr(state, "history_metadata_complete", False))
+        and not reconcile_generation
+        and not active_reconciliations
+    ):
+        enqueue_job(
+            database_url,
+            kind="gmail_full_reconcile",
+            queue="slow",
+            user_id=user_id,
+            dedupe_key=f"gmail-full-reconcile:{user_id}:progressive-upgrade:{sync_generation}",
+            priority=100,
+            payload={"user_id": user_id, "batch_size": 100},
+        )
+        active_reconciliations = 1
+    elif (
         state is not None
         and state.first_batch_imported_at
         and not gmail_history_cursor_is_authoritative(state)
@@ -335,7 +459,7 @@ def ensure_background_import_work(settings: Settings, *, user_id: str) -> None:
             queue="slow",
             user_id=user_id,
             dedupe_key=f"gmail-full-reconcile:{user_id}:trigger",
-            priority=90,
+            priority=100,
             payload={"user_id": user_id, "batch_size": 250},
         )
     if state is None or not state.first_batch_imported_at:
@@ -360,7 +484,20 @@ def ensure_background_import_work(settings: Settings, *, user_id: str) -> None:
         )
     active_backfills = count_active_jobs(database_url, user_id=user_id, kinds=["gmail_backfill"])
     full_backfill_completed_at = getattr(state, "full_backfill_completed_at", None) if state is not None else None
-    full_backfill_needed = bool(state and state.first_batch_imported_at and not full_backfill_completed_at)
+    legacy_backfill_started = bool(
+        state
+        and (
+            getattr(state, "full_backfill_started_at", None)
+            or getattr(state, "full_backfill_cursor", None)
+            or active_backfills
+        )
+    )
+    full_backfill_needed = bool(
+        state
+        and state.first_batch_imported_at
+        and not full_backfill_completed_at
+        and legacy_backfill_started
+    )
     if full_backfill_needed and not active_backfills:
         enqueue_job(
             database_url,
@@ -370,6 +507,31 @@ def ensure_background_import_work(settings: Settings, *, user_id: str) -> None:
             dedupe_key=f"gmail-backfill:{user_id}:resume",
             priority=80,
             payload={"user_id": user_id, "batch_size": BACKFILL_BATCH_SIZE},
+        )
+    body_backfill_needed = bool(
+        state
+        and sync_generation
+        and getattr(state, "history_metadata_complete", False)
+        and (
+            not getattr(state, "history_body_complete", False)
+            or not getattr(state, "attachment_descriptors_complete", True)
+        )
+    )
+    if body_backfill_needed and not count_active_jobs(
+        database_url,
+        user_id=user_id,
+        kinds=["gmail_body_backfill"],
+    ):
+        enqueue_job(
+            database_url,
+            kind="gmail_body_backfill",
+            queue="slow",
+            user_id=user_id,
+            dedupe_key=f"gmail-body-backfill:{user_id}",
+            priority=40,
+            max_attempts=10,
+            payload={"user_id": user_id, "batch_size": 25},
+            wake_existing=False,
         )
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user_id)
     if _ai_grouping_enabled(settings) and status_counts.get("pending", 0) > 0:
@@ -424,6 +586,7 @@ def build_app_session_response(settings: Settings, *, user) -> AppSessionRespons
         update={
             "full_import_running": full_import_running,
             "full_import_completed": full_import_completed,
+            **_sync_progress_kwargs(import_state),
         }
     )
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user.id)
@@ -450,6 +613,7 @@ def build_app_session_response(settings: Settings, *, user) -> AppSessionRespons
                 if not ai_grouping_enabled and legacy_ai_error and sync.last_error == legacy_ai_error
                 else sync.last_error or (last_ai_error if ai_grouping_enabled and status_counts.get("ready", 0) == 0 else None)
             ),
+            **_sync_progress_kwargs(import_state),
         }
     )
     readiness = _readiness_from_snapshot(settings, user=user, dashboard=dashboard, mailbox=mailbox, sync=sync)
@@ -497,6 +661,7 @@ def _empty_app_session_response(settings: Settings, *, user, auth: GoogleAuthSta
         total_threads=0,
         full_import_running=full_import_running,
         full_import_completed=full_import_completed,
+        **_sync_progress_kwargs(state),
     )
     sync = AppSessionSyncState(
         last_sync_at=None,
@@ -507,6 +672,7 @@ def _empty_app_session_response(settings: Settings, *, user, auth: GoogleAuthSta
         full_import_running=full_import_running,
         full_import_completed=full_import_completed,
         full_import_completed_at=full_import_completed_at,
+        **_sync_progress_kwargs(state),
     )
     readiness = _readiness_from_snapshot(settings, user=user, dashboard=dashboard, mailbox=mailbox, sync=sync)
     return AppSessionResponse(
@@ -563,6 +729,7 @@ def _readiness_from_snapshot(
         full_import_completed=sync.full_import_completed,
         user_display_name=display_name,
         error_message=sync.last_error if sync.last_error and not ready_to_enter else None,
+        **_sync_progress_kwargs(state),
     )
 
 
@@ -578,7 +745,10 @@ def refresh_app_session_snapshot(settings: Settings, *, user_id: str) -> AppSess
     auth = _google_auth_state(settings, user_id=user.id)
     dashboard = build_dashboard_response(settings, user_id=user.id, auth=auth, profile=user.profile)
     mailbox = build_mailbox_response(settings, user_id=user.id, label="inbox", limit=100)
-    _enqueue_body_fetch_for_mailbox_rows(settings, user_id=user.id, mailbox=mailbox, limit=BODY_WARMUP_GROUP_LIMIT, priority=70)
+    # Progressive bootstrap owns body priority: initial 25 at 90, remaining
+    # initial window at 60, and history via one resumable slow job. Merely
+    # building an app-session snapshot must not create a second Inbox-shaped
+    # warm-up queue that changes those global Gmail priorities.
     ai_grouping_enabled = _ai_grouping_enabled(settings)
     status_counts = count_mail_groups_by_enrichment_status(database_url, user_id=user.id)
     last_ai_error = latest_mail_group_ai_error(database_url, user_id=user.id) if ai_grouping_enabled else None
@@ -598,6 +768,7 @@ def refresh_app_session_snapshot(settings: Settings, *, user_id: str) -> AppSess
         ),
         pending_action_count=count_pending_thread_actions(database_url, user_id=user.id),
         last_ai_error=last_ai_error,
+        **_sync_progress_kwargs(state),
     )
     upsert_app_session_snapshot(
         database_url,
@@ -747,6 +918,7 @@ def build_post_login_readiness_response(
         full_import_completed=full_import_completed,
         user_display_name=display_name,
         error_message=state.last_sync_error if state and state.last_sync_error and not ready_to_enter else None,
+        **_sync_progress_kwargs(state),
     )
 
 
@@ -1251,6 +1423,15 @@ def build_mailbox_response(
         search_query=search_query,
     )
     threads = page.threads
+    initial_window_positions = (
+        list_gmail_initial_window_positions(
+            database_url,
+            user_id=user_id,
+            gmail_thread_ids=[thread_id for thread_id, _ in threads],
+        )
+        if state is not None and getattr(state, "sync_generation", None)
+        else {}
+    )
     thread_ai_groups = (
         list_mail_groups_for_gmail_threads(
             database_url,
@@ -1295,6 +1476,10 @@ def build_mailbox_response(
                 continue
         rendered_thread_ids.add(thread_id)
         row = _gmail_row_from_canonical_thread(thread_id, messages, mailbox_label, thread_ai_groups.get(thread_id))
+        if thread_id in initial_window_positions:
+            row = row.model_copy(
+                update={"initial_window_position": initial_window_positions[thread_id]}
+            )
         if _ai_grouping_enabled(settings):
             entries.append(
                 MailboxDisplayClusterEntry(
@@ -1340,6 +1525,7 @@ def build_mailbox_response(
         oldest_imported_at=oldest_imported_message_at(database_url, user_id=user_id),
         full_import_running=full_import_running,
         full_import_completed=full_import_completed,
+        **_sync_progress_kwargs(state),
     )
 
 
@@ -1446,6 +1632,7 @@ def build_mailbox_sync_state(settings: Settings, *, user_id: str) -> MailboxSync
         full_import_completed_at=full_import_completed_at,
         pending_action_count=count_pending_thread_actions(database_url, user_id=user_id),
         last_ai_error=None,
+        **_sync_progress_kwargs(state),
     )
 
 
@@ -1471,13 +1658,89 @@ def build_mailbox_realtime_state(settings: Settings, *, user_id: str) -> Mailbox
     )
 
 
-def build_group_detail_response(settings: Settings, *, user_id: str, group_id: str, limit: int = 50, offset: int = 0) -> ThreadReaderResponse | None:
+def build_group_detail_response(
+    settings: Settings,
+    *,
+    user_id: str,
+    group_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    promote_body_fetch: bool = True,
+    maximum_snapshot_messages: int | None = None,
+    maximum_snapshot_stored_bytes: int | None = None,
+) -> ThreadReaderResponse | None:
     database_url = str(settings.database_path)
     if _is_mailbox_display_cluster_id(group_id):
         if not _ai_grouping_enabled(settings):
             return None
-        return _build_mailbox_display_cluster_detail_response(settings, user_id=user_id, cluster_id=group_id, limit=limit, offset=offset)
-    canonical_messages = list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=group_id)
+        return _build_mailbox_display_cluster_detail_response(
+            settings,
+            user_id=user_id,
+            cluster_id=group_id,
+            limit=limit,
+            offset=offset,
+            promote_body_fetch=promote_body_fetch,
+        )
+
+    # The public single-thread reader is deliberately paginated in Postgres.
+    # Large conversations are a valid Gmail shape (mailing lists can have tens
+    # of thousands of messages), so slicing a fully materialized Python list
+    # here would turn the native client's bounded fallback into an unbounded
+    # API read. Batch snapshots retain the all-or-nothing bounded path below.
+    if maximum_snapshot_messages is None and maximum_snapshot_stored_bytes is None:
+        page = get_gmail_thread_message_page(
+            database_url,
+            user_id=user_id,
+            gmail_thread_id=group_id,
+            limit=limit,
+            offset=offset,
+        )
+        if page is not None:
+            ai_group = (
+                list_mail_groups_for_gmail_threads(database_url, user_id=user_id, gmail_thread_ids=[group_id]).get(group_id)
+                if _ai_grouping_enabled(settings)
+                else None
+            )
+            if _rebuild_missing_render_documents(settings, user_id=user_id, messages=page.messages):
+                page = get_gmail_thread_message_page(
+                    database_url,
+                    user_id=user_id,
+                    gmail_thread_id=group_id,
+                    limit=limit,
+                    offset=offset,
+                ) or page
+            if promote_body_fetch and page.incomplete_body_count > 0:
+                _enqueue_reader_body_fetch_best_effort(
+                    settings,
+                    user_id=user_id,
+                    gmail_thread_id=group_id,
+                    priority=100,
+                )
+            return ThreadReaderResponse(
+                entity_id=ai_group.id if ai_group else group_id,
+                user_id=user_id,
+                source="gmail",
+                gmail_thread_id=group_id,
+                subject=page.latest_subject,
+                title=(ai_group.ai_title if ai_group else None) or page.latest_subject,
+                summary=ai_group.ai_summary if ai_group else None,
+                total_messages=page.total_messages,
+                limit=limit,
+                offset=offset,
+                has_more=offset + len(page.messages) < page.total_messages,
+                messages=[_thread_message_from_gmail(message, settings=settings) for message in page.messages],
+                content_revision=page.content_revision,
+            )
+        if not _ai_grouping_enabled(settings):
+            return None
+
+    canonical_messages = list_messages_for_gmail_thread(
+        database_url,
+        user_id=user_id,
+        gmail_thread_id=group_id,
+        maximum_messages=maximum_snapshot_messages,
+        maximum_stored_bytes=maximum_snapshot_stored_bytes,
+    )
     if canonical_messages:
         ai_group = (
             list_mail_groups_for_gmail_threads(database_url, user_id=user_id, gmail_thread_ids=[group_id]).get(group_id)
@@ -1485,13 +1748,19 @@ def build_group_detail_response(settings: Settings, *, user_id: str, group_id: s
             else None
         )
         if _rebuild_missing_render_documents(settings, user_id=user_id, messages=canonical_messages):
-            canonical_messages = list_messages_for_gmail_thread(database_url, user_id=user_id, gmail_thread_id=group_id) or canonical_messages
-        if any(_needs_body_fetch(message) for message in canonical_messages):
+            canonical_messages = list_messages_for_gmail_thread(
+                database_url,
+                user_id=user_id,
+                gmail_thread_id=group_id,
+                maximum_messages=maximum_snapshot_messages,
+                maximum_stored_bytes=maximum_snapshot_stored_bytes,
+            ) or canonical_messages
+        if promote_body_fetch and any(_needs_body_fetch(message) for message in canonical_messages):
             _enqueue_reader_body_fetch_best_effort(
                 settings,
                 user_id=user_id,
                 gmail_thread_id=group_id,
-                priority=90,
+                priority=100,
             )
         messages = canonical_messages[offset : offset + limit]
         latest_message = max(canonical_messages, key=lambda item: item.internal_date or item.updated_at)
@@ -1507,7 +1776,8 @@ def build_group_detail_response(settings: Settings, *, user_id: str, group_id: s
             limit=limit,
             offset=offset,
             has_more=offset + len(messages) < len(canonical_messages),
-            messages=[_thread_message_from_gmail(message) for message in messages],
+            messages=[_thread_message_from_gmail(message, settings=settings) for message in messages],
+            content_revision=_gmail_thread_content_revision(canonical_messages),
         )
 
     if not _ai_grouping_enabled(settings):
@@ -1517,12 +1787,12 @@ def build_group_detail_response(settings: Settings, *, user_id: str, group_id: s
         return None
     if _rebuild_missing_render_documents(settings, user_id=user_id, messages=detail.messages):
         detail = get_mail_group_detail(database_url, user_id=user_id, group_id=group_id) or detail
-    if any(_needs_body_fetch(message) for message in detail.messages):
+    if promote_body_fetch and any(_needs_body_fetch(message) for message in detail.messages):
         _enqueue_reader_body_fetch_best_effort(
             settings,
             user_id=user_id,
             group_id=group_id,
-            priority=90,
+            priority=100,
         )
     detail_messages = _expand_group_messages_to_canonical_threads(database_url, user_id=user_id, messages=detail.messages)
     if _rebuild_missing_render_documents(settings, user_id=user_id, messages=detail_messages):
@@ -1540,7 +1810,8 @@ def build_group_detail_response(settings: Settings, *, user_id: str, group_id: s
         limit=limit,
         offset=offset,
         has_more=offset + len(messages) < len(detail_messages),
-        messages=[_thread_message_from_gmail(message) for message in messages],
+        messages=[_thread_message_from_gmail(message, settings=settings) for message in messages],
+        content_revision=_gmail_thread_content_revision(detail_messages),
     )
 
 
@@ -1551,6 +1822,7 @@ def _build_mailbox_display_cluster_detail_response(
     cluster_id: str,
     limit: int,
     offset: int,
+    promote_body_fetch: bool = True,
 ) -> ThreadReaderResponse | None:
     database_url = str(settings.database_path)
     for mailbox_label in ("inbox", "all"):
@@ -1578,9 +1850,9 @@ def _build_mailbox_display_cluster_detail_response(
                 ],
                 key=lambda item: item.internal_date or item.updated_at or "",
             )
-        if any(_needs_body_fetch(message) for message in detail_messages):
+        if promote_body_fetch and any(_needs_body_fetch(message) for message in detail_messages):
             for thread_id in sorted(thread_ids):
-                _enqueue_body_fetch_for_gmail_thread(settings, user_id=user_id, gmail_thread_id=thread_id, priority=90)
+                _enqueue_body_fetch_for_gmail_thread(settings, user_id=user_id, gmail_thread_id=thread_id, priority=100)
         row = _gmail_row_from_mailbox_display_cluster(
             _mailbox_display_cluster_key(thread_id=next(iter(thread_ids)), messages=detail_messages, mailbox_label=mailbox_label) or cluster_id,
             detail_messages,
@@ -1599,7 +1871,8 @@ def _build_mailbox_display_cluster_detail_response(
             limit=limit,
             offset=offset,
             has_more=offset + len(messages) < len(detail_messages),
-            messages=[_thread_message_from_gmail(message) for message in messages],
+            messages=[_thread_message_from_gmail(message, settings=settings) for message in messages],
+            content_revision=_gmail_thread_content_revision(detail_messages),
         )
     return None
 
@@ -1984,7 +2257,30 @@ def _gmail_row_from_canonical_thread(
     presentation_status = _presentation_status(ai_group)
     title = (ai_group.ai_title if ai_group is not None else None) or latest_message.subject
     summary = (ai_group.ai_summary if ai_group is not None else None) or latest_message.snippet
-    attachment_count = sum(len(gmail_attachments_for_message(message)) for message in row_messages)
+    projection = next(
+        (message for message in row_messages if message.mailbox_message_count is not None),
+        None,
+    )
+    attachment_count = (
+        max(0, int(projection.mailbox_attachment_count or 0))
+        if projection is not None
+        else sum(len(gmail_attachments_for_message(message)) for message in row_messages)
+    )
+    message_count = (
+        max(1, int(projection.mailbox_message_count or 1))
+        if projection is not None
+        else max(1, len(row_messages))
+    )
+    body_ready = (
+        bool(projection.mailbox_body_ready)
+        if projection is not None
+        else _gmail_thread_body_ready(row_messages)
+    )
+    content_revision = (
+        str(projection.mailbox_content_revision)
+        if projection is not None and projection.mailbox_content_revision
+        else _gmail_thread_content_revision(row_messages)
+    )
     return GmailThreadRow(
         thread_id=thread_id,
         entity_id=ai_group.id if ai_group is not None else thread_id,
@@ -1997,7 +2293,9 @@ def _gmail_row_from_canonical_thread(
         latest_sender=latest_message.sender,
         sender=display_sender,
         participants=participants,
-        message_count=max(1, len(row_messages)),
+        message_count=message_count,
+        body_ready=body_ready,
+        content_revision=content_revision,
         summary=summary,
         ai_group_id=ai_group.id if ai_group is not None else None,
         ai_title=ai_group.ai_title if ai_group is not None else None,
@@ -2053,6 +2351,8 @@ def _gmail_row_from_visible_group(group: VisibleMailGroupRecord, messages: list[
         sender=display_sender,
         participants=participants,
         message_count=max(1, len(row_messages)),
+        body_ready=_gmail_thread_body_ready(messages),
+        content_revision=_gmail_thread_content_revision(messages),
         summary=group.summary or latest_message.snippet,
         ai_group_id=group.source_group_id,
         ai_title=group.title,
@@ -2190,6 +2490,8 @@ def _gmail_row_from_mailbox_display_cluster(cluster_key: str, messages: list[Gma
         sender=provider_title,
         participants=_mailbox_display_participants(row_messages, mailbox_label),
         message_count=max(1, len(row_messages)),
+        body_ready=_gmail_thread_body_ready(messages),
+        content_revision=_gmail_thread_content_revision(messages),
         summary=summary,
         ai_group_id=None,
         ai_title=title,
@@ -2687,6 +2989,33 @@ def _address_header_values(value: Any) -> list[str]:
 
 
 def gmail_attachments_for_message(message: GmailMessageRecord) -> list[ThreadAttachment]:
+    if message.attachment_descriptors:
+        attachments: list[ThreadAttachment] = []
+        for index, descriptor in enumerate(message.attachment_descriptors):
+            attachment_id = str(descriptor.get("attachment_id") or "").strip()
+            if not attachment_id:
+                continue
+            filename = str(descriptor.get("filename") or "").strip()
+            try:
+                size = max(0, int(descriptor.get("size") or 0))
+            except (TypeError, ValueError):
+                size = 0
+            attachments.append(
+                ThreadAttachment(
+                    id=f"{message.message_id}:{attachment_id}",
+                    filename=filename or f"attachment-{index + 1}",
+                    mime_type=str(descriptor.get("mime_type") or "application/octet-stream"),
+                    size=size,
+                    attachment_id=attachment_id,
+                    part_id=str(descriptor.get("part_id") or index),
+                    download_url=(
+                        f"/v1/mailbox/messages/{quote(message.message_id, safe='')}"
+                        f"/attachments/{quote(attachment_id, safe='')}"
+                    ),
+                )
+            )
+        return attachments
+
     payload = message.raw_payload.get("payload") if isinstance(message.raw_payload, dict) else None
     if not isinstance(payload, dict):
         return []
@@ -2753,9 +3082,29 @@ def _gmail_part_headers(part: dict[str, Any]) -> dict[str, str]:
     return headers
 
 
-def _thread_message_from_gmail(message: GmailMessageRecord) -> ThreadMessage:
-    html_body = html_body_for_reader(message.html_body_sanitized)
-    html_render_document = html_render_document_for_reader(message.html_render_document)
+def _thread_message_from_gmail(message: GmailMessageRecord, *, settings: Settings | None = None) -> ThreadMessage:
+    reader_html_body = html_body_for_reader(message.html_body_sanitized)
+    reader_html_render_document = html_render_document_for_reader(message.html_render_document)
+    html_body = (
+        rewrite_external_image_sources(
+            settings,
+            user_id=message.user_id,
+            message_id=message.message_id,
+            document=reader_html_body,
+        )
+        if settings is not None and getattr(settings, "app_encryption_key", None)
+        else reader_html_body
+    )
+    html_render_document = (
+        rewrite_external_image_sources(
+            settings,
+            user_id=message.user_id,
+            message_id=message.message_id,
+            document=reader_html_render_document,
+        )
+        if settings is not None and getattr(settings, "app_encryption_key", None)
+        else reader_html_render_document
+    )
     return ThreadMessage(
         id=message.message_id,
         source="gmail",
@@ -2771,8 +3120,8 @@ def _thread_message_from_gmail(message: GmailMessageRecord) -> ThreadMessage:
         html_body=html_body,
         html_render_document=html_render_document,
         reader=build_thread_message_reader(
-            html_render_document=html_render_document,
-            html_body=html_body,
+            html_render_document=reader_html_render_document,
+            html_body=reader_html_body,
             text_body=message.text_body,
             snippet=message.snippet,
             headers=message.headers,
@@ -2799,7 +3148,7 @@ def _rebuild_missing_render_documents(settings: Settings, *, user_id: str, messa
 
 
 def _needs_body_fetch(message: GmailMessageRecord) -> bool:
-    if (message.body_fetch_status or "").lower() == "fetched":
+    if (message.body_fetch_status or "").lower() in {"fetched", "unavailable"}:
         return False
     return not has_persisted_renderable_body(
         text_body=message.text_body,
@@ -2807,6 +3156,27 @@ def _needs_body_fetch(message: GmailMessageRecord) -> bool:
         html_render_document=message.html_render_document,
         raw_payload=message.raw_payload,
     )
+
+
+def _gmail_thread_body_ready(messages: list[GmailMessageRecord]) -> bool:
+    return bool(messages) and all(not _needs_body_fetch(message) for message in messages)
+
+
+def _gmail_thread_content_revision(messages: list[GmailMessageRecord]) -> str:
+    """Return the same page-independent revision used by the DB reader query.
+
+    ``content_revision`` is the per-message reader-visible change clock. The
+    length prefix makes the ordered concatenation unambiguous without moving
+    bodies or attachment payloads through the API merely to calculate a thread
+    cache key. MD5 is used only as a compact opaque change token, never for a
+    security decision.
+    """
+
+    serialized = "".join(
+        f"{len(message.message_id)}:{message.message_id}:{max(1, int(message.content_revision or 1))}"
+        for message in sorted(messages, key=lambda item: item.message_id)
+    )
+    return hashlib.md5(serialized.encode("utf-8"), usedforsecurity=False).hexdigest()[:24]
 
 
 def _enqueue_reader_body_fetch_best_effort(
@@ -2842,55 +3212,6 @@ def _enqueue_reader_body_fetch_best_effort(
         )
 
 
-def _group_needs_body_warmup(messages: list[GmailMessageRecord]) -> bool:
-    return any((message.body_fetch_status or "missing") != "fetched" for message in messages)
-
-
-def _enqueue_body_fetch_for_groups(
-    settings: Settings,
-    *,
-    user_id: str,
-    group_ids: list[str],
-    priority: int,
-    limit: int,
-) -> None:
-    for group_id in list(dict.fromkeys([item for item in group_ids if item]))[:limit]:
-        _enqueue_body_fetch_for_group(settings, user_id=user_id, group_id=group_id, priority=priority)
-
-
-def _enqueue_body_fetch_for_mailbox_rows(
-    settings: Settings,
-    *,
-    user_id: str,
-    mailbox: MailboxResponse,
-    limit: int,
-    priority: int,
-) -> None:
-    group_ids: list[str] = []
-    thread_ids: list[str] = []
-    for section in mailbox.sections:
-        for row in section.rows:
-            if row.ai_group_id:
-                group_ids.append(row.ai_group_id)
-            elif _is_mailbox_display_cluster_id(row.thread_id):
-                thread_ids.extend(
-                    child.gmail_thread_id
-                    for child in row.children
-                    if child.gmail_thread_id
-                )
-            elif row.thread_id:
-                thread_ids.append(row.thread_id)
-            if len(group_ids) + len(thread_ids) >= limit:
-                break
-        if len(group_ids) + len(thread_ids) >= limit:
-            break
-    for group_id in list(dict.fromkeys(group_ids))[:limit]:
-        _enqueue_body_fetch_for_group(settings, user_id=user_id, group_id=group_id, priority=priority)
-    remaining = max(0, limit - len(set(group_ids)))
-    for thread_id in list(dict.fromkeys(thread_ids))[:remaining]:
-        _enqueue_body_fetch_for_gmail_thread(settings, user_id=user_id, gmail_thread_id=thread_id, priority=priority)
-
-
 def _enqueue_body_fetch_for_group(settings: Settings, *, user_id: str, group_id: str, priority: int) -> str:
     job = enqueue_job(
         str(settings.database_path),
@@ -2900,7 +3221,7 @@ def _enqueue_body_fetch_for_group(settings: Settings, *, user_id: str, group_id:
         dedupe_key=f"gmail-body-fetch:{user_id}:{group_id}",
         priority=priority,
         payload={"user_id": user_id, "group_id": group_id},
-        wake_existing=False,
+        wake_existing=priority >= 100,
     )
     return job.id
 
@@ -2914,7 +3235,7 @@ def _enqueue_body_fetch_for_gmail_thread(settings: Settings, *, user_id: str, gm
         dedupe_key=f"gmail-body-fetch-thread:{user_id}:{gmail_thread_id}",
         priority=priority,
         payload={"user_id": user_id, "gmail_thread_id": gmail_thread_id},
-        wake_existing=False,
+        wake_existing=priority >= 100,
     )
     return job.id
 

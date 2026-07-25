@@ -46,7 +46,7 @@ public final class AppSessionCache {
             + next.dashboard.feed.today.count
             + next.dashboard.feed.worthKnowing.count
         let dashboard = !allowEmptyDashboard && currentDashboardCount > 0 && nextDashboardCount == 0 ? current.dashboard : next.dashboard
-        let mailbox = !current.mailbox.isEmpty && next.mailbox.isEmpty ? current.mailbox : next.mailbox
+        let mailbox = Self.mergedMailbox(current: current, next: next)
 
         return AppSessionResponse(
             user: next.user,
@@ -70,6 +70,75 @@ public final class AppSessionCache {
         {
             defaults.removeObject(forKey: key)
         }
+    }
+
+    private static func mergedMailbox(
+        current: AppSessionResponse,
+        next: AppSessionResponse
+    ) -> MailboxResponse {
+        guard !current.mailbox.isEmpty, next.mailbox.isEmpty else {
+            return next.mailbox
+        }
+
+        let currentProgress = MailboxSyncProgress.newestMerged([
+            current.readiness.mailboxSyncProgress,
+            current.sync.mailboxSyncProgress,
+            current.mailbox.mailboxSyncProgress,
+        ])
+        let nextProgress = MailboxSyncProgress.newestMerged([
+            next.readiness.mailboxSyncProgress,
+            next.sync.mailboxSyncProgress,
+            next.mailbox.mailboxSyncProgress,
+        ])
+        let currentGeneration = normalizedGeneration(
+            currentProgress.syncGeneration ?? current.mailbox.syncGeneration
+        )
+        let nextGeneration = normalizedGeneration(
+            nextProgress.syncGeneration ?? next.mailbox.syncGeneration
+        )
+
+        // A newly reported progressive generation owns its empty first
+        // snapshot. Keeping a previous generation here makes an interrupted
+        // session/mailbox commit restore stale mail forever.
+        if let nextGeneration, nextGeneration != currentGeneration {
+            return next.mailbox
+        }
+        // Conversely, a generation-less legacy failure must not erase a
+        // generation-fenced cache.
+        if currentGeneration != nil, nextGeneration == nil {
+            return current.mailbox
+        }
+        if isConfirmedEmpty(next.mailbox, progress: nextProgress) {
+            return next.mailbox
+        }
+        return current.mailbox
+    }
+
+    private static func isConfirmedEmpty(
+        _ mailbox: MailboxResponse,
+        progress: MailboxSyncProgress
+    ) -> Bool {
+        guard mailbox.totalThreads == 0,
+              mailbox.sections.allSatisfy({ $0.rows.isEmpty }),
+              mailbox.nextCursor?.isEmpty != false,
+              mailbox.loadedThreads == nil || mailbox.loadedThreads == 0 else {
+            return false
+        }
+        let completeLegacySnapshot = mailbox.fullImportRunning != true
+            && mailbox.fullImportCompleted != false
+        let explicitlyConfirmedInitialWindow = progress.initialWindowComplete == true
+            && max(0, progress.initialTargetCount ?? 0) == 0
+            && max(0, progress.initialMetadataCount ?? 0) == 0
+            && max(0, progress.estimatedTotalCount ?? 0) == 0
+        return completeLegacySnapshot || explicitlyConfirmedInitialWindow
+    }
+
+    private static func normalizedGeneration(_ generation: String?) -> String? {
+        guard let generation = generation?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !generation.isEmpty else {
+            return nil
+        }
+        return generation
     }
 }
 
