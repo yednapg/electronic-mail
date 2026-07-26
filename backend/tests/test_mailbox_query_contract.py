@@ -251,7 +251,12 @@ class MailboxQueryContractTests(unittest.TestCase):
         self.assertEqual(cursor, "message-025")
         selection_sql, selection_params = connection.calls[0]
         self.assertIn("LIMIT :limit", selection_sql)
-        self.assertIn("message_id > :after_message_id", selection_sql)
+        self.assertIn(
+            "message_id > CAST(:after_message_id AS TEXT)",
+            selection_sql,
+        )
+        self.assertIn("FOR UPDATE", selection_sql)
+        self.assertNotIn("SKIP LOCKED", selection_sql)
         self.assertEqual(selection_params["limit"], 25)
         self.assertEqual(selection_params["after_message_id"], "message-000")
         self.assertEqual(

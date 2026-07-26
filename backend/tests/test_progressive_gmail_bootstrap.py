@@ -435,11 +435,11 @@ class ProgressiveGmailBootstrapTests(unittest.TestCase):
         self.assertIsNotNone(connection.update_params)
         self.assertEqual(connection.update_params["initial_ready"], 0)
 
-    def test_stale_pending_body_rows_are_recovered_after_worker_death(self) -> None:
+    def test_stale_pending_and_legacy_failed_body_rows_are_recovered(self) -> None:
         selector_source = inspect.getsource(list_messages_needing_body_fetch)
         state_source = inspect.getsource(mark_gmail_messages_body_fetch_state)
 
-        self.assertIn("body_fetch_status = 'pending'", selector_source)
+        self.assertIn("body_fetch_status IN ('pending', 'failed')", selector_source)
         self.assertIn("interval '15 minutes'", selector_source)
         self.assertIn("updated_at = now()", state_source)
 
