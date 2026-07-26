@@ -2570,7 +2570,7 @@ def list_messages_needing_body_fetch(
                   AND (
                     body_fetch_status = 'missing'
                     OR (
-                      body_fetch_status = 'pending'
+                      body_fetch_status IN ('pending', 'failed')
                       AND COALESCE(body_fetch_updated_at, updated_at) < now() - interval '15 minutes'
                     )
                   )
@@ -2606,10 +2606,13 @@ def backfill_gmail_attachment_descriptors_page(
                 FROM gmail_messages
                 WHERE user_id = :user_id
                   AND NOT attachment_descriptors_ready
-                  AND (:after_message_id IS NULL OR message_id > :after_message_id)
+                  AND (
+                    CAST(:after_message_id AS TEXT) IS NULL
+                    OR message_id > CAST(:after_message_id AS TEXT)
+                  )
                 ORDER BY message_id ASC
                 LIMIT :limit
-                FOR UPDATE SKIP LOCKED
+                FOR UPDATE
                 """
             ),
             {
@@ -2660,13 +2663,47 @@ def backfill_gmail_attachment_descriptors_page(
                 FROM gmail_messages
                 WHERE user_id = :user_id
                   AND NOT attachment_descriptors_ready
-                  AND (:page_cursor IS NULL OR message_id > :page_cursor)
+                  AND (
+                    CAST(:page_cursor AS TEXT) IS NULL
+                    OR message_id > CAST(:page_cursor AS TEXT)
+                  )
                 ORDER BY message_id ASC
                 LIMIT 1
                 """
             ),
             {"user_id": user_id, "page_cursor": page_cursor},
         ).scalar_one_or_none()
+        # A cursor may have advanced past a row inserted by another writer.
+        # Prove global convergence before publishing completion; otherwise
+        # restart from the beginning so no earlier hole can be stranded.
+        if next_message_id is None:
+            first_pending_message_id = connection.execute(
+                text(
+                    """
+                    SELECT message_id
+                    FROM gmail_messages
+                    WHERE user_id = :user_id
+                      AND NOT attachment_descriptors_ready
+                    ORDER BY message_id ASC
+                    LIMIT 1
+                    """
+                ),
+                {"user_id": user_id},
+            ).scalar_one_or_none()
+            if first_pending_message_id is not None:
+                next_message_id = first_pending_message_id
+                page_cursor = None
+                connection.execute(
+                    text(
+                        """
+                        UPDATE gmail_import_state
+                        SET attachment_descriptors_complete = FALSE,
+                            updated_at = now()
+                        WHERE user_id = :user_id
+                        """
+                    ),
+                    {"user_id": user_id},
+                )
         if next_message_id is None:
             connection.execute(
                 text(

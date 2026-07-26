@@ -1,13 +1,259 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 public protocol SessionTokenStoring: AnyObject {
     func load() -> String?
     func save(_ token: String) throws
     func clear()
+
+    /// Generation-aware stores persist this nonsecret intent before any
+    /// potentially blocking credential operation begins. Legacy stores return
+    /// `nil` and retain their original behavior.
+    func prepareMutation(_ kind: SessionTokenMutationKind) throws -> SessionTokenMutation?
+    func save(_ token: String, for mutation: SessionTokenMutation?) throws
+    func clear(for mutation: SessionTokenMutation?)
 }
 
-public final class UserDefaultsSessionTokenStore: SessionTokenStoring {
+public extension SessionTokenStoring {
+    func prepareMutation(_: SessionTokenMutationKind) throws -> SessionTokenMutation? {
+        nil
+    }
+
+    func save(_ token: String, for _: SessionTokenMutation?) throws {
+        try save(token)
+    }
+
+    func clear(for _: SessionTokenMutation?) {
+        clear()
+    }
+}
+
+public enum SessionTokenMutationKind: String, Codable, Equatable, Sendable {
+    case token
+    case tombstone
+}
+
+public struct SessionTokenMutation: Codable, Equatable, Sendable {
+    public let generationID: String
+    public let ordinal: UInt64
+    public let kind: SessionTokenMutationKind
+
+    init(generationID: String, ordinal: UInt64, kind: SessionTokenMutationKind) {
+        self.generationID = generationID
+        self.ordinal = ordinal
+        self.kind = kind
+    }
+}
+
+public enum SessionTokenLoadResult: Equatable, Sendable {
+    case loaded(String?)
+    case timedOut
+}
+
+public enum SessionTokenSaveResult: Equatable, Sendable {
+    case saved
+    case failed(String)
+    case timedOut
+}
+
+public enum SessionTokenClearResult: Equatable, Sendable {
+    case cleared
+    case failed(String)
+    case timedOut
+}
+
+/// A durably recorded sign-out intent whose credential-store work has not
+/// necessarily started yet. Creating this value only updates the nonsecret
+/// generation ledger; callers may therefore prepare it synchronously before
+/// exposing signed-out UI without invoking Security.framework on that actor.
+public struct PreparedSessionTokenClearIntent: Sendable {
+    fileprivate let mutation: SessionTokenMutation?
+
+    fileprivate init(mutation: SessionTokenMutation?) {
+        self.mutation = mutation
+    }
+}
+
+/// Runs synchronous credential-store operations away from UI actors and races
+/// them against an independent timeout queue. Security.framework calls cannot
+/// be cancelled, so this intentionally does not use a task group: a blocked
+/// operation is allowed to finish later while its one-shot result is discarded.
+public struct AsyncSessionTokenStore: Sendable {
+    private static let timeoutQueue = DispatchQueue(
+        label: "app.electronicmail.session-token.timeout",
+        qos: .userInitiated
+    )
+
+    /// Credential operations run concurrently so a Security.framework call
+    /// which never returns cannot poison this client-side execution lane.
+    /// Generation-aware stores write only immutable per-request records, so a
+    /// late operation cannot overwrite or delete a newer credential.
+    private let operationQueue: DispatchQueue
+    private let requestEpoch: SessionTokenRequestEpoch
+    private let prepareMutationOperation: @Sendable (SessionTokenMutationKind) throws -> SessionTokenMutation?
+    private let loadOperation: @Sendable () -> String?
+    private let saveOperation: @Sendable (String, SessionTokenMutation?) -> SessionTokenSaveResult
+    private let clearOperation: @Sendable (SessionTokenMutation?) -> Void
+
+    public init<Store: SessionTokenStoring & Sendable>(store: Store) {
+        operationQueue = DispatchQueue(
+            label: "app.electronicmail.session-token.\(UUID().uuidString)",
+            qos: .userInitiated,
+            attributes: .concurrent
+        )
+        requestEpoch = SessionTokenRequestEpoch()
+        prepareMutationOperation = { kind in try store.prepareMutation(kind) }
+        loadOperation = { store.load() }
+        saveOperation = { token, mutation in
+            do {
+                try store.save(token, for: mutation)
+                return .saved
+            } catch {
+                return .failed(error.localizedDescription)
+            }
+        }
+        clearOperation = { mutation in store.clear(for: mutation) }
+    }
+
+    public func load(timeout: TimeInterval) async -> SessionTokenLoadResult {
+        let epoch = requestEpoch.current()
+        return await execute(timeout: timeout, timeoutResult: .timedOut) {
+            let token = loadOperation()
+            return requestEpoch.isCurrent(epoch) ? .loaded(token) : .timedOut
+        }
+    }
+
+    public func save(_ token: String, timeout: TimeInterval) async -> SessionTokenSaveResult {
+        requestEpoch.advance()
+        let mutation: SessionTokenMutation?
+        do {
+            mutation = try prepareMutationOperation(.token)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+        return await execute(timeout: timeout, timeoutResult: .timedOut) {
+            saveOperation(token, mutation)
+        }
+    }
+
+    public func clear(timeout: TimeInterval) async -> SessionTokenClearResult {
+        let intent: PreparedSessionTokenClearIntent
+        do {
+            intent = try prepareClearIntent()
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+        return await clear(preparedIntent: intent, timeout: timeout)
+    }
+
+    /// Publishes the next desired generation before any asynchronous
+    /// credential operation is launched. Generation-aware stores use this as
+    /// the crash-safe boundary for sign-out, disconnect, and account deletion.
+    public func prepareClearIntent() throws -> PreparedSessionTokenClearIntent {
+        requestEpoch.advance()
+        let mutation = try prepareMutationOperation(.tombstone)
+        return PreparedSessionTokenClearIntent(mutation: mutation)
+    }
+
+    /// Completes a previously published sign-out intent away from UI actors.
+    /// A newer token generation remains authoritative even if this immutable
+    /// tombstone record finishes later.
+    public func clear(
+        preparedIntent: PreparedSessionTokenClearIntent,
+        timeout: TimeInterval
+    ) async -> SessionTokenClearResult {
+        return await execute(timeout: timeout, timeoutResult: .timedOut) {
+            clearOperation(preparedIntent.mutation)
+            return .cleared
+        }
+    }
+
+    private func execute<Result: Sendable>(
+        timeout: TimeInterval,
+        timeoutResult: Result,
+        operation: @escaping @Sendable () -> Result
+    ) async -> Result {
+        let oneShot = SessionTokenOperationOneShot<Result>()
+        operationQueue.async {
+            oneShot.resolve(operation())
+        }
+        Self.timeoutQueue.asyncAfter(deadline: .now() + max(0, timeout)) {
+            oneShot.resolve(timeoutResult)
+        }
+        return await oneShot.value()
+    }
+}
+
+private final class SessionTokenRequestEpoch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+
+    func current() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func advance() {
+        lock.lock()
+        value &+= 1
+        lock.unlock()
+    }
+
+    func isCurrent(_ candidate: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value == candidate
+    }
+}
+
+private final class SessionTokenOperationOneShot<Value: Sendable>: @unchecked Sendable {
+    private enum State {
+        case pending
+        case waiting(CheckedContinuation<Value, Never>)
+        case resolved(Value)
+    }
+
+    private let lock = NSLock()
+    private var state: State = .pending
+
+    func value() async -> Value {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            switch state {
+            case .pending:
+                state = .waiting(continuation)
+                lock.unlock()
+            case .resolved(let value):
+                lock.unlock()
+                continuation.resume(returning: value)
+            case .waiting:
+                lock.unlock()
+                preconditionFailure("A session-token operation may only be awaited once")
+            }
+        }
+    }
+
+    func resolve(_ value: Value) {
+        let continuation: CheckedContinuation<Value, Never>?
+        lock.lock()
+        switch state {
+        case .pending:
+            state = .resolved(value)
+            continuation = nil
+        case .waiting(let waiting):
+            state = .resolved(value)
+            continuation = waiting
+        case .resolved:
+            continuation = nil
+        }
+        lock.unlock()
+        continuation?.resume(returning: value)
+    }
+}
+
+public final class UserDefaultsSessionTokenStore: SessionTokenStoring, @unchecked Sendable {
     private let defaults: UserDefaults
     private let key: String
 
@@ -36,9 +282,243 @@ public final class UserDefaultsSessionTokenStore: SessionTokenStoring {
     }
 }
 
-public final class KeychainSessionTokenStore: SessionTokenStoring {
-    private static let service = "ElectronicMail"
-    private static let account = "email_session"
+private struct SessionTokenLedgerEntry: Codable, Equatable, Sendable {
+    let mutation: SessionTokenMutation
+    var recordPersisted: Bool
+}
+
+private struct SessionTokenLedgerState: Codable, Equatable, Sendable {
+    var nextOrdinal: UInt64 = 0
+    var desired: SessionTokenMutation?
+    var committedGenerationID: String?
+    var entries: [SessionTokenLedgerEntry] = []
+}
+
+private enum SessionTokenLedgerSnapshot: Sendable {
+    case absent
+    case corrupt
+    case available(SessionTokenLedgerState)
+}
+
+private final class SessionTokenGenerationLedger: @unchecked Sendable {
+    private static let lock = NSLock()
+    private static let storageKey = "ElectronicMail.session-token.v2.generation-ledger"
+
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults) {
+        self.defaults = defaults
+    }
+
+    func allocate(_ kind: SessionTokenMutationKind) throws -> SessionTokenMutation {
+        try Self.withLock {
+            var state: SessionTokenLedgerState
+            switch snapshotLocked() {
+            case .available(let existing):
+                state = existing
+            case .absent, .corrupt:
+                // An explicit user mutation may recover corrupt nonsecret
+                // metadata. The UUID account keeps it disjoint from any orphan.
+                state = SessionTokenLedgerState()
+            }
+            let highestOrdinal = max(
+                state.nextOrdinal,
+                state.entries.map(\.mutation.ordinal).max() ?? 0
+            )
+            guard highestOrdinal < UInt64.max else {
+                throw SessionTokenLedgerError.generationExhausted
+            }
+            let mutation = SessionTokenMutation(
+                generationID: UUID().uuidString.lowercased(),
+                ordinal: highestOrdinal + 1,
+                kind: kind
+            )
+            state.nextOrdinal = mutation.ordinal
+            state.desired = mutation
+            state.entries.append(SessionTokenLedgerEntry(mutation: mutation, recordPersisted: false))
+            try persistLocked(state)
+            return mutation
+        }
+    }
+
+    func allocateLegacyMigrationIfUnclaimed() throws -> SessionTokenMutation? {
+        try Self.withLock {
+            switch snapshotLocked() {
+            case .corrupt:
+                return nil
+            case .available(let existing) where existing.desired != nil:
+                return nil
+            case .absent, .available:
+                var state: SessionTokenLedgerState
+                if case .available(let existing) = snapshotLocked() {
+                    state = existing
+                } else {
+                    state = SessionTokenLedgerState()
+                }
+                let highestOrdinal = max(
+                    state.nextOrdinal,
+                    state.entries.map(\.mutation.ordinal).max() ?? 0
+                )
+                guard highestOrdinal < UInt64.max else {
+                    throw SessionTokenLedgerError.generationExhausted
+                }
+                let mutation = SessionTokenMutation(
+                    generationID: UUID().uuidString.lowercased(),
+                    ordinal: highestOrdinal + 1,
+                    kind: .token
+                )
+                state.nextOrdinal = mutation.ordinal
+                state.desired = mutation
+                state.entries.append(SessionTokenLedgerEntry(mutation: mutation, recordPersisted: false))
+                try persistLocked(state)
+                return mutation
+            }
+        }
+    }
+
+    func snapshot() -> SessionTokenLedgerSnapshot {
+        Self.withLock { snapshotLocked() }
+    }
+
+    func isDesired(_ mutation: SessionTokenMutation) -> Bool {
+        Self.withLock {
+            guard case .available(let state) = snapshotLocked() else {
+                return false
+            }
+            return state.desired == mutation
+        }
+    }
+
+    func containsAllocated(_ mutation: SessionTokenMutation) -> Bool {
+        Self.withLock {
+            guard case .available(let state) = snapshotLocked() else {
+                return false
+            }
+            return state.entries.contains { $0.mutation == mutation }
+        }
+    }
+
+    @discardableResult
+    func markRecordPersisted(_ mutation: SessionTokenMutation) throws -> Bool {
+        try Self.withLock {
+            guard case .available(var state) = snapshotLocked(),
+                  let index = state.entries.firstIndex(where: {
+                      $0.mutation == mutation
+                  }) else {
+                return false
+            }
+            state.entries[index].recordPersisted = true
+            let isDesired = state.desired == mutation
+            if isDesired {
+                state.committedGenerationID = mutation.generationID
+            }
+            try persistLocked(state)
+            return isDesired
+        }
+    }
+
+    /// Returns a cleanup plan from one ledger snapshot only after the newest
+    /// desired record is durable. A later allocation cannot add that former
+    /// desired record to this already-captured older-only plan.
+    func cleanupPlan() -> [SessionTokenMutation]? {
+        Self.withLock {
+            guard case .available(let state) = snapshotLocked(), let desired = state.desired else {
+                return nil
+            }
+            guard state.entries.contains(where: {
+                $0.mutation == desired && $0.recordPersisted
+            }) else {
+                return nil
+            }
+            return state.entries.compactMap { entry in
+                guard entry.recordPersisted, entry.mutation.ordinal < desired.ordinal else {
+                    return nil
+                }
+                return entry.mutation
+            }
+        }
+    }
+
+    func removeCleanedEntries(generationIDs: Set<String>) throws {
+        guard !generationIDs.isEmpty else {
+            return
+        }
+        try Self.withLock {
+            guard case .available(var state) = snapshotLocked() else {
+                return
+            }
+            state.entries.removeAll { generationIDs.contains($0.mutation.generationID) }
+            try persistLocked(state)
+        }
+    }
+
+    private func snapshotLocked() -> SessionTokenLedgerSnapshot {
+        guard let data = defaults.data(forKey: Self.storageKey) else {
+            return .absent
+        }
+        guard let state = try? JSONDecoder().decode(SessionTokenLedgerState.self, from: data) else {
+            return .corrupt
+        }
+        let uniqueGenerationIDs = Set(state.entries.map(\.mutation.generationID))
+        let uniqueOrdinals = Set(state.entries.map(\.mutation.ordinal))
+        guard uniqueGenerationIDs.count == state.entries.count,
+              uniqueOrdinals.count == state.entries.count,
+              state.nextOrdinal >= (state.entries.map(\.mutation.ordinal).max() ?? 0),
+              state.desired.map({ desired in state.entries.contains { $0.mutation == desired } }) ?? true,
+              state.committedGenerationID.map({ committed in
+                  state.entries.contains {
+                      $0.mutation.generationID == committed && $0.recordPersisted
+                  }
+              }) ?? true else {
+            return .corrupt
+        }
+        return .available(state)
+    }
+
+    private func persistLocked(_ state: SessionTokenLedgerState) throws {
+        let data = try JSONEncoder().encode(state)
+        defaults.set(data, forKey: Self.storageKey)
+        guard defaults.synchronize() else {
+            throw SessionTokenLedgerError.persistenceFailed
+        }
+    }
+
+    private static func withLock<Value>(_ operation: () throws -> Value) rethrows -> Value {
+        lock.lock()
+        defer { lock.unlock() }
+        return try operation()
+    }
+}
+
+private enum SessionTokenLedgerError: LocalizedError {
+    case generationExhausted
+    case persistenceFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .generationExhausted:
+            return "Electronic Mail could not allocate a new secure sign-in generation."
+        case .persistenceFailed:
+            return "Electronic Mail could not durably record the secure sign-in change."
+        }
+    }
+}
+
+protocol SessionTokenSecureRecordStoring: AnyObject, Sendable {
+    func readGenerationRecord(account: String) -> Data?
+    func addGenerationRecord(_ data: Data, account: String) throws
+    func deleteGenerationRecord(account: String) -> Bool
+    func readLegacyRecord() -> Data?
+    func deleteLegacyRecords()
+}
+
+public final class KeychainSessionTokenStore: SessionTokenStoring, @unchecked Sendable {
+    static let generationService = "ElectronicMail.session.v2"
+    private static let cleanupQueue = DispatchQueue(
+        label: "app.electronicmail.session-token.cleanup",
+        qos: .utility,
+        attributes: .concurrent
+    )
 
     static var securityPolicyAttributes: [String: Any] {
         [
@@ -72,104 +552,288 @@ public final class KeychainSessionTokenStore: SessionTokenStoring {
         #endif
     }
 
-    public init() {}
+    private let ledger: SessionTokenGenerationLedger
+    private let records: SessionTokenSecureRecordStoring
+    private let cleanupQueue: DispatchQueue
+
+    public convenience init(defaults: UserDefaults = .standard) {
+        self.init(
+            defaults: defaults,
+            records: KeychainSessionTokenSecureRecordStore(),
+            cleanupQueue: Self.cleanupQueue
+        )
+    }
+
+    init(
+        defaults: UserDefaults,
+        records: SessionTokenSecureRecordStoring,
+        cleanupQueue: DispatchQueue
+    ) {
+        ledger = SessionTokenGenerationLedger(defaults: defaults)
+        self.records = records
+        self.cleanupQueue = cleanupQueue
+    }
+
+    public func prepareMutation(_ kind: SessionTokenMutationKind) throws -> SessionTokenMutation? {
+        try ledger.allocate(kind)
+    }
 
     public func load() -> String? {
-        if let data = readData(query: secureQuery(synchronizable: false)) {
-            return String(data: data, encoding: .utf8)
-        }
-
-        if let synchronizedData = readData(query: secureQuery(synchronizable: true)) {
-            migrateToDeviceOnlyStorage(synchronizedData) {
-                SecItemDelete(self.secureQuery(synchronizable: true) as CFDictionary)
+        for _ in 0..<4 {
+            switch ledger.snapshot() {
+            case .corrupt:
+                return nil
+            case .absent:
+                guard let result = loadAndMigrateLegacyIfUnclaimed() else {
+                    if case .available = ledger.snapshot() {
+                        continue
+                    }
+                    return nil
+                }
+                return result
+            case .available(let state):
+                guard let desired = state.desired else {
+                    guard let result = loadAndMigrateLegacyIfUnclaimed() else {
+                        if ledger.snapshotDesiredGenerationID() != nil {
+                            continue
+                        }
+                        return nil
+                    }
+                    return result
+                }
+                guard ledger.isDesired(desired) else {
+                    continue
+                }
+                guard desired.kind == .token else {
+                    scheduleCleanup()
+                    return nil
+                }
+                guard let data = records.readGenerationRecord(account: Self.account(for: desired)) else {
+                    // A desired token with no exact record is intentionally
+                    // fail-closed. Never fall back to an older committed token.
+                    guard ledger.isDesired(desired) else {
+                        continue
+                    }
+                    return nil
+                }
+                guard ledger.isDesired(desired), let token = String(data: data, encoding: .utf8) else {
+                    continue
+                }
+                _ = try? ledger.markRecordPersisted(desired)
+                scheduleCleanup()
+                return token
             }
-            return String(data: synchronizedData, encoding: .utf8)
         }
-
-        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
-        if let classicData = readData(query: classicMacQuery()) {
-            migrateClassicMacDataToDataProtectionKeychain(classicData)
-            return String(data: classicData, encoding: .utf8)
-        }
-        #endif
-
         return nil
     }
 
     public func save(_ token: String) throws {
-        let destination = try writeSecureData(Data(token.utf8))
-        _ = SecItemDelete(secureQuery(synchronizable: true) as CFDictionary)
-        #if os(macOS)
-        if destination == .dataProtection {
-            _ = SecItemDelete(classicMacQuery() as CFDictionary)
+        let mutation = try ledger.allocate(.token)
+        try save(token, for: mutation)
+    }
+
+    public func save(_ token: String, for mutation: SessionTokenMutation?) throws {
+        let mutation = try mutation ?? ledger.allocate(.token)
+        guard mutation.kind == .token, ledger.containsAllocated(mutation) else {
+            throw SessionTokenLedgerError.persistenceFailed
         }
-        #endif
+        try records.addGenerationRecord(Data(token.utf8), account: Self.account(for: mutation))
+        _ = try ledger.markRecordPersisted(mutation)
+        scheduleCleanup()
     }
 
     public func clear() {
-        _ = SecItemDelete(secureQuery(synchronizable: false) as CFDictionary)
-        _ = SecItemDelete(secureQuery(synchronizable: true) as CFDictionary)
-        #if os(macOS)
-        _ = SecItemDelete(classicMacQuery() as CFDictionary)
-        _ = SecItemDelete(baseQuery() as CFDictionary)
-        #endif
+        guard let mutation = try? ledger.allocate(.tombstone) else {
+            return
+        }
+        clear(for: mutation)
     }
 
-    private enum StorageDestination: Equatable {
-        case dataProtection
-        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
-        case classicMac
-        #endif
-    }
-
-    @discardableResult
-    private func writeSecureData(_ data: Data) throws -> StorageDestination {
+    public func clear(for mutation: SessionTokenMutation?) {
+        guard let mutation = mutation ?? (try? ledger.allocate(.tombstone)),
+              mutation.kind == .tombstone,
+              ledger.containsAllocated(mutation) else {
+            return
+        }
         do {
-            try writeData(data, query: secureQuery(synchronizable: false), enforcesDeviceOnlyAccessibility: true)
-            return .dataProtection
+            try records.addGenerationRecord(Data("tombstone-v2".utf8), account: Self.account(for: mutation))
+            _ = try ledger.markRecordPersisted(mutation)
+            scheduleCleanup()
+        } catch {
+            // The durable desired tombstone was published before this Keychain
+            // call. A relaunch therefore remains signed out and never falls
+            // back to an older token; cleanup can retry after a later mutation.
+        }
+    }
+
+    static func account(for mutation: SessionTokenMutation) -> String {
+        let paddedOrdinal = String(format: "%020llu", mutation.ordinal)
+        return "session.v2.\(paddedOrdinal).\(mutation.generationID).\(mutation.kind.rawValue)"
+    }
+
+    private func loadAndMigrateLegacyIfUnclaimed() -> String? {
+        guard let data = records.readLegacyRecord(),
+              let token = String(data: data, encoding: .utf8),
+              !token.isEmpty else {
+            return nil
+        }
+        guard let mutation = try? ledger.allocateLegacyMigrationIfUnclaimed() else {
+            return nil
+        }
+        do {
+            try records.addGenerationRecord(data, account: Self.account(for: mutation))
+            _ = try ledger.markRecordPersisted(mutation)
+        } catch {
+            return nil
+        }
+        guard ledger.isDesired(mutation) else {
+            scheduleCleanup()
+            return nil
+        }
+        scheduleCleanup()
+        return token
+    }
+
+    private func scheduleCleanup() {
+        cleanupQueue.async { [ledger, records] in
+            guard let candidates = ledger.cleanupPlan() else {
+                return
+            }
+            var cleanedGenerationIDs = Set<String>()
+            for mutation in candidates {
+                if records.deleteGenerationRecord(account: Self.account(for: mutation)) {
+                    cleanedGenerationIDs.insert(mutation.generationID)
+                }
+            }
+            try? ledger.removeCleanedEntries(generationIDs: cleanedGenerationIDs)
+            records.deleteLegacyRecords()
+        }
+    }
+}
+
+private extension SessionTokenGenerationLedger {
+    func snapshotDesiredGenerationID() -> String? {
+        guard case .available(let state) = snapshot() else {
+            return nil
+        }
+        return state.desired?.generationID
+    }
+}
+
+private final class KeychainSessionTokenSecureRecordStore: SessionTokenSecureRecordStoring, @unchecked Sendable {
+    private static let legacyService = "ElectronicMail"
+    private static let legacyAccount = "email_session"
+
+    func readGenerationRecord(account: String) -> Data? {
+        if let data = readData(query: generationSecureQuery(account: account)) {
+            return data
+        }
+        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        return readData(query: generationClassicQuery(account: account), authenticationContext: context)
+        #else
+        return nil
+        #endif
+    }
+
+    func addGenerationRecord(_ data: Data, account: String) throws {
+        do {
+            try addImmutableData(
+                data,
+                query: generationSecureQuery(account: account),
+                enforcesDeviceOnlyAccessibility: true
+            )
         } catch KeychainError.status(let status) {
             #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
-            if Self.shouldUseClassicMacFallback(for: status, debugBuild: Self.classicMacFallbackEnabled) {
-                try writeData(data, query: classicMacQuery(), enforcesDeviceOnlyAccessibility: false)
-                return .classicMac
+            // Ad-hoc local builds may lack Data Protection Keychain
+            // entitlements; production Release builds never compile this fallback.
+            if KeychainSessionTokenStore.shouldUseClassicMacFallback(
+                for: status,
+                debugBuild: KeychainSessionTokenStore.classicMacFallbackEnabled
+            ) {
+                try addImmutableData(
+                    data,
+                    query: generationClassicQuery(account: account),
+                    enforcesDeviceOnlyAccessibility: false
+                )
+                return
             }
             #endif
             throw KeychainError.status(status)
         }
     }
 
-    private func writeData(
+    func deleteGenerationRecord(account: String) -> Bool {
+        let secureStatus = SecItemDelete(generationSecureQuery(account: account) as CFDictionary)
+        #if os(macOS)
+        let classicStatus = SecItemDelete(generationClassicQuery(account: account) as CFDictionary)
+        let secureDeletionFinished = Self.isSuccessfulDeletion(secureStatus)
+            || KeychainSessionTokenStore.shouldUseClassicMacFallback(
+                for: secureStatus,
+                debugBuild: KeychainSessionTokenStore.classicMacFallbackEnabled
+            )
+        return secureDeletionFinished && Self.isSuccessfulDeletion(classicStatus)
+        #else
+        return Self.isSuccessfulDeletion(secureStatus)
+        #endif
+    }
+
+    func readLegacyRecord() -> Data? {
+        if let data = readData(query: legacySecureQuery(synchronizable: false)) {
+            return data
+        }
+        if let data = readData(query: legacySecureQuery(synchronizable: true)) {
+            return data
+        }
+        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        return readData(query: legacyClassicQuery(), authenticationContext: context)
+        #else
+        return nil
+        #endif
+    }
+
+    func deleteLegacyRecords() {
+        _ = SecItemDelete(legacySecureQuery(synchronizable: false) as CFDictionary)
+        _ = SecItemDelete(legacySecureQuery(synchronizable: true) as CFDictionary)
+        #if os(macOS)
+        _ = SecItemDelete(legacyClassicQuery() as CFDictionary)
+        #endif
+    }
+
+    private func addImmutableData(
         _ data: Data,
         query: [String: Any],
         enforcesDeviceOnlyAccessibility: Bool
     ) throws {
-        var attributes: [String: Any] = [kSecValueData as String: data]
+        var item = query
+        item[kSecValueData as String] = data
         if enforcesDeviceOnlyAccessibility {
-            attributes[kSecAttrAccessible as String] = Self.securityPolicyAttributes[kSecAttrAccessible as String]
+            item[kSecAttrAccessible as String] = KeychainSessionTokenStore.securityPolicyAttributes[
+                kSecAttrAccessible as String
+            ]
         }
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status == errSecSuccess {
+        let status = SecItemAdd(item as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            guard readData(query: query) == data else {
+                throw KeychainError.status(status)
+            }
             return
         }
-        guard status == errSecItemNotFound else {
+        guard status == errSecSuccess else {
             throw KeychainError.status(status)
-        }
-
-        var newItem = query
-        newItem[kSecValueData as String] = data
-        if enforcesDeviceOnlyAccessibility {
-            newItem[kSecAttrAccessible as String] = Self.securityPolicyAttributes[kSecAttrAccessible as String]
-        }
-        let addStatus = SecItemAdd(newItem as CFDictionary, nil)
-        guard addStatus == errSecSuccess else {
-            throw KeychainError.status(addStatus)
         }
     }
 
-    private func readData(query base: [String: Any]) -> Data? {
+    private func readData(query base: [String: Any], authenticationContext: LAContext? = nil) -> Data? {
         var query = base
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
+        if let authenticationContext {
+            query[kSecUseAuthenticationContext as String] = authenticationContext
+        }
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         guard status == errSecSuccess, let data = item as? Data else {
@@ -178,54 +842,54 @@ public final class KeychainSessionTokenStore: SessionTokenStoring {
         return data
     }
 
-    private func migrateToDeviceOnlyStorage(_ data: Data, removeLegacyItem: () -> OSStatus) {
-        do {
-            try writeSecureData(data)
-            _ = removeLegacyItem()
-        } catch {
-            // Keep the source item intact and retry migration on the next access.
-        }
+    private func generationSecureQuery(account: String) -> [String: Any] {
+        var query = generationBaseQuery(account: account)
+        query[kSecUseDataProtectionKeychain as String] = true
+        query[kSecAttrSynchronizable as String] = false
+        return query
     }
 
-    private func secureQuery(synchronizable: Bool) -> [String: Any] {
-        var query = baseQuery()
-        query[kSecUseDataProtectionKeychain as String] = Self.securityPolicyAttributes[kSecUseDataProtectionKeychain as String]
+    #if os(macOS)
+    private func generationClassicQuery(account: String) -> [String: Any] {
+        var query = generationBaseQuery(account: account)
+        query[kSecAttrSynchronizable as String] = false
+        return query
+    }
+    #endif
+
+    private func generationBaseQuery(account: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: KeychainSessionTokenStore.generationService,
+            kSecAttrAccount as String: account,
+        ]
+    }
+
+    private func legacySecureQuery(synchronizable: Bool) -> [String: Any] {
+        var query = legacyBaseQuery()
+        query[kSecUseDataProtectionKeychain as String] = true
         query[kSecAttrSynchronizable as String] = synchronizable
         return query
     }
 
     #if os(macOS)
-    private func classicMacQuery() -> [String: Any] {
-        var query = baseQuery()
-        query[kSecAttrSynchronizable as String] = Self.classicMacLocalTestingPolicyAttributes[kSecAttrSynchronizable as String]
+    private func legacyClassicQuery() -> [String: Any] {
+        var query = legacyBaseQuery()
+        query[kSecAttrSynchronizable as String] = false
         return query
     }
-
-    #if DEBUG || ELECTRONIC_MAIL_LOCAL_BETA
-
-    private func migrateClassicMacDataToDataProtectionKeychain(_ data: Data) {
-        do {
-            try writeData(
-                data,
-                query: secureQuery(synchronizable: false),
-                enforcesDeviceOnlyAccessibility: true
-            )
-            _ = SecItemDelete(classicMacQuery() as CFDictionary)
-        } catch {
-            // Local ad-hoc builds can lack the entitlement required by the Data
-            // Protection Keychain. Keep the local-testing classic Keychain item
-            // intact; production Release builds never compile this fallback.
-        }
-    }
-    #endif
     #endif
 
-    private func baseQuery() -> [String: Any] {
+    private func legacyBaseQuery() -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.service,
-            kSecAttrAccount as String: Self.account,
+            kSecAttrService as String: Self.legacyService,
+            kSecAttrAccount as String: Self.legacyAccount,
         ]
+    }
+
+    private static func isSuccessfulDeletion(_ status: OSStatus) -> Bool {
+        status == errSecSuccess || status == errSecItemNotFound
     }
 }
 
