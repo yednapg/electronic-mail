@@ -729,6 +729,13 @@ private actor LocalMailStoreWorker {
         writeEpochFence.invalidate(through: operationGeneration)
     }
 
+    /// SQLite cleanup can include synchronous Security.framework calls. Keep
+    /// the whole destructive operation on this worker so a contended Keychain
+    /// never blocks AppKit's main thread.
+    func clearAll() {
+        store.clearAll()
+    }
+
     func pendingThreadActionCount(userID: String) -> Int {
         store.pendingThreadActions().lazy.filter { $0.userID == userID }.count
     }
@@ -852,6 +859,7 @@ public final class InboxStore: ObservableObject {
     private var inFlightFolderCountRequestID: UUID?
     private var accountOperationGeneration: UInt = 0
     private var localMailStoreWritesBlocked = false
+    private var pendingLocalMailStorePurge: Task<Void, Never>?
     private var attachmentOpenAuthorizations: [UUID: AttachmentOpenAuthorization] = [:]
     private var readerLabelMutationOwners: [ReaderLabelMutationKey: UUID] = [:]
     private var readerLabelMutationGenerations: [String: UInt] = [:]
@@ -1016,7 +1024,7 @@ public final class InboxStore: ObservableObject {
                     // available for the same account after reauthentication.
                     localMailStore.clearSession()
                 } else {
-                    localMailStore.clearAll()
+                    scheduleLocalMailStoreClearAll()
                 }
             }
             threadCache.clearMemory()
@@ -1075,7 +1083,7 @@ public final class InboxStore: ObservableObject {
             localMailStoreWritesBlocked = false
             throw error
         }
-        localMailStore.clearAll()
+        await localMailStoreWorker.clearAll()
         localMailStoreWritesBlocked = false
         pendingLocalActionCount = 0
         threadCache.clearMemory()
@@ -1431,6 +1439,7 @@ public final class InboxStore: ObservableObject {
 
     @discardableResult
     public func restoreLocalCache() async -> Bool {
+        await waitForPendingLocalMailStorePurge()
         let operationGeneration = accountOperationGeneration
         let memoryCachedSession = session ?? sessionCache.read()
         let diskCachedSession = memoryCachedSession == nil ? await localMailStoreWorker.readSession() : nil
@@ -1932,6 +1941,7 @@ public final class InboxStore: ObservableObject {
                 refreshFailed = true
             }
             let memoryCachedSession = sessionCache.read()
+            await waitForPendingLocalMailStorePurge()
             let diskCachedSession = memoryCachedSession == nil ? await localMailStoreWorker.readSession() : nil
             guard operationGeneration == accountOperationGeneration else {
                 return
@@ -2209,6 +2219,7 @@ public final class InboxStore: ObservableObject {
                 return
             }
             inFlightMailboxRefresh = nil
+            await waitForPendingLocalMailStorePurge()
             let cached = context.allowCachedFallback
                 ? await localMailStoreWorker.readMailbox(userID: context.userID, label: context.label)
                 : nil
@@ -2921,6 +2932,7 @@ public final class InboxStore: ObservableObject {
         expandedThreadIDs = []
         cancelActiveMailboxRefresh()
         lastMailboxRefreshAt[label] = nil
+        await waitForPendingLocalMailStorePurge()
         if let userID,
            let cached = await localMailStoreWorker.readMailbox(userID: userID, label: label) {
             guard operationGeneration == accountOperationGeneration,
@@ -3545,6 +3557,7 @@ public final class InboxStore: ObservableObject {
         let memoryCachedThread = force
             ? nil
             : threadCache.read(userID: userID, threadID: threadID).flatMap { $0.userID == userID ? $0 : nil }
+        await waitForPendingLocalMailStorePurge()
         let diskCachedThread = memoryCachedThread == nil && !force
             ? await localMailStoreWorker.readThread(userID: userID, threadID: threadID)
             : nil
@@ -4813,10 +4826,33 @@ public final class InboxStore: ObservableObject {
         )
     }
 
+    /// A direct token clear is synchronous UI state, but SQLite's destructive
+    /// cleanup may enter Security.framework to remove offline-content keys.
+    /// Chain purges on the local-store actor and make every later disk access
+    /// await the chain so a fast re-sign-in cannot recreate data before an
+    /// older purge finishes.
+    private func scheduleLocalMailStoreClearAll() {
+        let previousPurge = pendingLocalMailStorePurge
+        let worker = localMailStoreWorker
+        pendingLocalMailStorePurge = Task {
+            if let previousPurge {
+                await previousPurge.value
+            }
+            await worker.clearAll()
+        }
+    }
+
+    private func waitForPendingLocalMailStorePurge() async {
+        if let pendingLocalMailStorePurge {
+            await pendingLocalMailStorePurge.value
+        }
+    }
+
     private func persistLocalSession(
         _ session: AppSessionResponse,
         operationGeneration: UInt
     ) async {
+        await waitForPendingLocalMailStorePurge()
         guard !localMailStoreWritesBlocked else {
             return
         }
@@ -4832,6 +4868,7 @@ public final class InboxStore: ObservableObject {
         label: MailboxLabel,
         operationGeneration: UInt
     ) async {
+        await waitForPendingLocalMailStorePurge()
         guard !localMailStoreWritesBlocked else {
             return
         }
@@ -4852,6 +4889,7 @@ public final class InboxStore: ObservableObject {
         reentryLabels: [MailboxLabel],
         operationGeneration: UInt
     ) async {
+        await waitForPendingLocalMailStorePurge()
         guard !localMailStoreWritesBlocked else {
             return
         }
@@ -4872,6 +4910,7 @@ public final class InboxStore: ObservableObject {
         threadID: String,
         operationGeneration: UInt
     ) async {
+        await waitForPendingLocalMailStorePurge()
         guard !localMailStoreWritesBlocked else {
             return
         }
@@ -5354,6 +5393,7 @@ public final class InboxStore: ObservableObject {
     }
 
     private func refreshPendingLocalActionCount() async {
+        await waitForPendingLocalMailStorePurge()
         let operationGeneration = accountOperationGeneration
         guard let userID = session?.user.id else {
             if pendingLocalActionCount != 0 {
