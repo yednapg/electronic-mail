@@ -161,6 +161,9 @@ private enum AppLaunchStage {
 }
 
 private struct ElectronicMailRootView: View {
+    private static let tokenStore = MacSessionTokenStore()
+    private static let asyncTokenStore = AsyncSessionTokenStore(store: tokenStore)
+
     @ObservedObject var store: InboxStore
     @State private var stage: AppLaunchStage = .resolvingSession
     @State private var setupStartedAt = Date()
@@ -169,15 +172,17 @@ private struct ElectronicMailRootView: View {
     @State private var signInInProgress = false
     @State private var signInError: String?
 
-    private let tokenStore = MacSessionTokenStore()
-
     var body: some View {
         ZStack {
             switch stage {
             case .resolvingSession:
-                SessionResolvingView(errorMessage: resolvingError) {
-                    Task { await restoreExistingSessionIfAvailable() }
-                }
+                SessionResolvingView(
+                    errorMessage: resolvingError,
+                    onRetry: {
+                        Task { await restoreExistingSessionIfAvailable() }
+                    },
+                    onSignInAgain: continueToSignInWithoutDeletingSavedToken
+                )
             case .signIn:
                 GoogleSignInView(
                     isSigningIn: signInInProgress,
@@ -230,7 +235,7 @@ private struct ElectronicMailRootView: View {
             return
         }
 
-        tokenStore.clear()
+        clearSavedSessionTokenInBackground()
         signInInProgress = false
         setupError = nil
         resolvingError = nil
@@ -246,7 +251,15 @@ private struct ElectronicMailRootView: View {
             return
         }
         resolvingError = nil
-        guard let token = tokenStore.load(), !token.isEmpty else {
+        let loadResult = await Self.asyncTokenStore.load(timeout: 2)
+        guard stage == .resolvingSession else {
+            return
+        }
+        guard case .loaded(let savedToken) = loadResult else {
+            resolvingError = "Electronic Mail could not access your saved sign-in in time. Unlock your Mac and try again, or sign in again. Your saved sign-in was not removed."
+            return
+        }
+        guard let token = savedToken, !token.isEmpty else {
             stage = .signIn
             return
         }
@@ -265,7 +278,7 @@ private struct ElectronicMailRootView: View {
             if store.hasSessionToken {
                 resolvingError = message
             } else {
-                tokenStore.clear()
+                clearSavedSessionTokenInBackground()
                 signInError = message
                 stage = .signIn
             }
@@ -296,11 +309,10 @@ private struct ElectronicMailRootView: View {
                 baseURL: store.backendURL
             )
             let session = try await store.exchangeMobileSession(grant: grant)
-            try tokenStore.save(session.sessionToken)
+            try await saveSessionToken(session.sessionToken)
             Task { await store.load() }
             await startSetupFlow(minimumDisplaySeconds: 0, maximumWaitSeconds: 30)
         } catch {
-            tokenStore.clear()
             store.setSessionToken(nil)
             signInError = error.localizedDescription
         }
@@ -314,15 +326,15 @@ private struct ElectronicMailRootView: View {
             baseURL: store.backendURL
         )
         let session = try await store.exchangeMobileSession(grant: grant)
-        try tokenStore.save(session.sessionToken)
+        try await saveSessionToken(session.sessionToken)
         await store.load()
     }
 
     @MainActor
     private func performSignOut() async throws {
         try await store.logoutRemoteSession()
+        try beginSavedSessionTokenClear()
         ElectronicMailComposerShutdownCoordinator.shared.clearRecoveryData()
-        tokenStore.clear()
         store.setSessionToken(nil)
         signInError = nil
         withAnimation(.easeInOut(duration: 0.25)) {
@@ -333,8 +345,8 @@ private struct ElectronicMailRootView: View {
     @MainActor
     private func performGoogleDisconnect() async throws {
         try await store.disconnectGoogleAndDeleteData()
+        try beginSavedSessionTokenClear()
         ElectronicMailComposerShutdownCoordinator.shared.clearRecoveryData()
-        tokenStore.clear()
         store.setSessionToken(nil)
         signInError = "Google was disconnected."
         withAnimation(.easeInOut(duration: 0.25)) {
@@ -345,12 +357,59 @@ private struct ElectronicMailRootView: View {
     @MainActor
     private func performAccountDeletion() async throws {
         try await store.deleteAccountPermanently()
+        try beginSavedSessionTokenClear()
         ElectronicMailComposerShutdownCoordinator.shared.clearRecoveryData()
-        tokenStore.clear()
         store.setSessionToken(nil)
         signInError = "Your Electronic Mail account was deleted."
         withAnimation(.easeInOut(duration: 0.25)) {
             stage = .signIn
+        }
+    }
+
+    @MainActor
+    private func continueToSignInWithoutDeletingSavedToken() {
+        guard stage == .resolvingSession else {
+            return
+        }
+        resolvingError = nil
+        signInError = "Sign in again to reconnect Electronic Mail. Your previous saved sign-in has not been deleted."
+        withAnimation(.easeInOut(duration: 0.2)) {
+            stage = .signIn
+        }
+    }
+
+    @MainActor
+    private func saveSessionToken(_ token: String) async throws {
+        switch await Self.asyncTokenStore.save(token, timeout: 5) {
+        case .saved:
+            return
+        case .failed(let message):
+            throw RuntimeError(message)
+        case .timedOut:
+            throw RuntimeError(
+                "Electronic Mail could not save your sign-in in time. Unlock your Mac and try again."
+            )
+        }
+    }
+
+    @MainActor
+    private func clearSavedSessionTokenInBackground() {
+        do {
+            try beginSavedSessionTokenClear()
+        } catch {
+            signInError = error.localizedDescription
+        }
+    }
+
+    /// Synchronizes the nonsecret desired tombstone before returning. The
+    /// Security.framework write is intentionally launched only afterward on
+    /// AsyncSessionTokenStore's credential queue.
+    @MainActor
+    private func beginSavedSessionTokenClear() throws {
+        let preparedIntent = try Self.asyncTokenStore.prepareClearIntent()
+        let asyncTokenStore = Self.asyncTokenStore
+        Task {
+            _ = await asyncTokenStore.clear(preparedIntent: preparedIntent, timeout: 5)
         }
     }
 
@@ -426,12 +485,13 @@ private struct PostLoginCoordinator {
     }
 }
 
-private final class MacSessionTokenStore: SessionTokenStoring {
+private final class MacSessionTokenStore: SessionTokenStoring, @unchecked Sendable {
     private static let legacyPlaintextTokenKey = "ElectronicMail.debug.email_session"
-    private let store = KeychainSessionTokenStore()
+    private let store: KeychainSessionTokenStore
 
     init(defaults: UserDefaults = .standard) {
         defaults.removeObject(forKey: Self.legacyPlaintextTokenKey)
+        store = KeychainSessionTokenStore(defaults: defaults)
     }
 
     func load() -> String? {
@@ -445,12 +505,25 @@ private final class MacSessionTokenStore: SessionTokenStoring {
     func clear() {
         store.clear()
     }
+
+    func prepareMutation(_ kind: SessionTokenMutationKind) throws -> SessionTokenMutation? {
+        try store.prepareMutation(kind)
+    }
+
+    func save(_ token: String, for mutation: SessionTokenMutation?) throws {
+        try store.save(token, for: mutation)
+    }
+
+    func clear(for mutation: SessionTokenMutation?) {
+        store.clear(for: mutation)
+    }
 }
 
 private struct SessionResolvingView: View {
     @Environment(\.colorScheme) private var colorScheme
     let errorMessage: String?
     let onRetry: () -> Void
+    let onSignInAgain: () -> Void
 
     var body: some View {
         ZStack {
@@ -474,9 +547,14 @@ private struct SessionResolvingView: View {
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 520)
 
-                    Button("Try Again", action: onRetry)
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
+                    HStack(spacing: 12) {
+                        Button("Try Again", action: onRetry)
+                            .buttonStyle(.borderedProminent)
+
+                        Button("Sign In Again", action: onSignInAgain)
+                            .buttonStyle(.bordered)
+                    }
+                    .controlSize(.large)
                 } else {
                     ProgressView()
                         .controlSize(.small)

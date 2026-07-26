@@ -498,6 +498,184 @@ def _postgres_integration_enabled() -> bool:
 class UserMailGuardPostgresTests(unittest.TestCase):
     database_url = os.getenv("DATABASE_URL", "")
 
+    def test_stale_legacy_failed_body_is_retried_without_retrying_recent_failure(self) -> None:
+        user_id = f"guard-test-{uuid4()}"
+        stale_message_id = f"body-failed-stale-{uuid4()}"
+        recent_message_id = f"body-failed-recent-{uuid4()}"
+        self._create_connected_user(user_id)
+        self.addCleanup(self._delete_test_user, user_id)
+        self._insert_message(user_id, stale_message_id)
+        self._insert_message(user_id, recent_message_id)
+        mail_groups.mark_gmail_messages_body_fetch_state(
+            self.database_url,
+            user_id=user_id,
+            message_ids=[stale_message_id, recent_message_id],
+            status="failed",
+            error="legacy retryable failure",
+        )
+        with repository.get_engine(self.database_url).begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE gmail_messages
+                    SET body_fetch_updated_at = now() - interval '16 minutes'
+                    WHERE user_id = :user_id AND message_id = :message_id
+                    """
+                ),
+                {"user_id": user_id, "message_id": stale_message_id},
+            )
+
+        selected = mail_groups.list_messages_needing_body_fetch(
+            self.database_url,
+            user_id=user_id,
+            limit=25,
+        )
+
+        self.assertEqual(
+            [message.message_id for message in selected],
+            [stale_message_id],
+        )
+
+    def test_attachment_descriptor_backfill_accepts_initial_null_cursor(self) -> None:
+        user_id = f"guard-test-{uuid4()}"
+        message_id = f"descriptor-backfill-{uuid4()}"
+        self._create_connected_user(user_id)
+        self.addCleanup(self._delete_test_user, user_id)
+        self._insert_message(user_id, message_id)
+
+        processed, has_more, cursor = (
+            mail_groups.backfill_gmail_attachment_descriptors_page(
+                self.database_url,
+                user_id=user_id,
+                limit=25,
+                after_message_id=None,
+            )
+        )
+
+        self.assertEqual(processed, 1)
+        self.assertFalse(has_more)
+        self.assertEqual(cursor, message_id)
+        empty_processed, empty_has_more, empty_cursor = (
+            mail_groups.backfill_gmail_attachment_descriptors_page(
+                self.database_url,
+                user_id=user_id,
+                limit=25,
+                after_message_id=None,
+            )
+        )
+        self.assertEqual(empty_processed, 0)
+        self.assertFalse(empty_has_more)
+        self.assertIsNone(empty_cursor)
+        with repository.get_engine(self.database_url).connect() as connection:
+            descriptor_ready = connection.execute(
+                text(
+                    """
+                    SELECT attachment_descriptors_ready
+                    FROM gmail_messages
+                    WHERE user_id = :user_id AND message_id = :message_id
+                    """
+                ),
+                {"user_id": user_id, "message_id": message_id},
+            ).scalar_one()
+        self.assertTrue(descriptor_ready)
+
+    def test_attachment_descriptor_backfill_restarts_for_locked_earlier_cursor_hole(self) -> None:
+        user_id = f"guard-test-{uuid4()}"
+        suffix = str(uuid4())
+        earlier_message_id = f"descriptor-a-{suffix}"
+        cursor = f"descriptor-m-{suffix}"
+        later_message_id = f"descriptor-z-{suffix}"
+        self._create_connected_user(user_id)
+        self.addCleanup(self._delete_test_user, user_id)
+        self._insert_message(user_id, earlier_message_id)
+        self._insert_message(user_id, later_message_id)
+        engine = repository.get_engine(self.database_url)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO gmail_import_state (
+                      user_id, attachment_descriptors_complete, updated_at
+                    )
+                    VALUES (:user_id, TRUE, now())
+                    """
+                ),
+                {"user_id": user_id},
+            )
+
+        lock_connection = engine.connect()
+        lock_transaction = lock_connection.begin()
+        try:
+            lock_connection.execute(
+                text(
+                    """
+                    SELECT message_id
+                    FROM gmail_messages
+                    WHERE user_id = :user_id AND message_id = :message_id
+                    FOR UPDATE
+                    """
+                ),
+                {"user_id": user_id, "message_id": earlier_message_id},
+            ).scalar_one()
+
+            processed, has_more, restart_cursor = (
+                mail_groups.backfill_gmail_attachment_descriptors_page(
+                    self.database_url,
+                    user_id=user_id,
+                    limit=25,
+                    after_message_id=cursor,
+                )
+            )
+
+            self.assertEqual(processed, 1)
+            self.assertTrue(has_more)
+            self.assertIsNone(restart_cursor)
+            with engine.connect() as probe:
+                completion = probe.execute(
+                    text(
+                        """
+                        SELECT attachment_descriptors_complete
+                        FROM gmail_import_state
+                        WHERE user_id = :user_id
+                        """
+                    ),
+                    {"user_id": user_id},
+                ).scalar_one()
+            self.assertFalse(completion)
+        finally:
+            lock_transaction.rollback()
+            lock_connection.close()
+
+        processed, has_more, final_cursor = (
+            mail_groups.backfill_gmail_attachment_descriptors_page(
+                self.database_url,
+                user_id=user_id,
+                limit=25,
+                after_message_id=restart_cursor,
+            )
+        )
+        self.assertEqual(processed, 1)
+        self.assertFalse(has_more)
+        self.assertEqual(final_cursor, earlier_message_id)
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT state.attachment_descriptors_complete,
+                           COUNT(messages.message_id) FILTER (
+                             WHERE NOT messages.attachment_descriptors_ready
+                           ) AS pending_count
+                    FROM gmail_import_state AS state
+                    LEFT JOIN gmail_messages AS messages ON messages.user_id = state.user_id
+                    WHERE state.user_id = :user_id
+                    GROUP BY state.attachment_descriptors_complete
+                    """
+                ),
+                {"user_id": user_id},
+            ).mappings().one()
+        self.assertTrue(row["attachment_descriptors_complete"])
+        self.assertEqual(int(row["pending_count"] or 0), 0)
+
     def test_oauth_reconnect_rolls_back_guard_clear_when_token_write_fails(self) -> None:
         user_id = f"guard-test-{uuid4()}"
         self._create_connected_user(user_id)

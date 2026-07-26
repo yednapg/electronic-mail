@@ -67,6 +67,392 @@ final class ModelDecodingTests: XCTestCase {
         )
     }
 
+    func testGenerationKeychainServiceIsStableAcrossBuilds() {
+        XCTAssertEqual(KeychainSessionTokenStore.generationService, "ElectronicMail.session.v2")
+    }
+
+    func testAsyncSessionTokenStoreReturnsImmediateTokenOffMainThread() async {
+        let store = ImmediateSessionTokenTestStore(token: "saved-session")
+        let result = await AsyncSessionTokenStore(store: store).load(timeout: 1)
+
+        XCTAssertEqual(result, .loaded("saved-session"))
+        XCTAssertFalse(store.loadRanOnMainThread)
+    }
+
+    func testAsyncSessionTokenStoreTimesOutWithoutBlockingMainActor() async {
+        let loadStarted = expectation(description: "blocking token read started")
+        let loadFinished = expectation(description: "blocking token read eventually finished")
+        let store = BlockingSessionTokenTestStore(started: loadStarted, finished: loadFinished)
+        let asyncStore = AsyncSessionTokenStore(store: store)
+        let startedAt = Date()
+
+        let loadTask = Task { @MainActor in
+            await asyncStore.load(timeout: 0.08)
+        }
+        await fulfillment(of: [loadStarted], timeout: 1)
+
+        let mainActorResponded = expectation(description: "main actor stayed responsive")
+        Task { @MainActor in
+            mainActorResponded.fulfill()
+        }
+        await fulfillment(of: [mainActorResponded], timeout: 0.05)
+
+        let result = await loadTask.value
+        XCTAssertEqual(result, .timedOut)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.4)
+
+        store.release()
+        await fulfillment(of: [loadFinished], timeout: 1)
+    }
+
+    func testAsyncSessionTokenStoreIgnoresResultArrivingAfterTimeout() async {
+        let loadStarted = expectation(description: "late token read started")
+        let loadFinished = expectation(description: "late token read finished")
+        let store = BlockingSessionTokenTestStore(
+            token: "too-late-session",
+            started: loadStarted,
+            finished: loadFinished
+        )
+        let asyncStore = AsyncSessionTokenStore(store: store)
+
+        let result = await asyncStore.load(timeout: 0.03)
+        XCTAssertEqual(result, .timedOut)
+        await fulfillment(of: [loadStarted], timeout: 1)
+
+        store.release()
+        await fulfillment(of: [loadFinished], timeout: 1)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertEqual(result, .timedOut)
+    }
+
+    func testNeverReturningLoadCannotBlockNewerSave() async {
+        let loadStarted = expectation(description: "never-returning token read started")
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore(
+            blockedOperation: .legacyRead,
+            started: loadStarted
+        )
+        let cleanupQueue = DispatchQueue(label: "test.session-token.cleanup.never-load")
+        let store = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        let asyncStore = AsyncSessionTokenStore(store: store)
+
+        let loadTask = Task {
+            await asyncStore.load(timeout: 0.03)
+        }
+        await fulfillment(of: [loadStarted], timeout: 1)
+        let loadResult = await loadTask.value
+        XCTAssertEqual(loadResult, .timedOut)
+
+        let startedAt = Date()
+        let saveResult = await asyncStore.save("newer-session", timeout: 0.5)
+
+        XCTAssertEqual(saveResult, .saved)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.4)
+        let relaunchedStore = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        XCTAssertEqual(relaunchedStore.load(), "newer-session")
+    }
+
+    func testTimedOutOlderSaveCannotOverwriteNewerSave() async {
+        let olderSaveStarted = expectation(description: "older save started")
+        let olderSaveFinished = expectation(description: "older immutable record finished")
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore(
+            blockedOperation: .generationWrite("older-session"),
+            started: olderSaveStarted,
+            finished: olderSaveFinished
+        )
+        let cleanupQueue = DispatchQueue(label: "test.session-token.cleanup.late-save")
+        let store = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        let asyncStore = AsyncSessionTokenStore(store: store)
+
+        let olderTask = Task {
+            await asyncStore.save("older-session", timeout: 0.03)
+        }
+        await fulfillment(of: [olderSaveStarted], timeout: 1)
+        let olderResult = await olderTask.value
+        XCTAssertEqual(olderResult, .timedOut)
+
+        let startedAt = Date()
+        let newerResult = await asyncStore.save("newer-session", timeout: 0.5)
+        XCTAssertEqual(newerResult, .saved)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.4)
+        XCTAssertEqual(store.load(), "newer-session")
+        records.releaseBlockedOperation()
+
+        await fulfillment(of: [olderSaveFinished], timeout: 1)
+        cleanupQueue.sync {}
+        let relaunchedStore = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        XCTAssertEqual(relaunchedStore.load(), "newer-session")
+        XCTAssertEqual(records.generationWriteValues, ["newer-session", "older-session"])
+        XCTAssertEqual(Set(records.generationWriteAccounts).count, 2)
+    }
+
+    func testTimedOutOlderClearCannotDeleteNewerSave() async {
+        let clearStarted = expectation(description: "older clear started")
+        let clearFinished = expectation(description: "older tombstone record finished")
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore(
+            blockedOperation: .generationWrite("tombstone-v2"),
+            started: clearStarted,
+            finished: clearFinished
+        )
+        let cleanupQueue = DispatchQueue(label: "test.session-token.cleanup.late-clear")
+        let store = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        let asyncStore = AsyncSessionTokenStore(store: store)
+
+        let clearTask = Task {
+            await asyncStore.clear(timeout: 0.03)
+        }
+        await fulfillment(of: [clearStarted], timeout: 1)
+        let clearResult = await clearTask.value
+        XCTAssertEqual(clearResult, .timedOut)
+
+        let startedAt = Date()
+        let newerResult = await asyncStore.save("newer-session", timeout: 0.5)
+        XCTAssertEqual(newerResult, .saved)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.4)
+        XCTAssertEqual(store.load(), "newer-session")
+        records.releaseBlockedOperation()
+
+        await fulfillment(of: [clearFinished], timeout: 1)
+        cleanupQueue.sync {}
+        let relaunchedStore = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        XCTAssertEqual(relaunchedStore.load(), "newer-session")
+        XCTAssertEqual(records.generationWriteValues, ["newer-session", "tombstone-v2"])
+    }
+
+    func testTimedOutLoadMigrationCannotOverwriteNewerSave() async {
+        let loadStarted = expectation(description: "legacy load migration started")
+        let migrationFinished = expectation(description: "legacy immutable record finished")
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore(
+            legacyToken: "legacy-session",
+            blockedOperation: .generationWrite("legacy-session"),
+            started: loadStarted,
+            finished: migrationFinished
+        )
+        let cleanupQueue = DispatchQueue(label: "test.session-token.cleanup.late-migration")
+        let store = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        let asyncStore = AsyncSessionTokenStore(store: store)
+
+        let loadTask = Task {
+            await asyncStore.load(timeout: 0.03)
+        }
+        await fulfillment(of: [loadStarted], timeout: 1)
+        let loadResult = await loadTask.value
+        XCTAssertEqual(loadResult, .timedOut)
+
+        let startedAt = Date()
+        let newerResult = await asyncStore.save("newer-session", timeout: 0.5)
+        XCTAssertEqual(newerResult, .saved)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.4)
+        XCTAssertEqual(store.load(), "newer-session")
+        records.releaseBlockedOperation()
+
+        await fulfillment(of: [migrationFinished], timeout: 1)
+        cleanupQueue.sync {}
+        let relaunchedStore = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        XCTAssertEqual(relaunchedStore.load(), "newer-session")
+        XCTAssertEqual(records.generationWriteValues, ["newer-session", "legacy-session"])
+    }
+
+    func testPendingNewestGenerationFailsClosedAcrossRelaunch() throws {
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore()
+        let cleanupQueue = DispatchQueue(
+            label: "test.session-token.cleanup.pending-relaunch",
+            attributes: .initiallyInactive
+        )
+        let firstLaunch = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        try firstLaunch.save("older-session")
+        XCTAssertEqual(firstLaunch.load(), "older-session")
+
+        _ = try firstLaunch.prepareMutation(.token)
+        cleanupQueue.activate()
+        cleanupQueue.sync {}
+
+        let relaunchedStore = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        XCTAssertNil(relaunchedStore.load())
+        XCTAssertTrue(records.containsGenerationValue("older-session"))
+    }
+
+    func testPendingSignOutTombstoneSurvivesRelaunch() throws {
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore()
+        let cleanupQueue = DispatchQueue(
+            label: "test.session-token.cleanup.tombstone-relaunch",
+            attributes: .initiallyInactive
+        )
+        let firstLaunch = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        try firstLaunch.save("signed-in-session")
+        XCTAssertEqual(firstLaunch.load(), "signed-in-session")
+
+        let tombstone = try XCTUnwrap(firstLaunch.prepareMutation(.tombstone))
+        cleanupQueue.activate()
+        cleanupQueue.sync {}
+
+        let relaunchedStore = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        XCTAssertNil(relaunchedStore.load())
+        XCTAssertEqual(tombstone.kind, .tombstone)
+        XCTAssertTrue(records.containsGenerationValue("signed-in-session"))
+    }
+
+    func testPreparedClearIntentFailsClosedAfterImmediateQuitBeforeKeychainWorkStarts() async throws {
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore()
+        let cleanupQueue = DispatchQueue(label: "test.session-token.cleanup.immediate-quit")
+        let firstLaunch = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        try firstLaunch.save("signed-in-session")
+        cleanupQueue.sync {}
+        let asyncStore = AsyncSessionTokenStore(store: firstLaunch)
+
+        // This is the exact crash boundary used by explicit sign-out: the
+        // durable intent is synchronized while the process is still alive,
+        // but no credential-store task has been scheduled yet.
+        _ = try await MainActor.run {
+            try asyncStore.prepareClearIntent()
+        }
+
+        let relaunchedStore = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        XCTAssertNil(relaunchedStore.load())
+        XCTAssertEqual(records.generationWriteValues, ["signed-in-session"])
+        XCTAssertTrue(records.containsGenerationValue("signed-in-session"))
+    }
+
+    func testPreparedSignOutThenFastSignInWinsWhenClearFinishesLate() async throws {
+        let clearStarted = expectation(description: "prepared tombstone write started")
+        let clearFinished = expectation(description: "prepared tombstone write finished late")
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore(
+            blockedOperation: .generationWrite("tombstone-v2"),
+            started: clearStarted,
+            finished: clearFinished
+        )
+        let cleanupQueue = DispatchQueue(label: "test.session-token.cleanup.prepared-fast-signin")
+        let store = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        try store.save("signed-in-session")
+        let asyncStore = AsyncSessionTokenStore(store: store)
+        let preparedIntent = try await MainActor.run {
+            try asyncStore.prepareClearIntent()
+        }
+
+        let lateClear = Task { @MainActor in
+            await asyncStore.clear(preparedIntent: preparedIntent, timeout: 1)
+        }
+        await fulfillment(of: [clearStarted], timeout: 1)
+
+        let newSignIn = await asyncStore.save("new-session", timeout: 0.5)
+        XCTAssertEqual(newSignIn, .saved)
+        XCTAssertEqual(store.load(), "new-session")
+
+        records.releaseBlockedOperation()
+        await fulfillment(of: [clearFinished], timeout: 1)
+        let clearResult = await lateClear.value
+        XCTAssertEqual(clearResult, .cleared)
+        cleanupQueue.sync {}
+
+        let relaunchedStore = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        XCTAssertEqual(relaunchedStore.load(), "new-session")
+        XCTAssertEqual(
+            records.generationWriteValues,
+            ["signed-in-session", "new-session", "tombstone-v2"]
+        )
+        XCTAssertFalse(records.generationWriteMainThreadFlags.last ?? true)
+    }
+
+    func testRapidSaveClearSaveCompletesOutOfOrderWithoutRepointingNewestGeneration() throws {
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore()
+        let cleanupQueue = DispatchQueue(label: "test.session-token.cleanup.rapid-mutations")
+        let store = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        let firstSave = try XCTUnwrap(store.prepareMutation(.token))
+        let clear = try XCTUnwrap(store.prepareMutation(.tombstone))
+        let finalSave = try XCTUnwrap(store.prepareMutation(.token))
+
+        try store.save("newest-session", for: finalSave)
+        store.clear(for: clear)
+        try store.save("stale-session", for: firstSave)
+        cleanupQueue.sync {}
+
+        let relaunchedStore = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        XCTAssertEqual(relaunchedStore.load(), "newest-session")
+        XCTAssertEqual([firstSave.ordinal, clear.ordinal, finalSave.ordinal], [1, 2, 3])
+        XCTAssertEqual(Set(records.generationWriteAccounts).count, 3)
+    }
+
     func testReleaseKeychainPolicyNeverAllowsClassicMacFallback() {
         XCTAssertFalse(
             KeychainSessionTokenStore.shouldUseClassicMacFallback(
@@ -1392,6 +1778,99 @@ final class ModelDecodingTests: XCTestCase {
         )
     }
 
+    func testComposerRecoveryDestructivePurgeRunsOffMainActorWithoutBlockingUI() async {
+        let completionStarted = expectation(description: "composer recovery key purge started")
+        let completionFinished = expectation(description: "composer recovery key purge finished")
+        let probe = BlockingComposerRecoveryPurgeProbe(
+            started: completionStarted,
+            finished: completionFinished
+        )
+        let coordinator = await MainActor.run {
+            ElectronicMailComposerShutdownCoordinator(
+                recoveryPurgeOperations: ComposerRecoveryPurgeOperations(
+                    markPending: {
+                        probe.markPending()
+                    },
+                    completePending: {
+                        probe.runBlockingCompletion()
+                    }
+                )
+            )
+        }
+
+        await MainActor.run {
+            coordinator.clearRecoveryData()
+        }
+        await fulfillment(of: [completionStarted], timeout: 1)
+
+        XCTAssertEqual(probe.markPendingCount, 1)
+        XCTAssertFalse(probe.completionRanOnMainThread)
+
+        let mainActorResponded = expectation(description: "main actor stayed responsive during key purge")
+        Task { @MainActor in
+            mainActorResponded.fulfill()
+        }
+        await fulfillment(of: [mainActorResponded], timeout: 0.05)
+
+        probe.releaseCompletion()
+        await coordinator.waitForRecoveryDataPurge()
+        await fulfillment(of: [completionFinished], timeout: 1)
+        XCTAssertTrue(probe.didFinish)
+    }
+
+    func testComposerRecoveryDestructivePurgeKeepsDurableIntentUntilKeyDeletionCompletes() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ElectronicMailComposerPurgeTests-\(UUID().uuidString)", isDirectory: true)
+        let sealedRecoveryURL = directory.appendingPathComponent("ComposerRecovery.sealed")
+        let legacyRecoveryURL = directory.appendingPathComponent("ComposerRecovery.json")
+        let purgeMarkerURL = directory.appendingPathComponent("ComposerRecovery.purge-pending")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("sealed recovery".utf8).write(to: sealedRecoveryURL)
+        try Data("legacy recovery".utf8).write(to: legacyRecoveryURL)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let completionStarted = expectation(description: "durable composer purge completion started")
+        let fixture = DurableComposerRecoveryPurgeFixture(
+            sealedRecoveryURL: sealedRecoveryURL,
+            legacyRecoveryURL: legacyRecoveryURL,
+            purgeMarkerURL: purgeMarkerURL,
+            completionStarted: completionStarted
+        )
+        let coordinator = await MainActor.run {
+            ElectronicMailComposerShutdownCoordinator(
+                recoveryPurgeOperations: ComposerRecoveryPurgeOperations(
+                    markPending: {
+                        fixture.markPending()
+                    },
+                    completePending: {
+                        fixture.runBlockingCompletion()
+                    }
+                )
+            )
+        }
+
+        await MainActor.run {
+            coordinator.clearRecoveryData()
+        }
+        await fulfillment(of: [completionStarted], timeout: 1)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sealedRecoveryURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacyRecoveryURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: purgeMarkerURL.path))
+        XCTAssertTrue(fixture.keyIsPresent)
+        XCTAssertEqual(fixture.markPendingCount, 1)
+        XCTAssertEqual(fixture.completionCount, 0)
+
+        fixture.releaseCompletion()
+        await coordinator.waitForRecoveryDataPurge()
+
+        XCTAssertFalse(fixture.keyIsPresent)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: purgeMarkerURL.path))
+        XCTAssertEqual(fixture.completionCount, 1)
+    }
+
     func testDraftSaveRequestDecodesResponseFieldsWithBackwardCompatibleDefaults() throws {
         let data = Data(
             #"{"client_draft_id":"legacy-draft","gmail_draft_id":null,"gmail_thread_id":null,"to":[],"cc":[],"bcc":[],"subject":"","body_text":"","body_html":null,"attachments":null,"retained_attachment_ids":null,"created_at":"2026-07-23T00:00:00Z"}"#.utf8
@@ -2644,6 +3123,301 @@ final class ModelDecodingTests: XCTestCase {
                     result.append(data)
                 }
             }
+    }
+}
+
+private final class BlockingComposerRecoveryPurgeProbe: @unchecked Sendable {
+    private let started: XCTestExpectation
+    private let finished: XCTestExpectation
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var pendingMarks = 0
+    private var completed = false
+    private var completionUsedMainThread = false
+
+    init(started: XCTestExpectation, finished: XCTestExpectation) {
+        self.started = started
+        self.finished = finished
+    }
+
+    var markPendingCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingMarks
+    }
+
+    var completionRanOnMainThread: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return completionUsedMainThread
+    }
+
+    var didFinish: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return completed
+    }
+
+    func markPending() {
+        lock.lock()
+        pendingMarks += 1
+        lock.unlock()
+    }
+
+    func runBlockingCompletion() {
+        lock.lock()
+        completionUsedMainThread = Thread.isMainThread
+        lock.unlock()
+        started.fulfill()
+        releaseSemaphore.wait()
+        lock.lock()
+        completed = true
+        lock.unlock()
+        finished.fulfill()
+    }
+
+    func releaseCompletion() {
+        releaseSemaphore.signal()
+    }
+}
+
+private final class DurableComposerRecoveryPurgeFixture: @unchecked Sendable {
+    private let sealedRecoveryURL: URL
+    private let legacyRecoveryURL: URL
+    private let purgeMarkerURL: URL
+    private let completionStarted: XCTestExpectation
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var pendingMarks = 0
+    private var completions = 0
+    private var hasKey = true
+
+    init(
+        sealedRecoveryURL: URL,
+        legacyRecoveryURL: URL,
+        purgeMarkerURL: URL,
+        completionStarted: XCTestExpectation
+    ) {
+        self.sealedRecoveryURL = sealedRecoveryURL
+        self.legacyRecoveryURL = legacyRecoveryURL
+        self.purgeMarkerURL = purgeMarkerURL
+        self.completionStarted = completionStarted
+    }
+
+    var markPendingCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingMarks
+    }
+
+    var completionCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return completions
+    }
+
+    var keyIsPresent: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return hasKey
+    }
+
+    func markPending() {
+        try? Data("pending".utf8).write(to: purgeMarkerURL, options: .atomic)
+        try? FileManager.default.removeItem(at: sealedRecoveryURL)
+        try? FileManager.default.removeItem(at: legacyRecoveryURL)
+        lock.lock()
+        pendingMarks += 1
+        lock.unlock()
+    }
+
+    func runBlockingCompletion() {
+        completionStarted.fulfill()
+        releaseSemaphore.wait()
+        lock.lock()
+        hasKey = false
+        completions += 1
+        lock.unlock()
+        try? FileManager.default.removeItem(at: purgeMarkerURL)
+    }
+
+    func releaseCompletion() {
+        releaseSemaphore.signal()
+    }
+}
+
+private final class ImmediateSessionTokenTestStore: SessionTokenStoring, @unchecked Sendable {
+    private let token: String?
+    private let lock = NSLock()
+    private var didLoadOnMainThread = false
+
+    init(token: String?) {
+        self.token = token
+    }
+
+    var loadRanOnMainThread: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didLoadOnMainThread
+    }
+
+    func load() -> String? {
+        lock.lock()
+        didLoadOnMainThread = Thread.isMainThread
+        lock.unlock()
+        return token
+    }
+
+    func save(_ token: String) throws {}
+    func clear() {}
+}
+
+private final class BlockingSessionTokenTestStore: SessionTokenStoring, @unchecked Sendable {
+    private let token: String?
+    private let started: XCTestExpectation
+    private let finished: XCTestExpectation
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
+
+    init(
+        token: String? = "saved-session",
+        started: XCTestExpectation,
+        finished: XCTestExpectation
+    ) {
+        self.token = token
+        self.started = started
+        self.finished = finished
+    }
+
+    func load() -> String? {
+        started.fulfill()
+        releaseSemaphore.wait()
+        finished.fulfill()
+        return token
+    }
+
+    func release() {
+        releaseSemaphore.signal()
+    }
+
+    func save(_ token: String) throws {}
+    func clear() {}
+}
+
+private final class GenerationSessionTokenRecordTestStore: SessionTokenSecureRecordStoring, @unchecked Sendable {
+    enum BlockedOperation: Equatable {
+        case legacyRead
+        case generationWrite(String)
+    }
+
+    private let blockedOperation: BlockedOperation?
+    private let started: XCTestExpectation?
+    private let finished: XCTestExpectation?
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var didEnterBlockedOperation = false
+    private var generationRecords: [String: Data] = [:]
+    private var legacyRecord: Data?
+    private var writeValues: [String] = []
+    private var writeAccounts: [String] = []
+    private var writeMainThreadFlags: [Bool] = []
+
+    init(
+        legacyToken: String? = nil,
+        blockedOperation: BlockedOperation? = nil,
+        started: XCTestExpectation? = nil,
+        finished: XCTestExpectation? = nil
+    ) {
+        legacyRecord = legacyToken.map { Data($0.utf8) }
+        self.blockedOperation = blockedOperation
+        self.started = started
+        self.finished = finished
+    }
+
+    var generationWriteValues: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return writeValues
+    }
+
+    var generationWriteAccounts: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return writeAccounts
+    }
+
+    var generationWriteMainThreadFlags: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return writeMainThreadFlags
+    }
+
+    func containsGenerationValue(_ value: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return generationRecords.values.contains { data in
+            String(data: data, encoding: .utf8) == value
+        }
+    }
+
+    func readGenerationRecord(account: String) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return generationRecords[account]
+    }
+
+    func addGenerationRecord(_ data: Data, account: String) throws {
+        let value = String(data: data, encoding: .utf8) ?? "<binary>"
+        if shouldBlock(.generationWrite(value)) {
+            started?.fulfill()
+            releaseSemaphore.wait()
+            finished?.fulfill()
+        }
+        lock.lock()
+        if generationRecords[account] == nil {
+            generationRecords[account] = data
+            writeValues.append(value)
+            writeAccounts.append(account)
+            writeMainThreadFlags.append(Thread.isMainThread)
+        }
+        lock.unlock()
+    }
+
+    func deleteGenerationRecord(account: String) -> Bool {
+        lock.lock()
+        generationRecords.removeValue(forKey: account)
+        lock.unlock()
+        return true
+    }
+
+    func readLegacyRecord() -> Data? {
+        if shouldBlock(.legacyRead) {
+            started?.fulfill()
+            releaseSemaphore.wait()
+            finished?.fulfill()
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        return legacyRecord
+    }
+
+    func deleteLegacyRecords() {
+        lock.lock()
+        legacyRecord = nil
+        lock.unlock()
+    }
+
+    func releaseBlockedOperation() {
+        releaseSemaphore.signal()
+    }
+
+    private func shouldBlock(_ operation: BlockedOperation) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didEnterBlockedOperation, blockedOperation == operation else {
+            return false
+        }
+        didEnterBlockedOperation = true
+        return true
     }
 }
 

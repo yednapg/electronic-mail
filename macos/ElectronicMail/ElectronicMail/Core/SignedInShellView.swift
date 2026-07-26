@@ -28,12 +28,32 @@ enum ElectronicMailShellMetrics {
     }
 }
 
+struct ComposerRecoveryPurgeOperations: Sendable {
+    let markPending: @Sendable () -> Void
+    let completePending: @Sendable () async -> Void
+
+    static let live = ComposerRecoveryPurgeOperations(
+        markPending: {
+            ComposerRecoveryStore.requestDestructivePurge()
+        },
+        completePending: {
+            await ComposerRecoveryWriter.shared.completeDestructivePurge()
+        }
+    )
+}
+
 @MainActor
 public final class ElectronicMailComposerShutdownCoordinator {
     public static let shared = ElectronicMailComposerShutdownCoordinator()
 
     private var registrationID: UUID?
     private var prepareHandler: (() async -> Bool)?
+    private let recoveryPurgeOperations: ComposerRecoveryPurgeOperations
+    private var recoveryPurgeTask: Task<Void, Never>?
+
+    init(recoveryPurgeOperations: ComposerRecoveryPurgeOperations = .live) {
+        self.recoveryPurgeOperations = recoveryPurgeOperations
+    }
 
     public var hasActiveComposer: Bool {
         prepareHandler != nil
@@ -47,7 +67,21 @@ public final class ElectronicMailComposerShutdownCoordinator {
     }
 
     public func clearRecoveryData() {
-        ComposerRecoveryStore.clear(removeKey: true)
+        // Persist the destructive intent before returning to the sign-out UI.
+        // Keychain work is then serialized away from MainActor. If the process
+        // exits before it completes, the durable marker makes the next recovery
+        // load finish the purge instead of restoring a signed-out draft.
+        recoveryPurgeOperations.markPending()
+        let previousPurgeTask = recoveryPurgeTask
+        let completePending = recoveryPurgeOperations.completePending
+        recoveryPurgeTask = Task.detached(priority: .utility) {
+            await previousPurgeTask?.value
+            await completePending()
+        }
+    }
+
+    func waitForRecoveryDataPurge() async {
+        await recoveryPurgeTask?.value
     }
 
     fileprivate func register(id: UUID, prepare: @escaping () async -> Bool) {
@@ -1594,8 +1628,14 @@ private enum ComposerRecoveryStore {
     private static let maximumPlaintextBytes = 28 * 1_024 * 1_024
     private static let keychainService = "ElectronicMail"
     private static let keychainAccount = "composer_recovery_key_v1"
+    private static let destructivePurgePendingDefaultsKey =
+        "ElectronicMail.composer_recovery_destructive_purge_pending_v1"
 
     static func load() -> ComposerRecoverySnapshot? {
+        if destructivePurgePending {
+            completeDestructivePurge()
+            return nil
+        }
         removeLegacyPlaintextFile()
         guard let fileURL,
               let encrypted = try? Data(contentsOf: fileURL),
@@ -1607,18 +1647,24 @@ private enum ComposerRecoveryStore {
             let sealedBox = try AES.GCM.SealedBox(combined: encrypted)
             let plaintext = try AES.GCM.open(sealedBox, using: key)
             guard plaintext.count <= maximumPlaintextBytes else {
-                clear(removeKey: true)
+                requestDestructivePurge()
+                completeDestructivePurge()
                 return nil
             }
             return try JSONDecoder.backend.decode(ComposerRecoverySnapshot.self, from: plaintext)
         } catch {
-            clear(removeKey: true)
+            requestDestructivePurge()
+            completeDestructivePurge()
             return nil
         }
     }
 
     @discardableResult
     static func save(_ snapshot: ComposerRecoverySnapshot) -> Bool {
+        if destructivePurgePending {
+            completeDestructivePurge()
+            return false
+        }
         removeLegacyPlaintextFile()
         guard let fileURL,
               let plaintext = try? JSONEncoder.backend.encode(snapshot),
@@ -1644,17 +1690,65 @@ private enum ComposerRecoveryStore {
         }
     }
 
-    static func clear(removeKey: Bool = false) {
+    static func clear() {
         if let fileURL {
             try? FileManager.default.removeItem(at: fileURL)
         }
         removeLegacyPlaintextFile()
-        if removeKey {
-            _ = SecItemDelete(dataProtectionKeychainQuery() as CFDictionary)
-            #if os(macOS)
-            _ = SecItemDelete(classicMacKeychainQuery() as CFDictionary)
-            #endif
+    }
+
+    /// Records a durable purge intent without touching Security.framework.
+    /// This is safe to call synchronously from MainActor during sign-out.
+    static func requestDestructivePurge() {
+        UserDefaults.standard.set(true, forKey: destructivePurgePendingDefaultsKey)
+        if let destructivePurgeMarkerURL {
+            try? FileManager.default.createDirectory(
+                at: destructivePurgeMarkerURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try? Data("pending".utf8).write(to: destructivePurgeMarkerURL, options: .atomic)
         }
+        clear()
+    }
+
+    /// Completes a previously requested destructive purge. Callers must run
+    /// this away from MainActor because Keychain deletion can block inside
+    /// Security.framework. A transient failure retains the durable intent so
+    /// the next recovery load retries instead of exposing signed-out content.
+    static func completeDestructivePurge() {
+        guard destructivePurgePending else {
+            return
+        }
+        clear()
+        let dataProtectionStatus = SecItemDelete(dataProtectionKeychainQuery() as CFDictionary)
+        #if os(macOS)
+        let classicStatus = SecItemDelete(classicMacKeychainQuery() as CFDictionary)
+        let deletionFinished = keyDeletionReachedTerminalState(dataProtectionStatus)
+            && keyDeletionReachedTerminalState(classicStatus)
+        #else
+        let deletionFinished = keyDeletionReachedTerminalState(dataProtectionStatus)
+        #endif
+        guard deletionFinished else {
+            return
+        }
+        if let destructivePurgeMarkerURL {
+            try? FileManager.default.removeItem(at: destructivePurgeMarkerURL)
+        }
+        UserDefaults.standard.removeObject(forKey: destructivePurgePendingDefaultsKey)
+    }
+
+    private static var destructivePurgePending: Bool {
+        UserDefaults.standard.bool(forKey: destructivePurgePendingDefaultsKey)
+            || destructivePurgeMarkerURL.map {
+                FileManager.default.fileExists(atPath: $0.path)
+            } == true
+    }
+
+    private static func keyDeletionReachedTerminalState(_ status: OSStatus) -> Bool {
+        status == errSecSuccess
+            || status == errSecItemNotFound
+            || status == errSecMissingEntitlement
     }
 
     private static var fileURL: URL? {
@@ -1667,6 +1761,12 @@ private enum ComposerRecoveryStore {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
             .appendingPathComponent("ElectronicMail", isDirectory: true)
             .appendingPathComponent("ComposerRecovery.json", isDirectory: false)
+    }
+
+    private static var destructivePurgeMarkerURL: URL? {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("ElectronicMail", isDirectory: true)
+            .appendingPathComponent("ComposerRecovery.purge-pending", isDirectory: false)
     }
 
     private static func removeLegacyPlaintextFile() {
@@ -1804,6 +1904,10 @@ private actor ComposerRecoveryWriter {
 
     func clear() {
         ComposerRecoveryStore.clear()
+    }
+
+    func completeDestructivePurge() {
+        ComposerRecoveryStore.completeDestructivePurge()
     }
 }
 
