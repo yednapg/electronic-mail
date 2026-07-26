@@ -3049,6 +3049,76 @@ final class InboxStoreTests: XCTestCase {
         )
     }
 
+    func testSessionTokenClearKeepsMainActorResponsiveWhileLocalPurgeBlocks() async {
+        let purgeStarted = expectation(description: "local purge started")
+        let purgeFinished = expectation(description: "local purge finished")
+        let localStore = BlockingClearAllLocalMailStore(
+            purgeStarted: purgeStarted,
+            purgeFinished: purgeFinished
+        )
+        let store = InboxStore(
+            client: FailingAppClient(),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore
+        )
+        store.setSessionToken("live-session-token")
+
+        // Keep a failed implementation from deadlocking the test process. The
+        // normal path releases immediately after proving the MainActor moved.
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 1) {
+            localStore.releasePurge()
+        }
+
+        let startedAt = Date()
+        store.setSessionToken(nil)
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.1)
+        await fulfillment(of: [purgeStarted], timeout: 1)
+
+        let mainActorHeartbeat = expectation(description: "main actor remained responsive")
+        Task { @MainActor in
+            mainActorHeartbeat.fulfill()
+        }
+        await fulfillment(of: [mainActorHeartbeat], timeout: 0.05)
+        XCTAssertFalse(localStore.purgeRanOnMainThread)
+
+        localStore.releasePurge()
+        await fulfillment(of: [purgeFinished], timeout: 1)
+    }
+
+    func testFastResignInWaitsForOlderLocalPurgeBeforeReadingDiskCache() async {
+        let purgeStarted = expectation(description: "older local purge started")
+        let purgeFinished = expectation(description: "older local purge finished")
+        let localStore = BlockingClearAllLocalMailStore(
+            purgeStarted: purgeStarted,
+            purgeFinished: purgeFinished
+        )
+        localStore.writeSession(DemoAppFixtures.appSession)
+        let store = InboxStore(
+            client: FailingAppClient(),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore
+        )
+        store.setSessionToken("old-session-token")
+        store.setSessionToken(nil)
+        await fulfillment(of: [purgeStarted], timeout: 1)
+
+        store.setSessionToken("new-session-token")
+        let restore = Task { @MainActor in
+            await store.restoreLocalCache()
+        }
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(localStore.readSessionCallCount, 0)
+
+        localStore.releasePurge()
+        await fulfillment(of: [purgeFinished], timeout: 1)
+        let restored = await restore.value
+        XCTAssertFalse(restored)
+        XCTAssertEqual(localStore.readSessionCallCount, 1)
+        XCTAssertNil(localStore.readSession())
+    }
+
     func testLiveModeRequiresSessionTokenBeforeLoading() async {
         let store = InboxStore(
             client: FailingAppClient(),
@@ -7883,6 +7953,94 @@ private final class GatedThreadBatchAppClient: AppClient {
 
     func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
         try await demo.completeEntity(entityID, request: request)
+    }
+}
+
+private final class BlockingClearAllLocalMailStore: LocalMailStore, @unchecked Sendable {
+    private let base = MemoryLocalMailStore()
+    private let purgeStarted: XCTestExpectation
+    private let purgeFinished: XCTestExpectation
+    private let purgeRelease = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var purgeUsedMainThread = false
+    private var sessionReads = 0
+
+    init(purgeStarted: XCTestExpectation, purgeFinished: XCTestExpectation) {
+        self.purgeStarted = purgeStarted
+        self.purgeFinished = purgeFinished
+    }
+
+    var purgeRanOnMainThread: Bool {
+        lock.withLock { purgeUsedMainThread }
+    }
+
+    var readSessionCallCount: Int {
+        lock.withLock { sessionReads }
+    }
+
+    func releasePurge() {
+        purgeRelease.signal()
+    }
+
+    func readSession() -> AppSessionResponse? {
+        lock.withLock { sessionReads += 1 }
+        return base.readSession()
+    }
+
+    func writeSession(_ session: AppSessionResponse) {
+        base.writeSession(session)
+    }
+
+    func readMailbox(userID: String, label: MailboxLabel) -> MailboxResponse? {
+        base.readMailbox(userID: userID, label: label)
+    }
+
+    func writeMailbox(_ mailbox: MailboxResponse, userID: String, label: MailboxLabel) {
+        base.writeMailbox(mailbox, userID: userID, label: label)
+    }
+
+    func readThread(userID: String, threadID: String) -> ThreadReaderResponse? {
+        base.readThread(userID: userID, threadID: threadID)
+    }
+
+    func writeThread(_ thread: ThreadReaderResponse, userID: String, threadID: String) {
+        base.writeThread(thread, userID: userID, threadID: threadID)
+    }
+
+    func removeThread(userID: String, threadID: String) {
+        base.removeThread(userID: userID, threadID: threadID)
+    }
+
+    func purgeAccount(userID: String) {
+        base.purgeAccount(userID: userID)
+    }
+
+    func writePendingThreadAction(_ action: LocalPendingThreadAction) {
+        base.writePendingThreadAction(action)
+    }
+
+    func pendingThreadActions() -> [LocalPendingThreadAction] {
+        base.pendingThreadActions()
+    }
+
+    func removePendingThreadAction(clientActionID: String) {
+        base.removePendingThreadAction(clientActionID: clientActionID)
+    }
+
+    func markPendingThreadActionFailed(clientActionID: String, error: String) {
+        base.markPendingThreadActionFailed(clientActionID: clientActionID, error: error)
+    }
+
+    func clearSession() {
+        base.clearSession()
+    }
+
+    func clearAll() {
+        lock.withLock { purgeUsedMainThread = Thread.isMainThread }
+        purgeStarted.fulfill()
+        purgeRelease.wait()
+        base.clearAll()
+        purgeFinished.fulfill()
     }
 }
 
