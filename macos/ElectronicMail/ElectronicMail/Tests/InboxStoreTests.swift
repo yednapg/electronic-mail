@@ -498,6 +498,7 @@ final class InboxStoreTests: XCTestCase {
             threadCache: ThreadCache(defaults: .ephemeral()),
             automaticallyPrefetchThreads: false
         )
+        store.setSessionToken("live-session-token")
 
         await store.load()
         let sentSwitch = Task {
@@ -1411,7 +1412,7 @@ final class InboxStoreTests: XCTestCase {
         await actionGate.releaseRequest()
         await actionTask.value
         await readerGate.releaseRequest()
-        await readerTask.value
+        _ = await readerTask.value
 
         XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("STARRED") == true)
     }
@@ -1547,7 +1548,7 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("STARRED") == true)
 
         localStore.releaseBlockedThreadWrite()
-        await refreshTask.value
+        _ = await refreshTask.value
         await actionTask.value
 
         XCTAssertTrue(store.readerThread?.messages.first?.labelIDs.contains("STARRED") == true)
@@ -1609,6 +1610,7 @@ final class InboxStoreTests: XCTestCase {
             latestSourceRecordID: "msg-2",
             receivedAt: "2026-05-29T10:00:00+05:30",
             title: "Grouped message",
+            messageCount: 2,
             children: children
         )
         let mailbox = MailboxResponse(
@@ -1647,6 +1649,956 @@ final class InboxStoreTests: XCTestCase {
         store.toggleExpansion(threadID: "parent-thread")
         XCTAssertEqual(store.flatRows.map(\.id), ["parent-thread"])
         XCTAssertNil(store.selectedMessageID)
+    }
+
+    func testProjectedConversationWithOneSyntheticChildKeepsDisclosureVisible() async {
+        let threadID = "projected-conversation"
+        let newest = makeConversationChild(
+            id: "message-2",
+            threadID: threadID,
+            receivedAt: "2026-05-29T10:00:00+05:30"
+        )
+        let row = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: newest.messageID,
+            receivedAt: newest.receivedAt,
+            title: "Projected conversation",
+            messageCount: 2,
+            children: [newest]
+        )
+        let store = InboxStore(
+            client: FixedMailboxAppClient(mailbox: makeConversationMailbox(row: row)),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertEqual(store.flatRows.map(\.id), [threadID])
+        XCTAssertEqual(store.flatRows.first?.messageCount, 2)
+        XCTAssertEqual(store.flatRows.first?.isGrouped, true)
+        XCTAssertEqual(store.flatRows.first?.isExpandable, true)
+    }
+
+    func testLazyConversationExpansionUsesCompleteThreadWithoutDuplicatesInChronologicalOrder() async {
+        let threadID = "lazy-conversation"
+        let newestChild = makeConversationChild(
+            id: "message-3",
+            threadID: threadID,
+            receivedAt: "2026-05-29T10:00:00+05:30"
+        )
+        let row = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: newestChild.messageID,
+            receivedAt: newestChild.receivedAt,
+            title: "Lazy conversation",
+            messageCount: 3,
+            children: [newestChild]
+        )
+        let completeThread = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "message-3",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T04:30:00Z"
+                ),
+                makeConversationMessage(
+                    id: "message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:45:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T03:30:00Z"
+                ),
+                makeConversationMessage(
+                    id: "message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:30:00+05:30"
+                ),
+            ],
+            totalMessages: 3
+        )
+        let client = FixedMailboxAppClient(
+            mailbox: makeConversationMailbox(row: row),
+            threadResponses: [completeThread]
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+
+        store.toggleExpansion(threadID: threadID)
+        await waitForConversationState {
+            store.flatRows.first?.isExpanded == true
+        }
+
+        XCTAssertEqual(client.threadCallCount, 1)
+        XCTAssertEqual(
+            store.flatRows.map(\.id),
+            [
+                threadID,
+                "\(threadID)::message::message-1",
+                "\(threadID)::message::message-2",
+                "\(threadID)::message::message-3",
+            ]
+        )
+        XCTAssertEqual(Set(store.flatRows.map(\.id)).count, store.flatRows.count)
+    }
+
+    func testLazyConversationExpansionRefetchesWhenCachedContentRevisionIsStale() async {
+        let threadID = "revision-conversation"
+        let newest = makeConversationChild(
+            id: "current-message-2",
+            threadID: threadID,
+            receivedAt: "2026-05-29T10:00:00+05:30"
+        )
+        let row = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: newest.messageID,
+            receivedAt: newest.receivedAt,
+            title: "Revision conversation",
+            messageCount: 2,
+            contentRevision: "revision-current",
+            children: [newest]
+        )
+        let staleThread = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "stale-message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T08:00:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "stale-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:00:00+05:30"
+                ),
+            ],
+            contentRevision: "revision-stale"
+        )
+        let currentThread = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "current-message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:00:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "current-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:00:00+05:30"
+                ),
+            ],
+            contentRevision: "revision-current"
+        )
+        let client = FixedMailboxAppClient(
+            mailbox: makeConversationMailbox(row: row),
+            threadResponses: [currentThread]
+        )
+        let threadCache = ThreadCache(defaults: .ephemeral())
+        threadCache.write(staleThread, userID: DemoAppFixtures.userID, threadID: threadID)
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: threadCache,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+
+        store.toggleExpansion(threadID: threadID)
+        await waitForConversationState {
+            store.flatRows.first?.isExpanded == true
+        }
+
+        XCTAssertEqual(client.threadCallCount, 1)
+        XCTAssertEqual(
+            store.flatRows.map(\.id),
+            [
+                threadID,
+                "\(threadID)::message::current-message-1",
+                "\(threadID)::message::current-message-2",
+            ]
+        )
+        XCTAssertEqual(store.openedThreads[threadID]?.contentRevision, "revision-current")
+    }
+
+    func testLazyConversationExpansionAcceptsNewerAuthoritativeNetworkRevision() async {
+        let threadID = "newer-network-revision-conversation"
+        let projectedChild = makeConversationChild(
+            id: "revision-a-message",
+            threadID: threadID,
+            receivedAt: "2026-05-29T09:00:00+05:30"
+        )
+        let row = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: projectedChild.messageID,
+            receivedAt: projectedChild.receivedAt,
+            title: "Newer network revision",
+            messageCount: 2,
+            contentRevision: "revision-a",
+            children: [projectedChild]
+        )
+        let newerThread = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "revision-b-message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:00:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "revision-b-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:00:00+05:30"
+                ),
+            ],
+            contentRevision: "revision-b"
+        )
+        let client = FixedMailboxAppClient(
+            mailbox: makeConversationMailbox(row: row),
+            threadResponses: [newerThread]
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+
+        store.toggleExpansion(threadID: threadID)
+        await waitForConversationState {
+            store.flatRows.first?.isExpanded == true
+        }
+
+        XCTAssertEqual(client.threadCallCount, 1)
+        XCTAssertEqual(store.openedThreads[threadID]?.contentRevision, "revision-b")
+        XCTAssertEqual(
+            store.flatRows.map(\.id),
+            [
+                threadID,
+                "\(threadID)::message::revision-b-message-1",
+                "\(threadID)::message::revision-b-message-2",
+            ]
+        )
+    }
+
+    func testConversationExpansionDoesNotBlessResponseAfterMailboxRowAdvancesMidflight() async {
+        let threadID = "midflight-row-advance"
+        let rowA = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: "revision-a-message-2",
+            receivedAt: "2026-05-29T10:00:00+05:30",
+            title: "Revision A",
+            messageCount: 2,
+            contentRevision: "revision-a",
+            children: [
+                makeConversationChild(
+                    id: "revision-a-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:00:00+05:30"
+                )
+            ]
+        )
+        let rowC = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: "revision-c-message-2",
+            receivedAt: "2026-05-29T11:00:00+05:30",
+            title: "Revision C",
+            messageCount: 2,
+            contentRevision: "revision-c",
+            children: [
+                makeConversationChild(
+                    id: "revision-c-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T11:00:00+05:30"
+                )
+            ]
+        )
+        let responseB = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "revision-b-message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:30:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "revision-b-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:30:00+05:30"
+                ),
+            ],
+            contentRevision: "revision-b"
+        )
+        let requestGate = ReaderActionRequestGate()
+        let mailboxA = makeConversationMailbox(row: rowA).withTestMailboxRevision("mailbox-a")
+        let mailboxC = makeConversationMailbox(row: rowC).withTestMailboxRevision("mailbox-c")
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailboxA,
+            mailboxResponses: [mailboxA, mailboxC],
+            threadResponses: [responseB],
+            threadRequestGate: requestGate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        store.toggleExpansion(threadID: threadID)
+        await requestGate.waitUntilRequestStarts()
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: "advance-to-c",
+                event: "mailbox-changed",
+                data: #"{"mailbox_label":"inbox","payload":{"mailbox_revision":"mailbox-c","mailbox_labels":["inbox"]}}"#
+            )
+        )
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        XCTAssertEqual(store.flatRows.first?.title, "Revision C")
+        XCTAssertFalse(store.pendingConversationExpansionThreadIDs.contains(threadID))
+        await requestGate.releaseRequest()
+        await waitForConversationState {
+            store.openedThreads[threadID]?.contentRevision == "revision-b"
+        }
+
+        XCTAssertEqual(store.flatRows.map(\.id), [threadID])
+        XCTAssertEqual(store.flatRows.first?.isExpanded, false)
+        XCTAssertEqual(store.flatRows.first?.isExpandable, true)
+    }
+
+    func testConversationExpansionRetriesPreexistingJoinedMismatchWithFreshRequest() async {
+        let threadID = "joined-mismatch"
+        let row = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: "revision-a-message-2",
+            receivedAt: "2026-05-29T10:00:00+05:30",
+            title: "Joined mismatch",
+            messageCount: 2,
+            contentRevision: "revision-a",
+            children: [
+                makeConversationChild(
+                    id: "revision-a-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:00:00+05:30"
+                )
+            ]
+        )
+        let joinedResponse = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "joined-message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:00:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "joined-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:00:00+05:30"
+                ),
+            ],
+            contentRevision: "revision-b"
+        )
+        let freshResponse = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "fresh-message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:30:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "fresh-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:30:00+05:30"
+                ),
+            ],
+            contentRevision: "revision-c"
+        )
+        let requestGate = ReaderActionRequestGate()
+        let client = RealtimeEventAppClient(
+            sessionMailbox: makeConversationMailbox(row: row),
+            mailboxResponses: [makeConversationMailbox(row: row)],
+            threadResponses: [joinedResponse, freshResponse, freshResponse],
+            threadRequestGate: requestGate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        let preexistingFetch = Task {
+            await store.prefetchThread(threadID: threadID, force: true, silent: true)
+        }
+        await requestGate.waitUntilRequestStarts()
+        store.toggleExpansion(threadID: threadID)
+        await requestGate.releaseRequest()
+        _ = await preexistingFetch.value
+        await waitForConversationState {
+            store.flatRows.first?.isExpanded == true
+                && client.threadCallCount == 2
+        }
+
+        XCTAssertEqual(
+            store.flatRows.map(\.id),
+            [
+                threadID,
+                "\(threadID)::message::fresh-message-1",
+                "\(threadID)::message::fresh-message-2",
+            ]
+        )
+        XCTAssertEqual(store.openedThreads[threadID]?.contentRevision, "revision-c")
+
+        let subsequentFetchSucceeded = await store.prefetchThread(
+            threadID: threadID,
+            force: true,
+            silent: true
+        )
+        XCTAssertTrue(subsequentFetchSucceeded)
+        XCTAssertEqual(client.threadCallCount, 3)
+    }
+
+    func testAuthoritativeNetworkExpansionAcceptsConversationShrinkingFromThreeToTwoMessages() async {
+        let threadID = "conversation-shrank"
+        let row = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: "revision-a-message-3",
+            receivedAt: "2026-05-29T10:00:00+05:30",
+            title: "Three messages",
+            messageCount: 3,
+            contentRevision: "revision-a",
+            children: [
+                makeConversationChild(
+                    id: "revision-a-message-3",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:00:00+05:30"
+                )
+            ]
+        )
+        let currentThread = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "revision-b-message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:00:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "revision-b-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:00:00+05:30"
+                ),
+            ],
+            totalMessages: 2,
+            contentRevision: "revision-b"
+        )
+        let client = FixedMailboxAppClient(
+            mailbox: makeConversationMailbox(row: row),
+            threadResponses: [currentThread]
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+        store.toggleExpansion(threadID: threadID)
+        await waitForConversationState {
+            store.flatRows.first?.isExpanded == true
+        }
+
+        XCTAssertEqual(client.threadCallCount, 1)
+        XCTAssertEqual(store.flatRows.count, 3)
+        XCTAssertEqual(
+            store.flatRows.dropFirst().map(\.id),
+            [
+                "\(threadID)::message::revision-b-message-1",
+                "\(threadID)::message::revision-b-message-2",
+            ]
+        )
+    }
+
+    func testConversationExpansionAuthorityPrunesAsMailboxIdentityCatchesUpThenAdvances() async {
+        let threadID = "authority-pruning"
+        func row(revision: String, latestID: String, title: String) -> GmailThreadRow {
+            makeMailboxRow(
+                threadID: threadID,
+                latestSourceRecordID: latestID,
+                receivedAt: "2026-05-29T10:00:00+05:30",
+                title: title,
+                messageCount: 2,
+                contentRevision: revision,
+                children: [
+                    makeConversationChild(
+                        id: latestID,
+                        threadID: threadID,
+                        receivedAt: "2026-05-29T10:00:00+05:30"
+                    )
+                ]
+            )
+        }
+        let rowA = row(revision: "revision-a", latestID: "revision-a-message-2", title: "Revision A")
+        let rowB = row(revision: "revision-b", latestID: "revision-b-message-2", title: "Revision B")
+        let rowC = row(revision: "revision-c", latestID: "revision-c-message-2", title: "Revision C")
+        let threadB = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "revision-b-message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:00:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "revision-b-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:00:00+05:30"
+                ),
+            ],
+            contentRevision: "revision-b"
+        )
+        let mailboxA = makeConversationMailbox(row: rowA).withTestMailboxRevision("mailbox-a")
+        let mailboxB = makeConversationMailbox(row: rowB).withTestMailboxRevision("mailbox-b")
+        let mailboxC = makeConversationMailbox(row: rowC).withTestMailboxRevision("mailbox-c")
+        let client = RealtimeEventAppClient(
+            sessionMailbox: mailboxA,
+            mailboxResponses: [mailboxA, mailboxB, mailboxC],
+            threadResponses: [threadB]
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+
+        await store.load()
+        store.toggleExpansion(threadID: threadID)
+        await waitForConversationState {
+            store.flatRows.first?.isExpanded == true
+        }
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: "catch-up-to-b",
+                event: "mailbox-changed",
+                data: #"{"mailbox_label":"inbox","payload":{"mailbox_revision":"mailbox-b","mailbox_labels":["inbox"]}}"#
+            )
+        )
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        XCTAssertEqual(store.flatRows.first?.title, "Revision B")
+        XCTAssertEqual(store.flatRows.first?.isExpanded, true)
+        XCTAssertEqual(store.flatRows.count, 3)
+
+        store.handleMailboxServerEvent(
+            MailboxServerEvent(
+                id: "advance-to-c",
+                event: "mailbox-changed",
+                data: #"{"mailbox_label":"inbox","payload":{"mailbox_revision":"mailbox-c","mailbox_labels":["inbox"]}}"#
+            )
+        )
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        XCTAssertEqual(store.flatRows.first?.title, "Revision C")
+
+        XCTAssertEqual(store.flatRows.map(\.id), [threadID])
+        XCTAssertEqual(store.flatRows.first?.isExpanded, false)
+        XCTAssertFalse(store.expandedThreadIDs.contains(threadID))
+    }
+
+    func testDiskCacheReadCannotOverwriteConcurrentlyOpenedNewerThread() async {
+        let threadID = "disk-race-conversation"
+        let projectedChild = makeConversationChild(
+            id: "revision-b-message-2",
+            threadID: threadID,
+            receivedAt: "2026-05-29T10:00:00+05:30"
+        )
+        let row = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: projectedChild.messageID,
+            receivedAt: projectedChild.receivedAt,
+            title: "Disk race conversation",
+            messageCount: 2,
+            contentRevision: "revision-b",
+            children: [projectedChild]
+        )
+        let staleDiskThread = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "revision-a-message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T08:00:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "revision-a-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:00:00+05:30"
+                ),
+            ],
+            contentRevision: "revision-a"
+        )
+        let newerThread = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "revision-b-message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:00:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "revision-b-message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:00:00+05:30"
+                ),
+            ],
+            contentRevision: "revision-b"
+        )
+        let localStore = BlockingThreadWriteLocalMailStore(
+            blockOnThreadWriteCall: .max,
+            blockOnThreadReadCall: 1
+        )
+        localStore.writeThread(
+            staleDiskThread,
+            userID: DemoAppFixtures.userID,
+            threadID: threadID
+        )
+        let client = FixedMailboxAppClient(
+            mailbox: makeConversationMailbox(row: row),
+            threadResponses: [newerThread]
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+
+        store.toggleExpansion(threadID: threadID)
+        await waitForConversationState {
+            localStore.hasBlockedThreadRead
+        }
+
+        let newerFetch = Task {
+            await store.prefetchThread(threadID: threadID, force: true, silent: true)
+        }
+        await waitForConversationState {
+            store.openedThreads[threadID]?.contentRevision == "revision-b"
+        }
+        localStore.releaseBlockedThreadRead()
+
+        let newerFetchSucceeded = await newerFetch.value
+        XCTAssertTrue(newerFetchSucceeded)
+        await waitForConversationState {
+            store.flatRows.first?.isExpanded == true
+        }
+
+        XCTAssertEqual(localStore.recordedThreadReadCallCount, 1)
+        XCTAssertEqual(client.threadCallCount, 1)
+        XCTAssertEqual(store.openedThreads[threadID]?.contentRevision, "revision-b")
+        XCTAssertEqual(
+            store.flatRows.map(\.id),
+            [
+                threadID,
+                "\(threadID)::message::revision-b-message-1",
+                "\(threadID)::message::revision-b-message-2",
+            ]
+        )
+    }
+
+    func testLazyConversationExpansionReadsCompleteDiskCacheOnlyOnce() async {
+        let threadID = "disk-cached-conversation"
+        let newest = makeConversationChild(
+            id: "message-2",
+            threadID: threadID,
+            receivedAt: "2026-05-29T10:00:00+05:30"
+        )
+        let row = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: newest.messageID,
+            receivedAt: newest.receivedAt,
+            title: "Disk cached conversation",
+            messageCount: 2,
+            contentRevision: "revision-disk",
+            children: [newest]
+        )
+        let completeThread = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:00:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:00:00+05:30"
+                ),
+            ],
+            contentRevision: "revision-disk"
+        )
+        let localStore = BlockingThreadWriteLocalMailStore(blockOnThreadWriteCall: .max)
+        localStore.writeThread(
+            completeThread,
+            userID: DemoAppFixtures.userID,
+            threadID: threadID
+        )
+        let client = FixedMailboxAppClient(mailbox: makeConversationMailbox(row: row))
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            localMailStore: localStore,
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+        localStore.resetThreadReadCallCount()
+
+        store.toggleExpansion(threadID: threadID)
+        await waitForConversationState {
+            store.flatRows.first?.isExpanded == true
+        }
+
+        XCTAssertEqual(localStore.recordedThreadReadCallCount, 1)
+        XCTAssertEqual(client.threadCallCount, 0)
+        XCTAssertEqual(store.flatRows.count, 3)
+    }
+
+    func testFailedLazyConversationExpansionStaysCollapsedAndCanRetry() async {
+        let threadID = "retry-conversation"
+        let newest = makeConversationChild(
+            id: "message-2",
+            threadID: threadID,
+            receivedAt: "2026-05-29T10:00:00+05:30"
+        )
+        let row = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: newest.messageID,
+            receivedAt: newest.receivedAt,
+            title: "Retry conversation",
+            messageCount: 2,
+            children: [newest]
+        )
+        let completeThread = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:00:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:00:00+05:30"
+                ),
+            ]
+        )
+        let client = FixedMailboxAppClient(
+            mailbox: makeConversationMailbox(row: row),
+            threadResponses: [completeThread],
+            threadFailuresBeforeSuccess: 1
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+
+        store.toggleExpansion(threadID: threadID)
+        await waitForConversationState {
+            client.threadCallCount == 1
+                && !store.pendingConversationExpansionThreadIDs.contains(threadID)
+        }
+        XCTAssertEqual(store.flatRows.first?.isExpandable, true)
+        XCTAssertEqual(store.flatRows.first?.isExpanded, false)
+        XCTAssertEqual(store.flatRows.map(\.id), [threadID])
+
+        store.toggleExpansion(threadID: threadID)
+        await waitForConversationState {
+            store.flatRows.first?.isExpanded == true
+        }
+        XCTAssertEqual(client.threadCallCount, 2)
+        XCTAssertEqual(store.flatRows.count, 3)
+    }
+
+    func testCollapsingPendingConversationPreventsLateFetchFromReopeningIt() async {
+        let threadID = "cancelled-conversation"
+        let newest = makeConversationChild(
+            id: "message-2",
+            threadID: threadID,
+            receivedAt: "2026-05-29T10:00:00+05:30"
+        )
+        let row = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: newest.messageID,
+            receivedAt: newest.receivedAt,
+            title: "Cancelled conversation",
+            messageCount: 2,
+            children: [newest]
+        )
+        let completeThread = makeConversationThread(
+            threadID: threadID,
+            messages: [
+                makeConversationMessage(
+                    id: "message-1",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T09:00:00+05:30"
+                ),
+                makeConversationMessage(
+                    id: "message-2",
+                    threadID: threadID,
+                    receivedAt: "2026-05-29T10:00:00+05:30"
+                ),
+            ]
+        )
+        let requestGate = ReaderActionRequestGate()
+        let client = FixedMailboxAppClient(
+            mailbox: makeConversationMailbox(row: row),
+            threadResponses: [completeThread],
+            threadRequestGate: requestGate
+        )
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+
+        store.toggleExpansion(threadID: threadID)
+        await requestGate.waitUntilRequestStarts()
+        XCTAssertTrue(store.pendingConversationExpansionThreadIDs.contains(threadID))
+
+        store.toggleExpansion(threadID: threadID)
+        XCTAssertFalse(store.pendingConversationExpansionThreadIDs.contains(threadID))
+        await requestGate.releaseRequest()
+        await waitForConversationState {
+            store.openedThreads[threadID] != nil
+        }
+
+        XCTAssertEqual(store.flatRows.map(\.id), [threadID])
+        XCTAssertEqual(store.flatRows.first?.isExpanded, false)
+        XCTAssertEqual(store.flatRows.first?.isExpandable, true)
+    }
+
+    func testSingleMessageRowNeverShowsConversationDisclosure() async {
+        let threadID = "single-message"
+        let child = makeConversationChild(
+            id: "message-1",
+            threadID: threadID,
+            receivedAt: "2026-05-29T10:00:00+05:30"
+        )
+        let row = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: child.messageID,
+            receivedAt: child.receivedAt,
+            title: "Single message",
+            messageCount: 1,
+            lifecycleSourceIDs: ["message-1", "legacy-update"],
+            children: [child]
+        )
+        let store = InboxStore(
+            client: FixedMailboxAppClient(mailbox: makeConversationMailbox(row: row)),
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertEqual(store.flatRows.first?.isGrouped, true)
+        XCTAssertEqual(store.flatRows.first?.messageCount, 1)
+        XCTAssertEqual(store.flatRows.first?.isExpandable, false)
+    }
+
+    func testInboxConversationExpansionKeepsCanonicalSentReply() async {
+        let threadID = "cross-label-conversation"
+        let inboxChild = makeConversationChild(
+            id: "message-inbox",
+            threadID: threadID,
+            receivedAt: "2026-05-29T09:00:00+05:30",
+            labelIDs: ["INBOX"]
+        )
+        let sentChild = makeConversationChild(
+            id: "message-sent",
+            threadID: threadID,
+            receivedAt: "2026-05-29T10:00:00+05:30",
+            sender: "Me <me@example.com>",
+            labelIDs: ["SENT"]
+        )
+        let row = makeMailboxRow(
+            threadID: threadID,
+            latestSourceRecordID: sentChild.messageID,
+            receivedAt: sentChild.receivedAt,
+            title: "Inbox conversation with reply",
+            messageCount: 2,
+            children: [inboxChild, sentChild],
+            labelIDs: ["INBOX", "SENT"],
+            labels: ["INBOX", "SENT"]
+        )
+        let client = FixedMailboxAppClient(mailbox: makeConversationMailbox(row: row))
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral())
+        )
+        store.setSessionToken("live-session-token")
+        await store.load()
+
+        store.toggleExpansion(threadID: threadID)
+
+        XCTAssertEqual(
+            store.flatRows.map(\.id),
+            [
+                threadID,
+                "\(threadID)::message::message-inbox",
+                "\(threadID)::message::message-sent",
+            ]
+        )
+        XCTAssertEqual(store.flatRows.last?.sender, "Me")
+        XCTAssertEqual(client.threadCallCount, 0)
+    }
+
+    private func waitForConversationState(
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: @escaping @MainActor () -> Bool
+    ) async {
+        for _ in 0..<500 {
+            if condition() {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTFail("Timed out waiting for conversation state", file: file, line: line)
     }
 
     func testRowVisualStateMapping() async {
@@ -2018,11 +2970,13 @@ final class InboxStoreTests: XCTestCase {
         )
 
         await store.load()
-        async let first: Void = store.prefetchThread(threadID: "demo-special", force: true, silent: false)
-        async let second: Void = store.prefetchThread(threadID: "demo-special", force: true, silent: false)
-        _ = await (first, second)
+        async let first = store.prefetchThread(threadID: "demo-special", force: true, silent: false)
+        async let second = store.prefetchThread(threadID: "demo-special", force: true, silent: false)
+        let networkResults = await (first, second)
 
         XCTAssertEqual(client.threadCallCounts["demo-special"], 1)
+        XCTAssertTrue(networkResults.0)
+        XCTAssertTrue(networkResults.1)
     }
 
     func testThreadPrefetchLoadsEveryPageForLongConversation() async {
@@ -2084,7 +3038,7 @@ final class InboxStoreTests: XCTestCase {
         }
 
         store.setSessionToken(nil)
-        await fetch.value
+        _ = await fetch.value
 
         XCTAssertTrue(store.openedThreads.isEmpty)
         XCTAssertNil(
@@ -3049,7 +4003,7 @@ final class InboxStoreTests: XCTestCase {
         )
 
         blockingStore.releaseBlockedThreadWrite()
-        await prefetchTask.value
+        _ = await prefetchTask.value
         try await purgeTask.value
 
         XCTAssertEqual(client.purgeCallCount, 1)
@@ -6244,6 +7198,7 @@ private func makeMailboxRow(
     latestSourceRecordID: String,
     receivedAt: String,
     title: String,
+    messageCount: Int? = nil,
     bodyReady: Bool? = nil,
     contentRevision: String? = nil,
     initialWindowPosition: Int? = nil,
@@ -6267,7 +7222,7 @@ private func makeMailboxRow(
         latestSender: "Sender",
         sender: "Sender",
         participants: ["Sender"],
-        messageCount: updates.count,
+        messageCount: messageCount ?? updates.count,
         bodyReady: bodyReady,
         contentRevision: contentRevision,
         initialWindowPosition: initialWindowPosition,
@@ -6287,6 +7242,88 @@ private func makeMailboxRow(
         lifecycleUpdates: updates,
         children: children,
         enrichmentStatus: "ready"
+    )
+}
+
+private func makeConversationMailbox(
+    row: GmailThreadRow,
+    label: MailboxLabel = .inbox
+) -> MailboxResponse {
+    MailboxResponse(
+        label: label,
+        totalThreads: 1,
+        loadedThreads: 1,
+        sections: [GmailThreadSection(id: "today", title: "Today", rows: [row])],
+        fullImportRunning: false,
+        fullImportCompleted: true
+    )
+}
+
+private func makeConversationThread(
+    threadID: String,
+    messages: [ThreadMessage],
+    totalMessages: Int? = nil,
+    hasMore: Bool = false,
+    contentRevision: String? = "conversation-revision"
+) -> ThreadReaderResponse {
+    ThreadReaderResponse(
+        entityID: threadID,
+        userID: DemoAppFixtures.userID,
+        source: .gmail,
+        gmailThreadID: threadID,
+        subject: messages.last?.subject,
+        totalMessages: totalMessages ?? messages.count,
+        limit: max(1, messages.count),
+        offset: 0,
+        hasMore: hasMore,
+        messages: messages,
+        contentRevision: contentRevision
+    )
+}
+
+private func makeConversationMessage(
+    id: String,
+    threadID: String,
+    receivedAt: String,
+    fromAddress: String = "Sender <sender@example.com>",
+    to: String = "Me <me@example.com>",
+    labelIDs: [String] = ["INBOX"]
+) -> ThreadMessage {
+    ThreadMessage(
+        id: id,
+        source: .gmail,
+        threadID: threadID,
+        fromAddress: fromAddress,
+        to: to,
+        cc: nil,
+        bcc: nil,
+        subject: "Subject \(id)",
+        body: "Body \(id)",
+        htmlBody: nil,
+        htmlRenderDocument: nil,
+        snippet: "Snippet \(id)",
+        labelIDs: labelIDs,
+        receivedAt: receivedAt
+    )
+}
+
+private func makeConversationChild(
+    id: String,
+    threadID: String,
+    receivedAt: String,
+    sender: String = "Sender <sender@example.com>",
+    labelIDs: [String] = ["INBOX"]
+) -> GmailThreadChildRow {
+    GmailThreadChildRow(
+        messageID: id,
+        gmailThreadID: threadID,
+        sender: sender,
+        subject: "Subject \(id)",
+        snippet: "Snippet \(id)",
+        receivedAt: receivedAt,
+        labelIDs: labelIDs,
+        labels: labelIDs,
+        unread: labelIDs.contains("UNREAD")
     )
 }
 
@@ -6853,15 +7890,21 @@ private final class BlockingThreadWriteLocalMailStore: LocalMailStore {
     private let base: LocalMailStore
     private let lock = NSLock()
     private let releaseSemaphore = DispatchSemaphore(value: 0)
+    private let threadReadReleaseSemaphore = DispatchSemaphore(value: 0)
     private let blockOnThreadWriteCall: Int
+    private let blockOnThreadReadCall: Int?
     private var threadWriteCallCount = 0
+    private var threadReadCallCount = 0
     private var blockedThreadWrite = false
+    private var blockedThreadRead = false
 
     init(
         blockOnThreadWriteCall: Int,
+        blockOnThreadReadCall: Int? = nil,
         base: LocalMailStore = MemoryLocalMailStore()
     ) {
         self.blockOnThreadWriteCall = blockOnThreadWriteCall
+        self.blockOnThreadReadCall = blockOnThreadReadCall
         self.base = base
     }
 
@@ -6871,8 +7914,30 @@ private final class BlockingThreadWriteLocalMailStore: LocalMailStore {
         return blockedThreadWrite
     }
 
+    var hasBlockedThreadRead: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return blockedThreadRead
+    }
+
+    var recordedThreadReadCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return threadReadCallCount
+    }
+
+    func resetThreadReadCallCount() {
+        lock.lock()
+        threadReadCallCount = 0
+        lock.unlock()
+    }
+
     func releaseBlockedThreadWrite() {
         releaseSemaphore.signal()
+    }
+
+    func releaseBlockedThreadRead() {
+        threadReadReleaseSemaphore.signal()
     }
 
     func readSession() -> AppSessionResponse? {
@@ -6910,7 +7975,18 @@ private final class BlockingThreadWriteLocalMailStore: LocalMailStore {
     }
 
     func readThread(userID: String, threadID: String) -> ThreadReaderResponse? {
-        base.readThread(userID: userID, threadID: threadID)
+        lock.lock()
+        threadReadCallCount += 1
+        let shouldBlock = threadReadCallCount == blockOnThreadReadCall
+        if shouldBlock {
+            blockedThreadRead = true
+        }
+        lock.unlock()
+
+        if shouldBlock {
+            threadReadReleaseSemaphore.wait()
+        }
+        return base.readThread(userID: userID, threadID: threadID)
     }
 
     func writeThread(_ thread: ThreadReaderResponse, userID: String, threadID: String) {
@@ -7671,7 +8747,7 @@ private final class GlobalOfflineMetadataAppClient: AppClient {
     }
 
     func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
-        DemoAppFixtures.threads[threadID] ?? DemoAppFixtures.threads["demo-google-today"]!
+        return DemoAppFixtures.threads[threadID] ?? DemoAppFixtures.threads["demo-google-today"]!
     }
 
     func logout() async throws {}
@@ -7751,16 +8827,26 @@ private final class FixedMailboxAppClient: AppClient {
     private let fixedMailbox: MailboxResponse
     private let fixedSession: AppSessionResponse?
     private let successfulMailboxCallsBeforeFailure: Int?
+    private var fixedThreadResponses: [ThreadReaderResponse]
+    private var threadFailuresBeforeSuccess: Int
+    private let threadRequestGate: ReaderActionRequestGate?
     private var mailboxCallCount = 0
+    private(set) var threadCallCount = 0
 
     init(
         mailbox: MailboxResponse,
         session: AppSessionResponse? = nil,
-        successfulMailboxCallsBeforeFailure: Int? = nil
+        successfulMailboxCallsBeforeFailure: Int? = nil,
+        threadResponses: [ThreadReaderResponse] = [],
+        threadFailuresBeforeSuccess: Int = 0,
+        threadRequestGate: ReaderActionRequestGate? = nil
     ) {
         self.fixedMailbox = mailbox
         self.fixedSession = session
         self.successfulMailboxCallsBeforeFailure = successfulMailboxCallsBeforeFailure
+        self.fixedThreadResponses = threadResponses
+        self.threadFailuresBeforeSuccess = max(0, threadFailuresBeforeSuccess)
+        self.threadRequestGate = threadRequestGate
     }
 
     func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
@@ -7791,7 +8877,18 @@ private final class FixedMailboxAppClient: AppClient {
     }
 
     func thread(threadID: String, limit: Int, offset: Int) async throws -> ThreadReaderResponse {
-        DemoAppFixtures.threads[threadID] ?? DemoAppFixtures.threads["demo-google-today"]!
+        threadCallCount += 1
+        if let threadRequestGate {
+            await threadRequestGate.suspendRequest()
+        }
+        if threadFailuresBeforeSuccess > 0 {
+            threadFailuresBeforeSuccess -= 1
+            throw APIError.httpStatus(503)
+        }
+        if !fixedThreadResponses.isEmpty {
+            return fixedThreadResponses.removeFirst()
+        }
+        return DemoAppFixtures.threads[threadID] ?? DemoAppFixtures.threads["demo-google-today"]!
     }
 
     func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
