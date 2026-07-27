@@ -2204,6 +2204,8 @@ private struct EmailSenderAvatar: View {
 }
 
 private struct EmailMessageDetailsStrip: View {
+    private static let minimumLabelColumnWidth: CGFloat = 76
+
     let message: ThreadMessage
     let colorScheme: ColorScheme
 
@@ -2236,7 +2238,9 @@ private struct EmailMessageDetailsStrip: View {
                 Text(label)
                     .font(EmailReaderTypography.metadata(weight: .semibold))
                     .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                    .frame(width: 48, alignment: .leading)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .frame(minWidth: Self.minimumLabelColumnWidth, alignment: .leading)
 
                 Text(cleanValue)
                     .font(EmailReaderTypography.metadata())
