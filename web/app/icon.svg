@@ -1,4 +1,31 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect width="32" height="32" rx="8" fill="#111111"/>
-  <path d="M9 23V9h3.2l7.6 9.1V9H23v14h-3.2l-7.6-9.1V23H9Z" fill="#f4f4f4"/>
+  <defs>
+    <linearGradient id="surface" x1="16" y1="0" x2="16" y2="32" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#111111"/>
+      <stop offset="1" stop-color="#050505"/>
+    </linearGradient>
+    <linearGradient id="envelope" x1="16" y1="9" x2="16" y2="23" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0874E8"/>
+      <stop offset="1" stop-color="#005ACD"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="32" height="32" rx="8" fill="url(#surface)"/>
+  <rect x="4.5" y="7.5" width="23" height="17" rx="2.5" fill="url(#envelope)"/>
+  <path
+    d="m5.45 8.95 8.3 7.95a3.25 3.25 0 0 0 4.5 0l8.3-7.95"
+    fill="none"
+    stroke="#080808"
+    stroke-width="2.25"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="m5.45 23.2 7.25-7M26.55 23.2l-7.25-7"
+    fill="none"
+    stroke="#080808"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
 </svg>
