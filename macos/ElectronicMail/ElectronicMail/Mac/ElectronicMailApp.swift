@@ -251,7 +251,10 @@ private struct ElectronicMailRootView: View {
             return
         }
         resolvingError = nil
-        let loadResult = await Self.asyncTokenStore.load(timeout: 2)
+        let loadResult = await Self.asyncTokenStore.loadWithRetry(
+            initialTimeout: 2,
+            retryTimeout: 5
+        )
         guard stage == .resolvingSession else {
             return
         }

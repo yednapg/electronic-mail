@@ -124,6 +124,21 @@ public struct AsyncSessionTokenStore: Sendable {
         }
     }
 
+    /// Gives a transiently busy credential service one fresh concurrent read
+    /// before the caller interrupts launch with recovery UI. A timed-out
+    /// Security.framework call cannot be cancelled, so the retry deliberately
+    /// uses the store's concurrent operation lane instead of waiting behind it.
+    public func loadWithRetry(
+        initialTimeout: TimeInterval,
+        retryTimeout: TimeInterval
+    ) async -> SessionTokenLoadResult {
+        let initialResult = await load(timeout: initialTimeout)
+        guard initialResult == .timedOut, !Task.isCancelled else {
+            return initialResult
+        }
+        return await load(timeout: retryTimeout)
+    }
+
     public func save(_ token: String, timeout: TimeInterval) async -> SessionTokenSaveResult {
         requestEpoch.advance()
         let mutation: SessionTokenMutation?
@@ -725,81 +740,65 @@ private final class KeychainSessionTokenSecureRecordStore: SessionTokenSecureRec
     private static let legacyAccount = "email_session"
 
     func readGenerationRecord(account: String) -> Data? {
-        if let data = readData(query: generationSecureQuery(account: account)) {
-            return data
-        }
         #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
+        // Identity-free local builds do not carry the production Data
+        // Protection Keychain entitlement. Querying that keychain first can
+        // make securityd wait for authorization before returning
+        // errSecMissingEntitlement, so local builds use their explicitly
+        // non-synchronizing classic record directly.
         let context = LAContext()
         context.interactionNotAllowed = true
         return readData(query: generationClassicQuery(account: account), authenticationContext: context)
         #else
-        return nil
+        return readData(query: generationSecureQuery(account: account))
         #endif
     }
 
     func addGenerationRecord(_ data: Data, account: String) throws {
-        do {
-            try addImmutableData(
-                data,
-                query: generationSecureQuery(account: account),
-                enforcesDeviceOnlyAccessibility: true
-            )
-        } catch KeychainError.status(let status) {
-            #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
-            // Ad-hoc local builds may lack Data Protection Keychain
-            // entitlements; production Release builds never compile this fallback.
-            if KeychainSessionTokenStore.shouldUseClassicMacFallback(
-                for: status,
-                debugBuild: KeychainSessionTokenStore.classicMacFallbackEnabled
-            ) {
-                try addImmutableData(
-                    data,
-                    query: generationClassicQuery(account: account),
-                    enforcesDeviceOnlyAccessibility: false
-                )
-                return
-            }
-            #endif
-            throw KeychainError.status(status)
-        }
+        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
+        try addImmutableData(
+            data,
+            query: generationClassicQuery(account: account),
+            enforcesDeviceOnlyAccessibility: false
+        )
+        #else
+        try addImmutableData(
+            data,
+            query: generationSecureQuery(account: account),
+            enforcesDeviceOnlyAccessibility: true
+        )
+        #endif
     }
 
     func deleteGenerationRecord(account: String) -> Bool {
-        let secureStatus = SecItemDelete(generationSecureQuery(account: account) as CFDictionary)
-        #if os(macOS)
+        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
         let classicStatus = SecItemDelete(generationClassicQuery(account: account) as CFDictionary)
-        let secureDeletionFinished = Self.isSuccessfulDeletion(secureStatus)
-            || KeychainSessionTokenStore.shouldUseClassicMacFallback(
-                for: secureStatus,
-                debugBuild: KeychainSessionTokenStore.classicMacFallbackEnabled
-            )
-        return secureDeletionFinished && Self.isSuccessfulDeletion(classicStatus)
+        return Self.isSuccessfulDeletion(classicStatus)
         #else
+        let secureStatus = SecItemDelete(generationSecureQuery(account: account) as CFDictionary)
         return Self.isSuccessfulDeletion(secureStatus)
         #endif
     }
 
     func readLegacyRecord() -> Data? {
-        if let data = readData(query: legacySecureQuery(synchronizable: false)) {
-            return data
-        }
-        if let data = readData(query: legacySecureQuery(synchronizable: true)) {
-            return data
-        }
         #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
         let context = LAContext()
         context.interactionNotAllowed = true
         return readData(query: legacyClassicQuery(), authenticationContext: context)
         #else
-        return nil
+        if let data = readData(query: legacySecureQuery(synchronizable: false)) {
+            return data
+        }
+        return readData(query: legacySecureQuery(synchronizable: true))
         #endif
     }
 
     func deleteLegacyRecords() {
+        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
+        _ = SecItemDelete(legacyClassicQuery() as CFDictionary)
+        #else
         _ = SecItemDelete(legacySecureQuery(synchronizable: false) as CFDictionary)
         _ = SecItemDelete(legacySecureQuery(synchronizable: true) as CFDictionary)
-        #if os(macOS)
-        _ = SecItemDelete(legacyClassicQuery() as CFDictionary)
         #endif
     }
 
