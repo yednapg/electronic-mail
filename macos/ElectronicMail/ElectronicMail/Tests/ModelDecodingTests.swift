@@ -126,6 +126,27 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(result, .timedOut)
     }
 
+    func testAsyncSessionTokenStoreRetriesTimedOutLoadOnFreshConcurrentLane() async {
+        let firstLoadStarted = expectation(description: "first token read started")
+        let firstLoadFinished = expectation(description: "first token read eventually finished")
+        let store = FirstLoadBlockingSessionTokenTestStore(
+            token: "saved-session",
+            started: firstLoadStarted,
+            finished: firstLoadFinished
+        )
+        let asyncStore = AsyncSessionTokenStore(store: store)
+
+        let result = await asyncStore.loadWithRetry(
+            initialTimeout: 0.03,
+            retryTimeout: 0.5
+        )
+
+        XCTAssertEqual(result, .loaded("saved-session"))
+        await fulfillment(of: [firstLoadStarted], timeout: 1)
+        store.releaseFirstLoad()
+        await fulfillment(of: [firstLoadFinished], timeout: 1)
+    }
+
     func testNeverReturningLoadCannotBlockNewerSave() async {
         let loadStarted = expectation(description: "never-returning token read started")
         let defaults = UserDefaults.ephemeralTokenStoreDefaults()
@@ -3296,6 +3317,46 @@ private final class BlockingSessionTokenTestStore: SessionTokenStoring, @uncheck
     }
 
     func release() {
+        releaseSemaphore.signal()
+    }
+
+    func save(_ token: String) throws {}
+    func clear() {}
+}
+
+private final class FirstLoadBlockingSessionTokenTestStore: SessionTokenStoring, @unchecked Sendable {
+    private let token: String?
+    private let started: XCTestExpectation
+    private let finished: XCTestExpectation
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var loadCount = 0
+
+    init(
+        token: String?,
+        started: XCTestExpectation,
+        finished: XCTestExpectation
+    ) {
+        self.token = token
+        self.started = started
+        self.finished = finished
+    }
+
+    func load() -> String? {
+        lock.lock()
+        loadCount += 1
+        let isFirstLoad = loadCount == 1
+        lock.unlock()
+
+        if isFirstLoad {
+            started.fulfill()
+            releaseSemaphore.wait()
+            finished.fulfill()
+        }
+        return token
+    }
+
+    func releaseFirstLoad() {
         releaseSemaphore.signal()
     }
 
