@@ -12,6 +12,10 @@
   ],
   "scripts": {
     "setup": "bash scripts/bootstrap.sh",
+    "beta:setup": "bash scripts/setup-private-beta.sh",
+    "beta:check": "bash scripts/check-private-beta.sh",
+    "beta:start": "bash scripts/start-private-beta.sh",
+    "beta:test": "python3 -m unittest scripts/tests/test_private_beta_workflow.py",
     "start": "npm run dev:macos",
     "dev": "npm run dev:macos",
     "dev:macos": "bash scripts/dev-macos.sh",

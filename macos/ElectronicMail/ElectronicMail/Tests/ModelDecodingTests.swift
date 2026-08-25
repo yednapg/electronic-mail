@@ -1183,6 +1183,29 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertFalse(configuration.defaultWebpagePreferences.allowsContentJavaScript)
     }
 
+    func testEmailHTMLDocumentMarksTheCurrentAppearanceForTrustedDarkModeAdaptation() {
+        let html = #"<html><head></head><body><table><tr><td style="background:#fff;color:#111">Hello</td></tr></table></body></html>"#
+
+        let darkDocument = EmailHTMLDocument.renderableDocument(from: html, colorScheme: .dark)
+        let lightDocument = EmailHTMLDocument.renderableDocument(from: html, colorScheme: .light)
+
+        XCTAssertTrue(darkDocument.contains("color-scheme: dark"))
+        XCTAssertTrue(darkDocument.contains("--electronic-mail-dark-mode: 1"))
+        XCTAssertTrue(lightDocument.contains("color-scheme: light"))
+        XCTAssertTrue(lightDocument.contains("--electronic-mail-dark-mode: 0"))
+    }
+
+    func testEmailDarkModeUsesAnAppOwnedMainFrameScriptAndPreservesArtwork() {
+        let script = EmailHTMLDarkModePolicy.userScript
+
+        XCTAssertEqual(script.injectionTime, .atDocumentEnd)
+        XCTAssertTrue(script.isForMainFrameOnly)
+        XCTAssertTrue(script.source.contains("--electronic-mail-dark-mode"))
+        XCTAssertTrue(script.source.contains("'img', 'picture', 'video', 'canvas', 'svg'"))
+        XCTAssertTrue(script.source.contains("background-color"))
+        XCTAssertTrue(script.source.contains("-webkit-text-fill-color"))
+    }
+
     func testExternalLinkPolicyAllowsOnlySafeSchemes() {
         XCTAssertTrue(EmailExternalLinkPolicy.canOpen(URL(string: "https://example.com")!))
         XCTAssertTrue(EmailExternalLinkPolicy.canOpen(URL(string: "mailto:person@example.com")!))

@@ -1,0 +1,58 @@
+name: Private beta problem
+description: Report a local setup, sign-in, synchronization, or app failure
+title: "[Private beta] "
+labels: ["private-beta"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include Google client secrets, OAuth codes, access/refresh tokens, email addresses other than your own test address, subjects, bodies, recipients, or attachments.
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "14.7.1"
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: Mac model and processor
+      placeholder: "MacBook Air, Apple M2"
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Copy the short commit printed by npm run beta:check.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Failing area
+      options:
+        - Setup/check
+        - Google sign-in
+        - Initial synchronization
+        - Reading/search
+        - Compose/reply/drafts
+        - Mailbox action
+        - Relaunch/session
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps and result
+      description: Explain what you did, what appeared, and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted beta output
+      description: Paste only the relevant beta:check or beta:start lines after removing private mailbox data and all credentials.
+      render: shell

@@ -169,6 +169,19 @@ public struct SignedInShellView: View {
                     .accessibilityHidden(mailboxSearchOpen || composer != nil)
                     .zIndex(6)
 
+                if !navigationOpen,
+                   !mailboxSearchOpen,
+                   store.readerThreadID == nil,
+                   supplementalDestination == nil,
+                   composer == nil {
+                    ShellComposeButton(colorScheme: colorScheme, action: openComposeComposer)
+                        .position(
+                            x: proxy.size.width - ElectronicMailShellMetrics.navLeading - ElectronicMailShellMetrics.navHitFrame / 2,
+                            y: ElectronicMailShellMetrics.navTop + ElectronicMailShellMetrics.navHitFrame / 2
+                        )
+                        .zIndex(6)
+                }
+
                 if mailboxSearchOpen {
                     MailboxSearchOverlay(
                         query: $mailboxSearchText,
@@ -200,7 +213,7 @@ public struct SignedInShellView: View {
                             onReauthorizeGoogle: onReauthorizeGoogle,
                             onClose: closeComposer(preserving:)
                         )
-                        .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .center)))
+                        .transition(.opacity)
                         .zIndex(12)
                     }
                 }
@@ -439,7 +452,7 @@ public struct SignedInShellView: View {
             commandPaletteOpen = false
         }
         presentComposer(
-            MailComposerPresentation(mode: .compose, threadID: nil, sourceMessageID: nil, title: "New Message")
+            MailComposerPresentation(mode: .compose, threadID: nil, sourceMessageID: nil, title: "New message")
         )
     }
 
@@ -710,6 +723,35 @@ private struct ShellBackButton: View {
         .contentShape(Rectangle())
         .help("Back")
         .accessibilityLabel("Back")
+    }
+}
+
+private struct ShellComposeButton: View {
+    let colorScheme: ColorScheme
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "square.and.pencil")
+                .font(.system(size: 18, weight: .medium, design: .rounded))
+                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .frame(
+                    width: ElectronicMailShellMetrics.navHitFrame,
+                    height: ElectronicMailShellMetrics.navHitFrame
+                )
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(ElectronicMailDesign.readerControlFill(for: colorScheme))
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(ElectronicMailDesign.readerControlBorder(for: colorScheme), lineWidth: 1)
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("New message")
+        .accessibilityLabel("New message")
     }
 }
 
@@ -1921,19 +1963,9 @@ private struct MailComposerOverlay: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let sheetWidth = min(626, max(0, proxy.size.width - 48))
-            let sheetHeight = min(580, max(0, proxy.size.height - 48))
-
-            ZStack {
-                Button {
-                    NotificationCenter.default.post(name: .electronicMailComposerCloseRequested, object: nil)
-                } label: {
-                    Rectangle()
-                        .fill(Color.black.opacity(colorScheme == .dark ? 0.46 : 0.28))
-                        .ignoresSafeArea()
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close composer")
+            ZStack(alignment: .top) {
+                ElectronicMailDesign.background(for: colorScheme)
+                    .ignoresSafeArea()
 
                 MailComposerSheet(
                     presentation: presentation,
@@ -1943,14 +1975,7 @@ private struct MailComposerOverlay: View {
                     onReauthorizeGoogle: onReauthorizeGoogle,
                     onClose: onClose
                 )
-                .frame(width: sheetWidth, height: sheetHeight)
-                .background(ElectronicMailDesign.composerSurface(for: colorScheme))
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(ElectronicMailDesign.panelBorder(for: colorScheme), lineWidth: 1)
-                )
-                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.52 : 0.18), radius: 26, x: 0, y: 12)
+                .frame(maxWidth: 980, maxHeight: .infinity, alignment: .top)
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Message composer")
             }
@@ -1974,6 +1999,10 @@ private enum ComposerFocusField: Hashable {
     case body
 }
 
+private enum MailComposerLayout {
+    static let contentLeadingInset: CGFloat = 52
+}
+
 private struct MailComposerSheet: View {
     let presentation: MailComposerPresentation
     let recoverySnapshot: ComposerRecoverySnapshot?
@@ -1986,6 +2015,7 @@ private struct MailComposerSheet: View {
     @State private var toText = ""
     @State private var ccText = ""
     @State private var bccText = ""
+    @State private var showsCopyFields = false
     @State private var subject = ""
     @State private var bodyText = ""
     @State private var statusText: String?
@@ -2042,131 +2072,89 @@ private struct MailComposerSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             composerHeader
+                .padding(.bottom, 22)
 
-            Rectangle()
-                .fill(ElectronicMailDesign.divider(for: colorScheme))
-                .frame(height: 1)
-                .padding(.top, 12)
-
-            if loadingDraft {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("Loading draft…")
-                        .font(ElectronicMailComposerType.status())
-                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                }
-                .padding(.vertical, 8)
-            }
-
-            if let draftLoadError {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Draft could not be loaded")
-                        .font(ElectronicMailComposerType.value())
-                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                    Text(draftLoadError)
-                        .font(ElectronicMailComposerType.status())
-                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                        .lineLimit(2)
-                    Button("Retry") {
-                        Task {
-                            await loadInitialValues()
-                            if editorReady {
-                                focusedField = initialFocusField
-                            }
-                        }
+            VStack(alignment: .leading, spacing: 0) {
+                if loadingDraft {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Loading draft…")
+                            .font(ElectronicMailComposerType.status())
+                            .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                     }
-                    .buttonStyle(.plain)
-                    .font(ElectronicMailComposerType.control(weight: .semibold))
-                    .foregroundStyle(ElectronicMailDesign.appleBlue)
-                    .disabled(loadingDraft)
+                    .padding(.vertical, 8)
                 }
-                .padding(.vertical, 8)
-            }
 
-            composerField(
-                "To",
-                placeholder: "Add recipients",
-                text: $toText,
-                focus: .to,
-                usesTokenFill: true,
-                responseField: .to
-            )
-            composerField(
-                "Cc",
-                placeholder: "Add recipients",
-                text: $ccText,
-                focus: .cc,
-                usesTokenFill: true,
-                responseField: .cc
-            )
-            composerField("Bcc", placeholder: "Add hidden recipients", text: $bccText, focus: .bcc, usesTokenFill: true)
-            composerSubjectField
-
-            if effectiveMode == .forward, sourceAttachmentCount > 0 {
-                Toggle(
-                    "Include \(sourceAttachmentCount) original attachment\(sourceAttachmentCount == 1 ? "" : "s")",
-                    isOn: $includeOriginalAttachments
-                )
-                .toggleStyle(.checkbox)
-                .font(ElectronicMailComposerType.status())
-                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                .padding(.vertical, 7)
-                .disabled(composerControlsDisabled)
-            }
-
-            if !attachments.isEmpty || !existingDraftAttachments.isEmpty {
-                VStack(alignment: .leading, spacing: 5) {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 7) {
-                            ForEach(existingDraftAttachments) { attachment in
-                                composerAttachmentChip(
-                                    name: attachment.filename,
-                                    detail: "Saved attachment",
-                                    onRemove: {
-                                        existingDraftAttachments.removeAll { $0.id == attachment.id }
-                                        preserveExistingDraftAttachments = false
-                                        statusText = "Attachment will be removed on the next save."
-                                    }
-                                )
+                if let draftLoadError {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Draft could not be loaded")
+                            .font(ElectronicMailComposerType.value())
+                            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                        Text(draftLoadError)
+                            .font(ElectronicMailComposerType.status())
+                            .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                            .lineLimit(2)
+                        Button("Retry") {
+                            Task {
+                                await loadInitialValues()
+                                if editorReady {
+                                    focusedField = initialFocusField
+                                }
                             }
-                            ForEach(attachments) { attachment in
-                                composerAttachmentChip(
-                                    name: attachment.upload.filename,
-                                    detail: ByteCountFormatter.string(
-                                        fromByteCount: Int64(attachment.byteCount),
-                                        countStyle: .file
-                                    ),
-                                    onRemove: { attachments.removeAll { $0.id == attachment.id } }
-                                )
-                            }
-                        }
-                    }
-                    .frame(height: 38)
-
-                    if !existingDraftAttachments.isEmpty {
-                        Button("Remove saved attachments", role: .destructive) {
-                            existingDraftAttachments = []
-                            preserveExistingDraftAttachments = false
-                            statusText = "Saved attachments will be removed on the next save."
                         }
                         .buttonStyle(.plain)
-                        .font(ElectronicMailComposerType.status())
-                        .foregroundStyle(Color.red)
-                        .disabled(savingDraft || sending)
+                        .font(ElectronicMailComposerType.control(weight: .semibold))
+                        .foregroundStyle(ElectronicMailDesign.appleBlue)
+                        .disabled(loadingDraft)
                     }
+                    .padding(.vertical, 8)
                 }
-                .padding(.vertical, 6)
+
+                composerFromField
+                composerToField
+                if showsCopyFields || !ccText.isEmpty || !bccText.isEmpty {
+                    composerField(
+                        "Cc",
+                        placeholder: "Add recipients",
+                        text: $ccText,
+                        focus: .cc,
+                        usesTokenFill: true,
+                        responseField: .cc
+                    )
+                    composerField(
+                        "Bcc",
+                        placeholder: "Add hidden recipients",
+                        text: $bccText,
+                        focus: .bcc,
+                        usesTokenFill: true
+                    )
+                }
+                composerSubjectField
+
+                if effectiveMode == .forward, sourceAttachmentCount > 0 {
+                    Toggle(
+                        "Include \(sourceAttachmentCount) original attachment\(sourceAttachmentCount == 1 ? "" : "s")",
+                        isOn: $includeOriginalAttachments
+                    )
+                    .toggleStyle(.checkbox)
+                    .font(ElectronicMailComposerType.status())
+                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                    .padding(.vertical, 7)
+                    .disabled(composerControlsDisabled)
+                }
+
+                composerEditor
+
+                composerAttachments
+
+                composerFooter
+                    .padding(.top, 14)
             }
-
-            composerEditor
-                .padding(.top, 1)
-
-            composerFooter
-                .padding(.top, 10)
+            .padding(.leading, MailComposerLayout.contentLeadingInset)
         }
-        .padding(.horizontal, 14)
-        .padding(.top, 16)
-        .padding(.bottom, 10)
+        .padding(.horizontal, 28)
+        .padding(.top, 30)
+        .padding(.bottom, 18)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(effectiveMode.title) composer")
@@ -2181,8 +2169,14 @@ private struct MailComposerSheet: View {
             }
         }
         .onChange(of: toText) { _, _ in scheduleAutosave() }
-        .onChange(of: ccText) { _, _ in scheduleAutosave() }
-        .onChange(of: bccText) { _, _ in scheduleAutosave() }
+        .onChange(of: ccText) { _, value in
+            if !value.isEmpty { showsCopyFields = true }
+            scheduleAutosave()
+        }
+        .onChange(of: bccText) { _, value in
+            if !value.isEmpty { showsCopyFields = true }
+            scheduleAutosave()
+        }
         .onChange(of: subject) { _, _ in scheduleAutosave() }
         .onChange(of: bodyText) { _, _ in scheduleAutosave() }
         .onChange(of: attachments.map(\.id)) { _, _ in scheduleAutosave() }
@@ -2221,7 +2215,7 @@ private struct MailComposerSheet: View {
             isPresented: $confirmDeleteDraft,
             titleVisibility: .visible
         ) {
-            Button("Delete Draft", role: .destructive) { Task { await deleteDraft() } }
+            Button("Delete Draft", role: .destructive) { Task { await deleteOrDiscardDraft() } }
             Button("Keep Draft", role: .cancel) {}
         } message: {
             Text("This removes the draft from Electronic Mail and Gmail.")
@@ -2229,54 +2223,240 @@ private struct MailComposerSheet: View {
     }
 
     private var composerHeader: some View {
-        HStack(spacing: 10) {
-            if isResponseComposer {
-                Picker("Response type", selection: responseModeSelection) {
-                    ForEach(MailComposerResponseTransitionPolicy.modes, id: \.rawValue) { mode in
-                        Text(mode.title).tag(mode.rawValue)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .font(ElectronicMailComposerType.mode())
-                .frame(minWidth: 0, idealWidth: 264, maxWidth: 264, minHeight: 31, maxHeight: 31)
-                .disabled(responseModeControlsDisabled)
-                .transaction { transaction in
-                    transaction.animation = nil
-                }
-                .accessibilityLabel("Response type")
-                .help(
-                    unresolvedSendAttempt
-                        ? "Response type cannot change while delivery is being confirmed."
-                        : "Response type"
-                )
-            } else {
-                Text(effectiveMode.title)
-                    .font(ElectronicMailComposerType.value())
+        HStack(alignment: .top, spacing: 16) {
+            Button {
+                NotificationCenter.default.post(name: .electronicMailComposerCloseRequested, object: nil)
+            } label: {
+                Image(systemName: "chevron.backward")
+                    .font(.system(size: 17, weight: .semibold, design: .rounded))
                     .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                    .accessibilityAddTraits(.isHeader)
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Close composer")
+            .accessibilityLabel("Back")
+
+            VStack(alignment: .leading, spacing: 5) {
+                if isResponseComposer {
+                    Picker("Response type", selection: responseModeSelection) {
+                        ForEach(MailComposerResponseTransitionPolicy.modes, id: \.rawValue) { mode in
+                            Text(mode.title).tag(mode.rawValue)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .font(ElectronicMailComposerType.mode())
+                    .frame(minWidth: 0, idealWidth: 264, maxWidth: 264, minHeight: 31, maxHeight: 31)
+                    .disabled(responseModeControlsDisabled)
+                    .transaction { transaction in
+                        transaction.animation = nil
+                    }
+                    .accessibilityLabel("Response type")
+                    .help(
+                        unresolvedSendAttempt
+                            ? "Response type cannot change while delivery is being confirmed."
+                            : "Response type"
+                    )
+                } else {
+                    Text(presentation.title)
+                        .font(.system(size: 20, weight: .semibold, design: .rounded))
+                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                        .accessibilityAddTraits(.isHeader)
+                }
+
+                Text(composerHeaderStatus)
+                    .font(ElectronicMailComposerType.status())
+                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                    .lineLimit(1)
             }
 
             Spacer(minLength: 8)
 
-            if gmailDraftID != nil {
-                Menu {
-                    Button("Delete Draft", role: .destructive) {
-                        confirmDeleteDraft = true
-                    }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .frame(width: 32, height: 28)
-                        .contentShape(Rectangle())
+            Menu {
+                Button("Delete Draft", role: .destructive) {
+                    confirmDeleteDraft = true
                 }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .help("Draft actions")
-                .accessibilityLabel("Draft actions")
-                .disabled(composerControlsDisabled || savingDraft || loadingDraft)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
             }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .help("Draft actions")
+            .accessibilityLabel("Draft actions")
+            .disabled(composerControlsDisabled || savingDraft || loadingDraft)
         }
-        .frame(height: 31)
+        .frame(minHeight: 42, alignment: .top)
+    }
+
+    private var composerHeaderStatus: String {
+        if loadingDraft {
+            return "Loading draft…"
+        }
+        if savingDraft {
+            return "Saving draft…"
+        }
+        return gmailDraftID == nil ? "New draft" : "Draft saved"
+    }
+
+    private var composerFromField: some View {
+        HStack(spacing: 10) {
+            Text("From")
+                .font(ElectronicMailComposerType.label())
+                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                .frame(width: 86, alignment: .leading)
+
+            Circle()
+                .fill(ElectronicMailDesign.readerAvatarFill(for: colorScheme, highlighted: false))
+                .frame(width: 30, height: 30)
+                .overlay {
+                    Text(currentUserInitial)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                }
+
+            Text("You")
+                .font(ElectronicMailComposerType.value())
+                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+
+            if let email = store.session?.user.email, !email.isEmpty {
+                Text(email)
+                    .font(ElectronicMailComposerType.value())
+                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Image(systemName: "chevron.down")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+
+            Spacer(minLength: 0)
+        }
+        .frame(height: 50)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(ElectronicMailDesign.divider(for: colorScheme))
+                .frame(height: 1)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("From You, \(store.session?.user.email ?? "")")
+    }
+
+    private var composerToField: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Text("To")
+                .font(ElectronicMailComposerType.label())
+                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                .lineLimit(1)
+                .frame(width: 86, alignment: .leading)
+
+            TextField("Add recipients", text: composerFieldBinding($toText, responseField: .to))
+                .textFieldStyle(.plain)
+                .font(ElectronicMailComposerType.value())
+                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .padding(.horizontal, toText.isEmpty ? 0 : 9)
+                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 30, maxHeight: 30, alignment: .leading)
+                .layoutPriority(1)
+                .background(alignment: .leading) {
+                    if !toText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        GeometryReader { proxy in
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(ElectronicMailDesign.composerTokenFill(for: colorScheme))
+                                .frame(
+                                    width: min(
+                                        recipientFieldWidth(text: toText, placeholder: "Add recipients"),
+                                        proxy.size.width
+                                    )
+                                )
+                        }
+                    }
+                }
+                .accessibilityLabel("To")
+                .focused($focusedField, equals: .to)
+                .onSubmit { advanceFocus(after: .to) }
+
+            Button("Cc/Bcc") {
+                withAnimation(.easeInOut(duration: 0.12)) {
+                    showsCopyFields.toggle()
+                }
+                if showsCopyFields {
+                    focusedField = ccText.isEmpty ? .cc : .bcc
+                }
+            }
+            .buttonStyle(.plain)
+            .font(ElectronicMailComposerType.control())
+            .foregroundStyle(ElectronicMailDesign.appleBlue)
+            .frame(minHeight: 32)
+            .fixedSize(horizontal: true, vertical: false)
+            .contentShape(Rectangle())
+            .help(showsCopyFields ? "Hide Cc and Bcc" : "Show Cc and Bcc")
+        }
+        .frame(height: 50)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(ElectronicMailDesign.divider(for: colorScheme))
+                .frame(height: 1)
+        }
+        .disabled(composerControlsDisabled)
+    }
+
+    @ViewBuilder
+    private var composerAttachments: some View {
+        if !attachments.isEmpty || !existingDraftAttachments.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(existingDraftAttachments) { attachment in
+                            composerAttachmentChip(
+                                name: attachment.filename,
+                                detail: "Saved attachment",
+                                onRemove: {
+                                    existingDraftAttachments.removeAll { $0.id == attachment.id }
+                                    preserveExistingDraftAttachments = false
+                                    statusText = "Attachment will be removed on the next save."
+                                }
+                            )
+                        }
+                        ForEach(attachments) { attachment in
+                            composerAttachmentChip(
+                                name: attachment.upload.filename,
+                                detail: ByteCountFormatter.string(
+                                    fromByteCount: Int64(attachment.byteCount),
+                                    countStyle: .file
+                                ),
+                                onRemove: { attachments.removeAll { $0.id == attachment.id } }
+                            )
+                        }
+                    }
+                }
+                .frame(height: 42)
+
+                Text(attachmentSummary)
+                    .font(ElectronicMailComposerType.status())
+                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+            }
+            .padding(.top, 10)
+        }
+    }
+
+    private var currentUserInitial: String {
+        let source = store.session?.user.displayName
+            ?? store.session?.user.firstName
+            ?? store.session?.user.email
+            ?? "You"
+        return source.first.map { String($0).uppercased() } ?? "Y"
+    }
+
+    private var attachmentSummary: String {
+        let count = attachments.count + existingDraftAttachments.count
+        let totalBytes = attachments.reduce(0) { $0 + $1.byteCount }
+        let size = totalBytes > 0
+            ? ByteCountFormatter.string(fromByteCount: Int64(totalBytes), countStyle: .file)
+            : "saved"
+        return "\(count) attachment\(count == 1 ? "" : "s") · \(size)"
     }
 
     private var composerEditor: some View {
@@ -2304,25 +2484,23 @@ private struct MailComposerSheet: View {
                 .padding(.vertical, ElectronicMailComposerEditorLayout.textEditorVerticalInset)
                 .accessibilityLabel("Message body")
         }
-        .frame(minHeight: 150, maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(ElectronicMailDesign.composerEditorSurface(for: colorScheme))
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .stroke(
-                    focusedField == .body
-                        ? ElectronicMailDesign.appleBlue
-                        : ElectronicMailDesign.panelBorder(for: colorScheme),
-                    lineWidth: focusedField == .body ? 1.25 : 1
-                )
-        }
+        .frame(minHeight: 220, maxHeight: .infinity)
+        .padding(.top, 12)
         .disabled(composerControlsDisabled)
     }
 
     private var composerFooter: some View {
         HStack(spacing: 12) {
+            if let footerStatusText {
+                Text(footerStatusText == "Draft saved" ? "Saved just now" : footerStatusText)
+                    .font(ElectronicMailComposerType.status())
+                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            Spacer(minLength: 12)
+
             Button {
                 chooseAttachments()
             } label: {
@@ -2343,16 +2521,24 @@ private struct MailComposerSheet: View {
             .disabled(composerControlsDisabled || loadingAttachments)
             .accessibilityLabel(loadingAttachments ? "Preparing files" : "Attach files")
 
-            if let footerStatusText {
-                Text(footerStatusText)
-                    .font(ElectronicMailComposerType.status())
-                    .foregroundStyle(ElectronicMailDesign.tertiaryText(for: colorScheme))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: 180, alignment: .leading)
-                    .help(footerStatusText)
-                    .accessibilityLabel(footerStatusText)
+            Menu {
+                Button {
+                } label: {
+                    Label("Plain text", systemImage: "checkmark")
+                }
+                .disabled(true)
+            } label: {
+                Text("Formatting")
+                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
             }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .tint(ElectronicMailDesign.primaryText(for: colorScheme))
+            .font(ElectronicMailComposerType.control())
+            .frame(minHeight: 36)
+            .contentShape(Rectangle())
+            .help("Plain-text message formatting")
+            .disabled(composerControlsDisabled)
 
             if statusText?.localizedCaseInsensitiveContains("permission") == true {
                 Button {
@@ -2370,17 +2556,19 @@ private struct MailComposerSheet: View {
                 .disabled(reauthorizing)
             }
 
-            Spacer(minLength: 8)
-
-            Button("Cancel") {
-                Task { await requestClose() }
+            Button {
+                confirmDeleteDraft = true
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 16, weight: .medium))
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .font(ElectronicMailComposerType.control(weight: .semibold))
-            .foregroundStyle(ElectronicMailDesign.appleBlue)
-            .frame(minWidth: 54, minHeight: 36)
-            .contentShape(Rectangle())
-            .disabled(sending)
+            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+            .help("Delete draft")
+            .accessibilityLabel("Delete draft")
+            .disabled(composerControlsDisabled || savingDraft || loadingDraft)
 
             Button {
                 startSend(allowEmptySubject: false)
@@ -2388,17 +2576,27 @@ private struct MailComposerSheet: View {
                 if sending {
                     ProgressView().controlSize(.small)
                 } else {
-                    Text("Send")
+                    HStack(spacing: 10) {
+                        Text("Send")
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
                 }
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.regular)
             .font(ElectronicMailComposerType.control(weight: .semibold))
-            .frame(minWidth: 60)
+            .frame(minWidth: 104)
             .disabled(!canSend)
             .keyboardShortcut(.return, modifiers: [.command])
         }
-        .frame(height: 40)
+        .padding(.top, 12)
+        .frame(minHeight: 54)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(ElectronicMailDesign.divider(for: colorScheme))
+                .frame(height: 1)
+        }
     }
 
     private var effectiveMode: MailComposerMode {
@@ -2527,7 +2725,7 @@ private struct MailComposerSheet: View {
                 .font(ElectronicMailComposerType.label())
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                 .lineLimit(1)
-                .frame(width: 60, alignment: .leading)
+                .frame(width: 86, alignment: .leading)
             TextField(placeholder, text: composerFieldBinding(text, responseField: responseField))
                 .textFieldStyle(.plain)
                 .font(ElectronicMailComposerType.value())
@@ -2587,7 +2785,7 @@ private struct MailComposerSheet: View {
                 .font(ElectronicMailComposerType.label())
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                 .lineLimit(1)
-                .frame(width: 60, alignment: .leading)
+                .frame(width: 86, alignment: .leading)
 
             TextField("Subject", text: responsiveSubjectBinding, axis: .vertical)
                 .textFieldStyle(.plain)
@@ -3124,6 +3322,18 @@ private struct MailComposerSheet: View {
             guard !Task.isCancelled else { return }
             statusText = "Send failed: \(error.localizedDescription). You can retry safely."
         }
+    }
+
+    @MainActor
+    private func deleteOrDiscardDraft() async {
+        guard !savingDraft, !loadingDraft, !sending else {
+            return
+        }
+        guard gmailDraftID != nil else {
+            finishComposer()
+            return
+        }
+        await deleteDraft()
     }
 
     @MainActor

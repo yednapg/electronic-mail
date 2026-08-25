@@ -36,6 +36,32 @@ def _recording_guard(state: dict[str, bool], key: str = "active"):
         state[key] = False
 
 
+class GoogleOAuthUrlTests(unittest.TestCase):
+    def test_auth_url_forces_account_selection_before_consent(self) -> None:
+        flow = MagicMock(code_verifier="verifier")
+        flow.authorization_url.return_value = ("https://accounts.google.com/oauth", "oauth-state")
+        settings = SimpleNamespace(database_path="postgresql://example/db")
+
+        with (
+            patch.object(google_service, "create_flow", return_value=flow),
+            patch.object(google_service, "save_db_oauth_login_session") as save_session,
+        ):
+            result = google_service.get_google_auth_url(settings)
+
+        self.assertEqual(result, "https://accounts.google.com/oauth")
+        flow.authorization_url.assert_called_once_with(
+            access_type="offline",
+            prompt="select_account consent",
+        )
+        save_session.assert_called_once_with(
+            "postgresql://example/db",
+            state="oauth-state",
+            code_verifier="verifier",
+            redirect_to=None,
+            expires_at=ANY,
+        )
+
+
 class GoogleAuthRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(app)

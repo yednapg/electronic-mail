@@ -1986,7 +1986,7 @@ def replace_gmail_thread_orders(
     user_id: str,
     ordered_thread_ids_by_label: dict[str, list[str]],
 ) -> dict[str, str]:
-    """Atomically publish complete Gmail thread-list generations for a user."""
+    """Atomically publish complete Gmail conversation-order generations for a user."""
     normalized: dict[str, list[str]] = {}
     for raw_label, raw_thread_ids in ordered_thread_ids_by_label.items():
         label = _normalized_mailbox_label(raw_label)

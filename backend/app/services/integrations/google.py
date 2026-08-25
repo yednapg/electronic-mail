@@ -179,7 +179,14 @@ def build_google_service(
 def get_google_auth_url(settings: Settings, redirect_to: str | None = None) -> str:
     """Build and persist a PKCE Google authorization URL."""
     flow = create_flow(settings)
-    authorization_url, state = flow.authorization_url(access_type="offline", prompt="consent")
+    # Always show Google's account chooser before consent. Desktop browsers
+    # commonly have a different Google account active than the account the
+    # user intends to connect, and silently selecting that session can fail
+    # before Google returns an actionable OAuth error to our callback.
+    authorization_url, state = flow.authorization_url(
+        access_type="offline",
+        prompt="select_account consent",
+    )
     save_db_oauth_login_session(
         str(settings.database_path),
         state=state,

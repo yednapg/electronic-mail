@@ -318,7 +318,7 @@ def _apply_local_action(
 
 
 def _enqueue_immediate_thread_order_refresh(settings: Settings, *, user_id: str) -> bool:
-    """Wake one authoritative Gmail ordering scan after a durable action succeeds."""
+    """Wake one Gmail message-ordering scan after a durable action succeeds."""
     try:
         enqueue_job(
             str(settings.database_path),

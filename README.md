@@ -2,6 +2,19 @@
 
 Electronic Mail is a focused native macOS Gmail client. The launch build provides standard mail workflows—sign-in, mailbox folders, full synchronization, reading and search, compose/reply/forward, drafts, attachments, and Gmail actions—without AI features. The web service is limited to the native download page, OAuth completion, privacy, terms, and support; it is not a second email client.
 
+## Private source beta
+
+Trusted testers build and run the app locally; this path does not require TestFlight, an Apple Developer membership, Railway, signing, or notarization. After installing the requirements below, use:
+
+```bash
+npm run beta:setup -- your-gmail-address@gmail.com
+# Import or add your own Google OAuth web client credentials (see the guide).
+npm run beta:check
+npm run beta:start
+```
+
+The complete Google Cloud and troubleshooting instructions are in [`docs/PRIVATE_BETA.md`](docs/PRIVATE_BETA.md). Every tester uses their own Google Cloud test project and keeps its credentials out of Git.
+
 ## Local development
 
 Requirements are Node 22.22.0, npm 10 or 11, Python 3.12.13, full Xcode, and local Postgres. Then run:
