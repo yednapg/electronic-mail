@@ -46,7 +46,7 @@ class GmailThreadOrderRefreshTests(unittest.TestCase):
     @patch("app.services.gmail_importer.replace_gmail_thread_orders")
     @patch("app.services.gmail_importer.build_google_service")
     @patch("app.services.gmail_importer.create_authorized_credentials", return_value=object())
-    def test_refresh_uses_exact_gmail_specs_and_preserves_paginated_order(
+    def test_refresh_uses_newest_message_order_and_deduplicates_conversations(
         self,
         _mock_credentials: Mock,
         mock_build_service: Mock,
@@ -55,17 +55,31 @@ class GmailThreadOrderRefreshTests(unittest.TestCase):
         service = Mock()
         mock_build_service.return_value = service
         responses = [
-            {"threads": [{"id": "thread-a"}, {"id": "thread-b"}], "nextPageToken": "inbox-page-2"},
-            {"threads": [{"id": "thread-b"}, {"id": "thread-c"}]},
-            {"threads": [{"id": "thread-sent"}]},
-            {"threads": [{"id": "thread-draft"}]},
-            {"threads": [{"id": "thread-starred"}]},
-            {"threads": [{"id": "thread-spam"}]},
-            {"threads": [{"id": "thread-trash"}]},
-            {"threads": [{"id": "thread-all"}]},
-            {"threads": [{"id": "thread-archive"}]},
+            {
+                "messages": [
+                    {"id": "message-security", "threadId": "thread-security"},
+                    {"id": "message-new-reply", "threadId": "thread-updated"},
+                    {"id": "message-gemini", "threadId": "thread-gemini"},
+                ],
+                "nextPageToken": "inbox-page-2",
+            },
+            {
+                "messages": [
+                    # The original message is older than intervening threads;
+                    # the newer reply above must keep this conversation second.
+                    {"id": "message-original", "threadId": "thread-updated"},
+                    {"id": "message-maps", "threadId": "thread-maps"},
+                ]
+            },
+            {"messages": [{"id": "message-sent", "threadId": "thread-sent"}]},
+            {"messages": [{"id": "message-draft", "threadId": "thread-draft"}]},
+            {"messages": [{"id": "message-starred", "threadId": "thread-starred"}]},
+            {"messages": [{"id": "message-spam", "threadId": "thread-spam"}]},
+            {"messages": [{"id": "message-trash", "threadId": "thread-trash"}]},
+            {"messages": [{"id": "message-all", "threadId": "thread-all"}]},
+            {"messages": [{"id": "message-archive", "threadId": "thread-archive"}]},
         ]
-        service.users.return_value.threads.return_value.list.side_effect = [
+        service.users.return_value.messages.return_value.list.side_effect = [
             SimpleNamespace(execute=Mock(return_value=response)) for response in responses
         ]
         mock_replace.return_value = {"inbox": "generation-1"}
@@ -73,7 +87,7 @@ class GmailThreadOrderRefreshTests(unittest.TestCase):
         result = gmail_importer.refresh_gmail_thread_order(self.settings, user_id="user-1")
 
         self.assertEqual(result, {"inbox": "generation-1"})
-        list_calls = service.users.return_value.threads.return_value.list.call_args_list
+        list_calls = service.users.return_value.messages.return_value.list.call_args_list
         self.assertEqual(len(list_calls), 9)
         self.assertEqual(
             list_calls[0].kwargs,
@@ -100,7 +114,10 @@ class GmailThreadOrderRefreshTests(unittest.TestCase):
             "-label:inbox -label:sent -label:drafts -label:spam -label:trash",
         )
         ordered = mock_replace.call_args.kwargs["ordered_thread_ids_by_label"]
-        self.assertEqual(ordered["inbox"], ["thread-a", "thread-b", "thread-c"])
+        self.assertEqual(
+            ordered["inbox"],
+            ["thread-security", "thread-updated", "thread-gemini", "thread-maps"],
+        )
         self.assertEqual(set(ordered), {label for label, _query in gmail_importer.GMAIL_THREAD_ORDER_SPECS})
         self.assertEqual(mock_replace.call_args.kwargs["user_id"], "user-1")
 
@@ -115,8 +132,12 @@ class GmailThreadOrderRefreshTests(unittest.TestCase):
     ) -> None:
         service = Mock()
         mock_build_service.return_value = service
-        service.users.return_value.threads.return_value.list.side_effect = [
-            SimpleNamespace(execute=Mock(return_value={"threads": [{"id": "thread-a"}]})),
+        service.users.return_value.messages.return_value.list.side_effect = [
+            SimpleNamespace(
+                execute=Mock(
+                    return_value={"messages": [{"id": "message-a", "threadId": "thread-a"}]}
+                )
+            ),
             RuntimeError("temporary Gmail failure"),
         ]
 
