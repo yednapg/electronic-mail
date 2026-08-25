@@ -1501,7 +1501,15 @@ def _list_messages(
 
 
 def refresh_gmail_thread_order(settings: Settings, *, user_id: str) -> dict[str, str]:
-    """Snapshot Gmail's authoritative threads.list order for every app mailbox."""
+    """Snapshot Gmail's newest-message conversation order for every app mailbox.
+
+    Gmail documents ``messages.list`` as reverse chronological, while
+    ``threads.list`` does not define an ordering contract and can leave a
+    recently updated conversation at its original thread position.  Deduping
+    the chronological message stream by ``threadId`` gives each conversation
+    the rank of its newest matching message, which is the order Gmail presents
+    in its mailbox UI.
+    """
     credentials = create_authorized_credentials(settings, user_id=user_id)
     if credentials is None:
         raise GoogleCredentialsUnavailable("Google credentials are not connected")
@@ -1521,12 +1529,12 @@ def refresh_gmail_thread_order(settings: Settings, *, user_id: str) -> dict[str,
             }
             if page_token:
                 list_args["pageToken"] = page_token
-            response = service.users().threads().list(**list_args).execute()
-            raw_threads = response.get("threads") if isinstance(response, dict) else None
-            for raw_thread in raw_threads if isinstance(raw_threads, list) else []:
-                if not isinstance(raw_thread, dict) or not raw_thread.get("id"):
+            response = service.users().messages().list(**list_args).execute()
+            raw_messages = response.get("messages") if isinstance(response, dict) else None
+            for raw_message in raw_messages if isinstance(raw_messages, list) else []:
+                if not isinstance(raw_message, dict) or not raw_message.get("threadId"):
                     continue
-                thread_id = str(raw_thread["id"])
+                thread_id = str(raw_message["threadId"])
                 if thread_id in seen_thread_ids:
                     continue
                 seen_thread_ids.add(thread_id)
@@ -1535,7 +1543,7 @@ def refresh_gmail_thread_order(settings: Settings, *, user_id: str) -> dict[str,
             if not next_page_token:
                 break
             if next_page_token in seen_page_tokens:
-                raise RuntimeError("Gmail thread-order pagination repeated a page token")
+                raise RuntimeError("Gmail message-order pagination repeated a page token")
             seen_page_tokens.add(next_page_token)
             page_token = next_page_token
         ordered_by_label[label] = ordered_thread_ids
@@ -1552,12 +1560,13 @@ def _refresh_gmail_thread_order_best_effort(
     user_id: str,
     target_history_id: str | None,
 ) -> bool:
-    """Queue the expensive authoritative Gmail ordering scan off the sync path.
+    """Queue the expensive Gmail message-ordering scan off the sync path.
 
-    A complete ordering snapshot walks every page for each mailbox label. Doing
-    that inline made otherwise bounded imports and delta syncs wait on many
-    sequential Google API calls. The durable slow-queue job is deduplicated per
-    user, so bursts of Pub/Sub notifications collapse into one refresh.
+    A complete newest-message snapshot walks every page for each mailbox
+    label. Doing that inline made otherwise bounded imports and delta syncs
+    wait on many sequential Google API calls. The durable slow-queue job is
+    deduplicated per user, so bursts of Pub/Sub notifications collapse into one
+    refresh.
     """
     try:
         enqueue_job(

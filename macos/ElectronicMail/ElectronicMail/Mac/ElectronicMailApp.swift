@@ -25,7 +25,7 @@ struct ElectronicMailApp: App {
     }
 
     var body: some Scene {
-        Window("Electronic Mail", id: "main") {
+        Window("", id: "main") {
             ElectronicMailRootView(store: store)
                 .frame(minWidth: 1100, minHeight: 680)
                 .tint(ElectronicMailDesign.appleBlue)
@@ -132,7 +132,7 @@ private final class ElectronicMailWindowSurfaceView: NSView {
             return
         }
         window.styleMask.insert(.fullSizeContentView)
-        window.titleVisibility = .visible
+        window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.titlebarSeparatorStyle = .none
         window.backgroundColor = surfaceColor

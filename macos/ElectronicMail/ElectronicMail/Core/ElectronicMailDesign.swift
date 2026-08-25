@@ -54,6 +54,42 @@ public enum ElectronicMailDesign {
         Color(nsColor: .separatorColor)
     }
 
+    public static func readerHairline(for colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.12)
+    }
+
+    public static func readerControlFill(for colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark ? Color.white.opacity(0.055) : Color.black.opacity(0.045)
+    }
+
+    public static func readerControlBorder(for colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark ? Color.white.opacity(0.14) : Color.black.opacity(0.12)
+    }
+
+    public static func readerActionFill(for colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark
+            ? Color(red: 25.0 / 255.0, green: 25.0 / 255.0, blue: 27.0 / 255.0)
+            : Color(red: 238.0 / 255.0, green: 238.0 / 255.0, blue: 240.0 / 255.0)
+    }
+
+    public static let readerAskBorderGradient = LinearGradient(
+        colors: [
+            Color(red: 221.0 / 255.0, green: 161.0 / 255.0, blue: 143.0 / 255.0),
+            Color(red: 246.0 / 255.0, green: 217.0 / 255.0, blue: 145.0 / 255.0),
+            Color(red: 240.0 / 255.0, green: 166.0 / 255.0, blue: 190.0 / 255.0),
+            Color(red: 131.0 / 255.0, green: 201.0 / 255.0, blue: 244.0 / 255.0),
+        ],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+
+    public static func readerAvatarFill(for colorScheme: ColorScheme, highlighted: Bool) -> Color {
+        if highlighted {
+            return appleBlue
+        }
+        return colorScheme == .dark ? Color.white.opacity(0.19) : Color.black.opacity(0.16)
+    }
+
     public static func controlFill(for colorScheme: ColorScheme, selected: Bool = false) -> Color {
         if selected {
             return appleBlue.opacity(colorScheme == .dark ? 0.24 : 0.13)
@@ -202,10 +238,32 @@ public enum ElectronicMailComposerType {
     }
 }
 
+public enum ElectronicMailReaderType {
+    public static func title() -> Font {
+        .system(size: 30, weight: .bold, design: .rounded)
+    }
+
+    public static func sender(weight: Font.Weight = .semibold) -> Font {
+        .system(size: 16, weight: weight, design: .rounded)
+    }
+
+    public static func body(weight: Font.Weight = .regular) -> Font {
+        .system(size: 15, weight: weight, design: .rounded)
+    }
+
+    public static func metadata(weight: Font.Weight = .regular) -> Font {
+        .system(size: 14, weight: weight, design: .rounded)
+    }
+
+    public static func action(weight: Font.Weight = .regular) -> Font {
+        .system(size: 18, weight: weight, design: .rounded)
+    }
+}
+
 /// Shared editor geometry keeps the empty-state copy on the exact insertion
 /// origin used by SwiftUI's macOS TextEditor.
 enum ElectronicMailComposerEditorLayout {
-    static let textEditorHorizontalInset: CGFloat = 7
+    static let textEditorHorizontalInset: CGFloat = -5
     static let textEditorVerticalInset: CGFloat = 6
     static let nativeLineFragmentPadding: CGFloat = 5
     static let placeholderHorizontalInset = textEditorHorizontalInset + nativeLineFragmentPadding
