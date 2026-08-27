@@ -935,6 +935,14 @@ public final class InboxStore: ObservableObject {
         session?.dashboard.auth.missingScopes ?? []
     }
 
+    public var contactPhotosAvailable: Bool {
+        session?.dashboard.auth.contactPhotosAvailable == true
+    }
+
+    public var missingOptionalGoogleScopes: [String] {
+        session?.dashboard.auth.missingOptionalScopes ?? []
+    }
+
     public func setSessionToken(_ token: String?) {
         updateSessionToken(token, preservingPendingThreadActions: false)
     }

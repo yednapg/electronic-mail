@@ -35,6 +35,7 @@ from app.services.auth import require_current_user
 from app.services.gmail_importer import run_gmail_delta_sync
 from app.services.gmail_watch import ensure_gmail_watch
 from app.services.integrations.google import fetch_gmail_attachment
+from app.services.contact_avatars import contact_avatar_asset_is_owned
 from app.services.mailbox_actions import ThreadActionIdempotencyConflict, enqueue_thread_action
 from app.services.mailbox_drafts import (
     MailDraftIdentityConflict,
@@ -334,13 +335,23 @@ def mailbox_remote_image(request: Request, asset_id: str) -> Response:
     except RemoteImageTokenError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image asset not found") from exc
 
-    messages = list_messages_by_ids(
-        str(settings.database_path),
-        user_id=user.id,
-        message_ids=[asset.message_id],
-    )
-    if not messages:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image asset not found")
+    if asset.message_id.startswith("contact-avatar:"):
+        normalized_email = asset.message_id.removeprefix("contact-avatar:")
+        if not contact_avatar_asset_is_owned(
+            settings,
+            user_id=user.id,
+            normalized_email=normalized_email,
+            source_url=asset.source_url,
+        ):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image asset not found")
+    else:
+        messages = list_messages_by_ids(
+            str(settings.database_path),
+            user_id=user.id,
+            message_ids=[asset.message_id],
+        )
+        if not messages:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image asset not found")
     try:
         image = fetch_remote_image(asset.source_url)
     except RemoteImageBlocked as exc:

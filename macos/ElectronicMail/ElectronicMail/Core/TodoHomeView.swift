@@ -50,7 +50,7 @@ public struct TodoHomeView: View {
                 await store.load()
             }
         }
-        .environment(\.font, .system(.body, design: .rounded))
+        .environment(\.font, .body)
     }
 
     private func content(for snapshot: TodoHomeSnapshot) -> some View {
@@ -138,16 +138,6 @@ public struct TodoHomeView: View {
                     .font(TodoTypography.normal(weight: .regular))
                     .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
 
-                Button(action: onCompose) {
-                    Image(systemName: "square.and.pencil")
-                        .font(TodoTypography.normal(weight: .semibold))
-                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                        .frame(width: 30, height: 30)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("Compose email")
-                .accessibilityLabel("Compose email")
             }
 
         }
@@ -336,7 +326,10 @@ public struct TodoHomeView: View {
     }
 
     private func addButton(for section: TodoSectionModel, scrollProxy: ScrollViewProxy) -> some View {
-        Button {
+        ElectronicMailIconControl(
+            symbol: "plus",
+            accessibilityLabel: "Add to-do"
+        ) {
             let willOpen = composerSectionID != section.id
             withAnimation(.easeInOut(duration: 0.16)) {
                 composerSectionID = composerSectionID == section.id ? nil : section.id
@@ -348,14 +341,7 @@ public struct TodoHomeView: View {
                     }
                 }
             }
-        } label: {
-            Image(systemName: "plus")
-                .font(TodoTypography.normal(weight: .semibold))
-                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                .frame(width: 30, height: 30)
         }
-        .buttonStyle(.plain)
-        .help("Add to-do")
     }
 
     private func composerID(for sectionID: String) -> String {
@@ -395,26 +381,34 @@ public struct TodoHomeView: View {
 
                     HStack(spacing: 10) {
                         Spacer()
-                        Button("Cancel") {
+                        Button {
                             resetComposer()
+                        } label: {
+                            Text("Cancel")
+                                .padding(.horizontal, 13)
+                                .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.bordered)
+                        .buttonBorderShape(.capsule)
                         .font(TodoTypography.small(weight: .regular))
-                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
 
                         Button {
                             createManualTask(in: section)
                         } label: {
-                            if creatingTask {
-                                ProgressView()
-                                    .controlSize(.small)
-                            } else {
-                                Text("Add")
+                            Group {
+                                if creatingTask {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else {
+                                    Text("Add")
+                                }
                             }
+                            .padding(.horizontal, 16)
+                            .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(.borderedProminent)
+                        .buttonBorderShape(.capsule)
                         .font(TodoTypography.small(weight: .regular))
-                        .foregroundStyle(ElectronicMailDesign.appleBlue)
                         .disabled(creatingTask || draftTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
@@ -510,16 +504,16 @@ private struct SummarySymbol {
 }
 
 private enum TodoTypography {
-    static let normalSize: CGFloat = 18
-    static let lineHeight: CGFloat = 40
-    static let tracking: CGFloat = normalSize * 0.012
+    static let normalSize: CGFloat = 15
+    static let lineHeight: CGFloat = 34
+    static let tracking: CGFloat = 0
     static let sectionRowTopGap: CGFloat = 10
     static let contentTop: CGFloat = ElectronicMailShellMetrics.navTop + 8
     static let minContentWidth: CGFloat = 620
     static let maxContentWidth: CGFloat = 1000
 
     static func normal(weight: Font.Weight = .regular) -> Font {
-        .system(size: normalSize, weight: weight, design: .rounded)
+        .system(size: normalSize, weight: weight)
     }
 
     static func sectionTitle() -> Font {
@@ -539,7 +533,7 @@ private enum TodoTypography {
     }
 
     static func checkbox() -> Font {
-        .system(size: 18, weight: .regular, design: .rounded)
+        .system(size: 15, weight: .regular)
     }
 }
 
@@ -566,7 +560,7 @@ private struct SummaryTokenView: View {
                 .fixedSize(horizontal: true, vertical: false)
         case let .symbol(symbol):
             Image(systemName: symbol.name)
-                .symbolRenderingMode(.monochrome)
+                .symbolRenderingMode(.multicolor)
                 .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                 .font(TodoTypography.small(weight: .regular))
                 .fixedSize(horizontal: true, vertical: false)
@@ -975,7 +969,6 @@ private struct TodoItemRow: View {
     private func rowText(_ value: String, color: Color, alignment: TextAlignment = .leading) -> some View {
         Text(value)
             .font(TodoTypography.rowTitle())
-            .tracking(ElectronicMailType.bodyTracking)
             .foregroundStyle(color)
             .lineLimit(1)
             .truncationMode(.tail)
