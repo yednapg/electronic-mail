@@ -109,7 +109,7 @@ public struct SignedInShellView: View {
     @State private var selection: SignedInDestination = .inbox
     @State private var supplementalDestination: ShellSupplementalDestination?
     @State private var navigationOpen = false
-    @State private var mailboxSearchOpen = true
+    @State private var mailboxSearchOpen = false
     @State private var mailboxSearchFocusRequested = false
     @State private var commandPaletteOpen = false
     @State private var composer: MailComposerPresentation?
@@ -350,7 +350,15 @@ public struct SignedInShellView: View {
     }
 
     private func shellContentHeader(width: CGFloat) -> some View {
-        let searchWidth = min(360, max(220, width * 0.22))
+        let defaultSearchWidth = min(360, max(220, width * 0.22))
+        let searchWidth = max(
+            180,
+            defaultSearchWidth
+                - (ElectronicMailControlMetrics.mailboxHeaderTrailingInset
+                    - ElectronicMailControlMetrics.trailingInset)
+                + (ElectronicMailControlMetrics.headerControlGap
+                    - ElectronicMailControlMetrics.mailboxHeaderControlGap)
+        )
         let showsReader = store.readerThreadID != nil
         let readerTitleLeading = ElectronicMailControlMetrics.centeredContentLeading(
             containerWidth: width,
@@ -363,9 +371,9 @@ public struct SignedInShellView: View {
                 + readerTitleLeading
         } else if supplementalDestination == nil {
             ElectronicMailControlMetrics.headerControlSize
-                + ElectronicMailControlMetrics.headerControlGap
+                + ElectronicMailControlMetrics.mailboxHeaderControlGap
                 + (mailboxSearchOpen ? searchWidth : ElectronicMailControlMetrics.headerControlSize)
-                + ElectronicMailControlMetrics.trailingInset
+                + ElectronicMailControlMetrics.mailboxHeaderTrailingInset
         } else {
             ElectronicMailControlMetrics.headerControlSize + ElectronicMailControlMetrics.trailingInset
         }
@@ -376,6 +384,12 @@ public struct SignedInShellView: View {
                 ? readerTitleLeading
                 : ElectronicMailControlMetrics.headerTitleLeading,
             titleTrailingReservation: trailingControlsWidth,
+            trailingSpacing: supplementalDestination == nil && !showsReader
+                ? ElectronicMailControlMetrics.mailboxHeaderControlGap
+                : ElectronicMailControlMetrics.headerControlGap,
+            trailingInset: supplementalDestination == nil && !showsReader
+                ? ElectronicMailControlMetrics.mailboxHeaderTrailingInset
+                : ElectronicMailControlMetrics.trailingInset,
             leading: {
                 if showsReader {
                     ShellBackButton(colorScheme: colorScheme, action: closeReader)
@@ -404,12 +418,13 @@ public struct SignedInShellView: View {
                             .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                             .lineLimit(1)
                     }
+                    .offset(y: ElectronicMailControlMetrics.readerHeaderContentOffsetY)
                     .help(readerHeaderTitle)
                     .accessibilityElement(children: .combine)
                     .accessibilityAddTraits(.isHeader)
                 } else {
                     Text(headerTitle)
-                        .font(ElectronicMailType.headerTitle(weight: .semibold))
+                        .font(ElectronicMailType.mailboxHeader())
                         .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -432,7 +447,8 @@ public struct SignedInShellView: View {
                             DebouncedMailboxToolbarSearchField(
                                 query: $mailboxSearchText,
                                 focusRequested: mailboxSearchFocusRequested,
-                                onCancel: closeMailboxSearch
+                                onCancel: closeMailboxSearch,
+                                onFocusLost: closeMailboxSearch
                             )
                             .padding(.horizontal, 11)
                             .frame(width: searchWidth, height: ElectronicMailControlMetrics.headerSearchHeight)
@@ -446,8 +462,13 @@ public struct SignedInShellView: View {
                 }
             }
         )
+        .frame(
+            height: ElectronicMailControlMetrics.headerHeight
+                + (showsReader ? ElectronicMailControlMetrics.readerHeaderContentOffsetY : 0),
+            alignment: .top
+        )
         .animation(
-            reduceMotion ? nil : .easeInOut(duration: 0.2),
+            searchAnimation,
             value: mailboxSearchOpen
         )
     }
@@ -505,14 +526,26 @@ public struct SignedInShellView: View {
     private var searchFieldTransition: AnyTransition {
         guard !reduceMotion else { return .opacity }
         return .asymmetric(
-            insertion: .move(edge: .trailing).combined(with: .opacity),
-            removal: .opacity
+            insertion: .move(edge: .trailing)
+                .combined(with: .scale(scale: 0.96, anchor: .trailing))
+                .combined(with: .opacity),
+            removal: .scale(scale: 0.88, anchor: .trailing)
+                .combined(with: .opacity)
         )
     }
 
     private var searchButtonTransition: AnyTransition {
         guard !reduceMotion else { return .opacity }
-        return .opacity.combined(with: .scale(scale: 0.92))
+        return .asymmetric(
+            insertion: .scale(scale: 0.82).combined(with: .opacity),
+            removal: .scale(scale: 0.90).combined(with: .opacity)
+        )
+    }
+
+    private var searchAnimation: Animation? {
+        reduceMotion
+            ? nil
+            : .spring(response: 0.34, dampingFraction: 0.84, blendDuration: 0.08)
     }
 
     @ViewBuilder
@@ -652,7 +685,7 @@ public struct SignedInShellView: View {
 
     private func openMailboxSearch() {
         store.closeReader()
-        withAnimation(.easeInOut(duration: 0.12)) {
+        withAnimation(searchAnimation) {
             supplementalDestination = nil
             navigationOpen = false
             commandPaletteOpen = false
@@ -662,7 +695,7 @@ public struct SignedInShellView: View {
     }
 
     private func closeMailboxSearch() {
-        withAnimation(.easeInOut(duration: 0.12)) {
+        withAnimation(searchAnimation) {
             mailboxSearchOpen = false
             mailboxSearchFocusRequested = false
         }
@@ -979,6 +1012,7 @@ private struct ShellMenuButton: View {
         Button(action: action) {
             ElectronicMailHamburgerIcon()
                 .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .opacity(ElectronicMailControlMetrics.mailboxHeaderIconOpacity)
                 .frame(
                     width: ElectronicMailShellMetrics.navIconFrame,
                     height: ElectronicMailShellMetrics.navIconFrame
@@ -1021,6 +1055,7 @@ private struct ShellComposeButton: View {
         ElectronicMailIconControl(
             symbol: "square.and.pencil",
             accessibilityLabel: "New message",
+            symbolOpacity: ElectronicMailControlMetrics.mailboxHeaderIconOpacity,
             action: action
         )
     }
@@ -1034,6 +1069,7 @@ private struct ShellSearchButton: View {
         ElectronicMailIconControl(
             symbol: ElectronicMailSymbols.search,
             accessibilityLabel: "Search Mail",
+            symbolOpacity: ElectronicMailControlMetrics.mailboxHeaderIconOpacity,
             action: action
         )
         .accessibilityHint("Expands the mailbox search field")
@@ -1122,7 +1158,8 @@ private struct MailboxSearchOverlay: View {
                 DebouncedMailboxToolbarSearchField(
                     query: $query,
                     focusRequested: true,
-                    onCancel: onClose
+                    onCancel: onClose,
+                    onFocusLost: onClose
                 )
                 .frame(width: 420, height: 30)
 
@@ -1150,16 +1187,19 @@ private struct DebouncedMailboxToolbarSearchField: View {
     @FocusState private var isFocused: Bool
     private let focusRequested: Bool
     private let onCancel: () -> Void
+    private let onFocusLost: () -> Void
 
     init(
         query: Binding<String>,
         focusRequested: Bool,
-        onCancel: @escaping () -> Void
+        onCancel: @escaping () -> Void,
+        onFocusLost: @escaping () -> Void
     ) {
         self._query = query
         self._fieldText = State(initialValue: query.wrappedValue)
         self.focusRequested = focusRequested
         self.onCancel = onCancel
+        self.onFocusLost = onFocusLost
     }
 
     var body: some View {
@@ -1167,6 +1207,7 @@ private struct DebouncedMailboxToolbarSearchField: View {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(.secondary)
+                .opacity(ElectronicMailControlMetrics.mailboxHeaderIconOpacity)
                 .accessibilityHidden(true)
 
             TextField("Search Mail", text: $fieldText)
@@ -1180,6 +1221,7 @@ private struct DebouncedMailboxToolbarSearchField: View {
                 Button {
                     fieldText = ""
                     query = ""
+                    isFocused = true
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 13, weight: .medium))
@@ -1205,9 +1247,15 @@ private struct DebouncedMailboxToolbarSearchField: View {
             .task(id: focusRequested) {
                 // A visible TextField can become the window's first responder while
                 // SwiftUI installs it. Re-apply the requested state on the next run
-                // loop so the default-expanded search does not capture arrow keys.
+                // loop so an icon-triggered expansion reliably receives typing.
                 await Task.yield()
                 isFocused = focusRequested
+            }
+            .task(id: isFocused) {
+                guard !isFocused else { return }
+                try? await Task.sleep(nanoseconds: 140_000_000)
+                guard !Task.isCancelled, !isFocused else { return }
+                onFocusLost()
             }
     }
 }
@@ -2516,47 +2564,50 @@ private struct MailComposerSheet: View {
                 )
             },
             title: {
-                if isResponseComposer {
-                    HStack(spacing: 8) {
-                        Text(effectiveMode.title)
+                Group {
+                    if isResponseComposer {
+                        HStack(spacing: 8) {
+                            Text(effectiveMode.title)
+                                .font(.system(size: ElectronicMailComposerType.modeSize, weight: .semibold))
+                                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                                .accessibilityAddTraits(.isHeader)
+
+                            Menu {
+                                ForEach(MailComposerResponseTransitionPolicy.modes, id: \.rawValue) { mode in
+                                    Button {
+                                        requestResponseModeChange(mode)
+                                    } label: {
+                                        Label(
+                                            mode.title,
+                                            systemImage: mode == effectiveMode ? "checkmark" : mode.menuSymbol
+                                        )
+                                    }
+                                    .disabled(mode == effectiveMode)
+                                }
+                            } label: {
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                                    .frame(
+                                        width: ElectronicMailControlMetrics.headerControlSize,
+                                        height: ElectronicMailControlMetrics.headerControlSize
+                                    )
+                                    .contentShape(Circle())
+                            }
+                            .menuIndicator(.hidden)
+                            .electronicMailGlassButton(role: .standard, shape: .circle)
+                            .disabled(responseModeControlsDisabled)
+                            .help("Choose Reply, Reply All, or Forward")
+                            .accessibilityLabel(Text("Response type, \(effectiveMode.title)"))
+                        }
+                    } else {
+                        Text(composerDisplayTitle)
                             .font(.system(size: ElectronicMailComposerType.modeSize, weight: .semibold))
                             .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                             .accessibilityAddTraits(.isHeader)
-
-                        Menu {
-                            ForEach(MailComposerResponseTransitionPolicy.modes, id: \.rawValue) { mode in
-                                Button {
-                                    requestResponseModeChange(mode)
-                                } label: {
-                                    Label(
-                                        mode.title,
-                                        systemImage: mode == effectiveMode ? "checkmark" : mode.menuSymbol
-                                    )
-                                }
-                                .disabled(mode == effectiveMode)
-                            }
-                        } label: {
-                            Image(systemName: "chevron.down")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                                .frame(
-                                    width: ElectronicMailControlMetrics.headerControlSize,
-                                    height: ElectronicMailControlMetrics.headerControlSize
-                                )
-                                .contentShape(Circle())
-                        }
-                        .menuIndicator(.hidden)
-                        .electronicMailGlassButton(role: .standard, shape: .circle)
-                        .disabled(responseModeControlsDisabled)
-                        .help("Choose Reply, Reply All, or Forward")
-                        .accessibilityLabel(Text("Response type, \(effectiveMode.title)"))
                     }
-                } else {
-                    Text(composerDisplayTitle)
-                        .font(.system(size: ElectronicMailComposerType.modeSize, weight: .semibold))
-                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                        .accessibilityAddTraits(.isHeader)
                 }
+                .offset(y: ElectronicMailControlMetrics.composerHeaderContentOffsetY)
             },
             trailing: {
                 ElectronicMailIconControl(
@@ -2567,6 +2618,11 @@ private struct MailComposerSheet: View {
                 )
                 .disabled(composerControlsDisabled || savingDraft || loadingDraft)
             }
+        )
+        .frame(
+            height: ElectronicMailControlMetrics.headerHeight
+                + ElectronicMailControlMetrics.composerHeaderContentOffsetY,
+            alignment: .top
         )
     }
 

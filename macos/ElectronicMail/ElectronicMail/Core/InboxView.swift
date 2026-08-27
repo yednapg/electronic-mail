@@ -40,7 +40,10 @@ public struct InboxView: View {
                         thread: store.readerThread,
                         row: store.readerRow,
                         errorMessage: store.readerError,
-                        currentUserDisplayName: store.session?.user.displayName ?? store.session?.user.firstName,
+                        currentUserDisplayName: store.session?.readiness.userDisplayName
+                            ?? store.session?.dashboard.profile?.displayName
+                            ?? store.session?.user.displayName
+                            ?? store.session?.user.firstName,
                         currentUserEmail: store.session?.user.email,
                         colorScheme: colorScheme,
                         mailboxLabel: store.activeMailboxLabel,
@@ -1073,7 +1076,10 @@ private struct InboxSectionHeader: View, Equatable {
         VStack(alignment: .leading, spacing: 0) {
             Text(title)
                 .font(ElectronicMailMailboxType.section())
-                .foregroundStyle(ElectronicMailDesign.sectionText(for: colorScheme))
+                .foregroundStyle(
+                    ElectronicMailDesign.sectionText(for: colorScheme)
+                        .opacity(ElectronicMailMailboxType.sectionOpacity)
+                )
                 .lineLimit(1)
                 .frame(height: metrics.sectionLabelHeight, alignment: .leading)
                 .accessibilityAddTraits(.isHeader)
