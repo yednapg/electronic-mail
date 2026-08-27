@@ -60,19 +60,25 @@ public struct GoogleAuthState: Codable, Equatable {
     let connectURL: String?
     let canSendMail: Bool
     let missingScopes: [String]
+    let contactPhotosAvailable: Bool
+    let missingOptionalScopes: [String]
 
     init(
         available: Bool,
         connected: Bool,
         connectURL: String?,
         canSendMail: Bool = false,
-        missingScopes: [String] = []
+        missingScopes: [String] = [],
+        contactPhotosAvailable: Bool = false,
+        missingOptionalScopes: [String] = []
     ) {
         self.available = available
         self.connected = connected
         self.connectURL = connectURL
         self.canSendMail = canSendMail
         self.missingScopes = missingScopes
+        self.contactPhotosAvailable = contactPhotosAvailable
+        self.missingOptionalScopes = missingOptionalScopes
     }
 
     enum CodingKeys: String, CodingKey {
@@ -81,6 +87,8 @@ public struct GoogleAuthState: Codable, Equatable {
         case connectURL = "connect_url"
         case canSendMail = "can_send_mail"
         case missingScopes = "missing_scopes"
+        case contactPhotosAvailable = "contact_photos_available"
+        case missingOptionalScopes = "missing_optional_scopes"
     }
 
     public init(from decoder: Decoder) throws {
@@ -90,6 +98,8 @@ public struct GoogleAuthState: Codable, Equatable {
         connectURL = try container.decodeIfPresent(String.self, forKey: .connectURL)
         canSendMail = try container.decodeIfPresent(Bool.self, forKey: .canSendMail) ?? false
         missingScopes = try container.decodeIfPresent([String].self, forKey: .missingScopes) ?? []
+        contactPhotosAvailable = try container.decodeIfPresent(Bool.self, forKey: .contactPhotosAvailable) ?? false
+        missingOptionalScopes = try container.decodeIfPresent([String].self, forKey: .missingOptionalScopes) ?? []
     }
 }
 
@@ -2317,6 +2327,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
     let source: SourceType
     let threadID: String?
     let fromAddress: String?
+    let senderAvatarAssetID: String?
     let replyTo: String?
     let to: String?
     let cc: String?
@@ -2337,6 +2348,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         case source
         case threadID = "thread_id"
         case fromAddress = "from_address"
+        case senderAvatarAssetID = "sender_avatar_asset_id"
         case replyTo = "reply_to"
         case to
         case cc
@@ -2366,6 +2378,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         source = try container.decode(SourceType.self, forKey: .source)
         threadID = try container.decodeIfPresent(String.self, forKey: .threadID)
         fromAddress = try container.decodeIfPresent(String.self, forKey: .fromAddress)
+        senderAvatarAssetID = try container.decodeIfPresent(String.self, forKey: .senderAvatarAssetID)
         replyTo = try container.decodeIfPresent(String.self, forKey: .replyTo)
         to = try container.decodeIfPresent(String.self, forKey: .to)
         cc = try container.decodeIfPresent(String.self, forKey: .cc)
@@ -2400,6 +2413,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         source: SourceType,
         threadID: String?,
         fromAddress: String?,
+        senderAvatarAssetID: String? = nil,
         replyTo: String? = nil,
         to: String?,
         cc: String?,
@@ -2419,6 +2433,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         self.source = source
         self.threadID = threadID
         self.fromAddress = fromAddress
+        self.senderAvatarAssetID = senderAvatarAssetID
         self.replyTo = replyTo
         self.to = to
         self.cc = cc
@@ -2447,6 +2462,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         source = message.source
         threadID = message.threadID
         fromAddress = message.fromAddress
+        senderAvatarAssetID = message.senderAvatarAssetID
         replyTo = message.replyTo
         to = message.to
         cc = message.cc

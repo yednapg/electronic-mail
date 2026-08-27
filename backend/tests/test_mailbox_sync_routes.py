@@ -229,7 +229,17 @@ class MailboxSyncRouteTests(unittest.TestCase):
         self.assertTrue(state.reauth_required)
         self.assertEqual(state.missing_scopes, [GMAIL_FULL_SCOPE])
         self.assertEqual(state.connect_url, "http://127.0.0.1:3001/auth/google")
-        missing_scopes.assert_called_once_with(settings, user_id="user-1", required_scopes=[GMAIL_FULL_SCOPE])
+        self.assertEqual(
+            missing_scopes.call_args_list,
+            [
+                unittest.mock.call(settings, user_id="user-1", required_scopes=[GMAIL_FULL_SCOPE]),
+                unittest.mock.call(
+                    settings,
+                    user_id="user-1",
+                    required_scopes=[google_integration.GOOGLE_CONTACTS_READ_SCOPE],
+                ),
+            ],
+        )
 
     def test_sync_now_returns_not_connected_when_credentials_are_missing(self) -> None:
         state = MailboxSyncStateResponse(connected=True, total_threads=12)

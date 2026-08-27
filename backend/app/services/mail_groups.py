@@ -102,7 +102,13 @@ from app.services.attention_classifier import (
     is_terminal_classification,
     workflow_cluster_key,
 )
-from app.services.integrations.google import GMAIL_FULL_SCOPE, check_user_google_credentials, missing_google_scopes
+from app.services.integrations.google import (
+    GMAIL_FULL_SCOPE,
+    GOOGLE_CONTACTS_READ_SCOPE,
+    check_user_google_credentials,
+    missing_google_scopes,
+)
+from app.services.contact_avatars import normalize_contact_email, resolve_contact_avatar_asset_ids
 from app.services.mailbox_events import GMAIL_PUBSUB_RECEIVED, latest_event
 from app.services.remote_images import rewrite_external_image_sources
 
@@ -290,12 +296,19 @@ def _google_auth_state(settings: Settings, *, user_id: str) -> GoogleAuthState:
     connected = user_can_write_gmail(str(settings.database_path), user_id=user_id)
     missing_scopes = missing_google_scopes(settings, user_id=user_id, required_scopes=[GMAIL_FULL_SCOPE]) if connected else []
     reauth_required = connected and bool(missing_scopes)
+    missing_optional_scopes = (
+        missing_google_scopes(settings, user_id=user_id, required_scopes=[GOOGLE_CONTACTS_READ_SCOPE])
+        if connected
+        else []
+    )
     return GoogleAuthState(
         available=settings.google_configured,
         connected=connected,
         connect_url=f"{settings.backend_origin}/auth/google" if not connected or reauth_required else None,
         can_send_mail=connected and not missing_scopes,
         missing_scopes=missing_scopes,
+        contact_photos_available=connected and not missing_optional_scopes,
+        missing_optional_scopes=missing_optional_scopes,
         reauth_required=reauth_required,
         error="Google needs full mail permission. Please sign in with Google again." if reauth_required else None,
     )
@@ -1728,7 +1741,7 @@ def build_group_detail_response(
                 limit=limit,
                 offset=offset,
                 has_more=offset + len(page.messages) < page.total_messages,
-                messages=[_thread_message_from_gmail(message, settings=settings) for message in page.messages],
+                messages=_thread_messages_from_gmail(page.messages, settings=settings, user_id=user_id),
                 content_revision=page.content_revision,
             )
         if not _ai_grouping_enabled(settings):
@@ -1776,7 +1789,7 @@ def build_group_detail_response(
             limit=limit,
             offset=offset,
             has_more=offset + len(messages) < len(canonical_messages),
-            messages=[_thread_message_from_gmail(message, settings=settings) for message in messages],
+            messages=_thread_messages_from_gmail(messages, settings=settings, user_id=user_id),
             content_revision=_gmail_thread_content_revision(canonical_messages),
         )
 
@@ -1810,7 +1823,7 @@ def build_group_detail_response(
         limit=limit,
         offset=offset,
         has_more=offset + len(messages) < len(detail_messages),
-        messages=[_thread_message_from_gmail(message, settings=settings) for message in messages],
+        messages=_thread_messages_from_gmail(messages, settings=settings, user_id=user_id),
         content_revision=_gmail_thread_content_revision(detail_messages),
     )
 
@@ -1871,7 +1884,7 @@ def _build_mailbox_display_cluster_detail_response(
             limit=limit,
             offset=offset,
             has_more=offset + len(messages) < len(detail_messages),
-            messages=[_thread_message_from_gmail(message, settings=settings) for message in messages],
+            messages=_thread_messages_from_gmail(messages, settings=settings, user_id=user_id),
             content_revision=_gmail_thread_content_revision(detail_messages),
         )
     return None
@@ -3082,7 +3095,12 @@ def _gmail_part_headers(part: dict[str, Any]) -> dict[str, str]:
     return headers
 
 
-def _thread_message_from_gmail(message: GmailMessageRecord, *, settings: Settings | None = None) -> ThreadMessage:
+def _thread_message_from_gmail(
+    message: GmailMessageRecord,
+    *,
+    settings: Settings | None = None,
+    sender_avatar_asset_id: str | None = None,
+) -> ThreadMessage:
     reader_html_body = html_body_for_reader(message.html_body_sanitized)
     reader_html_render_document = html_render_document_for_reader(message.html_render_document)
     html_body = (
@@ -3110,6 +3128,7 @@ def _thread_message_from_gmail(message: GmailMessageRecord, *, settings: Setting
         source="gmail",
         thread_id=message.gmail_thread_id,
         from_address=message.sender,
+        sender_avatar_asset_id=sender_avatar_asset_id,
         reply_to=str(message.headers.get("reply-to") or message.headers.get("Reply-To") or "").strip() or None,
         to=message.recipients.get("to") if isinstance(message.recipients.get("to"), str) else None,
         cc=message.recipients.get("cc") if isinstance(message.recipients.get("cc"), str) else None,
@@ -3131,6 +3150,31 @@ def _thread_message_from_gmail(message: GmailMessageRecord, *, settings: Setting
         label_ids=message.label_ids,
         received_at=message.internal_date or message.updated_at,
     )
+
+
+def _thread_messages_from_gmail(
+    messages: list[GmailMessageRecord],
+    *,
+    settings: Settings,
+    user_id: str,
+) -> list[ThreadMessage]:
+    try:
+        avatar_assets = resolve_contact_avatar_asset_ids(
+            settings,
+            user_id=user_id,
+            sender_values=[message.sender for message in messages],
+        )
+    except Exception:
+        logger.info("Contact avatar enrichment unavailable for user_id=%s", user_id, exc_info=True)
+        avatar_assets = {}
+    return [
+        _thread_message_from_gmail(
+            message,
+            settings=settings,
+            sender_avatar_asset_id=avatar_assets.get(normalize_contact_email(message.sender) or ""),
+        )
+        for message in messages
+    ]
 
 
 def _rebuild_missing_render_documents(settings: Settings, *, user_id: str, messages: list[GmailMessageRecord]) -> bool:

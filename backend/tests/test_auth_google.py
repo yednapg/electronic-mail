@@ -52,6 +52,7 @@ class GoogleOAuthUrlTests(unittest.TestCase):
         flow.authorization_url.assert_called_once_with(
             access_type="offline",
             prompt="select_account consent",
+            include_granted_scopes="true",
         )
         save_session.assert_called_once_with(
             "postgresql://example/db",

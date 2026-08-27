@@ -7,6 +7,9 @@ import SwiftUI
 struct ElectronicMailApp: App {
     @NSApplicationDelegateAdaptor(ElectronicMailApplicationDelegate.self) private var appDelegate
     @StateObject private var store: InboxStore
+    private let visualQAMode: Bool
+    private let signInVisualQAMode: Bool
+    private let visualQAColorScheme: ColorScheme?
 
     init() {
 #if ELECTRONIC_MAIL_LOCAL_BETA
@@ -15,24 +18,56 @@ struct ElectronicMailApp: App {
             Darwin.exit(EXIT_SUCCESS)
         }
 #endif
-        let localMailStore = AppClientFactory.makeLocalMailStore()
-        _store = StateObject(
-            wrappedValue: InboxStore(
-                client: AppClientFactory.makeDefaultClient(localMailStore: localMailStore),
-                localMailStore: localMailStore
+#if DEBUG
+        let arguments = CommandLine.arguments
+        signInVisualQAMode = arguments.contains("--electronic-mail-sign-in-visual-qa")
+        visualQAMode = arguments.contains("--electronic-mail-visual-qa") || signInVisualQAMode
+        if arguments.contains("--electronic-mail-visual-qa-dark") {
+            visualQAColorScheme = .dark
+        } else if arguments.contains("--electronic-mail-visual-qa-light") {
+            visualQAColorScheme = .light
+        } else {
+            visualQAColorScheme = nil
+        }
+#else
+        visualQAMode = false
+        signInVisualQAMode = false
+        visualQAColorScheme = nil
+#endif
+        if visualQAMode {
+            _store = StateObject(wrappedValue: InboxStore(client: DemoAppClient()))
+        } else {
+            let localMailStore = AppClientFactory.makeLocalMailStore()
+            _store = StateObject(
+                wrappedValue: InboxStore(
+                    client: AppClientFactory.makeDefaultClient(localMailStore: localMailStore),
+                    localMailStore: localMailStore
+                )
             )
-        )
+        }
     }
 
     var body: some Scene {
         Window("", id: "main") {
-            ElectronicMailRootView(store: store)
-                .frame(minWidth: 1100, minHeight: 680)
+            ElectronicMailRootView(
+                store: store,
+                visualQAMode: visualQAMode,
+                startsAtSignIn: signInVisualQAMode
+            )
+                .frame(
+                    minWidth: ElectronicMailControlMetrics.onboardingWindowWidth,
+                    minHeight: ElectronicMailControlMetrics.onboardingWindowHeight
+                )
                 .tint(ElectronicMailDesign.appleBlue)
-                .background(ElectronicMailWindowSurface())
+                .electronicMailSymbolAppearance()
+                .background(ElectronicMailTrafficLightOverlayInstaller())
+                .preferredColorScheme(visualQAColorScheme)
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 1440, height: 900)
+        .defaultSize(
+            width: ElectronicMailControlMetrics.onboardingWindowWidth,
+            height: ElectronicMailControlMetrics.onboardingWindowHeight
+        )
         .commands {
             CommandGroup(replacing: .sidebar) {
                 Button("Toggle Navigation") {
@@ -91,51 +126,254 @@ struct ElectronicMailApp: App {
     }
 }
 
-private struct ElectronicMailWindowSurface: NSViewRepresentable {
-    @Environment(\.colorScheme) private var colorScheme
+private struct ElectronicMailTrafficLightOverlayInstaller: NSViewRepresentable {
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
 
-    func makeNSView(context _: Context) -> ElectronicMailWindowSurfaceView {
-        let view = ElectronicMailWindowSurfaceView()
-        view.surfaceColor = surfaceColor
+    func makeNSView(context: Context) -> WindowResolvingView {
+        let view = WindowResolvingView()
+        view.onWindowChange = { [weak coordinator = context.coordinator] window in
+            coordinator?.install(in: window)
+        }
         return view
     }
 
-    func updateNSView(_ view: ElectronicMailWindowSurfaceView, context _: Context) {
-        view.surfaceColor = surfaceColor
+    func updateNSView(_ nsView: WindowResolvingView, context: Context) {
+        context.coordinator.install(in: nsView.window)
     }
 
-    private var surfaceColor: NSColor {
-        colorScheme == .dark ? .black : .white
+    static func dismantleNSView(_ nsView: WindowResolvingView, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    @MainActor
+    final class Coordinator {
+        private var controller: TrafficLightOverlayController?
+
+        func install(in window: NSWindow?) {
+            guard let window else { return }
+            if controller?.window === window {
+                controller?.updateGeometry()
+                return
+            }
+            uninstall()
+            let controller = TrafficLightOverlayController(window: window)
+            self.controller = controller
+            controller.install()
+        }
+
+        func uninstall() {
+            controller?.uninstall()
+            controller = nil
+        }
     }
 }
 
-private final class ElectronicMailWindowSurfaceView: NSView {
-    var surfaceColor = NSColor.black {
-        didSet {
-            guard surfaceColor != oldValue else {
-                return
-            }
-            window?.backgroundColor = surfaceColor
-        }
-    }
+private final class WindowResolvingView: NSView {
+    var onWindowChange: ((NSWindow?) -> Void)?
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        applyWindowSurface()
-        DispatchQueue.main.async { [weak self] in
-            self?.applyWindowSurface()
+        onWindowChange?(window)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+}
+
+@MainActor
+private final class TrafficLightOverlayController {
+    private(set) weak var window: NSWindow?
+    private weak var containerView: NSView?
+    private var overlayView: TrafficLightMaskView?
+    private var buttonMaskViews: [TrafficLightButtonMaskView] = []
+    private var observations: [NSObjectProtocol] = []
+
+    init(window: NSWindow) {
+        self.window = window
+    }
+
+    func install() {
+        updateGeometry()
+        guard let window else { return }
+        let notifications: [Notification.Name] = [
+            NSWindow.didResizeNotification,
+            NSWindow.didEnterFullScreenNotification,
+            NSWindow.didExitFullScreenNotification,
+            NSWindow.didBecomeKeyNotification,
+            NSWindow.didResignKeyNotification,
+        ]
+        observations = notifications.map { name in
+            NotificationCenter.default.addObserver(
+                forName: name,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.updateGeometry() }
+            }
         }
     }
 
-    private func applyWindowSurface() {
-        guard let window else {
+    func uninstall() {
+        observations.forEach(NotificationCenter.default.removeObserver)
+        observations.removeAll()
+        overlayView?.removeFromSuperview()
+        overlayView = nil
+        buttonMaskViews.forEach { $0.removeFromSuperview() }
+        buttonMaskViews.removeAll()
+        containerView = nil
+    }
+
+    func updateGeometry() {
+        guard let window,
+              let close = window.standardWindowButton(.closeButton),
+              let minimize = window.standardWindowButton(.miniaturizeButton),
+              let zoom = window.standardWindowButton(.zoomButton),
+              let container = close.superview,
+              minimize.superview === container,
+              zoom.superview === container else {
+            overlayView?.removeFromSuperview()
+            overlayView = nil
+            buttonMaskViews.forEach { $0.removeFromSuperview() }
+            buttonMaskViews.removeAll()
+            containerView = nil
             return
         }
-        window.styleMask.insert(.fullSizeContentView)
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.titlebarSeparatorStyle = .none
-        window.backgroundColor = surfaceColor
+
+        let buttons = [close, minimize, zoom]
+        let groupFrame = buttons
+            .map(\.frame)
+            .reduce(NSRect.null) { $0.union($1) }
+            .insetBy(dx: -1, dy: -1)
+
+        let overlay: TrafficLightMaskView
+        if let current = overlayView, containerView === container {
+            overlay = current
+        } else {
+            overlayView?.removeFromSuperview()
+            overlay = TrafficLightMaskView(frame: groupFrame)
+            container.addSubview(overlay, positioned: .above, relativeTo: nil)
+            overlayView = overlay
+            containerView = container
+        }
+
+        overlay.frame = groupFrame
+        overlay.onPointerInsideChange = { [weak self] inside in
+            self?.setButtonMasksVisible(!inside)
+        }
+        overlay.updateTrackingArea()
+
+        if buttonMaskViews.count != buttons.count
+            || zip(buttonMaskViews, buttons).contains(where: { pair in
+                pair.0.superview !== pair.1
+            }) {
+            buttonMaskViews.forEach { $0.removeFromSuperview() }
+            buttonMaskViews = buttons.map { button in
+                let mask = TrafficLightButtonMaskView(frame: button.bounds)
+                mask.autoresizingMask = [.width, .height]
+                button.addSubview(mask)
+                return mask
+            }
+        }
+        for (mask, button) in zip(buttonMaskViews, buttons) {
+            mask.frame = button.bounds
+            mask.isWindowActive = window.isKeyWindow
+            mask.needsDisplay = true
+        }
+        setButtonMasksVisible(!overlay.pointerInside, animated: false)
+    }
+
+    private func setButtonMasksVisible(_ visible: Bool, animated: Bool = true) {
+        let changes = {
+            self.buttonMaskViews.forEach { $0.alphaValue = visible ? 1 : 0 }
+        }
+        guard animated, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            changes()
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.12
+            self.buttonMaskViews.forEach { mask in
+                mask.animator().alphaValue = visible ? 1 : 0
+            }
+        }
+    }
+}
+
+private final class TrafficLightMaskView: NSView {
+    var onPointerInsideChange: ((Bool) -> Void)?
+    private(set) var pointerInside = false
+    private var pointerTrackingArea: NSTrackingArea?
+
+    override var isOpaque: Bool { false }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // The system buttons remain the actual hit targets underneath.
+        nil
+    }
+
+    func updateTrackingArea() {
+        if let pointerTrackingArea {
+            removeTrackingArea(pointerTrackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        pointerTrackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        setPointerInside(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        setPointerInside(false)
+    }
+
+    private func setPointerInside(_ inside: Bool) {
+        guard pointerInside != inside else { return }
+        pointerInside = inside
+        onPointerInsideChange?(inside)
+    }
+}
+
+private final class TrafficLightButtonMaskView: NSView {
+    var isWindowActive = true
+
+    override var isOpaque: Bool { false }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        // An opaque neutral cover is required here; translucent gray allows the
+        // native red/yellow/green fills underneath to bleed through.
+        let neutral = NSColor(
+            deviceWhite: isWindowActive ? 0.34 : 0.26,
+            alpha: 1
+        )
+        neutral.setFill()
+        NSBezierPath(ovalIn: bounds).fill()
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func electronicMailSymbolAppearance() -> some View {
+        if #available(macOS 26.0, *) {
+            symbolRenderingMode(.multicolor)
+                .symbolColorRenderingMode(.gradient)
+        } else {
+            symbolRenderingMode(.multicolor)
+        }
     }
 }
 
@@ -165,12 +403,19 @@ private struct ElectronicMailRootView: View {
     private static let asyncTokenStore = AsyncSessionTokenStore(store: tokenStore)
 
     @ObservedObject var store: InboxStore
-    @State private var stage: AppLaunchStage = .resolvingSession
+    private let visualQAMode: Bool
+    @State private var stage: AppLaunchStage
     @State private var setupStartedAt = Date()
     @State private var setupError: String?
     @State private var resolvingError: String?
     @State private var signInInProgress = false
     @State private var signInError: String?
+
+    init(store: InboxStore, visualQAMode: Bool = false, startsAtSignIn: Bool = false) {
+        self.store = store
+        self.visualQAMode = visualQAMode
+        _stage = State(initialValue: startsAtSignIn ? .signIn : (visualQAMode ? .app : .resolvingSession))
+    }
 
     var body: some View {
         ZStack {
@@ -216,6 +461,7 @@ private struct ElectronicMailRootView: View {
             }
         }
         .task {
+            guard !visualQAMode else { return }
             await restoreExistingSessionIfAvailable()
         }
         .onChange(of: store.hasSessionToken) { hadSession, hasSession in
@@ -535,12 +781,12 @@ private struct SessionResolvingView: View {
 
             VStack(spacing: 18) {
                 Image(systemName: "envelope.fill")
-                    .font(.system(size: 34, weight: .semibold, design: .rounded))
+                    .font(.system(size: 28, weight: .medium))
                     .symbolRenderingMode(.monochrome)
                     .foregroundStyle(ElectronicMailDesign.appleBlue)
 
                 Text("Electronic Mail")
-                    .font(ElectronicMailType.title())
+                    .font(ElectronicMailType.title(weight: .semibold))
                     .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
 
                 if let errorMessage {
@@ -551,13 +797,24 @@ private struct SessionResolvingView: View {
                         .frame(maxWidth: 520)
 
                     HStack(spacing: 12) {
-                        Button("Try Again", action: onRetry)
-                            .buttonStyle(.borderedProminent)
+                        Button(action: onRetry) {
+                            Text("Try Again")
+                                .padding(.horizontal, 18)
+                                .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
+                                .contentShape(Capsule())
+                        }
+                        .font(ElectronicMailType.body(weight: .semibold))
+                        .electronicMailGlassButton(role: .prominent, shape: .capsule)
 
-                        Button("Sign In Again", action: onSignInAgain)
-                            .buttonStyle(.bordered)
+                        Button(action: onSignInAgain) {
+                            Text("Sign In Again")
+                                .padding(.horizontal, 18)
+                                .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
+                                .contentShape(Capsule())
+                        }
+                        .font(ElectronicMailType.body(weight: .semibold))
+                        .electronicMailGlassButton(role: .standard, shape: .capsule)
                     }
-                    .controlSize(.large)
                 } else {
                     ProgressView()
                         .controlSize(.small)
@@ -581,53 +838,248 @@ private struct GoogleSignInView: View {
     let onSignIn: () -> Void
 
     var body: some View {
-        ZStack {
-            ElectronicMailDesign.background(for: colorScheme)
-                .ignoresSafeArea()
+        GeometryReader { proxy in
+            ZStack(alignment: .bottomTrailing) {
+                ElectronicMailDesign.background(for: colorScheme)
+                    .ignoresSafeArea()
 
-            VStack(spacing: 32) {
-                HStack(spacing: 16) {
-                    Image(systemName: "envelope.open.fill")
-                        .symbolRenderingMode(.palette)
-                        .foregroundStyle(ElectronicMailDesign.selectedText(for: colorScheme), ElectronicMailDesign.appleBlue)
+                welcomeContent
+                    .frame(maxWidth: 480)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
 
-                    Image(systemName: "arrow.right")
-                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                signInArea
+                    .padding(.trailing, 24)
+                    .padding(.bottom, 24)
+            }
+            .frame(width: proxy.size.width, height: proxy.size.height)
+        }
+        .background(ElectronicMailSignInWindowSizer())
+    }
 
-                    Image(systemName: "checkmark.square.fill")
-                        .symbolRenderingMode(.palette)
-                        .foregroundStyle(.white, Color.green)
-                }
-                .font(ElectronicMailType.sectionTitle())
+    private var welcomeContent: some View {
+        VStack(spacing: 0) {
+            ElectronicMailWelcomeAppIcon()
+                .padding(.bottom, 20)
 
-                Text("A focused home for your email.")
-                    .font(ElectronicMailType.sectionTitle())
-                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+            Text("Welcome to Electronic Mail")
+                .font(ElectronicMailType.heroTitle(weight: .semibold))
+                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .multilineTextAlignment(.center)
+                .padding(.bottom, 22)
 
-                Button(action: onSignIn) {
+            GoogleSignInFeatureRow()
+                .padding(.bottom, 22)
+
+            Text("A focused home for the email that matters.\nConnect your Google account to get started.")
+                .font(ElectronicMailType.welcomeBody())
+                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .multilineTextAlignment(.center)
+                .lineSpacing(3)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private var signInArea: some View {
+        VStack(alignment: .trailing, spacing: 14) {
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(ElectronicMailType.body())
+                    .foregroundStyle(Color.red.opacity(colorScheme == .dark ? 0.92 : 0.82))
+                    .multilineTextAlignment(.trailing)
+                    .frame(maxWidth: 440, alignment: .trailing)
+                    .transition(.opacity)
+            }
+
+            Button(action: onSignIn) {
+                Group {
                     if isSigningIn {
                         ProgressView()
                             .controlSize(.small)
+                            .tint(.white)
+                            .frame(minWidth: 126)
                     } else {
                         Text("Sign in with Google")
-                            .font(ElectronicMailType.body())
                     }
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(isSigningIn)
-                .help("Sign in with Google")
+                .padding(.horizontal, 16)
+                .frame(minHeight: 38)
+                .contentShape(Capsule())
+            }
+            .font(ElectronicMailType.small(weight: .medium))
+            .electronicMailGlassButton(role: .prominent, shape: .capsule)
+            .disabled(isSigningIn)
+            .help("Sign in with Google")
+            .accessibilityLabel(isSigningIn ? "Signing in with Google" : "Sign in with Google")
+            .accessibilityValue(isSigningIn ? "In progress" : "Ready")
+        }
+    }
+}
 
-                if let errorMessage {
-                    Text(errorMessage)
-                        .font(ElectronicMailType.small())
-                        .foregroundStyle(Color.red.opacity(0.82))
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 560)
+private struct ElectronicMailSignInWindowSizer: NSViewRepresentable {
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> WindowResolvingView {
+        let view = WindowResolvingView()
+        view.onWindowChange = { [weak coordinator = context.coordinator] window in
+            coordinator?.applyDefaultSize(to: window)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: WindowResolvingView, context: Context) {
+        context.coordinator.applyDefaultSize(to: nsView.window)
+    }
+
+    @MainActor
+    final class Coordinator {
+        private weak var sizedWindow: NSWindow?
+
+        func applyDefaultSize(to window: NSWindow?) {
+            guard let window,
+                  sizedWindow !== window,
+                  !window.styleMask.contains(.fullScreen) else {
+                return
+            }
+
+            sizedWindow = window
+            window.setContentSize(
+                NSSize(
+                    width: ElectronicMailControlMetrics.onboardingWindowWidth,
+                    height: ElectronicMailControlMetrics.onboardingWindowHeight
+                )
+            )
+            window.center()
+        }
+    }
+}
+
+private struct ElectronicMailWelcomeAppIcon: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        iconArtwork
+        .frame(width: 68, height: 68)
+        .shadow(
+            color: Color.black.opacity(colorScheme == .dark ? 0.34 : 0.16),
+            radius: 6,
+            y: 3
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Electronic Mail")
+    }
+
+    @ViewBuilder
+    private var iconArtwork: some View {
+        if colorScheme == .dark {
+            Image(nsImage: NSApplication.shared.applicationIconImage)
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+        } else {
+            ZStack {
+                RoundedRectangle(cornerRadius: 17, style: .continuous)
+                    .fill(ElectronicMailDesign.appleBlue)
+
+                Image(systemName: "envelope.fill")
+                    .symbolRenderingMode(.hierarchical)
+                    .font(.system(size: 32, weight: .medium))
+                    .foregroundStyle(.white)
+            }
+        }
+    }
+}
+
+private struct GoogleSignInFeatureRow: View {
+    private let features: [GoogleSignInFeature] = [
+        GoogleSignInFeature(
+            symbol: ElectronicMailSymbols.search,
+            label: "Search",
+            tint: ElectronicMailDesign.featureSearch
+        ),
+        GoogleSignInFeature(
+            symbol: ElectronicMailSymbols.contacts,
+            label: "Contacts",
+            tint: ElectronicMailDesign.featureContacts
+        ),
+        GoogleSignInFeature(
+            symbol: ElectronicMailSymbols.moveToInbox,
+            label: "Inbox",
+            tint: ElectronicMailDesign.featureInbox
+        ),
+        GoogleSignInFeature(
+            symbol: ElectronicMailSymbols.starredFilled,
+            label: "Starred",
+            tint: ElectronicMailDesign.featureStarred
+        ),
+        GoogleSignInFeature(
+            symbol: ElectronicMailSymbols.reply,
+            label: "Reply",
+            tint: ElectronicMailDesign.featureReply
+        ),
+    ]
+
+    var body: some View {
+        ElectronicMailGlassGroup(spacing: 14) {
+            HStack(spacing: 14) {
+                ForEach(features) { feature in
+                    GoogleSignInFeatureIcon(feature: feature)
                 }
             }
-            .padding(.top, 18)
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Electronic Mail features")
+    }
+}
+
+private struct GoogleSignInFeature: Identifiable {
+    let symbol: String
+    let label: String
+    let tint: Color
+
+    var id: String { label }
+}
+
+private struct GoogleSignInFeatureIcon: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorScheme) private var colorScheme
+    let feature: GoogleSignInFeature
+
+    @ViewBuilder
+    var body: some View {
+        if #available(macOS 26.0, *), !reduceTransparency {
+            icon
+                .glassEffect(
+                    .regular.tint(feature.tint.opacity(colorScheme == .dark ? 0.28 : 0.18)),
+                    in: Circle()
+                )
+        } else {
+            icon
+                .background {
+                    Circle()
+                        .fill(reduceTransparency ? feature.tint.opacity(0.14) : .clear)
+                        .background(.regularMaterial, in: Circle())
+                }
+                .overlay {
+                    Circle()
+                        .strokeBorder(
+                            feature.tint.opacity(colorScheme == .dark ? 0.30 : 0.20),
+                            lineWidth: 1
+                        )
+                }
+        }
+    }
+
+    private var icon: some View {
+        Image(systemName: feature.symbol)
+            .symbolRenderingMode(.monochrome)
+            .font(.system(size: 19, weight: .medium))
+            .foregroundStyle(feature.tint)
+            .frame(width: 42, height: 42)
+            .contentShape(Circle())
+            .accessibilityLabel(feature.label)
     }
 }
 
@@ -663,18 +1115,20 @@ private struct SetupAnimationView: View {
                         Text(errorMessage)
                             .font(ElectronicMailType.body())
                             .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                        Button("Retry") {
-                            onRetry()
+                        Button(action: onRetry) {
+                            Text("Retry")
+                                .padding(.horizontal, 18)
+                                .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
+                                .contentShape(Capsule())
                         }
-                        .buttonStyle(.plain)
-                        .font(ElectronicMailType.small(weight: .semibold))
-                        .foregroundStyle(ElectronicMailDesign.appleBlue)
+                        .font(ElectronicMailType.body(weight: .semibold))
+                        .electronicMailGlassButton(role: .standard, shape: .capsule)
                     }
                 }
             }
             .id(startedAt)
         }
-        .environment(\.font, .system(.body, design: .rounded))
+        .environment(\.font, .body)
     }
 
     private var statusText: String {

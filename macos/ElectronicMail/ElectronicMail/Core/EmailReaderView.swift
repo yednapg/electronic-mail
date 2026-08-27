@@ -38,15 +38,6 @@ struct EmailReaderView: View {
                 ZStack(alignment: .bottom) {
                     ScrollView(.vertical, showsIndicators: true) {
                         EmailReaderChrome(contentWidth: contentWidth) {
-                            ReaderThreadHeader(
-                                title: readerTitle,
-                                messageCount: resolvedMessageCount,
-                                latestMessage: presentation.items.last?.message ?? messages.last,
-                                colorScheme: colorScheme,
-                                mailboxLabel: mailboxLabel,
-                                onThreadAction: onThreadAction
-                            )
-
                             if resolvedMessageCount <= 1 {
                                 SingleEmailContent(
                                     threadID: threadID,
@@ -95,10 +86,9 @@ struct EmailReaderView: View {
 
                     if let activeMessage, errorMessage == nil {
                         ReaderActionBubbles(
-                            askAvailable: onAsk != nil,
-                            onAsk: { onAsk?(activeMessage) },
-                            onForward: { onRespond(.forward, activeMessage.id) },
-                            onReply: { onRespond(.reply, activeMessage.id) }
+                            onReply: { onRespond(.reply, activeMessage.id) },
+                            onReplyAll: { onRespond(.replyAll, activeMessage.id) },
+                            onForward: { onRespond(.forward, activeMessage.id) }
                         )
                         .frame(width: contentWidth)
                         .padding(.bottom, EmailReaderMetrics.actionOverlayBottom)
@@ -363,53 +353,6 @@ private struct EmailMessageRenderIdentity: Hashable {
     let renderRevision: UInt64
 }
 
-private struct ReaderThreadHeader: View {
-    let title: String
-    let messageCount: Int
-    let latestMessage: ThreadMessage?
-    let colorScheme: ColorScheme
-    let mailboxLabel: MailboxLabel
-    let onThreadAction: (GmailThreadAction, String?) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: EmailReaderMetrics.threadTitleToMetadata) {
-            HStack(alignment: .top, spacing: EmailReaderMetrics.threadTitleActionGap) {
-                Text(title)
-                    .font(EmailReaderTypography.threadTitle())
-                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                    .lineLimit(2)
-                    .truncationMode(.tail)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .layoutPriority(1)
-
-                ReaderThreadActions(
-                    colorScheme: colorScheme,
-                    mailboxLabel: mailboxLabel,
-                    isUnread: latestMessage?.labelIDs.contains(where: { $0.uppercased() == "UNREAD" }) == true,
-                    isStarred: latestMessage?.labelIDs.contains(where: { $0.uppercased() == "STARRED" }) == true,
-                    onThreadAction: { onThreadAction($0, nil) }
-                )
-                .fixedSize(horizontal: true, vertical: false)
-            }
-            .frame(minHeight: EmailReaderMetrics.headerActionHeight, alignment: .top)
-
-            Text(metadata)
-                .font(EmailReaderTypography.metadata())
-                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                .lineLimit(1)
-        }
-    }
-
-    private var metadata: String {
-        let countLabel = messageCount == 1 ? "1 message" : "\(messageCount) messages"
-        guard let receivedAt = latestMessage?.receivedAt else {
-            return countLabel
-        }
-        return "\(countLabel) · \(EmailReaderText.dayGrouping(receivedAt))"
-    }
-}
-
 private struct ReaderThreadActions: View {
     let colorScheme: ColorScheme
     let mailboxLabel: MailboxLabel
@@ -432,6 +375,7 @@ private struct ReaderThreadActions: View {
                 symbol: mailboxLabel == .trash ? "trash.slash" : "trash",
                 help: mailboxLabel == .trash ? "Delete permanently" : "Move to Trash",
                 colorScheme: colorScheme,
+                destructive: mailboxLabel == .trash,
                 action: performTrashAction
             )
 
@@ -462,40 +406,28 @@ private struct ReaderThreadActions: View {
 
     private var primaryActionSymbol: String {
         switch mailboxLabel {
-        case .archive:
-            return "tray.and.arrow.down"
-        case .spam:
-            return "checkmark.shield"
-        case .trash:
-            return "arrow.uturn.backward"
-        default:
-            return "archivebox"
+        case .archive: return "tray.and.arrow.down"
+        case .spam: return "checkmark.shield"
+        case .trash: return "arrow.uturn.backward"
+        default: return "archivebox"
         }
     }
 
     private var primaryActionHelp: String {
         switch mailboxLabel {
-        case .archive:
-            return "Move to Inbox"
-        case .spam:
-            return "Not Spam"
-        case .trash:
-            return "Restore from Trash"
-        default:
-            return "Archive conversation"
+        case .archive: return "Move to Inbox"
+        case .spam: return "Not Spam"
+        case .trash: return "Restore from Trash"
+        default: return "Archive conversation"
         }
     }
 
     private func performPrimaryAction() {
         switch mailboxLabel {
-        case .archive:
-            onThreadAction(.unarchive)
-        case .spam:
-            onThreadAction(.notSpam)
-        case .trash:
-            onThreadAction(.restoreTrash)
-        default:
-            onThreadAction(.archive)
+        case .archive: onThreadAction(.unarchive)
+        case .spam: onThreadAction(.notSpam)
+        case .trash: onThreadAction(.restoreTrash)
+        default: onThreadAction(.archive)
         }
     }
 
@@ -512,111 +444,75 @@ private struct ReaderIconButton: View {
     let symbol: String
     let help: String
     let colorScheme: ColorScheme
+    var destructive = false
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .foregroundStyle(destructive ? Color.red : ElectronicMailDesign.primaryText(for: colorScheme))
                 .frame(width: EmailReaderMetrics.headerActionHeight, height: EmailReaderMetrics.headerActionHeight)
-                .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(ElectronicMailDesign.readerControlFill(for: colorScheme))
-                )
-                .overlay {
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .stroke(ElectronicMailDesign.readerControlBorder(for: colorScheme), lineWidth: 1)
-                }
-                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .contentShape(Circle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.bordered)
+        .buttonBorderShape(.circle)
+        .tint(destructive ? Color.red : ElectronicMailDesign.appleBlue)
         .help(help)
         .accessibilityLabel(help)
     }
 }
 
 private struct ReaderActionBubbles: View {
-    let askAvailable: Bool
-    let onAsk: () -> Void
-    let onForward: () -> Void
     let onReply: () -> Void
+    let onReplyAll: () -> Void
+    let onForward: () -> Void
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        HStack(spacing: 14) {
-            actionButton(
-                title: "Ask",
-                symbol: "magnifyingglass",
-                primary: false,
-                gradientBorder: true,
-                available: askAvailable,
-                action: onAsk
-            )
-            .help(askAvailable ? "Ask about this email" : "Ask is not available yet")
+        ElectronicMailFloatingActionGroup(spacing: ElectronicMailControlMetrics.readerActionGap) {
+            HStack(spacing: ElectronicMailControlMetrics.readerActionGap) {
+                actionButton(
+                    title: "Reply",
+                    symbol: ElectronicMailSymbols.reply,
+                    role: .prominent,
+                    action: onReply
+                )
 
-            actionButton(
-                title: "Forward",
-                symbol: "arrowshape.turn.up.right",
-                primary: false,
-                gradientBorder: false,
-                available: true,
-                action: onForward
-            )
+                actionButton(
+                    title: "Reply All",
+                    symbol: "arrowshape.turn.up.left.2.fill",
+                    role: .standard,
+                    action: onReplyAll
+                )
 
-            actionButton(
-                title: "Reply",
-                symbol: "arrowshape.turn.up.left",
-                primary: true,
-                gradientBorder: false,
-                available: true,
-                action: onReply
-            )
+                actionButton(
+                    title: "Forward",
+                    symbol: "arrowshape.turn.up.right.fill",
+                    role: .standard,
+                    action: onForward
+                )
+            }
         }
         .frame(maxWidth: .infinity, alignment: .center)
-        .background {
-            ReaderActionFocusBackdrop(colorScheme: colorScheme)
-                .frame(maxWidth: EmailReaderMetrics.actionFocusBackdropWidth)
-                .frame(height: EmailReaderMetrics.actionFocusBackdropHeight)
-        }
     }
 
     private func actionButton(
         title: String,
         symbol: String,
-        primary: Bool,
-        gradientBorder: Bool,
-        available: Bool,
+        role: ElectronicMailFloatingActionRole,
         action: @escaping () -> Void
     ) -> some View {
-        Button {
-            guard available else { return }
-            action()
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: symbol)
-                    .font(.system(size: 18, weight: .medium))
-                Text(title)
-                    .font(ElectronicMailReaderType.action(weight: .medium))
-            }
-            .foregroundStyle(primary ? Color.white : ElectronicMailDesign.primaryText(for: colorScheme))
-            .padding(.horizontal, 22)
-            .frame(height: EmailReaderMetrics.actionBubbleHeight)
-            .background(
-                Capsule()
-                    .fill(primary ? ElectronicMailDesign.appleBlue : ElectronicMailDesign.readerActionFill(for: colorScheme))
-            )
-            .overlay {
-                if gradientBorder {
-                    Capsule()
-                        .strokeBorder(ElectronicMailDesign.readerAskBorderGradient, lineWidth: 1.5)
-                }
-            }
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
+        ElectronicMailIconControl(
+            symbol: symbol,
+            accessibilityLabel: title,
+            role: role,
+            controlSize: ElectronicMailControlMetrics.actionHeight,
+            symbolSize: ElectronicMailControlMetrics.headerSymbolSize,
+            action: action
+        )
+        .help(title)
         .accessibilityLabel(title)
-        .accessibilityHint(available ? "" : "Unavailable")
     }
 }
 
@@ -624,20 +520,21 @@ private struct ReaderActionFocusBackdrop: View {
     let colorScheme: ColorScheme
 
     var body: some View {
-        Rectangle()
+        Capsule()
             .fill(
                 LinearGradient(
                     colors: [
                         backdropColor.opacity(0),
-                        backdropColor.opacity(0.64),
-                        backdropColor.opacity(0.84),
-                        backdropColor.opacity(0.64),
+                        backdropColor.opacity(0.32),
+                        backdropColor.opacity(0.54),
+                        backdropColor.opacity(0.32),
                         backdropColor.opacity(0),
                     ],
                     startPoint: .leading,
                     endPoint: .trailing
                 )
             )
+            .blur(radius: 18)
             .mask {
                 LinearGradient(
                     colors: [.clear, .black, .black, .clear],
@@ -684,6 +581,8 @@ private struct EmailReaderTitleHeader: View {
                     }
                     .font(EmailReaderTypography.metadata(weight: .medium))
                     .foregroundStyle(ElectronicMailDesign.appleBlue)
+                    .padding(.vertical, 3)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .help(summaryModel.controlAccessibilityLabel)
@@ -1496,7 +1395,9 @@ private struct EmailReaderDetailDisclosure: View {
                     Text(title)
                         .font(EmailReaderTypography.metadata(weight: .medium))
                 }
-                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                .foregroundStyle(ElectronicMailDesign.appleBlue)
+                .padding(.vertical, 3)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
@@ -2174,7 +2075,9 @@ enum EmailHTMLDocument {
     }
     body {
       margin: 0;
-      font-family: sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+      font-size: 15px;
+      line-height: 1.45;
       color: \(textColor);
     }
     a {
@@ -2629,9 +2532,14 @@ private struct EmailMessageHeader: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            EmailSenderAvatar(name: senderName, colorScheme: colorScheme, highlighted: isUnread)
+            EmailSenderAvatar(
+                name: senderName,
+                assetID: message.senderAvatarAssetID,
+                colorScheme: colorScheme,
+                highlighted: isUnread
+            )
 
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: ElectronicMailControlMetrics.readerTwoLineGap) {
                 if allowsCollapse {
                     Button(action: onToggle) {
                         senderLine
@@ -2669,6 +2577,8 @@ private struct EmailMessageHeader: View {
                         }
                         .font(EmailReaderTypography.metadata(weight: .medium))
                         .foregroundStyle(ElectronicMailDesign.appleBlue)
+                        .padding(.vertical, 3)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .help(detailsExpanded ? "Hide message details" : "Show message details")
@@ -2685,34 +2595,22 @@ private struct EmailMessageHeader: View {
 
             Spacer(minLength: 16)
 
-            HStack(spacing: 6) {
-                ReaderMoreActionsMenu(
-                    colorScheme: colorScheme,
-                    mailboxLabel: mailboxLabel,
-                    isUnread: isUnread,
-                    isStarred: message.labelIDs.contains(where: { $0.uppercased() == "STARRED" }),
-                    includesResponses: true,
-                    onRespond: { mode in onRespond(mode, message.id) },
-                    onThreadAction: { action in onThreadAction(action, message.id) }
-                )
-
-                if allowsCollapse {
-                    Button(action: onToggle) {
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                            .frame(width: 28, height: 28)
-                            .rotationEffect(.degrees(expanded ? 180 : 0))
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .animation(
-                        reduceMotion ? nil : .smooth(duration: EmailReaderMetrics.chevronDuration),
-                        value: expanded
-                    )
-                    .help(expanded ? "Collapse email" : "Expand email")
-                    .accessibilityLabel(expanded ? "Collapse email" : "Expand email")
+            if allowsCollapse {
+                Button(action: onToggle) {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                        .frame(width: 28, height: 28)
+                        .rotationEffect(.degrees(expanded ? 180 : 0))
+                        .contentShape(Circle())
                 }
+                .buttonStyle(.plain)
+                .animation(
+                    reduceMotion ? nil : .smooth(duration: EmailReaderMetrics.chevronDuration),
+                    value: expanded
+                )
+                .help(expanded ? "Collapse email" : "Expand email")
+                .accessibilityLabel(expanded ? "Collapse email" : "Expand email")
             }
         }
         .frame(
@@ -2770,17 +2668,35 @@ private struct EmailMessageHeader: View {
 
 private struct EmailSenderAvatar: View {
     let name: String
+    let assetID: String?
     let colorScheme: ColorScheme
     let highlighted: Bool
+
+    @State private var remoteImage: NSImage?
 
     var body: some View {
         Circle()
             .fill(ElectronicMailDesign.readerAvatarFill(for: colorScheme, highlighted: highlighted))
             .frame(width: EmailReaderMetrics.avatarSize, height: EmailReaderMetrics.avatarSize)
             .overlay {
-                Text(initial)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Color.white)
+                if let remoteImage {
+                    Image(nsImage: remoteImage)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: EmailReaderMetrics.avatarSize, height: EmailReaderMetrics.avatarSize)
+                        .clipShape(Circle())
+                } else {
+                    Text(initial)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Color.white)
+                }
+            }
+            .task(id: assetID) {
+                remoteImage = nil
+                guard let assetID, !assetID.isEmpty else { return }
+                guard let loaded = try? await EmailRemoteImageLoader.shared.load(assetID: assetID),
+                      !Task.isCancelled else { return }
+                remoteImage = NSImage(data: loaded.data)
             }
             .accessibilityHidden(true)
     }
@@ -2920,8 +2836,7 @@ private struct ReaderMoreActionsMenu: View {
     let includesResponses: Bool
     let onRespond: (MailComposerMode) -> Void
     let onThreadAction: (GmailThreadAction) -> Void
-    var bordered = false
-
+    var bordered: Bool = false
     @State private var confirmPermanentDelete = false
 
     var body: some View {
@@ -2971,22 +2886,10 @@ private struct ReaderMoreActionsMenu: View {
                     width: bordered ? EmailReaderMetrics.headerActionHeight : 28,
                     height: bordered ? EmailReaderMetrics.headerActionHeight : 28
                 )
-                .background {
-                    if bordered {
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(ElectronicMailDesign.readerControlFill(for: colorScheme))
-                    }
-                }
-                .overlay {
-                    if bordered {
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .stroke(ElectronicMailDesign.readerControlBorder(for: colorScheme), lineWidth: 1)
-                    }
-                }
-                .contentShape(Rectangle())
+                .contentShape(Circle())
         }
-        .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
+        .modifier(ReaderMoreActionsButtonStyle(bordered: bordered))
         .fixedSize()
         .help("More actions")
         .accessibilityLabel("More email actions")
@@ -3001,6 +2904,21 @@ private struct ReaderMoreActionsMenu: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This cannot be undone.")
+        }
+    }
+}
+
+private struct ReaderMoreActionsButtonStyle: ViewModifier {
+    let bordered: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if bordered {
+            content
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.circle)
+        } else {
+            content.menuStyle(.borderlessButton)
         }
     }
 }
@@ -3033,9 +2951,11 @@ private struct EmailReaderErrorView: View {
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
 
             Button("Retry", action: onRetry)
-                .buttonStyle(.plain)
+                .padding(.horizontal, 14)
+                .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
                 .font(EmailReaderTypography.body(weight: .semibold))
-                .foregroundStyle(ElectronicMailDesign.appleBlue)
 
             Spacer(minLength: 0)
         }
@@ -3053,24 +2973,23 @@ private struct EmailReaderErrorView: View {
 }
 
 private enum EmailReaderMetrics {
-    static let maxContentWidth: CGFloat = 940
-    static let horizontalPadding: CGFloat = 28
-    static let contentTop: CGFloat = ElectronicMailShellMetrics.navTop
-    static let headerActionHeight: CGFloat = 40
+    static let maxContentWidth = ElectronicMailControlMetrics.readerMaxWidth
+    static let horizontalPadding: CGFloat = 36
+    static let contentTop = ElectronicMailControlMetrics.readerContentTop
+    static let headerActionHeight = ElectronicMailControlMetrics.headerControlSize
     static let threadTitleActionGap: CGFloat = 20
-    static let threadTitleToMetadata: CGFloat = 10
-    static let headerToConversation: CGFloat = 40
-    static let collapsedRowHeight: CGFloat = 76
-    static let messageHeaderHeight: CGFloat = 60
-    static let messageHeaderVerticalPadding: CGFloat = 7
+    static let headerToConversation = ElectronicMailControlMetrics.readerHeaderToConversation
+    static let collapsedRowHeight: CGFloat = 82
+    static let messageHeaderHeight: CGFloat = 66
+    static let messageHeaderVerticalPadding: CGFloat = 8
     static let messageHeaderToDetails: CGFloat = 12
     static let detailRowSpacing: CGFloat = 17
     static let detailPanelVerticalPadding: CGFloat = 15
     static let expandedMessageBottomSpacing: CGFloat = 28
-    static let avatarSize: CGFloat = 34
-    static let actionBubbleHeight: CGFloat = 48
+    static let avatarSize: CGFloat = 36
+    static let actionBubbleHeight = ElectronicMailControlMetrics.actionHeight
     static let actionOverlayBottom: CGFloat = 76
-    static let actionOverlayClearance: CGFloat = 240
+    static let actionOverlayClearance: CGFloat = 188
     static let actionFocusBackdropWidth: CGFloat = 580
     static let actionFocusBackdropHeight: CGFloat = 112
     static let cardRadius: CGFloat = 7
@@ -3086,7 +3005,7 @@ private enum EmailReaderMetrics {
 
 private enum EmailReaderTypography {
     static func threadTitle() -> Font {
-        .system(size: 27, weight: .bold, design: .rounded)
+        ElectronicMailReaderType.title()
     }
 
     static func title(weight: Font.Weight = .bold) -> Font {
@@ -3118,12 +3037,12 @@ private enum EmailReaderTypography {
     }
 
     static func actionIcon(weight: Font.Weight = .regular) -> Font {
-        .system(size: 16, weight: weight, design: .rounded)
+        .system(size: 16, weight: weight)
     }
 
 }
 
-private enum EmailReaderText {
+enum EmailReaderText {
     static let loadingFullEmail = "Loading full email..."
 
     static func senderName(_ rawValue: String?) -> String? {

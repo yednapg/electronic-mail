@@ -7,24 +7,24 @@ import UniformTypeIdentifiers
 enum ElectronicMailShellMetrics {
     static let navTop: CGFloat = 12
     static let navLeading: CGFloat = 20
-    static let navIconFrame: CGFloat = 22
-    static let navHitFrame: CGFloat = 40
-    static let navTitleGap: CGFloat = 8
-    static let navHeaderTitleGap: CGFloat = 4
-    static let navTextLeading: CGFloat = navLeading + navHitFrame + navHeaderTitleGap
-    static let contentTop: CGFloat = navTop + 44
+    static let navIconFrame = ElectronicMailControlMetrics.headerSymbolSize
+    static let navHitFrame = ElectronicMailControlMetrics.headerControlSize
+    static let navTitleGap = ElectronicMailControlMetrics.headerTitleGap
+    static let navHeaderTitleGap = ElectronicMailControlMetrics.headerTitleGap
+    static let navTextLeading = ElectronicMailControlMetrics.headerTitleLeading
+    static let contentTop: CGFloat = 8
     static let contentMaxWidth: CGFloat = 900
 
-    private static let figmaCanvasWidth: CGFloat = 1_724
-    private static let figmaUtilityCenterX: CGFloat = 77
-    private static let figmaTextLeadingX: CGFloat = 129
-
     static func utilityCenter(for width: CGFloat) -> CGFloat {
-        width * figmaUtilityCenterX / figmaCanvasWidth
+        ElectronicMailLayoutMetrics(width: width).utilityCenter
     }
 
-    static func textLeading(for width: CGFloat) -> CGFloat {
-        width * figmaTextLeadingX / figmaCanvasWidth
+    static func headerUtilityCenter(for _: CGFloat) -> CGFloat {
+        ElectronicMailControlMetrics.headerLeadingControlCenter
+    }
+
+    static func textLeading(for _: CGFloat) -> CGFloat {
+        ElectronicMailControlMetrics.headerTitleLeading
     }
 }
 
@@ -100,6 +100,7 @@ public final class ElectronicMailComposerShutdownCoordinator {
 
 public struct SignedInShellView: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject private var store: InboxStore
     private let onReauthorizeGoogle: () async throws -> Void
     private let onSignOut: () async throws -> Void
@@ -108,13 +109,17 @@ public struct SignedInShellView: View {
     @State private var selection: SignedInDestination = .inbox
     @State private var supplementalDestination: ShellSupplementalDestination?
     @State private var navigationOpen = false
-    @State private var mailboxSearchOpen = false
+    @State private var mailboxSearchOpen = true
+    @State private var mailboxSearchFocusRequested = false
     @State private var commandPaletteOpen = false
     @State private var composer: MailComposerPresentation?
     @State private var recoveredComposerSnapshot: ComposerRecoverySnapshot?
     @State private var composerRecoveryLoadGate = MailComposerRecoveryLoadGate<MailComposerPresentation>()
     @State private var pendingCommandThreadID: String?
     @State private var mailboxSearchText = ""
+    @State private var confirmPermanentReaderDelete = false
+    @State private var contactPhotoAuthorizationRunning = false
+    @AppStorage("ElectronicMailContactPhotoPromptDismissed") private var contactPhotoPromptDismissed = false
 
     public init(
         store: InboxStore,
@@ -135,21 +140,8 @@ public struct SignedInShellView: View {
             ZStack(alignment: .topLeading) {
                 content
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .allowsHitTesting(!navigationOpen && !mailboxSearchOpen && composer == nil)
-                    .accessibilityHidden(navigationOpen || mailboxSearchOpen || composer != nil)
-
-                if !navigationOpen,
-                   store.readerThreadID == nil,
-                   supplementalDestination != .todos {
-                    ShellHeaderTitle(
-                        title: headerTitle,
-                        width: proxy.size.width,
-                        colorScheme: colorScheme
-                    )
-                    .transition(.opacity)
-                    .accessibilityHidden(mailboxSearchOpen || composer != nil)
-                    .zIndex(4)
-                }
+                    .allowsHitTesting(!navigationOpen && composer == nil)
+                    .accessibilityHidden(navigationOpen || composer != nil)
 
                 if navigationOpen {
                     ShellNavigationCanvas(
@@ -162,34 +154,27 @@ public struct SignedInShellView: View {
                     .allowsHitTesting(composer == nil)
                     .accessibilityHidden(composer != nil)
                     .zIndex(2)
-                }
 
-                fixedNavigationButton(width: proxy.size.width)
-                    .allowsHitTesting(!mailboxSearchOpen && composer == nil)
-                    .accessibilityHidden(mailboxSearchOpen || composer != nil)
-                    .zIndex(6)
-
-                if !navigationOpen,
-                   !mailboxSearchOpen,
-                   store.readerThreadID == nil,
-                   supplementalDestination == nil,
-                   composer == nil {
-                    ShellComposeButton(colorScheme: colorScheme, action: openComposeComposer)
-                        .position(
-                            x: proxy.size.width - ElectronicMailShellMetrics.navLeading - ElectronicMailShellMetrics.navHitFrame / 2,
-                            y: ElectronicMailShellMetrics.navTop + ElectronicMailShellMetrics.navHitFrame / 2
-                        )
-                        .zIndex(6)
-                }
-
-                if mailboxSearchOpen {
-                    MailboxSearchOverlay(
-                        query: $mailboxSearchText,
+                    ShellMenuButton(
                         colorScheme: colorScheme,
-                        onClose: closeMailboxSearch
+                        accessibilityLabel: "Hide Navigation",
+                        action: toggleNavigation
                     )
-                    .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
-                    .zIndex(8)
+                    .position(
+                        x: ElectronicMailControlMetrics.headerLeadingControlCenter,
+                        y: ElectronicMailControlMetrics.headerCenterY
+                    )
+                    .allowsHitTesting(composer == nil)
+                    .accessibilityHidden(composer != nil)
+                    .zIndex(6)
+                }
+
+                if showsContactPhotoPermissionPrompt {
+                    contactPhotoPermissionPrompt
+                        .frame(width: proxy.size.width, height: proxy.size.height, alignment: .bottom)
+                        .padding(.bottom, 24)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                        .zIndex(8)
                 }
 
                 if commandPaletteOpen {
@@ -234,7 +219,10 @@ public struct SignedInShellView: View {
                 .zIndex(20)
             }
         }
-        .background(ElectronicMailDesign.background(for: colorScheme))
+        .background {
+            ElectronicMailDesign.background(for: colorScheme)
+                .ignoresSafeArea()
+        }
         .task(id: selection) {
             await applyMailboxSelection()
         }
@@ -279,10 +267,256 @@ public struct SignedInShellView: View {
                 closeReader()
             }
         }
+        .confirmationDialog(
+            "Delete this email permanently?",
+            isPresented: $confirmPermanentReaderDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Permanently", role: .destructive) {
+                performReaderAction(.deleteForever)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This cannot be undone.")
+        }
+    }
+
+    private var showsContactPhotoPermissionPrompt: Bool {
+        !contactPhotoPromptDismissed
+            && !store.contactPhotosAvailable
+            && !store.missingOptionalGoogleScopes.isEmpty
+            && !navigationOpen
+            && composer == nil
+            && !commandPaletteOpen
+    }
+
+    private var contactPhotoPermissionPrompt: some View {
+        HStack(spacing: 12) {
+            Image(systemName: ElectronicMailSymbols.contacts)
+                .font(.system(size: 16, weight: .medium))
+
+            Text("Show photos from your saved Google Contacts?")
+                .font(ElectronicMailType.body(weight: .medium))
+
+            Button("Not now") {
+                contactPhotoPromptDismissed = true
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+
+            Button {
+                Task { await authorizeContactPhotos() }
+            } label: {
+                if contactPhotoAuthorizationRunning {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Text("Allow contact photos")
+                }
+            }
+            .disabled(contactPhotoAuthorizationRunning)
+            .electronicMailGlassButton(role: .prominent, shape: .capsule)
+        }
+        .padding(.leading, 16)
+        .padding(.trailing, 8)
+        .frame(height: ElectronicMailControlMetrics.actionHeight + 8)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(.white.opacity(colorScheme == .dark ? 0.14 : 0.24)))
+        .accessibilityElement(children: .contain)
+    }
+
+    @MainActor
+    private func authorizeContactPhotos() async {
+        contactPhotoAuthorizationRunning = true
+        defer { contactPhotoAuthorizationRunning = false }
+        do {
+            try await onReauthorizeGoogle()
+        } catch {
+            // Contacts are optional; keep the prompt available without
+            // interrupting mailbox navigation or presenting a blocking error.
+        }
     }
 
     @ViewBuilder
     private var content: some View {
+        GeometryReader { proxy in
+            VStack(alignment: .leading, spacing: 0) {
+                shellContentHeader(width: proxy.size.width)
+
+                destinationContent
+            }
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+        }
+    }
+
+    private func shellContentHeader(width: CGFloat) -> some View {
+        let searchWidth = min(360, max(220, width * 0.22))
+        let showsReader = store.readerThreadID != nil
+        let readerTitleLeading = ElectronicMailControlMetrics.centeredContentLeading(
+            containerWidth: width,
+            maxContentWidth: ElectronicMailControlMetrics.readerMaxWidth,
+            horizontalPadding: EmailReaderHeaderLayout.horizontalPadding
+        )
+        let trailingControlsWidth: CGFloat = if showsReader {
+            ElectronicMailControlMetrics.headerControlSize * 5
+                + ElectronicMailControlMetrics.readerActionGap * 4
+                + readerTitleLeading
+        } else if supplementalDestination == nil {
+            ElectronicMailControlMetrics.headerControlSize
+                + ElectronicMailControlMetrics.headerControlGap
+                + (mailboxSearchOpen ? searchWidth : ElectronicMailControlMetrics.headerControlSize)
+                + ElectronicMailControlMetrics.trailingInset
+        } else {
+            ElectronicMailControlMetrics.headerControlSize + ElectronicMailControlMetrics.trailingInset
+        }
+
+        return ElectronicMailShellHeader(
+            width: width,
+            titleLeading: showsReader
+                ? readerTitleLeading
+                : ElectronicMailControlMetrics.headerTitleLeading,
+            titleTrailingReservation: trailingControlsWidth,
+            leading: {
+                if showsReader {
+                    ShellBackButton(colorScheme: colorScheme, action: closeReader)
+                } else {
+                    ShellMenuButton(
+                        colorScheme: colorScheme,
+                        accessibilityLabel: navigationOpen ? "Hide Navigation" : "Show Navigation",
+                        action: toggleNavigation
+                    )
+                }
+            },
+            title: {
+                if showsReader {
+                    VStack(
+                        alignment: .leading,
+                        spacing: ElectronicMailControlMetrics.readerTwoLineGap
+                    ) {
+                        Text(readerHeaderTitle)
+                            .font(ElectronicMailReaderType.title())
+                            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+
+                        Text(readerHeaderMetadata)
+                            .font(ElectronicMailReaderType.metadata())
+                            .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                            .lineLimit(1)
+                    }
+                    .help(readerHeaderTitle)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityAddTraits(.isHeader)
+                } else {
+                    Text(headerTitle)
+                        .font(ElectronicMailType.headerTitle(weight: .semibold))
+                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(headerTitle)
+                        .accessibilityAddTraits(.isHeader)
+                }
+            },
+            trailing: {
+                if showsReader {
+                    readerHeaderActions
+                        .padding(
+                            .trailing,
+                            max(0, readerTitleLeading - ElectronicMailControlMetrics.trailingInset)
+                        )
+                } else {
+                    ShellComposeButton(colorScheme: colorScheme, action: openComposeComposer)
+
+                    if supplementalDestination == nil {
+                        if mailboxSearchOpen {
+                            DebouncedMailboxToolbarSearchField(
+                                query: $mailboxSearchText,
+                                focusRequested: mailboxSearchFocusRequested,
+                                onCancel: closeMailboxSearch
+                            )
+                            .padding(.horizontal, 11)
+                            .frame(width: searchWidth, height: ElectronicMailControlMetrics.headerSearchHeight)
+                            .electronicMailGlassPanel(shape: .capsule)
+                            .transition(searchFieldTransition)
+                        } else {
+                            ShellSearchButton(colorScheme: colorScheme, action: openMailboxSearch)
+                                .transition(searchButtonTransition)
+                        }
+                    }
+                }
+            }
+        )
+        .animation(
+            reduceMotion ? nil : .easeInOut(duration: 0.2),
+            value: mailboxSearchOpen
+        )
+    }
+
+    private enum EmailReaderHeaderLayout {
+        static let horizontalPadding: CGFloat = 36
+    }
+
+    private var readerHeaderActions: some View {
+        ElectronicMailGlassGroup(spacing: ElectronicMailControlMetrics.readerActionGap) {
+            HStack(spacing: ElectronicMailControlMetrics.readerActionGap) {
+                ElectronicMailIconControl(
+                    symbol: readerPrimaryActionSymbol,
+                    accessibilityLabel: readerPrimaryActionTitle,
+                    action: performReaderPrimaryAction
+                )
+
+                ElectronicMailIconControl(
+                    symbol: readerTrashActionSymbol,
+                    accessibilityLabel: readerTrashActionTitle,
+                    role: store.activeMailboxLabel == .trash ? .destructive : .standard,
+                    action: performReaderTrashAction
+                )
+
+                ElectronicMailIconControl(
+                    symbol: readerIsStarred ? ElectronicMailSymbols.starredFilled : ElectronicMailSymbols.starred,
+                    accessibilityLabel: readerIsStarred ? "Unstar Conversation" : "Star Conversation",
+                    action: {
+                        performReaderAction(readerIsStarred ? .unstar : .star)
+                    }
+                )
+
+                ElectronicMailIconControl(
+                    symbol: readerIsUnread ? "envelope.open.fill" : "envelope.fill",
+                    accessibilityLabel: readerIsUnread ? "Mark as Read" : "Mark as Unread",
+                    action: {
+                        performReaderAction(readerIsUnread ? .markRead : .markUnread)
+                    }
+                )
+
+                ElectronicMailIconControl(
+                    symbol: store.activeMailboxLabel == .spam
+                        ? "checkmark.shield.fill"
+                        : "exclamationmark.octagon.fill",
+                    accessibilityLabel: store.activeMailboxLabel == .spam ? "Not Spam" : "Mark as Spam",
+                    action: {
+                        performReaderAction(store.activeMailboxLabel == .spam ? .notSpam : .markSpam)
+                    }
+                )
+                .disabled(store.activeMailboxLabel == .trash)
+            }
+        }
+    }
+
+    private var searchFieldTransition: AnyTransition {
+        guard !reduceMotion else { return .opacity }
+        return .asymmetric(
+            insertion: .move(edge: .trailing).combined(with: .opacity),
+            removal: .opacity
+        )
+    }
+
+    private var searchButtonTransition: AnyTransition {
+        guard !reduceMotion else { return .opacity }
+        return .opacity.combined(with: .scale(scale: 0.92))
+    }
+
+    @ViewBuilder
+    private var destinationContent: some View {
         switch supplementalDestination {
         case .todos:
             TodoHomeView(
@@ -316,37 +550,102 @@ public struct SignedInShellView: View {
         return ShellPrimaryNavigationDestination(mailboxDestination: selection)
     }
 
-    @ViewBuilder
-    private func fixedNavigationButton(width: CGFloat) -> some View {
-        if store.readerThreadID != nil, !navigationOpen {
-            ShellBackButton(colorScheme: colorScheme, action: closeReader)
-                .position(
-                    x: ElectronicMailShellMetrics.utilityCenter(for: width),
-                    y: ElectronicMailShellMetrics.navTop + ElectronicMailShellMetrics.navHitFrame / 2
-                )
+    private var readerMessage: ThreadMessage? {
+        store.readerThread?.messages.last
+    }
+
+    private var readerHeaderTitle: String {
+        nonEmpty(store.readerThread?.title)
+            ?? nonEmpty(store.readerThread?.subject)
+            ?? nonEmpty(store.readerRow?.title)
+            ?? "Email"
+    }
+
+    private var readerHeaderMetadata: String {
+        let messages = store.readerThread?.messages ?? []
+        let count = max(1, max(messages.count, store.readerRow?.messageCount ?? 1))
+        let countLabel = count == 1 ? "1 message" : "\(count) messages"
+
+        guard let receivedAt = messages.last?.receivedAt else {
+            return countLabel
+        }
+        return "\(countLabel) · \(EmailReaderText.dayGrouping(receivedAt))"
+    }
+
+    private func nonEmpty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
+
+    private var readerIsUnread: Bool {
+        readerMessage?.labelIDs.contains(where: { $0.uppercased() == "UNREAD" }) == true
+    }
+
+    private var readerIsStarred: Bool {
+        readerMessage?.labelIDs.contains(where: { $0.uppercased() == "STARRED" }) == true
+    }
+
+    private var readerPrimaryActionSymbol: String {
+        switch store.activeMailboxLabel {
+        case .archive: return ElectronicMailSymbols.moveToInbox
+        case .spam: return "checkmark.shield.fill"
+        case .trash: return "arrow.uturn.backward.circle.fill"
+        default: return "archivebox.fill"
+        }
+    }
+
+    private var readerPrimaryActionTitle: String {
+        switch store.activeMailboxLabel {
+        case .archive: return "Move to Inbox"
+        case .spam: return "Not Spam"
+        case .trash: return "Restore from Trash"
+        default: return "Archive Conversation"
+        }
+    }
+
+    private var readerTrashActionSymbol: String {
+        store.activeMailboxLabel == .trash ? "trash.slash.fill" : "trash.fill"
+    }
+
+    private var readerTrashActionTitle: String {
+        store.activeMailboxLabel == .trash ? "Delete Permanently" : "Move to Trash"
+    }
+
+    private func performReaderPrimaryAction() {
+        switch store.activeMailboxLabel {
+        case .archive: performReaderAction(.unarchive)
+        case .spam: performReaderAction(.notSpam)
+        case .trash: performReaderAction(.restoreTrash)
+        default: performReaderAction(.archive)
+        }
+    }
+
+    private func performReaderTrashAction() {
+        if store.activeMailboxLabel == .trash {
+            confirmPermanentReaderDelete = true
         } else {
-            ShellMenuButton(
-                colorScheme: colorScheme,
-                accessibilityLabel: navigationOpen ? "Hide navigation" : "Show navigation",
-                action: toggleNavigation
-            )
-            .position(
-                x: ElectronicMailShellMetrics.utilityCenter(for: width),
-                y: ElectronicMailShellMetrics.navTop + ElectronicMailShellMetrics.navHitFrame / 2
-            )
+            performReaderAction(.moveTrash)
+        }
+    }
+
+    private func performReaderAction(_ action: GmailThreadAction) {
+        guard let threadID = store.readerThreadID else { return }
+        Task {
+            await store.performReaderThreadAction(action, threadID: threadID, messageID: nil)
         }
     }
 
     private func toggleNavigation() {
-        withAnimation(ShellNavigationMotion.screen) {
-            mailboxSearchOpen = false
+        guard composer == nil else { return }
+        withAnimation(reduceMotion ? nil : ShellNavigationMotion.screen) {
+            mailboxSearchFocusRequested = false
             commandPaletteOpen = false
             navigationOpen.toggle()
         }
     }
 
     private func closeNavigation() {
-        withAnimation(ShellNavigationMotion.screen) {
+        withAnimation(reduceMotion ? nil : ShellNavigationMotion.screen) {
             navigationOpen = false
         }
     }
@@ -358,12 +657,14 @@ public struct SignedInShellView: View {
             navigationOpen = false
             commandPaletteOpen = false
             mailboxSearchOpen = true
+            mailboxSearchFocusRequested = true
         }
     }
 
     private func closeMailboxSearch() {
         withAnimation(.easeInOut(duration: 0.12)) {
             mailboxSearchOpen = false
+            mailboxSearchFocusRequested = false
         }
     }
 
@@ -371,9 +672,9 @@ public struct SignedInShellView: View {
         pendingCommandThreadID = nil
         store.closeReader()
 
-        withAnimation(ShellNavigationMotion.screen) {
+        withAnimation(reduceMotion ? nil : ShellNavigationMotion.screen) {
             navigationOpen = false
-            mailboxSearchOpen = false
+            mailboxSearchFocusRequested = false
             supplementalDestination = destination.supplementalDestination
             if let mailboxDestination = destination.mailboxDestination {
                 selection = mailboxDestination
@@ -399,7 +700,7 @@ public struct SignedInShellView: View {
     private func openCommandPalette() {
         withAnimation(.easeInOut(duration: 0.12)) {
             navigationOpen = false
-            mailboxSearchOpen = false
+            mailboxSearchFocusRequested = false
             commandPaletteOpen = true
         }
     }
@@ -438,7 +739,7 @@ public struct SignedInShellView: View {
         pendingCommandThreadID = nil
         supplementalDestination = nil
         navigationOpen = false
-        mailboxSearchOpen = false
+        mailboxSearchFocusRequested = false
         selection = destination
     }
 
@@ -448,7 +749,7 @@ public struct SignedInShellView: View {
         }
         withAnimation(.easeInOut(duration: 0.12)) {
             navigationOpen = false
-            mailboxSearchOpen = false
+            mailboxSearchFocusRequested = false
             commandPaletteOpen = false
         }
         presentComposer(
@@ -577,7 +878,6 @@ enum ShellSupplementalDestination: Equatable {
 }
 
 enum ShellPrimaryNavigationDestination: String, CaseIterable, Identifiable {
-    case todos = "To-do's"
     case inbox = "Inbox"
     case starred = "Starred"
     case drafts = "Drafts"
@@ -586,6 +886,7 @@ enum ShellPrimaryNavigationDestination: String, CaseIterable, Identifiable {
     case trash = "Trash"
     case archive = "Archive"
     case all = "All Mail"
+    case todos = "To-do's"
 
     var id: Self {
         self
@@ -658,7 +959,6 @@ private struct ShellHeaderTitle: View {
     var body: some View {
         Text(title)
             .font(ElectronicMailType.headerTitle())
-            .tracking(ElectronicMailType.titleTracking)
             .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
             .lineLimit(1)
             .frame(height: ElectronicMailShellMetrics.navHitFrame, alignment: .leading)
@@ -687,14 +987,14 @@ private struct ShellMenuButton: View {
                     width: ElectronicMailShellMetrics.navHitFrame,
                     height: ElectronicMailShellMetrics.navHitFrame
                 )
-                .contentShape(Rectangle())
+                .contentShape(Circle())
         }
-        .buttonStyle(.plain)
+        .electronicMailGlassButton(role: .standard, shape: .circle)
         .frame(
             width: ElectronicMailShellMetrics.navHitFrame,
             height: ElectronicMailShellMetrics.navHitFrame
         )
-        .contentShape(Rectangle())
+        .contentShape(Circle())
         .help(accessibilityLabel)
         .accessibilityLabel(accessibilityLabel)
     }
@@ -705,24 +1005,11 @@ private struct ShellBackButton: View {
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            Image(systemName: "chevron.backward")
-                .font(.system(size: 18, weight: .semibold, design: .rounded))
-                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                .frame(
-                    width: ElectronicMailShellMetrics.navHitFrame,
-                    height: ElectronicMailShellMetrics.navHitFrame
-                )
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .frame(
-            width: ElectronicMailShellMetrics.navHitFrame,
-            height: ElectronicMailShellMetrics.navHitFrame
+        ElectronicMailIconControl(
+            symbol: "chevron.backward",
+            accessibilityLabel: "Back",
+            action: action
         )
-        .contentShape(Rectangle())
-        .help("Back")
-        .accessibilityLabel("Back")
     }
 }
 
@@ -731,27 +1018,25 @@ private struct ShellComposeButton: View {
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            Image(systemName: "square.and.pencil")
-                .font(.system(size: 18, weight: .medium, design: .rounded))
-                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                .frame(
-                    width: ElectronicMailShellMetrics.navHitFrame,
-                    height: ElectronicMailShellMetrics.navHitFrame
-                )
-                .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(ElectronicMailDesign.readerControlFill(for: colorScheme))
-                )
-                .overlay {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(ElectronicMailDesign.readerControlBorder(for: colorScheme), lineWidth: 1)
-                }
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help("New message")
-        .accessibilityLabel("New message")
+        ElectronicMailIconControl(
+            symbol: "square.and.pencil",
+            accessibilityLabel: "New message",
+            action: action
+        )
+    }
+}
+
+private struct ShellSearchButton: View {
+    let colorScheme: ColorScheme
+    let action: () -> Void
+
+    var body: some View {
+        ElectronicMailIconControl(
+            symbol: ElectronicMailSymbols.search,
+            accessibilityLabel: "Search Mail",
+            action: action
+        )
+        .accessibilityHint("Expands the mailbox search field")
     }
 }
 
@@ -762,11 +1047,14 @@ private struct ShellNavigationCanvas: View {
     let onSelect: (ShellPrimaryNavigationDestination) -> Void
 
     var body: some View {
+        let firstRowTop = ElectronicMailControlMetrics.headerCenterY
+            - ElectronicMailMailboxType.navigationRowHeight / 2
+
         ZStack(alignment: .topLeading) {
             ElectronicMailDesign.background(for: colorScheme)
                 .ignoresSafeArea()
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 0) {
                 ForEach(ShellPrimaryNavigationDestination.allCases) { destination in
                     ShellNavigationItem(
                         destination: destination,
@@ -776,8 +1064,8 @@ private struct ShellNavigationCanvas: View {
                     )
                 }
             }
-            .padding(.top, ElectronicMailShellMetrics.navTop)
-            .padding(.leading, ElectronicMailShellMetrics.textLeading(for: width))
+            .padding(.top, firstRowTop)
+            .padding(.leading, ElectronicMailControlMetrics.headerTitleLeading)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .contain)
@@ -794,11 +1082,10 @@ private struct ShellNavigationItem: View {
     var body: some View {
         Button(action: action) {
             Text(destination.title)
-                .font(ElectronicMailType.title())
-                .tracking(ElectronicMailType.titleTracking)
+                .font(ElectronicMailMailboxType.navigationItem())
                 .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                .opacity(isSelected ? 1 : 0.78)
-                .frame(height: ElectronicMailShellMetrics.navHitFrame)
+                .opacity(isSelected ? 1 : 0.82)
+                .frame(height: ElectronicMailMailboxType.navigationRowHeight)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -834,23 +1121,22 @@ private struct MailboxSearchOverlay: View {
             HStack(spacing: 10) {
                 DebouncedMailboxToolbarSearchField(
                     query: $query,
+                    focusRequested: true,
                     onCancel: onClose
                 )
-                    .frame(width: 420, height: 30)
+                .frame(width: 420, height: 30)
 
                 Button("Done", action: onClose)
-                    .buttonStyle(.plain)
+                    .padding(.horizontal, 12)
+                    .frame(minHeight: 32)
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
                     .font(ElectronicMailType.small(weight: .semibold))
-                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                     .accessibilityHint("Closes the search field and keeps the current results")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(ElectronicMailDesign.divider(for: colorScheme), lineWidth: 1)
-            }
             .padding(.top, ElectronicMailShellMetrics.navTop)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -861,100 +1147,68 @@ private struct MailboxSearchOverlay: View {
 private struct DebouncedMailboxToolbarSearchField: View {
     @Binding private var query: String
     @State private var fieldText: String
+    @FocusState private var isFocused: Bool
+    private let focusRequested: Bool
     private let onCancel: () -> Void
 
-    init(query: Binding<String>, onCancel: @escaping () -> Void) {
+    init(
+        query: Binding<String>,
+        focusRequested: Bool,
+        onCancel: @escaping () -> Void
+    ) {
         self._query = query
         self._fieldText = State(initialValue: query.wrappedValue)
+        self.focusRequested = focusRequested
         self.onCancel = onCancel
     }
 
     var body: some View {
-        MailboxToolbarSearchField(text: $fieldText, onCancel: onCancel)
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+
+            TextField("Search Mail", text: $fieldText)
+                .textFieldStyle(.plain)
+                .font(ElectronicMailType.body())
+                .focused($isFocused)
+                .onExitCommand(perform: onCancel)
+                .accessibilityLabel("Search Mail")
+
+            if !fieldText.isEmpty {
+                Button {
+                    fieldText = ""
+                    query = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear Search")
+                .accessibilityLabel("Clear Search")
+            }
+        }
             .task(id: fieldText) {
                 if fieldText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    if query != fieldText {
-                        query = fieldText
-                    }
+                    if query != fieldText { query = fieldText }
                     return
                 }
                 try? await Task.sleep(nanoseconds: 350_000_000)
-                guard !Task.isCancelled, query != fieldText else {
-                    return
-                }
+                guard !Task.isCancelled, query != fieldText else { return }
                 query = fieldText
             }
             .onChange(of: query) { _, nextQuery in
-                if fieldText != nextQuery {
-                    fieldText = nextQuery
-                }
+                if fieldText != nextQuery { fieldText = nextQuery }
             }
-    }
-}
-
-private struct MailboxToolbarSearchField: NSViewRepresentable {
-    @Binding var text: String
-    let onCancel: () -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, onCancel: onCancel)
-    }
-
-    func makeNSView(context: Context) -> ElectronicMailSearchField {
-        let field = ElectronicMailSearchField()
-        field.delegate = context.coordinator
-        field.onCancel = context.coordinator.onCancel
-        field.placeholderString = "Search Mail"
-        field.controlSize = .regular
-        field.bezelStyle = .roundedBezel
-        field.sendsSearchStringImmediately = true
-        field.sendsWholeSearchString = false
-        field.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
-        field.setAccessibilityLabel("Search Mail")
-        return field
-    }
-
-    func updateNSView(_ field: ElectronicMailSearchField, context: Context) {
-        context.coordinator.text = $text
-        context.coordinator.onCancel = onCancel
-        field.onCancel = context.coordinator.onCancel
-        if field.stringValue != text {
-            field.stringValue = text
-        }
-    }
-
-    final class Coordinator: NSObject, NSSearchFieldDelegate {
-        var text: Binding<String>
-        var onCancel: () -> Void
-
-        init(text: Binding<String>, onCancel: @escaping () -> Void) {
-            self.text = text
-            self.onCancel = onCancel
-        }
-
-        func controlTextDidChange(_ notification: Notification) {
-            guard let field = notification.object as? NSSearchField else {
-                return
+            .task(id: focusRequested) {
+                // A visible TextField can become the window's first responder while
+                // SwiftUI installs it. Re-apply the requested state on the next run
+                // loop so the default-expanded search does not capture arrow keys.
+                await Task.yield()
+                isFocused = focusRequested
             }
-            text.wrappedValue = field.stringValue
-        }
-    }
-}
-
-final class ElectronicMailSearchField: NSSearchField {
-    var onCancel: () -> Void = {}
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        guard let window else {
-            return
-        }
-        window.makeFirstResponder(self)
-        selectText(nil)
-    }
-
-    override func cancelOperation(_ sender: Any?) {
-        onCancel()
     }
 }
 
@@ -1248,14 +1502,12 @@ private struct CommandPaletteView: View {
                     if query.isEmpty {
                         Text("Command + K")
                             .font(ElectronicMailType.title())
-                            .tracking(ElectronicMailType.titleTracking)
                             .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                     }
 
                     TextField("", text: $query)
                         .textFieldStyle(.plain)
                         .font(ElectronicMailType.title())
-                        .tracking(ElectronicMailType.titleTracking)
                         .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                         .focused($searchFocused)
                 }
@@ -1288,13 +1540,8 @@ private struct CommandPaletteView: View {
                 }
             }
             .padding(16)
-            .frame(width: 640)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(ElectronicMailDesign.panelBorder(for: colorScheme), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.48 : 0.16), radius: 22, x: 0, y: 10)
+            .frame(minWidth: 320, maxWidth: ElectronicMailControlMetrics.paletteMaxWidth)
+            .electronicMailGlassPanel(shape: .panel(radius: 16))
             .background(
                 CommandPaletteNavigationCapture(
                     selectedIndex: $selectedIndex,
@@ -1335,9 +1582,9 @@ private struct CommandPaletteResultRow: View {
     let colorScheme: ColorScheme
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: ElectronicMailControlMetrics.headerControlGap) {
             Image(systemName: symbolName)
-                .font(ElectronicMailType.detail(weight: .semibold))
+                .font(.system(size: ElectronicMailControlMetrics.headerSymbolSize, weight: .medium))
                 .foregroundStyle(selected ? ElectronicMailDesign.selectedText(for: colorScheme) : ElectronicMailDesign.secondaryText(for: colorScheme))
                 .frame(width: 26)
 
@@ -1355,7 +1602,7 @@ private struct CommandPaletteResultRow: View {
 
             Spacer(minLength: 16)
         }
-        .frame(height: 48)
+        .frame(height: ElectronicMailControlMetrics.paletteRowHeight)
         .padding(.horizontal, 10)
         .background(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -1581,9 +1828,9 @@ enum SignedInDestination: CaseIterable, Hashable, Identifiable {
     var systemImage: String {
         switch self {
         case .inbox:
-            return "tray.full"
+            return ElectronicMailSymbols.inbox
         case .starred:
-            return "star"
+            return ElectronicMailSymbols.starred
         case .drafts:
             return "doc"
         case .sent:
@@ -1975,7 +2222,6 @@ private struct MailComposerOverlay: View {
                     onReauthorizeGoogle: onReauthorizeGoogle,
                     onClose: onClose
                 )
-                .frame(maxWidth: 980, maxHeight: .infinity, alignment: .top)
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Message composer")
             }
@@ -2001,6 +2247,10 @@ private enum ComposerFocusField: Hashable {
 
 private enum MailComposerLayout {
     static let contentLeadingInset: CGFloat = 52
+    static let canvasHorizontalInset: CGFloat = 28
+    static let fieldLabelWidth: CGFloat = 86
+    static let fieldSpacing: CGFloat = 10
+    static let valueLeadingInset: CGFloat = fieldLabelWidth + fieldSpacing
 }
 
 private struct MailComposerSheet: View {
@@ -2070,11 +2320,17 @@ private struct MailComposerSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            composerHeader
-                .padding(.bottom, 22)
-
+        GeometryReader { proxy in
             VStack(alignment: .leading, spacing: 0) {
+                composerHeader(width: proxy.size.width)
+
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(composerHeaderSubtitle)
+                        .font(ElectronicMailComposerType.status())
+                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                        .lineLimit(1)
+                        .padding(.bottom, 14)
+
                 if loadingDraft {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
@@ -2102,9 +2358,11 @@ private struct MailComposerSheet: View {
                                 }
                             }
                         }
-                        .buttonStyle(.plain)
+                        .padding(.horizontal, 14)
+                        .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
+                        .buttonStyle(.bordered)
+                        .buttonBorderShape(.capsule)
                         .font(ElectronicMailComposerType.control(weight: .semibold))
-                        .foregroundStyle(ElectronicMailDesign.appleBlue)
                         .disabled(loadingDraft)
                     }
                     .padding(.vertical, 8)
@@ -2144,17 +2402,27 @@ private struct MailComposerSheet: View {
                 }
 
                 composerEditor
+                    .padding(.leading, MailComposerLayout.valueLeadingInset)
 
                 composerAttachments
+                    .padding(.leading, MailComposerLayout.valueLeadingInset)
 
                 composerFooter
                     .padding(.top, 14)
+                }
+                .padding(.leading, MailComposerLayout.contentLeadingInset)
+                .padding(.horizontal, MailComposerLayout.canvasHorizontalInset)
+                .padding(.top, 18)
+                .padding(.bottom, 20)
+                .frame(
+                    maxWidth: ElectronicMailControlMetrics.composerMaxWidth,
+                    maxHeight: .infinity,
+                    alignment: .topLeading
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
-            .padding(.leading, MailComposerLayout.contentLeadingInset)
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
         }
-        .padding(.horizontal, 28)
-        .padding(.top, 30)
-        .padding(.bottom, 18)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(effectiveMode.title) composer")
@@ -2222,73 +2490,89 @@ private struct MailComposerSheet: View {
         }
     }
 
-    private var composerHeader: some View {
-        HStack(alignment: .top, spacing: 16) {
-            Button {
-                NotificationCenter.default.post(name: .electronicMailComposerCloseRequested, object: nil)
-            } label: {
-                Image(systemName: "chevron.backward")
-                    .font(.system(size: 17, weight: .semibold, design: .rounded))
-                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                    .frame(width: 36, height: 36)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Close composer")
-            .accessibilityLabel("Back")
+    private func composerHeader(width: CGFloat) -> some View {
+        let titleLeading = ElectronicMailControlMetrics.centeredContentLeading(
+            containerWidth: width,
+            maxContentWidth: ElectronicMailControlMetrics.composerMaxWidth,
+            contentInset: MailComposerLayout.contentLeadingInset
+                + MailComposerLayout.canvasHorizontalInset
+        )
 
-            VStack(alignment: .leading, spacing: 5) {
+        return ElectronicMailShellHeader(
+            width: width,
+            titleLeading: titleLeading,
+            titleTrailingReservation: ElectronicMailControlMetrics.headerControlSize
+                + ElectronicMailControlMetrics.trailingInset,
+            leading: {
+                ElectronicMailIconControl(
+                    symbol: "chevron.backward",
+                    accessibilityLabel: "Back",
+                    action: {
+                        NotificationCenter.default.post(
+                            name: .electronicMailComposerCloseRequested,
+                            object: nil
+                        )
+                    }
+                )
+            },
+            title: {
                 if isResponseComposer {
-                    Picker("Response type", selection: responseModeSelection) {
-                        ForEach(MailComposerResponseTransitionPolicy.modes, id: \.rawValue) { mode in
-                            Text(mode.title).tag(mode.rawValue)
+                    HStack(spacing: 8) {
+                        Text(effectiveMode.title)
+                            .font(.system(size: ElectronicMailComposerType.modeSize, weight: .semibold))
+                            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                            .accessibilityAddTraits(.isHeader)
+
+                        Menu {
+                            ForEach(MailComposerResponseTransitionPolicy.modes, id: \.rawValue) { mode in
+                                Button {
+                                    requestResponseModeChange(mode)
+                                } label: {
+                                    Label(
+                                        mode.title,
+                                        systemImage: mode == effectiveMode ? "checkmark" : mode.menuSymbol
+                                    )
+                                }
+                                .disabled(mode == effectiveMode)
+                            }
+                        } label: {
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                                .frame(
+                                    width: ElectronicMailControlMetrics.headerControlSize,
+                                    height: ElectronicMailControlMetrics.headerControlSize
+                                )
+                                .contentShape(Circle())
                         }
+                        .menuIndicator(.hidden)
+                        .electronicMailGlassButton(role: .standard, shape: .circle)
+                        .disabled(responseModeControlsDisabled)
+                        .help("Choose Reply, Reply All, or Forward")
+                        .accessibilityLabel(Text("Response type, \(effectiveMode.title)"))
                     }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .font(ElectronicMailComposerType.mode())
-                    .frame(minWidth: 0, idealWidth: 264, maxWidth: 264, minHeight: 31, maxHeight: 31)
-                    .disabled(responseModeControlsDisabled)
-                    .transaction { transaction in
-                        transaction.animation = nil
-                    }
-                    .accessibilityLabel("Response type")
-                    .help(
-                        unresolvedSendAttempt
-                            ? "Response type cannot change while delivery is being confirmed."
-                            : "Response type"
-                    )
                 } else {
-                    Text(presentation.title)
-                        .font(.system(size: 20, weight: .semibold, design: .rounded))
+                    Text(composerDisplayTitle)
+                        .font(.system(size: ElectronicMailComposerType.modeSize, weight: .semibold))
                         .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                         .accessibilityAddTraits(.isHeader)
                 }
-
-                Text(composerHeaderStatus)
-                    .font(ElectronicMailComposerType.status())
-                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                    .lineLimit(1)
+            },
+            trailing: {
+                ElectronicMailIconControl(
+                    symbol: "trash.fill",
+                    accessibilityLabel: "Delete draft",
+                    role: .destructive,
+                    action: { confirmDeleteDraft = true }
+                )
+                .disabled(composerControlsDisabled || savingDraft || loadingDraft)
             }
+        )
+    }
 
-            Spacer(minLength: 8)
-
-            Menu {
-                Button("Delete Draft", role: .destructive) {
-                    confirmDeleteDraft = true
-                }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .frame(width: 36, height: 36)
-                    .contentShape(Rectangle())
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .help("Draft actions")
-            .accessibilityLabel("Draft actions")
-            .disabled(composerControlsDisabled || savingDraft || loadingDraft)
-        }
-        .frame(minHeight: 42, alignment: .top)
+    private var composerDisplayTitle: String {
+        let typedSubject = subject.trimmingCharacters(in: .whitespacesAndNewlines)
+        return typedSubject.isEmpty ? presentation.title : typedSubject
     }
 
     private var composerHeaderStatus: String {
@@ -2298,22 +2582,53 @@ private struct MailComposerSheet: View {
         if savingDraft {
             return "Saving draft…"
         }
-        return gmailDraftID == nil ? "New draft" : "Draft saved"
+        return gmailDraftID == nil ? "New draft" : "Saved just now"
+    }
+
+    private var composerHeaderSubtitle: String {
+        guard isResponseComposer,
+              effectiveMode != .forward,
+              let recipient = responseHeaderRecipientName else {
+            return composerHeaderStatus
+        }
+        return "to \(recipient)  ·  \(composerHeaderStatus)"
+    }
+
+    private var responseHeaderRecipientName: String? {
+        let messages = store.readerThread?.messages ?? []
+        guard let message = messages.first(where: { $0.id == presentation.sourceMessageID })
+            ?? messages.max(by: { $0.receivedAt < $1.receivedAt }),
+              let rawValue = message.replyTo ?? message.fromAddress else {
+            return nil
+        }
+
+        let candidate = rawValue
+            .split(separator: "<", maxSplits: 1)
+            .first
+            .map(String.init) ?? rawValue
+        let cleaned = candidate
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        guard !cleaned.isEmpty else { return nil }
+        if cleaned.contains("@") {
+            return cleaned
+        }
+        return cleaned
     }
 
     private var composerFromField: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: MailComposerLayout.fieldSpacing) {
             Text("From")
                 .font(ElectronicMailComposerType.label())
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                .frame(width: 86, alignment: .leading)
+                .frame(width: MailComposerLayout.fieldLabelWidth, alignment: .leading)
 
             Circle()
                 .fill(ElectronicMailDesign.readerAvatarFill(for: colorScheme, highlighted: false))
                 .frame(width: 30, height: 30)
                 .overlay {
                     Text(currentUserInitial)
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                 }
 
@@ -2335,7 +2650,7 @@ private struct MailComposerSheet: View {
 
             Spacer(minLength: 0)
         }
-        .frame(height: 50)
+        .frame(height: ElectronicMailControlMetrics.composerFieldHeight)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(ElectronicMailDesign.divider(for: colorScheme))
@@ -2346,12 +2661,12 @@ private struct MailComposerSheet: View {
     }
 
     private var composerToField: some View {
-        HStack(alignment: .center, spacing: 10) {
+        HStack(alignment: .center, spacing: MailComposerLayout.fieldSpacing) {
             Text("To")
                 .font(ElectronicMailComposerType.label())
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                 .lineLimit(1)
-                .frame(width: 86, alignment: .leading)
+                .frame(width: MailComposerLayout.fieldLabelWidth, alignment: .leading)
 
             TextField("Add recipients", text: composerFieldBinding($toText, responseField: .to))
                 .textFieldStyle(.plain)
@@ -2386,15 +2701,16 @@ private struct MailComposerSheet: View {
                     focusedField = ccText.isEmpty ? .cc : .bcc
                 }
             }
-            .buttonStyle(.plain)
             .font(ElectronicMailComposerType.control())
-            .foregroundStyle(ElectronicMailDesign.appleBlue)
+            .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+            .padding(.horizontal, 8)
             .frame(minHeight: 32)
             .fixedSize(horizontal: true, vertical: false)
             .contentShape(Rectangle())
+            .buttonStyle(.plain)
             .help(showsCopyFields ? "Hide Cc and Bcc" : "Show Cc and Bcc")
         }
-        .frame(height: 50)
+        .frame(height: ElectronicMailControlMetrics.composerFieldHeight)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(ElectronicMailDesign.divider(for: colorScheme))
@@ -2501,94 +2817,105 @@ private struct MailComposerSheet: View {
 
             Spacer(minLength: 12)
 
-            Button {
-                chooseAttachments()
-            } label: {
-                HStack(spacing: 5) {
-                    if loadingAttachments {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "paperclip")
+            ElectronicMailGlassGroup(spacing: ElectronicMailControlMetrics.actionGap) {
+                HStack(spacing: ElectronicMailControlMetrics.actionGap) {
+                    Button {
+                        chooseAttachments()
+                    } label: {
+                        HStack(spacing: 6) {
+                            if loadingAttachments {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Image(systemName: "paperclip")
+                                    .font(.system(size: ElectronicMailControlMetrics.headerSymbolSize, weight: .medium))
+                            }
+                        }
+                        .frame(
+                            width: ElectronicMailControlMetrics.actionHeight,
+                            height: ElectronicMailControlMetrics.actionHeight
+                        )
+                        .contentShape(Circle())
                     }
-                    Text(loadingAttachments ? "Preparing" : "Attach")
-                }
-            }
-            .buttonStyle(.plain)
-            .font(ElectronicMailComposerType.control(weight: .semibold))
-            .foregroundStyle(ElectronicMailDesign.appleBlue)
-            .frame(minWidth: 68, minHeight: 36, alignment: .leading)
-            .contentShape(Rectangle())
-            .disabled(composerControlsDisabled || loadingAttachments)
-            .accessibilityLabel(loadingAttachments ? "Preparing files" : "Attach files")
+                    .font(ElectronicMailComposerType.control(weight: .semibold))
+                    .electronicMailGlassButton(role: .standard, shape: .circle)
+                    .disabled(composerControlsDisabled || loadingAttachments)
+                    .accessibilityLabel(loadingAttachments ? "Preparing files" : "Attach files")
+                    .help("Attach files")
 
-            Menu {
-                Button {
-                } label: {
-                    Label("Plain text", systemImage: "checkmark")
-                }
-                .disabled(true)
-            } label: {
-                Text("Formatting")
-                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .tint(ElectronicMailDesign.primaryText(for: colorScheme))
-            .font(ElectronicMailComposerType.control())
-            .frame(minHeight: 36)
-            .contentShape(Rectangle())
-            .help("Plain-text message formatting")
-            .disabled(composerControlsDisabled)
-
-            if statusText?.localizedCaseInsensitiveContains("permission") == true {
-                Button {
-                    Task { await reauthorize() }
-                } label: {
-                    if reauthorizing {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Text("Grant permission")
+                    Menu {
+                        Button {
+                        } label: {
+                            Label("Plain text", systemImage: "checkmark")
+                        }
+                        .disabled(true)
+                    } label: {
+                        Text("Formatting")
+                            .padding(.horizontal, 16)
+                            .frame(minWidth: 104, minHeight: ElectronicMailControlMetrics.actionHeight)
+                            .contentShape(Capsule())
                     }
-                }
-                .buttonStyle(.plain)
-                .font(ElectronicMailComposerType.control(weight: .semibold))
-                .foregroundStyle(ElectronicMailDesign.appleBlue)
-                .disabled(reauthorizing)
-            }
+                    .menuIndicator(.hidden)
+                    .font(ElectronicMailComposerType.control(weight: .medium))
+                    .electronicMailGlassButton(role: .standard, shape: .capsule)
+                    .help("Plain-text message formatting")
+                    .disabled(composerControlsDisabled)
 
-            Button {
-                confirmDeleteDraft = true
-            } label: {
-                Image(systemName: "trash")
-                    .font(.system(size: 16, weight: .medium))
-                    .frame(width: 36, height: 36)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-            .help("Delete draft")
-            .accessibilityLabel("Delete draft")
-            .disabled(composerControlsDisabled || savingDraft || loadingDraft)
-
-            Button {
-                startSend(allowEmptySubject: false)
-            } label: {
-                if sending {
-                    ProgressView().controlSize(.small)
-                } else {
-                    HStack(spacing: 10) {
-                        Text("Send")
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 10, weight: .semibold))
+                    if statusText?.localizedCaseInsensitiveContains("permission") == true {
+                        Button {
+                            Task { await reauthorize() }
+                        } label: {
+                            if reauthorizing {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Text("Grant permission")
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
+                        .font(ElectronicMailComposerType.control(weight: .semibold))
+                        .electronicMailGlassButton(role: .standard, shape: .capsule)
+                        .disabled(reauthorizing)
                     }
+
+                    Button {
+                        confirmDeleteDraft = true
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 16, weight: .medium))
+                            .frame(
+                                width: ElectronicMailControlMetrics.actionHeight,
+                                height: ElectronicMailControlMetrics.actionHeight
+                            )
+                            .contentShape(Circle())
+                    }
+                    .electronicMailGlassButton(role: .standard, shape: .circle)
+                    .help("Delete draft")
+                    .accessibilityLabel("Delete draft")
+                    .disabled(composerControlsDisabled || savingDraft || loadingDraft)
+
+                    Button {
+                        startSend(allowEmptySubject: false)
+                    } label: {
+                        if sending {
+                            ProgressView().controlSize(.small)
+                                .frame(minWidth: 88, minHeight: ElectronicMailControlMetrics.actionHeight)
+                        } else {
+                            HStack(spacing: 8) {
+                                Text("Send")
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 10, weight: .semibold))
+                            }
+                            .padding(.horizontal, 18)
+                            .frame(minWidth: 88, minHeight: ElectronicMailControlMetrics.actionHeight)
+                            .contentShape(Capsule())
+                        }
+                    }
+                    .font(ElectronicMailComposerType.control(weight: .semibold))
+                    .electronicMailGlassButton(role: .prominent, shape: .capsule)
+                    .disabled(!canSend)
+                    .keyboardShortcut(.return, modifiers: [.command])
                 }
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.regular)
-            .font(ElectronicMailComposerType.control(weight: .semibold))
-            .frame(minWidth: 104)
-            .disabled(!canSend)
-            .keyboardShortcut(.return, modifiers: [.command])
         }
         .padding(.top, 12)
         .frame(minHeight: 54)
@@ -2647,16 +2974,6 @@ private struct MailComposerSheet: View {
         case .draft:
             return parsedAddresses(toText).isEmpty ? .to : .body
         }
-    }
-
-    private var responseModeSelection: Binding<String> {
-        Binding(
-            get: { effectiveMode.rawValue },
-            set: { rawValue in
-                guard let mode = MailComposerMode(rawValue: rawValue) else { return }
-                requestResponseModeChange(mode)
-            }
-        )
     }
 
     private var canSend: Bool {
@@ -2720,12 +3037,12 @@ private struct MailComposerSheet: View {
         usesTokenFill: Bool = false,
         responseField: MailComposerResponseField? = nil
     ) -> some View {
-        HStack(alignment: .center, spacing: 10) {
+        HStack(alignment: .center, spacing: MailComposerLayout.fieldSpacing) {
             Text(label)
                 .font(ElectronicMailComposerType.label())
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                 .lineLimit(1)
-                .frame(width: 86, alignment: .leading)
+                .frame(width: MailComposerLayout.fieldLabelWidth, alignment: .leading)
             TextField(placeholder, text: composerFieldBinding(text, responseField: responseField))
                 .textFieldStyle(.plain)
                 .font(ElectronicMailComposerType.value())
@@ -2751,7 +3068,7 @@ private struct MailComposerSheet: View {
                 .focused($focusedField, equals: focus)
                 .onSubmit { advanceFocus(after: focus) }
         }
-        .frame(height: 44)
+        .frame(height: ElectronicMailControlMetrics.composerFieldHeight)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(ElectronicMailDesign.divider(for: colorScheme))
@@ -2780,12 +3097,12 @@ private struct MailComposerSheet: View {
     }
 
     private var composerSubjectField: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
+        HStack(alignment: .firstTextBaseline, spacing: MailComposerLayout.fieldSpacing) {
             Text("Subject")
                 .font(ElectronicMailComposerType.label())
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                 .lineLimit(1)
-                .frame(width: 86, alignment: .leading)
+                .frame(width: MailComposerLayout.fieldLabelWidth, alignment: .leading)
 
             TextField("Subject", text: responsiveSubjectBinding, axis: .vertical)
                 .textFieldStyle(.plain)
@@ -3754,6 +4071,15 @@ private extension MailComposerMode {
         }
     }
 
+    var menuSymbol: String {
+        switch self {
+        case .reply: return "arrowshape.turn.up.left"
+        case .replyAll: return "arrowshape.turn.up.left.2"
+        case .forward: return "arrowshape.turn.up.right"
+        case .compose, .draft: return "square.and.pencil"
+        }
+    }
+
 }
 
 private struct ComposerKeyboardCapture: NSViewRepresentable {
@@ -3869,17 +4195,19 @@ private struct ShellAccountCommandHandler: View {
         .sheet(isPresented: $confirmDeleteAccount) {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Permanently delete your account?")
-                    .font(.title3.weight(.semibold))
+                    .font(ElectronicMailType.headerTitle(weight: .semibold))
                 Text("This removes your Electronic Mail account, synced email data, drafts stored by the app, and active sessions. Your messages in Gmail are not deleted.")
+                    .font(ElectronicMailType.body())
                     .foregroundStyle(.secondary)
                 Text("Type DELETE to confirm.")
-                    .font(.callout.weight(.medium))
+                    .font(ElectronicMailType.detail(weight: .medium))
                 TextField("DELETE", text: $deleteAccountConfirmation)
                     .textFieldStyle(.roundedBorder)
+                    .font(ElectronicMailType.body())
                     .disabled(deletingAccount)
                 if let deleteAccountError {
                     Text(deleteAccountError)
-                        .font(.callout)
+                        .font(ElectronicMailType.detail())
                         .foregroundStyle(.red)
                 }
                 HStack {
@@ -3887,10 +4215,12 @@ private struct ShellAccountCommandHandler: View {
                     Button("Cancel", role: .cancel) {
                         confirmDeleteAccount = false
                     }
+                    .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
                     .disabled(deletingAccount)
                     Button("Delete Account", role: .destructive) {
                         deleteAccount()
                     }
+                    .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
                     .disabled(
                         deletingAccount
                             || deleteAccountConfirmation.trimmingCharacters(in: .whitespacesAndNewlines) != "DELETE"

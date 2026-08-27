@@ -50,10 +50,13 @@ GMAIL_WRITE_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 GMAIL_FULL_SCOPE = "https://mail.google.com/"
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+GOOGLE_CONTACTS_READ_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 GOOGLE_PROFILE_SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"]
 # Full mailbox access is intentionally the only Gmail scope. Gmail's permanent
 # delete endpoints require it; it also subsumes read, modify, draft, and send.
-GOOGLE_SCOPES = [*GOOGLE_PROFILE_SCOPES, GMAIL_FULL_SCOPE]
+GOOGLE_REQUIRED_SCOPES = [*GOOGLE_PROFILE_SCOPES, GMAIL_FULL_SCOPE]
+GOOGLE_OPTIONAL_SCOPES = [GOOGLE_CONTACTS_READ_SCOPE]
+GOOGLE_SCOPES = [*GOOGLE_REQUIRED_SCOPES, *GOOGLE_OPTIONAL_SCOPES]
 GOOGLE_API_TIMEOUT_SECONDS = 20
 GOOGLE_TOKEN_REVOCATION_MAX_ATTEMPTS = 1_000_000
 GOOGLE_REVOCATION_ERROR_BODY_LIMIT = 4096
@@ -186,6 +189,7 @@ def get_google_auth_url(settings: Settings, redirect_to: str | None = None) -> s
     authorization_url, state = flow.authorization_url(
         access_type="offline",
         prompt="select_account consent",
+        include_granted_scopes="true",
     )
     save_db_oauth_login_session(
         str(settings.database_path),
@@ -361,7 +365,9 @@ def _load_authorized_credentials(
     }
 
     try:
-        credentials = Credentials.from_authorized_user_info(normalized_tokens, GOOGLE_SCOPES)
+        # Use the scopes actually granted to this token. Older accounts must
+        # remain fully usable even when the optional Contacts grant is absent.
+        credentials = Credentials.from_authorized_user_info(normalized_tokens, sorted(stored_scopes))
     except Exception:
         if user_id is None:
             clear_google_auth_state()

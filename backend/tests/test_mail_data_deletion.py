@@ -8,6 +8,7 @@ from app.db import mail_groups
 
 
 EXPECTED_MAIL_DATA_DELETE_ORDER = (
+    "google_contact_avatar_cache",
     "app_session_snapshots",
     "gmail_client_drafts",
     "gmail_pending_sends",

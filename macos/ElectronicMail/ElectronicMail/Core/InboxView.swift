@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import SwiftUI
@@ -490,6 +491,12 @@ private struct InboxMailboxList: View, Equatable {
                     return .handled
                 }
                 .onDeleteCommand(perform: onMoveToTrash)
+                .background {
+                    InboxKeyboardNavigationCapture { delta in
+                        moveSelection(by: delta, scrollProxy: scrollProxy)
+                    }
+                    .frame(width: 0, height: 0)
+                }
                 .transaction { transaction in
                     transaction.disablesAnimations = true
                 }
@@ -516,6 +523,109 @@ private struct InboxMailboxList: View, Equatable {
     }
 }
 
+enum InboxKeyboardNavigationPolicy {
+    static func selectionDelta(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags,
+        isTextEditing: Bool
+    ) -> Int? {
+        guard !isTextEditing else {
+            return nil
+        }
+
+        let navigationBlockingModifiers: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
+        guard modifiers.intersection(navigationBlockingModifiers).isEmpty else {
+            return nil
+        }
+
+        switch keyCode {
+        case 126:
+            return -1
+        case 125:
+            return 1
+        default:
+            return nil
+        }
+    }
+}
+
+private struct InboxKeyboardNavigationCapture: NSViewRepresentable {
+    let onMove: (Int) -> Void
+
+    func makeNSView(context: Context) -> NavigationView {
+        let view = NavigationView()
+        view.onMove = onMove
+        return view
+    }
+
+    func updateNSView(_ nsView: NavigationView, context: Context) {
+        nsView.onMove = onMove
+        nsView.installMonitorIfNeeded()
+    }
+
+    static func dismantleNSView(_ nsView: NavigationView, coordinator: ()) {
+        nsView.removeMonitor()
+    }
+
+    final class NavigationView: NSView {
+        var onMove: ((Int) -> Void)?
+        private var monitor: Any?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window == nil {
+                removeMonitor()
+            } else {
+                installMonitorIfNeeded()
+            }
+        }
+
+        deinit {
+            removeMonitor()
+        }
+
+        func installMonitorIfNeeded() {
+            guard monitor == nil, window != nil else {
+                return
+            }
+
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                self?.handle(event) ?? event
+            }
+        }
+
+        func removeMonitor() {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+                self.monitor = nil
+            }
+        }
+
+        private func handle(_ event: NSEvent) -> NSEvent? {
+            guard
+                let window,
+                event.windowNumber == window.windowNumber,
+                window.isKeyWindow
+            else {
+                return event
+            }
+
+            let responder = window.firstResponder
+            let isTextEditing = responder is NSTextView || responder is NSTextField
+            guard let delta = InboxKeyboardNavigationPolicy.selectionDelta(
+                keyCode: event.keyCode,
+                modifiers: event.modifierFlags,
+                isTextEditing: isTextEditing
+            ) else {
+                return event
+            }
+
+            onMove?(delta)
+            return nil
+        }
+    }
+}
+
 private struct InboxSyncFooter: View {
     let message: String
     let showsProgress: Bool
@@ -537,9 +647,11 @@ private struct InboxSyncFooter: View {
             Spacer(minLength: 12)
             if showsRetry {
                 Button("Retry", action: onRetry)
-                    .buttonStyle(.plain)
+                    .padding(.horizontal, 14)
+                    .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
                     .font(ElectronicMailType.small(weight: .semibold))
-                    .foregroundStyle(ElectronicMailDesign.appleBlue)
             }
         }
         .padding(.horizontal, 28)
@@ -937,9 +1049,11 @@ private struct InboxEmptyState: View {
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
             if !isLoading && showsRetry {
                 Button("Try Again", action: onRetry)
-                    .buttonStyle(.plain)
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
                     .font(ElectronicMailType.small(weight: .semibold))
-                    .foregroundStyle(ElectronicMailDesign.appleBlue)
             }
         }
         .frame(maxWidth: .infinity)
@@ -1027,7 +1141,7 @@ private struct InboxRowView: View, Equatable {
                         if row.hasAttachments {
                             Image(systemName: "paperclip")
                                 .font(.system(size: metrics.attachmentIconSize, weight: .regular))
-                                .symbolRenderingMode(.monochrome)
+                                .symbolRenderingMode(.multicolor)
                                 .foregroundStyle(attachmentIconColor)
                         } else {
                             Color.clear
@@ -1059,16 +1173,11 @@ private struct InboxRowView: View, Equatable {
 
             if row.isExpandable, let onToggleExpansion {
                 Button(action: onToggleExpansion) {
-                    ZStack {
-                        Circle()
-                            .stroke(disclosureColor, lineWidth: 1.5)
-
-                        Image(systemName: row.isExpanded ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 8, weight: .bold))
-                            .symbolRenderingMode(.monochrome)
-                            .foregroundStyle(disclosureColor)
-                    }
-                    .frame(width: metrics.disclosureIconSize, height: metrics.disclosureIconSize)
+                    Image(systemName: row.isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .symbolRenderingMode(.multicolor)
+                        .foregroundStyle(disclosureColor)
+                        .frame(width: metrics.disclosureIconSize, height: metrics.disclosureIconSize)
                     .frame(width: metrics.disclosureHitWidth, height: ElectronicMailTypography.bodyLineHeight)
                     .contentShape(Rectangle())
                 }
@@ -1098,7 +1207,6 @@ private struct InboxRowView: View, Equatable {
     private func rowText(_ value: String, alignment: Alignment, font: Font, color: Color) -> some View {
         Text(value)
             .font(font)
-            .tracking(ElectronicMailTypography.bodyTracking)
             .foregroundStyle(color)
             .lineLimit(1)
             .truncationMode(.tail)
@@ -1148,18 +1256,11 @@ private struct InboxRowView: View, Equatable {
 }
 
 private enum ElectronicMailTypography {
-    static let bodyTracking: CGFloat = 0.05
     static let bodyLineHeight = ElectronicMailMailboxType.rowHeight
 }
 
 private struct InboxLayoutMetrics: Equatable {
     let windowWidth: CGFloat
-
-    private let utilityCenterRatio: CGFloat = 77 / 1_724
-    private let senderLeadingRatio: CGFloat = 129 / 1_724
-    private let subjectLeadingRatio: CGFloat = 512 / 1_724
-    private let timeTrailingRatio: CGFloat = (1_724 - 1_568) / 1_724
-    private let dividerTrailingRatio: CGFloat = (1_724 - 1_629) / 1_724
 
     let disclosureIconSize: CGFloat = 22
     let disclosureHitWidth: CGFloat = 40
@@ -1170,14 +1271,18 @@ private struct InboxLayoutMetrics: Equatable {
     let attachmentTimeGap: CGFloat = 16
     let timeWidth: CGFloat = 120
     let childIndent: CGFloat = 18
-    let sectionLabelHeight: CGFloat = 40
+    let sectionLabelHeight: CGFloat = 38
 
     init(windowSize: CGSize) {
         windowWidth = windowSize.width
     }
 
+    private var sharedGrid: ElectronicMailLayoutMetrics {
+        ElectronicMailLayoutMetrics(width: windowWidth)
+    }
+
     var utilityCenter: CGFloat {
-        windowWidth * utilityCenterRatio
+        sharedGrid.utilityCenter
     }
 
     var disclosureHitLeading: CGFloat {
@@ -1185,11 +1290,11 @@ private struct InboxLayoutMetrics: Equatable {
     }
 
     var senderLeading: CGFloat {
-        windowWidth * senderLeadingRatio
+        sharedGrid.textLeading
     }
 
     var subjectLeading: CGFloat {
-        max(senderLeading + senderSubjectGap, windowWidth * subjectLeadingRatio)
+        sharedGrid.subjectLeading
     }
 
     var senderWidth: CGFloat {
@@ -1197,15 +1302,15 @@ private struct InboxLayoutMetrics: Equatable {
     }
 
     var trailingInset: CGFloat {
-        windowWidth * timeTrailingRatio
+        sharedGrid.dateTrailing
     }
 
     var dividerTrailing: CGFloat {
-        windowWidth * dividerTrailingRatio
+        trailingInset
     }
 
     func sectionTopSpacing(isFirst: Bool) -> CGFloat {
-        isFirst ? 10 : ElectronicMailTypography.bodyLineHeight
+        isFirst ? 12 : 24
     }
 }
 
