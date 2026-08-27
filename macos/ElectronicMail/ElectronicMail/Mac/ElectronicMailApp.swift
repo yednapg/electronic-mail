@@ -1,6 +1,7 @@
 import ElectronicMailCore
 import AppKit
 import Darwin
+import QuartzCore
 import SwiftUI
 
 @main
@@ -391,7 +392,7 @@ private final class ElectronicMailApplicationDelegate: NSObject, NSApplicationDe
     }
 }
 
-private enum AppLaunchStage {
+private enum AppLaunchStage: Equatable {
     case resolvingSession
     case signIn
     case setup
@@ -460,6 +461,7 @@ private struct ElectronicMailRootView: View {
                     .transition(.opacity)
             }
         }
+        .background(ElectronicMailWindowPresentation(stage: stage))
         .task {
             guard !visualQAMode else { return }
             await restoreExistingSessionIfAvailable()
@@ -691,6 +693,136 @@ private struct ElectronicMailRootView: View {
     }
 }
 
+private struct ElectronicMailWindowPresentation: NSViewRepresentable {
+    let stage: AppLaunchStage
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> WindowResolvingView {
+        let view = WindowResolvingView()
+        view.onWindowChange = { [weak coordinator = context.coordinator] window in
+            coordinator?.attach(to: window)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: WindowResolvingView, context: Context) {
+        context.coordinator.update(window: nsView.window, stage: stage)
+    }
+
+    @MainActor
+    final class Coordinator {
+        private weak var presentedWindow: NSWindow?
+        private var requestedStage: AppLaunchStage?
+        private var presentedStage: AppLaunchStage?
+
+        func attach(to window: NSWindow?) {
+            guard let requestedStage else {
+                return
+            }
+            apply(window: window, stage: requestedStage)
+
+            // SwiftUI may restore a persisted scene frame immediately after
+            // attaching the representable. Reassert this launch stage on the
+            // next run-loop turn so compact onboarding wins that one-time race.
+            DispatchQueue.main.async { [weak self, weak window] in
+                guard let self,
+                      let window,
+                      self.requestedStage == requestedStage else {
+                    return
+                }
+                self.apply(window: window, stage: requestedStage, force: true)
+            }
+        }
+
+        func update(window: NSWindow?, stage: AppLaunchStage) {
+            requestedStage = stage
+            apply(window: window, stage: stage)
+        }
+
+        private func apply(window: NSWindow?, stage: AppLaunchStage, force: Bool = false) {
+            guard let window, !window.styleMask.contains(.fullScreen) else {
+                return
+            }
+
+            let isNewWindow = presentedWindow !== window
+            let stageChanged = presentedStage != stage
+            guard force || isNewWindow || stageChanged else {
+                return
+            }
+
+            let previousStage = isNewWindow ? nil : presentedStage
+            presentedWindow = window
+            presentedStage = stage
+
+            window.contentMinSize = NSSize(
+                width: ElectronicMailControlMetrics.onboardingWindowWidth,
+                height: ElectronicMailControlMetrics.onboardingWindowHeight
+            )
+
+            let targetFrame = targetFrame(for: stage, window: window)
+            let shouldAnimate = previousStage != nil && stageChanged
+            setFrame(targetFrame, of: window, stage: stage, animated: shouldAnimate)
+        }
+
+        private func targetFrame(for stage: AppLaunchStage, window: NSWindow) -> NSRect {
+            let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame ?? window.frame
+            switch stage {
+            case .app:
+                let inset = min(
+                    ElectronicMailControlMetrics.mainWindowBackdropInset,
+                    max(0, min(visibleFrame.width, visibleFrame.height) / 10)
+                )
+                return visibleFrame.insetBy(dx: inset, dy: inset)
+            case .resolvingSession, .signIn, .setup:
+                let maximumContentSize = NSSize(
+                    width: max(1, visibleFrame.width - (ElectronicMailControlMetrics.mainWindowBackdropInset * 2)),
+                    height: max(1, visibleFrame.height - (ElectronicMailControlMetrics.mainWindowBackdropInset * 2))
+                )
+                let contentSize = NSSize(
+                    width: min(ElectronicMailControlMetrics.onboardingWindowWidth, maximumContentSize.width),
+                    height: min(ElectronicMailControlMetrics.onboardingWindowHeight, maximumContentSize.height)
+                )
+                let frameSize = window.frameRect(
+                    forContentRect: NSRect(origin: .zero, size: contentSize)
+                ).size
+                return NSRect(
+                    x: visibleFrame.midX - (frameSize.width / 2),
+                    y: visibleFrame.midY - (frameSize.height / 2),
+                    width: frameSize.width,
+                    height: frameSize.height
+                )
+            }
+        }
+
+        private func setFrame(
+            _ frame: NSRect,
+            of window: NSWindow,
+            stage: AppLaunchStage,
+            animated: Bool
+        ) {
+            guard animated,
+                  !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+                window.setFrame(frame, display: true)
+                return
+            }
+
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = stage == .app ? 0.62 : 0.32
+                context.timingFunction = CAMediaTimingFunction(
+                    controlPoints: 0.22,
+                    0.78,
+                    0.24,
+                    1
+                )
+                window.animator().setFrame(frame, display: true)
+            }
+        }
+    }
+}
+
 @MainActor
 private struct PostLoginCoordinator {
     let store: InboxStore
@@ -853,7 +985,6 @@ private struct GoogleSignInView: View {
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
-        .background(ElectronicMailSignInWindowSizer())
     }
 
     private var welcomeContent: some View {
@@ -912,46 +1043,6 @@ private struct GoogleSignInView: View {
             .help("Sign in with Google")
             .accessibilityLabel(isSigningIn ? "Signing in with Google" : "Sign in with Google")
             .accessibilityValue(isSigningIn ? "In progress" : "Ready")
-        }
-    }
-}
-
-private struct ElectronicMailSignInWindowSizer: NSViewRepresentable {
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
-    }
-
-    func makeNSView(context: Context) -> WindowResolvingView {
-        let view = WindowResolvingView()
-        view.onWindowChange = { [weak coordinator = context.coordinator] window in
-            coordinator?.applyDefaultSize(to: window)
-        }
-        return view
-    }
-
-    func updateNSView(_ nsView: WindowResolvingView, context: Context) {
-        context.coordinator.applyDefaultSize(to: nsView.window)
-    }
-
-    @MainActor
-    final class Coordinator {
-        private weak var sizedWindow: NSWindow?
-
-        func applyDefaultSize(to window: NSWindow?) {
-            guard let window,
-                  sizedWindow !== window,
-                  !window.styleMask.contains(.fullScreen) else {
-                return
-            }
-
-            sizedWindow = window
-            window.setContentSize(
-                NSSize(
-                    width: ElectronicMailControlMetrics.onboardingWindowWidth,
-                    height: ElectronicMailControlMetrics.onboardingWindowHeight
-                )
-            )
-            window.center()
         }
     }
 }
