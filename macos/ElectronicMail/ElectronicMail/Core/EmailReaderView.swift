@@ -494,6 +494,13 @@ private struct ReaderActionBubbles: View {
                 )
             }
         }
+        .background {
+            ReaderActionFocusBackdrop(colorScheme: colorScheme)
+                .frame(
+                    width: EmailReaderMetrics.actionFocusBackdropWidth,
+                    height: EmailReaderMetrics.actionFocusBackdropHeight
+                )
+        }
         .frame(maxWidth: .infinity, alignment: .center)
     }
 
@@ -2622,25 +2629,18 @@ private struct EmailMessageHeader: View {
     }
 
     private var senderLine: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text(senderName)
                 .font(EmailReaderTypography.messageTitle())
                 .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                 .lineLimit(1)
-                .layoutPriority(2)
-
-            if let senderEmail {
-                Text(senderEmail)
-                    .font(EmailReaderTypography.metadata())
-                    .foregroundStyle(ElectronicMailDesign.tertiaryText(for: colorScheme))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
+                .truncationMode(.tail)
 
             Text(recipientSummary)
                 .font(EmailReaderTypography.metadata())
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                 .lineLimit(1)
+                .layoutPriority(1)
         }
         .contentShape(Rectangle())
     }
@@ -2651,10 +2651,6 @@ private struct EmailMessageHeader: View {
 
     private var senderName: String {
         EmailReaderText.senderName(message.fromAddress) ?? "Unknown sender"
-    }
-
-    private var senderEmail: String? {
-        EmailReaderText.emailAddress(message.fromAddress)
     }
 
     private var recipientSummary: String {
@@ -3088,7 +3084,8 @@ enum EmailReaderText {
         let display = recipientDisplayName(
             first,
             currentUserDisplayName: currentUserDisplayName,
-            currentUserEmail: currentUserEmail
+            currentUserEmail: currentUserEmail,
+            allowsCurrentUserAlias: addresses.count == 1
         ) ?? emailAddress(first) ?? first
         if addresses.count > 1 {
             return "\(display) +\(addresses.count - 1)"
@@ -3116,19 +3113,27 @@ enum EmailReaderText {
     private static func recipientDisplayName(
         _ rawValue: String,
         currentUserDisplayName: String?,
-        currentUserEmail: String?
+        currentUserEmail: String?,
+        allowsCurrentUserAlias: Bool
     ) -> String? {
         let rawEmail = emailAddress(rawValue)?.lowercased()
         let userEmail = currentUserEmail?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
+        let parsedName = parsedDisplayName(rawValue)
         if let rawEmail,
            let userEmail,
            rawEmail == userEmail,
            let name = cleanDisplayName(currentUserDisplayName) {
             return name
         }
-        return parsedDisplayName(rawValue)
+        if allowsCurrentUserAlias,
+           rawEmail != nil,
+           parsedName == nil,
+           let name = cleanDisplayName(currentUserDisplayName) {
+            return name
+        }
+        return parsedName
     }
 
     private static func parsedDisplayName(_ rawValue: String) -> String? {

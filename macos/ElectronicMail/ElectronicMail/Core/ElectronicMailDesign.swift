@@ -144,8 +144,11 @@ public enum ElectronicMailDesign {
 /// readable widths, but every navigation and action control resolves through
 /// these semantic measurements so switching destinations never changes scale.
 public enum ElectronicMailControlMetrics {
-    public static let onboardingWindowWidth: CGFloat = 900
-    public static let onboardingWindowHeight: CGFloat = 600
+    /// Launch, sign-in, and mailbox preparation stay in a deliberately compact
+    /// centered window before the ready inbox unfolds into the main workspace.
+    public static let onboardingWindowWidth: CGFloat = 680
+    public static let onboardingWindowHeight: CGFloat = 520
+    public static let mainWindowBackdropInset: CGFloat = 24
     public static let headerHeight: CGFloat = 64
     public static let headerCenterY: CGFloat = headerHeight / 2
     public static let headerControlSize: CGFloat = 36
@@ -154,16 +157,31 @@ public enum ElectronicMailControlMetrics {
     /// its visible bubble is optically the same height as a 36-point icon button.
     public static let headerSearchHeight: CGFloat = 42
     public static let headerSymbolSize: CGFloat = 18
+    /// Mailbox navigation, compose, and search stay available without
+    /// competing with the current mailbox title and message content.
+    public static let mailboxHeaderIconOpacity: CGFloat = 0.50
     /// Native glass blooms beyond the nominal control frame. A 32-point frame
     /// gap produces the same visible air as the 32-point outer/title interval.
     public static let headerControlGap: CGFloat = 32
+    /// Mailbox compose and search controls form a tighter pair than the
+    /// independent controls used on the other shell surfaces.
+    public static let mailboxHeaderControlGap: CGFloat = headerControlGap / 2
+    /// Mailbox trailing controls align with the inbox date column.
+    public static let mailboxHeaderTrailingInset: CGFloat = headerTitleLeading
     /// Reader actions form a denser, content-scoped tool group. This is
     /// intentionally reader-only; shell and search spacing remain unchanged.
     public static let readerActionGap: CGFloat = headerControlGap / 2
     /// Shared vertical gap for the Reader's two-line information groups:
     /// subject/metadata and sender/date.
     public static let readerTwoLineGap: CGFloat = 6
-    public static let readerContentTop: CGFloat = 8
+    /// The Reader subject begins below the toolbar controls instead of sharing
+    /// their upper edge. Back and action controls keep their existing position.
+    public static let readerHeaderContentOffsetY: CGFloat = 14
+    /// Compose uses the same page-start rhythm as the Reader.
+    public static let composerHeaderContentOffsetY: CGFloat = readerHeaderContentOffsetY
+    /// Reader content begins below the fixed toolbar, with enough breathing
+    /// room that the subject reads as page content instead of another control.
+    public static let readerContentTop: CGFloat = 20
     public static let readerHeaderToConversation: CGFloat = 12
     public static let headerOuterInset: CGFloat = 32
     public static let headerLeadingControlCenter: CGFloat = headerOuterInset + headerControlSize / 2
@@ -195,7 +213,7 @@ public enum ElectronicMailControlMetrics {
 }
 
 /// Responsive mailbox anchors derived from the approved Figma grid. The
-/// disclosure, sender, and date share the shell's fixed edge anchors; the
+/// disclosure, sender, and date share the mailbox's fixed edge anchors; the
 /// subject alone expands responsively with the available width.
 struct ElectronicMailLayoutMetrics: Equatable {
     let width: CGFloat
@@ -216,7 +234,7 @@ struct ElectronicMailLayoutMetrics: Equatable {
     }
 
     var dateTrailing: CGFloat {
-        ElectronicMailControlMetrics.trailingInset
+        textLeading
     }
 }
 
@@ -226,6 +244,8 @@ struct ElectronicMailShellHeader<Leading: View, Title: View, Trailing: View>: Vi
     let width: CGFloat
     let titleLeading: CGFloat
     let titleTrailingReservation: CGFloat
+    let trailingSpacing: CGFloat
+    let trailingInset: CGFloat
     private let leading: Leading
     private let title: Title
     private let trailing: Trailing
@@ -234,6 +254,8 @@ struct ElectronicMailShellHeader<Leading: View, Title: View, Trailing: View>: Vi
         width: CGFloat,
         titleLeading: CGFloat = ElectronicMailControlMetrics.headerTitleLeading,
         titleTrailingReservation: CGFloat = 0,
+        trailingSpacing: CGFloat = ElectronicMailControlMetrics.headerControlGap,
+        trailingInset: CGFloat = ElectronicMailControlMetrics.trailingInset,
         @ViewBuilder leading: () -> Leading,
         @ViewBuilder title: () -> Title,
         @ViewBuilder trailing: () -> Trailing
@@ -241,6 +263,8 @@ struct ElectronicMailShellHeader<Leading: View, Title: View, Trailing: View>: Vi
         self.width = width
         self.titleLeading = titleLeading
         self.titleTrailingReservation = titleTrailingReservation
+        self.trailingSpacing = trailingSpacing
+        self.trailingInset = trailingInset
         self.leading = leading()
         self.title = title()
         self.trailing = trailing()
@@ -264,11 +288,11 @@ struct ElectronicMailShellHeader<Leading: View, Title: View, Trailing: View>: Vi
                     y: ElectronicMailControlMetrics.headerCenterY
                 )
 
-            HStack(spacing: ElectronicMailControlMetrics.headerControlGap) {
+            HStack(spacing: trailingSpacing) {
                 Spacer(minLength: 0)
                 trailing
             }
-            .padding(.trailing, ElectronicMailControlMetrics.trailingInset)
+            .padding(.trailing, trailingInset)
         }
         .frame(width: width, height: ElectronicMailControlMetrics.headerHeight, alignment: .leading)
         .accessibilityElement(children: .contain)
@@ -311,6 +335,7 @@ struct ElectronicMailIconControl: View {
     var role: ElectronicMailGlassRole = .standard
     var controlSize: CGFloat = ElectronicMailControlMetrics.headerControlSize
     var symbolSize: CGFloat = ElectronicMailControlMetrics.headerSymbolSize
+    var symbolOpacity: CGFloat = 1
     let action: () -> Void
 
     var body: some View {
@@ -321,6 +346,7 @@ struct ElectronicMailIconControl: View {
                 controlSize: controlSize,
                 symbolSize: symbolSize
             )
+            .opacity(symbolOpacity)
         }
         .electronicMailGlassButton(role: role, shape: .circle)
         .frame(
@@ -741,6 +767,7 @@ public enum ElectronicMailType {
     public static let heroTitleSize: CGFloat = 28
     public static let welcomeBodySize: CGFloat = 15
     public static let titleSize: CGFloat = 17
+    public static let mailboxHeaderSize: CGFloat = 20
     public static let sectionTitleSize: CGFloat = 17
     public static let bodySize: CGFloat = 15
     public static let bodyLineHeight: CGFloat = 20
@@ -758,6 +785,10 @@ public enum ElectronicMailType {
 
     public static func title(weight: Font.Weight = .bold) -> Font {
         .system(size: titleSize, weight: weight)
+    }
+
+    public static func mailboxHeader(weight: Font.Weight = .semibold) -> Font {
+        .system(size: mailboxHeaderSize, weight: weight)
     }
 
     public static func headerTitle(weight: Font.Weight = .bold) -> Font {
@@ -799,7 +830,8 @@ public enum ElectronicMailMailboxType {
     /// Navigation expands directly from the shell title, so its labels use the
     /// same type role and a compact, menu-like vertical rhythm.
     public static let navigationRowHeight: CGFloat = 32
-    public static let sectionSize: CGFloat = 15
+    public static let sectionSize: CGFloat = 17
+    public static let sectionOpacity: CGFloat = 0.50
     public static let senderSize: CGFloat = 15
     public static let subjectSize: CGFloat = 15
     public static let metadataSize: CGFloat = 15
@@ -821,7 +853,7 @@ public enum ElectronicMailMailboxType {
     }
 
     public static func section() -> Font {
-        .system(size: sectionSize, weight: .semibold)
+        .system(size: sectionSize, weight: .regular)
     }
 
     public static func sender(unread: Bool) -> Font {

@@ -6,6 +6,25 @@ import Security
 @testable import ElectronicMailCore
 
 final class ModelDecodingTests: XCTestCase {
+    func testReaderRecipientLabelUsesAccountNameForSingleAddressAlias() {
+        XCTAssertEqual(
+            EmailReaderText.recipientLabel(
+                "gaurav@pandey.family",
+                currentUserDisplayName: "Gaurav Pandey",
+                currentUserEmail: "yednapg@gmail.com"
+            ),
+            "to Gaurav Pandey"
+        )
+        XCTAssertEqual(
+            EmailReaderText.recipientLabel(
+                "teammate@example.com, gaurav@pandey.family",
+                currentUserDisplayName: "Gaurav Pandey",
+                currentUserEmail: "yednapg@gmail.com"
+            ),
+            "to teammate@example.com +1"
+        )
+    }
+
     func testInboxKeyboardNavigationRoutesOnlyPlainArrowKeysOutsideTextEditing() {
         XCTAssertEqual(
             InboxKeyboardNavigationPolicy.selectionDelta(
@@ -79,6 +98,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(ElectronicMailType.heroTitleSize, 28)
         XCTAssertEqual(ElectronicMailType.welcomeBodySize, 15)
         XCTAssertEqual(ElectronicMailType.titleSize, 17)
+        XCTAssertEqual(ElectronicMailType.mailboxHeaderSize, 20)
         XCTAssertEqual(ElectronicMailType.sectionTitleSize, 17)
         XCTAssertEqual(ElectronicMailType.bodySize, 15)
         XCTAssertEqual(ElectronicMailType.bodyLineHeight, 20)
@@ -86,7 +106,8 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(ElectronicMailType.smallSize, 13)
         XCTAssertEqual(ElectronicMailType.statusSize, 13)
         XCTAssertEqual(ElectronicMailMailboxType.rowHeight, 35)
-        XCTAssertEqual(ElectronicMailMailboxType.sectionSize, 15)
+        XCTAssertEqual(ElectronicMailMailboxType.sectionSize, 17)
+        XCTAssertEqual(ElectronicMailMailboxType.sectionOpacity, 0.50)
         XCTAssertEqual(ElectronicMailMailboxType.senderSize, 15)
         XCTAssertEqual(ElectronicMailMailboxType.subjectSize, 15)
         XCTAssertEqual(ElectronicMailMailboxType.metadataSize, 15)
@@ -102,8 +123,9 @@ final class ModelDecodingTests: XCTestCase {
     }
 
     func testSharedMacControlRolesRemainConsistent() {
-        XCTAssertEqual(ElectronicMailControlMetrics.onboardingWindowWidth, 900)
-        XCTAssertEqual(ElectronicMailControlMetrics.onboardingWindowHeight, 600)
+        XCTAssertEqual(ElectronicMailControlMetrics.onboardingWindowWidth, 680)
+        XCTAssertEqual(ElectronicMailControlMetrics.onboardingWindowHeight, 520)
+        XCTAssertEqual(ElectronicMailControlMetrics.mainWindowBackdropInset, 24)
         XCTAssertEqual(ElectronicMailControlMetrics.headerHeight, 64)
         XCTAssertEqual(ElectronicMailControlMetrics.headerCenterY, 32)
         XCTAssertEqual(ElectronicMailControlMetrics.headerOuterInset, 32)
@@ -114,10 +136,15 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(ElectronicMailControlMetrics.headerControlSize, 36)
         XCTAssertEqual(ElectronicMailControlMetrics.headerSearchHeight, 42)
         XCTAssertEqual(ElectronicMailControlMetrics.headerSymbolSize, 18)
+        XCTAssertEqual(ElectronicMailControlMetrics.mailboxHeaderIconOpacity, 0.50)
         XCTAssertEqual(ElectronicMailControlMetrics.headerControlGap, 32)
+        XCTAssertEqual(ElectronicMailControlMetrics.mailboxHeaderControlGap, 16)
+        XCTAssertEqual(ElectronicMailControlMetrics.mailboxHeaderTrailingInset, 100)
         XCTAssertEqual(ElectronicMailControlMetrics.readerActionGap, 16)
         XCTAssertEqual(ElectronicMailControlMetrics.readerTwoLineGap, 6)
-        XCTAssertEqual(ElectronicMailControlMetrics.readerContentTop, 8)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderContentOffsetY, 14)
+        XCTAssertEqual(ElectronicMailControlMetrics.composerHeaderContentOffsetY, 14)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerContentTop, 20)
         XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderToConversation, 12)
         XCTAssertEqual(ElectronicMailControlMetrics.actionHeight, 40)
         XCTAssertEqual(ElectronicMailControlMetrics.actionGap, 32)
@@ -158,13 +185,13 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(figma.utilityCenter, 50, accuracy: 0.001)
         XCTAssertEqual(figma.textLeading, 100, accuracy: 0.001)
         XCTAssertEqual(figma.subjectLeading, 643, accuracy: 0.001)
-        XCTAssertEqual(figma.dateTrailing, 32, accuracy: 0.001)
+        XCTAssertEqual(figma.dateTrailing, figma.textLeading, accuracy: 0.001)
 
         let narrow = ElectronicMailLayoutMetrics(width: 600)
         XCTAssertEqual(narrow.utilityCenter, 50)
         XCTAssertEqual(narrow.textLeading, 100)
         XCTAssertEqual(narrow.subjectLeading, 296)
-        XCTAssertEqual(narrow.dateTrailing, 32)
+        XCTAssertEqual(narrow.dateTrailing, narrow.textLeading)
     }
 
     func testUnreadTextIsPureWhiteInDarkMode() throws {
