@@ -31,6 +31,7 @@ from app.db.repository import (
 from app.schemas.domain import DashboardProfile, GoogleAuthState
 from app.services.integrations.google import (
     GMAIL_FULL_SCOPE,
+    GOOGLE_CONTACTS_READ_SCOPE,
     check_user_google_credentials,
     missing_google_scopes,
 )
@@ -131,12 +132,19 @@ def auth_state_for_request(settings: Settings, request: Request, *, verify_googl
 
     missing_scopes = missing_google_scopes(settings, user_id=user.id, required_scopes=[GMAIL_FULL_SCOPE]) if has_token else [GMAIL_FULL_SCOPE]
     reauth_required = has_token and bool(missing_scopes)
+    missing_optional_scopes = (
+        missing_google_scopes(settings, user_id=user.id, required_scopes=[GOOGLE_CONTACTS_READ_SCOPE])
+        if has_token
+        else []
+    )
     return GoogleAuthState(
         available=True,
         connected=has_token,
         connect_url=f"{settings.backend_origin}/auth/google" if not has_token or reauth_required else None,
         can_send_mail=has_token and not missing_scopes,
         missing_scopes=missing_scopes if has_token else [],
+        contact_photos_available=has_token and not missing_optional_scopes,
+        missing_optional_scopes=missing_optional_scopes,
         reauth_required=reauth_required,
         error="Google needs full mail permission. Please sign in with Google again." if reauth_required else None,
     )

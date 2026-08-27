@@ -122,6 +122,8 @@ class GoogleAuthState(BaseModel):
     connect_url: str | None = None
     can_send_mail: bool = False
     missing_scopes: list[str] = Field(default_factory=list)
+    contact_photos_available: bool = False
+    missing_optional_scopes: list[str] = Field(default_factory=list)
     reauth_required: bool = False
     error: str | None = None
 
@@ -682,6 +684,7 @@ class ThreadMessage(BaseModel):
     source: SourceType
     thread_id: str | None = None
     from_address: str | None = None
+    sender_avatar_asset_id: str | None = None
     reply_to: str | None = None
     to: str | None = None
     cc: str | None = None

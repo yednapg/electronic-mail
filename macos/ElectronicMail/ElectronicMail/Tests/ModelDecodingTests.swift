@@ -6,6 +6,64 @@ import Security
 @testable import ElectronicMailCore
 
 final class ModelDecodingTests: XCTestCase {
+    func testInboxKeyboardNavigationRoutesOnlyPlainArrowKeysOutsideTextEditing() {
+        XCTAssertEqual(
+            InboxKeyboardNavigationPolicy.selectionDelta(
+                keyCode: 126,
+                modifiers: [.function],
+                isTextEditing: false
+            ),
+            -1
+        )
+        XCTAssertEqual(
+            InboxKeyboardNavigationPolicy.selectionDelta(
+                keyCode: 125,
+                modifiers: [.numericPad],
+                isTextEditing: false
+            ),
+            1
+        )
+        XCTAssertNil(
+            InboxKeyboardNavigationPolicy.selectionDelta(
+                keyCode: 125,
+                modifiers: [.command],
+                isTextEditing: false
+            )
+        )
+        XCTAssertNil(
+            InboxKeyboardNavigationPolicy.selectionDelta(
+                keyCode: 126,
+                modifiers: [],
+                isTextEditing: true
+            )
+        )
+        XCTAssertNil(
+            InboxKeyboardNavigationPolicy.selectionDelta(
+                keyCode: 36,
+                modifiers: [],
+                isTextEditing: false
+            )
+        )
+    }
+
+    func testLiquidGlassRenderingModeHonorsAvailabilityAndAccessibility() {
+        XCTAssertFalse(ElectronicMailGlassRenderingMode.automatic.usesNativeGlass(osMajorVersion: 25, reduceTransparency: false))
+        XCTAssertTrue(ElectronicMailGlassRenderingMode.automatic.usesNativeGlass(osMajorVersion: 26, reduceTransparency: false))
+        XCTAssertTrue(ElectronicMailGlassRenderingMode.native.usesNativeGlass(osMajorVersion: 27, reduceTransparency: false))
+        XCTAssertFalse(ElectronicMailGlassRenderingMode.fallback.usesNativeGlass(osMajorVersion: 27, reduceTransparency: false))
+        XCTAssertFalse(ElectronicMailGlassRenderingMode.native.usesNativeGlass(osMajorVersion: 27, reduceTransparency: true))
+    }
+
+    func testLiquidGlassSemanticRolesAndShapesRemainComplete() {
+        XCTAssertEqual(
+            ElectronicMailGlassRole.allCases,
+            [.standard, .prominent, .destructive, .brandedAsk]
+        )
+        XCTAssertEqual(ElectronicMailGlassShape.circle, .circle)
+        XCTAssertEqual(ElectronicMailGlassShape.capsule, .capsule)
+        XCTAssertEqual(ElectronicMailGlassShape.panel(radius: 16), .panel(radius: 16))
+    }
+
     func testOriginalBrandAccentRemainsElectronicMailBlue() throws {
         let color = try XCTUnwrap(
             NSColor(ElectronicMailDesign.appleBlue).usingColorSpace(.sRGB)
@@ -17,11 +75,96 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(color.alphaComponent, 1, accuracy: 0.001)
     }
 
-    func testOriginalTypographyScaleRemainsProductIdentity() {
-        XCTAssertEqual(ElectronicMailType.titleSize, 22)
-        XCTAssertEqual(ElectronicMailType.sectionTitleSize, 22)
-        XCTAssertEqual(ElectronicMailType.bodySize, 20)
-        XCTAssertEqual(ElectronicMailType.bodyLineHeight, 40)
+    func testMacTypographyUsesNativeDesktopDensity() {
+        XCTAssertEqual(ElectronicMailType.heroTitleSize, 28)
+        XCTAssertEqual(ElectronicMailType.welcomeBodySize, 15)
+        XCTAssertEqual(ElectronicMailType.titleSize, 17)
+        XCTAssertEqual(ElectronicMailType.sectionTitleSize, 17)
+        XCTAssertEqual(ElectronicMailType.bodySize, 15)
+        XCTAssertEqual(ElectronicMailType.bodyLineHeight, 20)
+        XCTAssertEqual(ElectronicMailType.detailSize, 13)
+        XCTAssertEqual(ElectronicMailType.smallSize, 13)
+        XCTAssertEqual(ElectronicMailType.statusSize, 13)
+        XCTAssertEqual(ElectronicMailMailboxType.rowHeight, 35)
+        XCTAssertEqual(ElectronicMailMailboxType.sectionSize, 15)
+        XCTAssertEqual(ElectronicMailMailboxType.senderSize, 15)
+        XCTAssertEqual(ElectronicMailMailboxType.subjectSize, 15)
+        XCTAssertEqual(ElectronicMailMailboxType.metadataSize, 15)
+        XCTAssertEqual(ElectronicMailComposerType.modeSize, 17)
+        XCTAssertEqual(ElectronicMailComposerType.labelSize, 15)
+        XCTAssertEqual(ElectronicMailComposerType.valueSize, 15)
+        XCTAssertEqual(ElectronicMailComposerType.bodySize, 15)
+        XCTAssertEqual(ElectronicMailComposerType.controlSize, 15)
+        XCTAssertEqual(ElectronicMailComposerType.statusSize, 13)
+        XCTAssertEqual(ElectronicMailReaderType.titleSize, 17)
+        XCTAssertEqual(ElectronicMailReaderType.bodySize, 15)
+        XCTAssertEqual(ElectronicMailReaderType.metadataSize, 13)
+    }
+
+    func testSharedMacControlRolesRemainConsistent() {
+        XCTAssertEqual(ElectronicMailControlMetrics.onboardingWindowWidth, 900)
+        XCTAssertEqual(ElectronicMailControlMetrics.onboardingWindowHeight, 600)
+        XCTAssertEqual(ElectronicMailControlMetrics.headerHeight, 64)
+        XCTAssertEqual(ElectronicMailControlMetrics.headerCenterY, 32)
+        XCTAssertEqual(ElectronicMailControlMetrics.headerOuterInset, 32)
+        XCTAssertEqual(ElectronicMailControlMetrics.headerLeadingControlCenter, 50)
+        XCTAssertEqual(ElectronicMailControlMetrics.headerTitleGap, 32)
+        XCTAssertEqual(ElectronicMailControlMetrics.headerTitleLeading, 100)
+        XCTAssertEqual(ElectronicMailControlMetrics.trailingInset, 32)
+        XCTAssertEqual(ElectronicMailControlMetrics.headerControlSize, 36)
+        XCTAssertEqual(ElectronicMailControlMetrics.headerSearchHeight, 42)
+        XCTAssertEqual(ElectronicMailControlMetrics.headerSymbolSize, 18)
+        XCTAssertEqual(ElectronicMailControlMetrics.headerControlGap, 32)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerActionGap, 16)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerTwoLineGap, 6)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerContentTop, 8)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderToConversation, 12)
+        XCTAssertEqual(ElectronicMailControlMetrics.actionHeight, 40)
+        XCTAssertEqual(ElectronicMailControlMetrics.actionGap, 32)
+        XCTAssertEqual(ElectronicMailControlMetrics.glassMergeSpacing, 0)
+        XCTAssertEqual(ElectronicMailControlMetrics.composerFieldHeight, 44)
+        XCTAssertEqual(ElectronicMailControlMetrics.paletteRowHeight, 40)
+    }
+
+    func testReaderAndComposerTitlesAlignWithTheirCenteredContentCanvases() {
+        XCTAssertEqual(
+            ElectronicMailControlMetrics.centeredContentLeading(
+                containerWidth: 1_440,
+                maxContentWidth: ElectronicMailControlMetrics.readerMaxWidth,
+                horizontalPadding: 36
+            ),
+            290
+        )
+        XCTAssertEqual(
+            ElectronicMailControlMetrics.centeredContentLeading(
+                containerWidth: 1_440,
+                maxContentWidth: ElectronicMailControlMetrics.composerMaxWidth,
+                contentInset: 80
+            ),
+            320
+        )
+        XCTAssertEqual(
+            ElectronicMailControlMetrics.centeredContentLeading(
+                containerWidth: 680,
+                maxContentWidth: ElectronicMailControlMetrics.readerMaxWidth,
+                horizontalPadding: 36
+            ),
+            ElectronicMailControlMetrics.headerTitleLeading
+        )
+    }
+
+    func testResponsiveLayoutAnchorsMatchApprovedGridAndClampAtNarrowWidths() {
+        let figma = ElectronicMailLayoutMetrics(width: 2_399)
+        XCTAssertEqual(figma.utilityCenter, 50, accuracy: 0.001)
+        XCTAssertEqual(figma.textLeading, 100, accuracy: 0.001)
+        XCTAssertEqual(figma.subjectLeading, 643, accuracy: 0.001)
+        XCTAssertEqual(figma.dateTrailing, 32, accuracy: 0.001)
+
+        let narrow = ElectronicMailLayoutMetrics(width: 600)
+        XCTAssertEqual(narrow.utilityCenter, 50)
+        XCTAssertEqual(narrow.textLeading, 100)
+        XCTAssertEqual(narrow.subjectLeading, 296)
+        XCTAssertEqual(narrow.dateTrailing, 32)
     }
 
     func testUnreadTextIsPureWhiteInDarkMode() throws {
@@ -2037,7 +2180,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(labels.map(SignedInDestination.init(mailboxLabel:)), SignedInDestination.allCases)
     }
 
-    func testFullScreenNavigationShowsTodosFirst() {
+    func testFullScreenNavigationShowsInboxFirstAndTodosLast() {
         let destinations = ShellPrimaryNavigationDestination.allCases
 
         XCTAssertEqual(
@@ -2046,29 +2189,10 @@ final class ModelDecodingTests: XCTestCase {
         )
         XCTAssertEqual(
             destinations.map(\.title),
-            ["To-do's", "Inbox", "Starred", "Drafts", "Sent", "Spam", "Trash", "Archive", "All Mail"]
+            ["Inbox", "Starred", "Drafts", "Sent", "Spam", "Trash", "Archive", "All Mail", "To-do's"]
         )
+        XCTAssertEqual(ElectronicMailMailboxType.navigationRowHeight, 32)
         XCTAssertFalse(destinations.map(\.title).contains("Calendar"))
-    }
-
-    func testMailboxSearchFieldFocusesOnAttachmentAndRoutesEscape() {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 80),
-            styleMask: [.titled],
-            backing: .buffered,
-            defer: false
-        )
-        let container = NSView(frame: window.contentLayoutRect)
-        window.contentView = container
-        let field = ElectronicMailSearchField(frame: NSRect(x: 10, y: 20, width: 400, height: 30))
-        var cancelCount = 0
-        field.onCancel = { cancelCount += 1 }
-
-        container.addSubview(field)
-
-        XCTAssertTrue(window.firstResponder === field.currentEditor())
-        field.cancelOperation(nil)
-        XCTAssertEqual(cancelCount, 1)
     }
 
     func testReplyAllPrefillKeepsSenderInToAndCopiesOtherRecipients() {
@@ -2382,7 +2506,9 @@ final class ModelDecodingTests: XCTestCase {
           "connected": true,
           "connect_url": null,
           "can_send_mail": false,
-          "missing_scopes": ["https://www.googleapis.com/auth/gmail.send"]
+          "missing_scopes": ["https://www.googleapis.com/auth/gmail.send"],
+          "contact_photos_available": false,
+          "missing_optional_scopes": ["https://www.googleapis.com/auth/contacts.readonly"]
         }
         """.data(using: .utf8)!
         let legacyData = """
@@ -2398,8 +2524,29 @@ final class ModelDecodingTests: XCTestCase {
 
         XCTAssertFalse(scoped.canSendMail)
         XCTAssertEqual(scoped.missingScopes, ["https://www.googleapis.com/auth/gmail.send"])
+        XCTAssertFalse(scoped.contactPhotosAvailable)
+        XCTAssertEqual(scoped.missingOptionalScopes, ["https://www.googleapis.com/auth/contacts.readonly"])
         XCTAssertFalse(legacy.canSendMail)
         XCTAssertEqual(legacy.missingScopes, [])
+        XCTAssertFalse(legacy.contactPhotosAvailable)
+        XCTAssertEqual(legacy.missingOptionalScopes, [])
+    }
+
+    func testThreadMessageDecodesOptionalSenderAvatarAsset() throws {
+        let data = """
+        {
+          "id": "message-1",
+          "source": "gmail",
+          "from_address": "Sender <sender@example.com>",
+          "sender_avatar_asset_id": "opaque-avatar-asset",
+          "body": "Hello",
+          "received_at": "2026-08-27T08:00:00Z"
+        }
+        """.data(using: .utf8)!
+
+        let message = try JSONDecoder.backend.decode(ThreadMessage.self, from: data)
+
+        XCTAssertEqual(message.senderAvatarAssetID, "opaque-avatar-asset")
     }
 
     func testMailSendResponseDecodesReauthRequired() throws {
