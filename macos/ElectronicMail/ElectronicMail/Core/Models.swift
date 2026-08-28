@@ -771,7 +771,7 @@ public struct GmailThreadRow: Codable, Equatable, Identifiable, Hashable {
     }
 }
 
-private enum EmailAddressDisplayFormatter {
+enum EmailAddressDisplayFormatter {
     static func displayName(from rawValue: String) -> String {
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else {
@@ -1788,6 +1788,26 @@ enum MailComposerPolicy {
         return recoveryAccountUserID == currentAccountUserID
     }
 
+    static func shouldRestoreRecovery(
+        mode: MailComposerMode,
+        hasUnresolvedSendAttempt: Bool,
+        hasGmailDraft: Bool,
+        hasEditedResponseField: Bool,
+        authoredTextFields: [String],
+        attachmentCount: Int
+    ) -> Bool {
+        if hasUnresolvedSendAttempt || hasGmailDraft {
+            return true
+        }
+        if responseMode(for: mode) != nil, hasEditedResponseField {
+            return true
+        }
+        return hasDraftContent(
+            textFields: authoredTextFields,
+            attachmentCount: attachmentCount
+        )
+    }
+
     static func closeDecision(
         recoveryPersisted: Bool,
         requiresGmailDraftSave: Bool,
@@ -1859,10 +1879,10 @@ struct MailComposerRecoveryLoadGate<Presentation> {
         return presentation
     }
 
-    mutating func complete(recoveredPresentation: Presentation?) -> Presentation? {
+    mutating func complete() -> Presentation? {
         isComplete = true
         defer { pendingPresentation = nil }
-        return recoveredPresentation ?? pendingPresentation
+        return pendingPresentation
     }
 }
 

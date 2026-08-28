@@ -125,6 +125,8 @@ final class ModelDecodingTests: XCTestCase {
     func testSharedMacControlRolesRemainConsistent() {
         XCTAssertEqual(ElectronicMailControlMetrics.onboardingWindowWidth, 680)
         XCTAssertEqual(ElectronicMailControlMetrics.onboardingWindowHeight, 520)
+        XCTAssertEqual(ElectronicMailControlMetrics.mainWindowWidth, 1512)
+        XCTAssertEqual(ElectronicMailControlMetrics.mainWindowHeight, 918)
         XCTAssertEqual(ElectronicMailControlMetrics.mainWindowBackdropInset, 24)
         XCTAssertEqual(ElectronicMailControlMetrics.headerHeight, 64)
         XCTAssertEqual(ElectronicMailControlMetrics.headerCenterY, 32)
@@ -142,7 +144,20 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(ElectronicMailControlMetrics.mailboxHeaderTrailingInset, 100)
         XCTAssertEqual(ElectronicMailControlMetrics.readerActionGap, 16)
         XCTAssertEqual(ElectronicMailControlMetrics.readerTwoLineGap, 6)
-        XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderContentOffsetY, 14)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerSubjectLineLimit, 2)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderContentOffsetY, 10)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerResponseTopSpacing, 28)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerResponseBottomSpacing, 48)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerFloatingActionsBottomInset, 40)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerFixedActionsReservedHeight, 116)
+        XCTAssertEqual(
+            ElectronicMailControlMetrics.readerDetailsLabelOpacity,
+            5.0 / 7.0,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeHeight, 72)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeActivationDistance, 16)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeTopInset, 74)
         XCTAssertEqual(ElectronicMailControlMetrics.composerHeaderContentOffsetY, 14)
         XCTAssertEqual(ElectronicMailControlMetrics.readerContentTop, 20)
         XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderToConversation, 12)
@@ -151,6 +166,89 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(ElectronicMailControlMetrics.glassMergeSpacing, 0)
         XCTAssertEqual(ElectronicMailControlMetrics.composerFieldHeight, 44)
         XCTAssertEqual(ElectronicMailControlMetrics.paletteRowHeight, 40)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerActionRailWidth(controlCount: 0), 0)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerActionRailWidth(controlCount: 5), 244)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerActionRailWidth(controlCount: 6), 296)
+    }
+
+    func testMainWindowUsesReferenceSizeCenteredOnLargeDisplays() {
+        let frame = ElectronicMailWindowLayout.mainFrame(
+            in: CGRect(x: 0, y: 0, width: 1680, height: 1050)
+        )
+
+        XCTAssertEqual(frame.width, 1512)
+        XCTAssertEqual(frame.height, 918)
+        XCTAssertEqual(frame.midX, 840)
+        XCTAssertEqual(frame.midY, 525)
+    }
+
+    func testMainWindowClampsToSmallDisplaysWithTwentyFourPointMargins() {
+        let frame = ElectronicMailWindowLayout.mainFrame(
+            in: CGRect(x: 50, y: 30, width: 1200, height: 800)
+        )
+
+        XCTAssertEqual(frame, CGRect(x: 74, y: 54, width: 1152, height: 752))
+    }
+
+    func testReaderScrollFadeProgressTracksTravelInEitherDirection() {
+        XCTAssertEqual(ElectronicMailReaderScrollFade.progress(forContentTop: 12), 0.75)
+        XCTAssertEqual(ElectronicMailReaderScrollFade.progress(forContentTop: 0), 0)
+        XCTAssertEqual(ElectronicMailReaderScrollFade.progress(forContentTop: -8), 0.5)
+        XCTAssertEqual(ElectronicMailReaderScrollFade.progress(forContentTop: -16), 1)
+        XCTAssertEqual(ElectronicMailReaderScrollFade.progress(forContentTop: -80), 1)
+        XCTAssertEqual(
+            ElectronicMailReaderScrollFade.progress(
+                forContentTop: 84,
+                initialContentTop: 100
+            ),
+            1
+        )
+        XCTAssertEqual(
+            ElectronicMailReaderScrollFade.progress(
+                forContentTop: 110,
+                initialContentTop: 100
+            ),
+            0.625
+        )
+    }
+
+    func testReaderWebFadeMasksTheFixedViewportEdge() {
+        XCTAssertEqual(
+            ElectronicMailReaderWebFade.alpha(
+                atWindowY: 200,
+                fadeTop: 200,
+                fadeBottom: 128,
+                progress: 1
+            ),
+            0
+        )
+        XCTAssertEqual(
+            ElectronicMailReaderWebFade.alpha(
+                atWindowY: 164,
+                fadeTop: 200,
+                fadeBottom: 128,
+                progress: 1
+            ),
+            0.5
+        )
+        XCTAssertEqual(
+            ElectronicMailReaderWebFade.alpha(
+                atWindowY: 128,
+                fadeTop: 200,
+                fadeBottom: 128,
+                progress: 1
+            ),
+            1
+        )
+        XCTAssertEqual(
+            ElectronicMailReaderWebFade.alpha(
+                atWindowY: 200,
+                fadeTop: 200,
+                fadeBottom: 128,
+                progress: 0
+            ),
+            1
+        )
     }
 
     func testReaderAndComposerTitlesAlignWithTheirCenteredContentCanvases() {
@@ -1365,6 +1463,18 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertTrue(lightDocument.contains("--electronic-mail-dark-mode: 0"))
     }
 
+    func testEmailHTMLDocumentCentersFixedRootContentAndPreventsHorizontalOverflow() {
+        let html = #"<html><head></head><body><table width="700"><tr><td><img width="1200" src="data:image/png;base64,AA=="></td></tr></table></body></html>"#
+
+        let document = EmailHTMLDocument.renderableDocument(from: html, colorScheme: .dark)
+
+        XCTAssertTrue(document.contains("body > table"))
+        XCTAssertTrue(document.contains("margin-left: auto !important"))
+        XCTAssertNotNil(document.range(of: #"table\s*\{\s*max-width:\s*100%\s*!important"#, options: .regularExpression))
+        XCTAssertNotNil(document.range(of: #"img\s*\{\s*max-width:\s*100%\s*!important"#, options: .regularExpression))
+        XCTAssertTrue(document.contains("overflow-wrap: anywhere"))
+    }
+
     func testEmailDarkModeUsesAnAppOwnedMainFrameScriptAndPreservesArtwork() {
         let script = EmailHTMLDarkModePolicy.userScript
 
@@ -1933,18 +2043,58 @@ final class ModelDecodingTests: XCTestCase {
         )
     }
 
-    func testComposerPresentationWaitsForDelayedRecoveryLoad() {
+    func testComposerPolicyDropsUnchangedResponseRecoveryWithoutUserContent() {
+        XCTAssertFalse(
+            MailComposerPolicy.shouldRestoreRecovery(
+                mode: .forward,
+                hasUnresolvedSendAttempt: false,
+                hasGmailDraft: false,
+                hasEditedResponseField: false,
+                authoredTextFields: ["", ""],
+                attachmentCount: 0
+            )
+        )
+        XCTAssertTrue(
+            MailComposerPolicy.shouldRestoreRecovery(
+                mode: .forward,
+                hasUnresolvedSendAttempt: false,
+                hasGmailDraft: false,
+                hasEditedResponseField: false,
+                authoredTextFields: ["", "Keep this text"],
+                attachmentCount: 0
+            )
+        )
+        XCTAssertTrue(
+            MailComposerPolicy.shouldRestoreRecovery(
+                mode: .reply,
+                hasUnresolvedSendAttempt: true,
+                hasGmailDraft: false,
+                hasEditedResponseField: false,
+                authoredTextFields: ["", ""],
+                attachmentCount: 0
+            )
+        )
+    }
+
+    func testQueuedComposerIntentWinsIfRecoveryFinishesLoadingAfterUserAction() {
         var gate = MailComposerRecoveryLoadGate<String>()
 
         XCTAssertFalse(gate.isComplete)
         XCTAssertNil(gate.request("new composer"))
         XCTAssertNil(gate.request("later command"))
         XCTAssertEqual(
-            gate.complete(recoveredPresentation: "offline recovered draft"),
-            "offline recovered draft"
+            gate.complete(),
+            "new composer"
         )
         XCTAssertTrue(gate.isComplete)
         XCTAssertEqual(gate.request("new composer after recovery"), "new composer after recovery")
+    }
+
+    func testRecoveredComposerDoesNotOpenAutomaticallyWithoutAUserAction() {
+        var gate = MailComposerRecoveryLoadGate<String>()
+
+        XCTAssertNil(gate.complete())
+        XCTAssertTrue(gate.isComplete)
     }
 
     func testDeferredComposerOpensAfterRecoveryLoadFindsNothing() {
@@ -1952,7 +2102,7 @@ final class ModelDecodingTests: XCTestCase {
 
         XCTAssertNil(gate.request("queued composer"))
         XCTAssertEqual(
-            gate.complete(recoveredPresentation: nil),
+            gate.complete(),
             "queued composer"
         )
     }
@@ -2216,10 +2366,27 @@ final class ModelDecodingTests: XCTestCase {
         )
         XCTAssertEqual(
             destinations.map(\.title),
-            ["Inbox", "Starred", "Drafts", "Sent", "Spam", "Trash", "Archive", "All Mail", "To-do's"]
+            ["Inbox", "AI Inbox", "Starred", "Drafts", "Sent", "Spam", "Trash", "Archive", "All Mail", "To-do's"]
         )
-        XCTAssertEqual(ElectronicMailMailboxType.navigationRowHeight, 32)
+        XCTAssertEqual(
+            destinations.map(\.symbolName),
+            [
+                "tray.full", "sparkles", "star", "doc.text", "paperplane",
+                "exclamationmark.octagon", "trash", "archivebox", "tray.2",
+                "checkmark.circle",
+            ]
+        )
+        XCTAssertEqual(ElectronicMailMailboxType.navigationRowHeight, 36)
         XCTAssertFalse(destinations.map(\.title).contains("Calendar"))
+    }
+
+    func testAIReaderChromeProgressKeepsSummaryFullWhileLiftingIt() {
+        XCTAssertEqual(AIReaderChromeScrollPolicy.progress(scrollDistance: -8), 0)
+        XCTAssertEqual(AIReaderChromeScrollPolicy.progress(scrollDistance: 0), 0)
+        XCTAssertEqual(AIReaderChromeScrollPolicy.progress(scrollDistance: 24), 0.5)
+        XCTAssertEqual(AIReaderChromeScrollPolicy.progress(scrollDistance: 48), 1)
+        XCTAssertEqual(AIReaderChromeScrollPolicy.progress(scrollDistance: 200), 1)
+        XCTAssertEqual(AIReaderChromeScrollPolicy.summaryLift, 24)
     }
 
     func testReplyAllPrefillKeepsSenderInToAndCopiesOtherRecipients() {
@@ -2808,6 +2975,29 @@ final class ModelDecodingTests: XCTestCase {
         )
     }
 
+    func testEmailBodyResolverRestoresCompactedMailingListHeaderLines() {
+        let flattened = "Send list submissions to list@example.com Date: Fri, 28 Aug 2026 05:32:00 -0000 From: Speaker <speaker@example.com> Subject: Conference proposal To: list@example.com Message-ID: <message@example.com> Content-Type: text/plain; charset=\"utf-8\" Hi all, the proposal deadline is next week."
+        let reader = ThreadMessageReader(
+            primaryText: flattened,
+            renderMode: "plain_conversation",
+            markers: [],
+            signatureText: nil,
+            quotedText: nil,
+            footerText: nil,
+            originalHTMLAvailable: false,
+            htmlIsRich: false,
+            quoteDetected: false
+        )
+        let message = makeThreadMessage(id: "mailing-list", body: flattened, reader: reader)
+
+        guard case .text(let body) = EmailReaderBodyResolver.bodyKind(message: message, fallbackText: "") else {
+            return XCTFail("Expected compacted mailing-list text to stay in the native reader")
+        }
+        XCTAssertTrue(body.contains("Date: Fri, 28 Aug 2026 05:32:00 -0000\n\nFrom: Speaker"))
+        XCTAssertTrue(body.contains("From: Speaker <speaker@example.com>\nSubject: Conference proposal"))
+        XCTAssertTrue(body.contains("Message-ID: <message@example.com>\nContent-Type: text/plain; charset=\"utf-8\"\n\nHi all"))
+    }
+
     func testEmailBodyResolverRoutesImageOnlyHTMLToHTML() {
         let html = #"""
         <html>
@@ -2998,6 +3188,176 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(EmailReaderBodyResolver.renderableHTML(from: message), html)
     }
 
+    func testEmailBodyResolverRecoversDesignedSingleTableFromStalePlainMode() {
+        let html = #"""
+        <!doctype html>
+        <html>
+          <body style="margin:0;background:#f5f5f5">
+            <table class="renewal-card" width="100%" role="presentation" style="max-width:640px;margin:0 auto;background:#ffffff">
+              <tbody>
+                <tr><td class="eyebrow" style="padding:24px 32px 8px;color:#666666;letter-spacing:1px">RENEWAL NOTICE</td></tr>
+                <tr><td class="headline" style="padding:0 32px;font-size:30px;line-height:36px">Your domains need attention</td></tr>
+                <tr><td class="body-copy" style="padding:20px 32px;font-size:16px;line-height:24px">Some domains in your account have expired and are about to be suspended. Renew them to keep your websites and services online.</td></tr>
+                <tr><td class="callout" style="padding:16px 32px;background:#fff4d6">Review the expiration dates and renewal status for each affected domain.</td></tr>
+                <tr><td class="button-row" style="padding:24px 32px 32px"><a href="https://domain-harbor.example/account" style="display:inline-block;padding:12px 18px;background:#ef476f;color:#ffffff">Review domains</a></td></tr>
+              </tbody>
+            </table>
+          </body>
+        </html>
+        """#
+        let preview = "RENEWAL NOTICE Your domains need attention."
+        let reader = ThreadMessageReader(
+            primaryText: preview,
+            renderMode: "plain_conversation",
+            markers: [],
+            signatureText: nil,
+            quotedText: nil,
+            footerText: nil,
+            originalHTMLAvailable: true,
+            htmlIsRich: false,
+            quoteDetected: false
+        )
+        let message = makeThreadMessage(
+            id: "renewal-notice",
+            body: preview,
+            htmlBody: html,
+            htmlRenderDocument: html,
+            reader: reader
+        )
+
+        XCTAssertNil(EmailReaderBodyResolver.immediatePlainText(message: message, fallbackText: ""))
+        XCTAssertEqual(
+            EmailReaderBodyResolver.bodyKind(message: message, fallbackText: ""),
+            .html(html, fallbackText: "RENEWAL NOTICE\n\nYour domains need attention\n\nSome domains in your account have expired and are about to be suspended. Renew them to keep your websites and services online.\n\nReview the expiration dates and renewal status for each affected domain.\n\nReview domains")
+        )
+    }
+
+    func testHTMLConversationPolicyCollapsesOutlookReplyHistoryAndKeepsCurrentRichBody() {
+        let html = #"""
+        <html>
+          <head><style>.signature { color: #666; }</style></head>
+          <body>
+            <p>The branch-change request is now complete.</p>
+            <img src="cid:confirmation" alt="Confirmation">
+            <p class="signature">Warm regards,<br>Moni</p>
+            <div style="border:none;border-top:solid #E1E1E1 1.0pt;padding:3.0pt 0in 0in 0in">
+              <b>From:</b> TestUser<br>
+              <b>Sent:</b> Friday, August 21, 2026 5:14 PM<br>
+              <b>To:</b> Moni M<br>
+              <b>Subject:</b> EXTERNAL: Older request
+              <p>This older request must start collapsed.</p>
+            </div>
+          </body>
+        </html>
+        """#
+
+        let presentation = EmailHTMLConversationPolicy.presentation(
+            from: html,
+            quoteDetected: true
+        )
+
+        XCTAssertTrue(presentation.hasHiddenQuotedContent)
+        XCTAssertTrue(presentation.primaryHTML.contains("branch-change request is now complete"))
+        XCTAssertTrue(presentation.primaryHTML.contains("cid:confirmation"))
+        XCTAssertTrue(presentation.primaryHTML.contains(".signature"))
+        XCTAssertFalse(presentation.primaryHTML.contains("This older request must start collapsed"))
+        XCTAssertTrue(presentation.originalHTML.contains("This older request must start collapsed"))
+        XCTAssertTrue(presentation.primaryHTML.contains("</body>"))
+    }
+
+    func testHTMLConversationPolicyCollapsesGmailQuoteContainer() {
+        let html = #"<html><body><p>Current answer.</p><div class="gmail_quote">On Tuesday, Alex wrote:<p>Older question.</p></div></body></html>"#
+
+        let presentation = EmailHTMLConversationPolicy.presentation(
+            from: html,
+            quoteDetected: true
+        )
+
+        XCTAssertTrue(presentation.hasHiddenQuotedContent)
+        XCTAssertTrue(presentation.primaryHTML.contains("Current answer"))
+        XCTAssertFalse(presentation.primaryHTML.contains("Older question"))
+        XCTAssertTrue(presentation.originalHTML.contains("Older question"))
+    }
+
+    func testHTMLConversationPolicyKeepsPureForwardVisible() {
+        let html = #"<html><body><br><blockquote type="cite"><div>Begin forwarded message:</div><p>The forwarded email is the only meaningful content.</p></blockquote></body></html>"#
+
+        let presentation = EmailHTMLConversationPolicy.presentation(
+            from: html,
+            quoteDetected: true
+        )
+
+        XCTAssertFalse(presentation.hasHiddenQuotedContent)
+        XCTAssertEqual(presentation.primaryHTML, html)
+        XCTAssertTrue(presentation.primaryHTML.contains("only meaningful content"))
+    }
+
+    func testHTMLConversationPolicyDoesNotCollapseNewsletterBlockquoteWithoutQuoteSignal() {
+        let html = #"<html><body><h1>Weekly update</h1><blockquote>Customer testimonial</blockquote><a href="https://example.com">Read more</a></body></html>"#
+
+        let presentation = EmailHTMLConversationPolicy.presentation(
+            from: html,
+            quoteDetected: false
+        )
+
+        XCTAssertFalse(presentation.hasHiddenQuotedContent)
+        XCTAssertEqual(presentation.primaryHTML, html)
+    }
+
+    func testEmailBodyResolverUsesStructuredTextForPureForward() {
+        let flattened = "Begin forwarded message: From: Alex Subject: Update The first paragraph. The second paragraph."
+        let structured = """
+        Begin forwarded message:
+
+        From: Alex
+        Subject: Update
+
+        The first paragraph.
+
+        The second paragraph.
+        """
+        let reader = ThreadMessageReader(
+            primaryText: flattened,
+            renderMode: "plain_conversation",
+            markers: [],
+            signatureText: nil,
+            quotedText: structured,
+            footerText: nil,
+            originalHTMLAvailable: true,
+            quoteDetected: true
+        )
+        let message = makeThreadMessage(body: flattened, reader: reader)
+
+        XCTAssertEqual(
+            EmailReaderBodyResolver.bodyKind(message: message, fallbackText: ""),
+            .text(structured)
+        )
+        XCTAssertNil(EmailReaderBodyResolver.quotedTextForDisclosure(from: message))
+    }
+
+    func testEmailBodyResolverExposesDistinctQuotedTextAsDisclosure() {
+        let reader = ThreadMessageReader(
+            primaryText: "Current answer.",
+            renderMode: "plain_conversation",
+            markers: [],
+            signatureText: nil,
+            quotedText: "On Tuesday, Alex wrote:\nOlder question.",
+            footerText: nil,
+            originalHTMLAvailable: false,
+            quoteDetected: true
+        )
+        let message = makeThreadMessage(body: "Fallback", reader: reader)
+
+        XCTAssertEqual(
+            EmailReaderBodyResolver.bodyKind(message: message, fallbackText: ""),
+            .text("Current answer.")
+        )
+        XCTAssertEqual(
+            EmailReaderBodyResolver.quotedTextForDisclosure(from: message),
+            "On Tuesday, Alex wrote:\nOlder question."
+        )
+    }
+
     func testThreadPresentationOrdersOldestToNewestAndExpandsLatestFirst() {
         let newest = makeThreadMessage(id: "newest", receivedAt: "2026-05-19T19:33:06+00:00")
         let oldest = makeThreadMessage(id: "oldest", receivedAt: "2026-05-19T19:31:42+00:00")
@@ -3021,6 +3381,30 @@ final class ModelDecodingTests: XCTestCase {
                 userExpandedMessageKeys: []
             )
         )
+    }
+
+    func testInitialMessagePolicyPrefersExplicitFocusOverNewest() throws {
+        let newest = makeThreadMessage(id: "newest", receivedAt: "2026-05-19T19:33:06+00:00")
+        let oldest = makeThreadMessage(id: "oldest", receivedAt: "2026-05-19T19:31:42+00:00")
+        let presentation = EmailThreadPresentation.snapshot(from: [newest, oldest])
+
+        let focused = try XCTUnwrap(
+            EmailReaderInitialMessagePolicy.target(
+                focusedMessageID: "oldest",
+                in: presentation
+            )
+        )
+        XCTAssertEqual(focused.messageKey, .unique(messageID: "oldest"))
+        XCTAssertTrue(focused.explicitlyFocused)
+
+        let fallback = try XCTUnwrap(
+            EmailReaderInitialMessagePolicy.target(
+                focusedMessageID: "missing",
+                in: presentation
+            )
+        )
+        XCTAssertEqual(fallback.messageKey, .unique(messageID: "newest"))
+        XCTAssertFalse(fallback.explicitlyFocused)
     }
 
     func testThreadPresentationParsesEachTimestampOnceWhileOrdering() {
@@ -3318,6 +3702,131 @@ final class ModelDecodingTests: XCTestCase {
             historyMetadataComplete: fullImportCompleted,
             lastProgressAt: lastProgressAt
         )
+    }
+
+    func testAIInboxResponseDecodesSeparateMatterAndOrganizingRows() throws {
+        let data = Data(
+            """
+            {
+              "profile": {
+                "consented": true,
+                "enabled": true,
+                "available": true,
+                "grouping_style": "focused",
+                "rollout_mode": "live",
+                "active_generation_id": "generation-1",
+                "revision": 4
+              },
+              "generation_id": "generation-1",
+              "revision": "4:generation-1:8",
+              "stale": false,
+              "stale_reason": null,
+              "matters": [{
+                "id": "matter-1",
+                "kind": "matter",
+                "title": "Example Bank processed the account request",
+                "summary": "The request was submitted and HSBC confirmed completion.",
+                "status": "completed",
+                "confidence_state": "confirmed",
+                "confidence": 0.99,
+                "latest_message_at": "2026-08-27T10:00:00+00:00",
+                "message_count": 4,
+                "unread": true,
+                "starred": false,
+                "participants": ["HSBC Support"],
+                "counterpart_entities": ["HSBC", "CCIL"],
+                "evidence_message_ids": ["message-4"],
+                "revision": 8,
+                "matching_message_ids": ["message-2"]
+              }],
+              "organizing": [{
+                "id": "organizing:thread-2",
+                "kind": "organizing",
+                "gmail_thread_id": "thread-2",
+                "title": "New message",
+                "sender": "Sender",
+                "counterpart_entities": ["Domain Harbor"],
+                "snippet": "Waiting for organization",
+                "latest_message_at": "2026-08-27T11:00:00+00:00",
+                "message_count": 1,
+                "state": "organizing",
+                "error": null,
+                "matching_message_ids": []
+              }],
+              "generated_at": "2026-08-27T11:00:01+00:00"
+            }
+            """.utf8
+        )
+
+        let response = try JSONDecoder.backend.decode(AIInboxResponse.self, from: data)
+
+        XCTAssertEqual(response.profile.groupingStyle, .focused)
+        XCTAssertEqual(response.matters.first?.status, .completed)
+        XCTAssertEqual(response.matters.first?.confidenceState, .confirmed)
+        XCTAssertEqual(response.matters.first?.matchingMessageIDs, ["message-2"])
+        XCTAssertEqual(response.matters.first?.counterpartEntities, ["HSBC", "CCIL"])
+        XCTAssertEqual(response.organizing.first?.state, "organizing")
+        XCTAssertEqual(response.organizing.first?.counterpartEntities, ["Domain Harbor"])
+
+        let legacyJSON = String(decoding: data, as: UTF8.self)
+            .replacingOccurrences(of: "\"counterpart_entities\": [\"HSBC\", \"CCIL\"],", with: "")
+            .replacingOccurrences(of: "\"counterpart_entities\": [\"Domain Harbor\"],", with: "")
+        let legacyResponse = try JSONDecoder.backend.decode(
+            AIInboxResponse.self,
+            from: Data(legacyJSON.utf8)
+        )
+        XCTAssertNil(legacyResponse.matters.first?.counterpartEntities)
+        XCTAssertNil(legacyResponse.organizing.first?.counterpartEntities)
+    }
+
+    func testAIInboxCounterpartFormattingPrefersEntitiesAndDeduplicatesLabels() {
+        XCTAssertEqual(
+            AIInboxParticipantFormatting.counterpartLabel(["Northstar", "northstar"]),
+            "Northstar"
+        )
+        XCTAssertEqual(
+            AIInboxParticipantFormatting.counterpartLabel(["HSBC", "CCIL"]),
+            "HSBC and CCIL"
+        )
+        XCTAssertEqual(
+            AIInboxParticipantFormatting.counterpartLabel(["HSBC", "CCIL", "Northstar"]),
+            "HSBC, CCIL, and Northstar"
+        )
+        XCTAssertEqual(
+            AIInboxParticipantFormatting.listLabel(
+                counterpartEntities: nil,
+                fallbackParticipants: ["Bank Support", "Bank Support"],
+                emptyLabel: "Waiting"
+            ),
+            "Bank Support"
+        )
+        XCTAssertEqual(
+            AIInboxParticipantFormatting.listLabel(
+                counterpartEntities: nil,
+                fallbackParticipants: ["Northstar Bank", "TestUser"],
+                emptyLabel: "Waiting"
+            ),
+            "Northstar Bank and TestUser"
+        )
+    }
+
+    func testMatterDecisionRequestEncodesRevisionAndExactSelectedMessages() throws {
+        let request = MatterDecisionRequest(
+            clientDecisionID: "decision-1",
+            decision: "move",
+            matterID: "matter-1",
+            targetMatterID: "matter-2",
+            messageIDs: ["message-1", "message-3"],
+            expectedRevision: 7
+        )
+
+        let data = try JSONEncoder.backend.encode(request)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(object["client_decision_id"] as? String, "decision-1")
+        XCTAssertEqual(object["target_matter_id"] as? String, "matter-2")
+        XCTAssertEqual(object["expected_revision"] as? Int, 7)
+        XCTAssertEqual(object["message_ids"] as? [String], ["message-1", "message-3"])
     }
 
     private func preferenceData(_ defaults: UserDefaults) -> Data {

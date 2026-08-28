@@ -598,6 +598,21 @@ def _import_sent_message(settings: Settings, *, user_id: str, message_id: str) -
     parsed = mark_full_gmail_payload_body_fetch_status(parsed)
     record = GmailMessageRecord(created_at="", updated_at="", **parsed)
     upsert_gmail_messages(str(settings.database_path), [record])
+    try:
+        from app.services.ai_inbox import enqueue_message_organization
+
+        enqueue_message_organization(
+            settings,
+            user_id=user_id,
+            message_id=record.message_id,
+            content_revision=record.content_revision,
+        )
+    except Exception as exc:
+        logger.warning(
+            "AI Inbox organization could not be queued for sent mail user_id=%s error=%s",
+            user_id,
+            type(exc).__name__,
+        )
     rebuild_touched_mail_groups(settings, user_id=user_id, message_ids=[record.message_id], use_ai=False)
     enqueue_projection_refresh(settings, user_id=user_id, priority=25)
 

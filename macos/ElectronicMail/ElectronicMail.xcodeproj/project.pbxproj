@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A1A1A1A1A1A1A1A1A1A1A101 /* AIInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1A1A1A1A1A1A1A1A1A1A100 /* AIInbox.swift */; };
 		A11111111111111111111111 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A22222222222222222222222 /* PrivacyInfo.xcprivacy */; };
 		A66666666666666666666666 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A22222222222222222222222 /* PrivacyInfo.xcprivacy */; };
 		A44444444444444444444444 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A55555555555555555555555 /* Assets.xcassets */; };
@@ -162,6 +163,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A1A1A1A1A1A1A1A1A1A1A100 /* AIInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIInbox.swift; sourceTree = "<group>"; };
 		A22222222222222222222222 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		A33333333333333333333333 /* ElectronicMail.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ElectronicMail.entitlements; sourceTree = "<group>"; };
 		A55555555555555555555555 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -395,6 +397,7 @@
 		F7A710C78824B1D98666B4BC /* Core */ = {
 			isa = PBXGroup;
 			children = (
+				A1A1A1A1A1A1A1A1A1A1A100 /* AIInbox.swift */,
 				0C0A77C95EA34E90A5200001 /* AttachmentPrefetchCoordinator.swift */,
 				D1139801E4AE9E09FEFCADE0 /* AppClient.swift */,
 				51A82E6E83CB2F01653310C9 /* AppConfiguration.swift */,
@@ -673,6 +676,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A1A1A1A1A1A1A1A1A1A1A101 /* AIInbox.swift in Sources */,
 				0C0A77C95EA34E90A5300001 /* AttachmentPrefetchCoordinator.swift in Sources */,
 				BE1F6B1BE413185277F42DA7 /* AppClient.swift in Sources */,
 				4A90C425C83E253DE4697898 /* AppConfiguration.swift in Sources */,

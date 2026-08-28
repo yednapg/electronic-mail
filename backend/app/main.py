@@ -17,6 +17,7 @@ from app.api.routes.post_login import router as post_login_router
 from app.api.routes.system import router as system_router
 from app.api.routes.mailbox import router as mailbox_router
 from app.api.routes.tasks import router as tasks_router
+from app.api.routes.ai_inbox import router as ai_inbox_router
 from app.core.config import Settings, load_settings
 from app.core.observability import RequestObservabilityMiddleware, configure_observability
 from app.core.rate_limit import RateLimitMiddleware
@@ -55,6 +56,7 @@ def create_app(runtime_settings: Settings) -> FastAPI:
     application.include_router(app_session_router)
     application.include_router(mailbox_router)
     application.include_router(jobs_router)
+    application.include_router(ai_inbox_router)
 
     if not production_like:
         application.include_router(first_run_router)

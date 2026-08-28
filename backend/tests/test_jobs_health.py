@@ -51,6 +51,14 @@ class QueueHealthTests(unittest.TestCase):
                     "age_seconds": 5,
                 },
                 {
+                    "worker_id": "ai",
+                    "queues_json": '["ai"]',
+                    "current_job_id": None,
+                    "release_sha": EXPECTED_RELEASE,
+                    "last_seen_at": "2026-05-21T10:00:00+00:00",
+                    "age_seconds": 6,
+                },
+                {
                     "worker_id": "poller",
                     "queues_json": '["gmail_poll"]',
                     "current_job_id": None,

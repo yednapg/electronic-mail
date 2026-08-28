@@ -807,6 +807,7 @@ public final class InboxStore: ObservableObject {
     @Published public private(set) var downloadingAttachmentIDs: Set<AttachmentDownloadID> = []
 
     private let client: AppClient
+    var aiInboxClient: AppClient { client }
     private let sessionCache: AppSessionCache
     private let threadCache: ThreadCache
     private let localMailStore: LocalMailStore
@@ -3959,6 +3960,8 @@ public final class InboxStore: ObservableObject {
         lastSSEEventType = event.event
         lastSSEEventAt = eventDate
         switch event.event {
+        case "ai-inbox-changed", "ai-profile-changed", "ai-processing-progress":
+            NotificationCenter.default.post(name: .electronicMailAIInboxChanged, object: nil)
         case "mailbox-search-hydrated":
             let envelope = decodedEventEnvelope(event.data)
             guard let searchKey = envelope.searchKey else {

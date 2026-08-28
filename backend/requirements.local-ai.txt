@@ -1,0 +1,3 @@
+# Local AI Inbox testing only. Production continues to install requirements.lock
+# and uses the Responses API provider.
+openai-codex==0.147.0

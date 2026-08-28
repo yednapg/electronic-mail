@@ -102,6 +102,7 @@ public struct SignedInShellView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject private var store: InboxStore
+    @StateObject private var aiInboxStore: AIInboxStore
     private let onReauthorizeGoogle: () async throws -> Void
     private let onSignOut: () async throws -> Void
     private let onDisconnectGoogle: () async throws -> Void
@@ -111,14 +112,19 @@ public struct SignedInShellView: View {
     @State private var navigationOpen = false
     @State private var mailboxSearchOpen = false
     @State private var mailboxSearchFocusRequested = false
+    @State private var aiInboxSettingsOpen = false
+    @State private var aiInboxOrganizeOpen = false
     @State private var commandPaletteOpen = false
     @State private var composer: MailComposerPresentation?
     @State private var recoveredComposerSnapshot: ComposerRecoverySnapshot?
+    @State private var pendingComposerPresentation: MailComposerPresentation?
     @State private var composerRecoveryLoadGate = MailComposerRecoveryLoadGate<MailComposerPresentation>()
     @State private var pendingCommandThreadID: String?
     @State private var mailboxSearchText = ""
     @State private var confirmPermanentReaderDelete = false
+    @State private var confirmAIMatterTrash = false
     @State private var contactPhotoAuthorizationRunning = false
+    @State private var aiReaderChromeProgress: CGFloat = 0
     @AppStorage("ElectronicMailContactPhotoPromptDismissed") private var contactPhotoPromptDismissed = false
 
     public init(
@@ -129,6 +135,7 @@ public struct SignedInShellView: View {
         onDeleteAccount: @escaping () async throws -> Void = {}
     ) {
         self.store = store
+        _aiInboxStore = StateObject(wrappedValue: AIInboxStore(client: store.aiInboxClient))
         self.onReauthorizeGoogle = onReauthorizeGoogle
         self.onSignOut = onSignOut
         self.onDisconnectGoogle = onDisconnectGoogle
@@ -263,8 +270,8 @@ public struct SignedInShellView: View {
                 closeMailboxSearch()
             } else if navigationOpen {
                 closeNavigation()
-            } else if store.readerThreadID != nil {
-                closeReader()
+            } else if store.readerThreadID != nil || activeAIMatter != nil {
+                closeActiveReader()
             }
         }
         .confirmationDialog(
@@ -279,6 +286,50 @@ public struct SignedInShellView: View {
         } message: {
             Text("This cannot be undone.")
         }
+        .alert("Move this matter to Trash?", isPresented: $confirmAIMatterTrash) {
+            Button("Cancel", role: .cancel) {}
+            Button("Move to Trash", role: .destructive) {
+                guard let matter = activeAIMatter else { return }
+                Task { await performAIMatterAction(.moveTrash, matter: matter, confirmTrash: true) }
+            }
+        } message: {
+            if let matter = activeAIMatter {
+                let threadCount = Set(matter.messages.compactMap(\.threadID)).count
+                Text("This changes exactly \(matter.totalMessages) messages across \(threadCount) Gmail \(threadCount == 1 ? "thread" : "threads").")
+            }
+        }
+        .confirmationDialog(
+            "Resume your unsent message?",
+            isPresented: composerRecoveryConflictPresented,
+            titleVisibility: .visible
+        ) {
+            if let recovery = recoveredComposerSnapshot {
+                Button("Resume \(recovery.mode.title)") {
+                    resumeRecoveredComposer()
+                }
+            }
+            if let requestedPresentation = pendingComposerPresentation {
+                Button("Discard and \(requestedPresentation.actionTitle)", role: .destructive) {
+                    discardRecoveryAndPresentRequestedComposer()
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingComposerPresentation = nil
+            }
+        } message: {
+            Text("A different unsent message is waiting. Resume it, or discard it before starting another message.")
+        }
+    }
+
+    private var composerRecoveryConflictPresented: Binding<Bool> {
+        Binding(
+            get: { pendingComposerPresentation != nil },
+            set: { isPresented in
+                if !isPresented {
+                    pendingComposerPresentation = nil
+                }
+            }
+        )
     }
 
     private var showsContactPhotoPermissionPrompt: Bool {
@@ -359,114 +410,139 @@ public struct SignedInShellView: View {
                 + (ElectronicMailControlMetrics.headerControlGap
                     - ElectronicMailControlMetrics.mailboxHeaderControlGap)
         )
-        let showsReader = store.readerThreadID != nil
+        let showsReader = store.readerThreadID != nil || activeAIMatter != nil
+        let showsMailboxControls = supplementalDestination == nil || supplementalDestination == .aiInbox
+        let fixedTrailingControlCount: CGFloat = supplementalDestination == .aiInbox ? 2 : 1
         let readerTitleLeading = ElectronicMailControlMetrics.centeredContentLeading(
             containerWidth: width,
             maxContentWidth: ElectronicMailControlMetrics.readerMaxWidth,
             horizontalPadding: EmailReaderHeaderLayout.horizontalPadding
         )
+        let readerActionControlCount = activeAIMatter == nil ? 5 : 6
         let trailingControlsWidth: CGFloat = if showsReader {
-            ElectronicMailControlMetrics.headerControlSize * 5
-                + ElectronicMailControlMetrics.readerActionGap * 4
-                + readerTitleLeading
-        } else if supplementalDestination == nil {
-            ElectronicMailControlMetrics.headerControlSize
-                + ElectronicMailControlMetrics.mailboxHeaderControlGap
+            readerTitleLeading
+                + ElectronicMailControlMetrics.readerActionRailWidth(
+                    controlCount: readerActionControlCount
+                )
+                + ElectronicMailControlMetrics.readerActionGap
+        } else if showsMailboxControls {
+            ElectronicMailControlMetrics.headerControlSize * fixedTrailingControlCount
+                + ElectronicMailControlMetrics.mailboxHeaderControlGap * fixedTrailingControlCount
                 + (mailboxSearchOpen ? searchWidth : ElectronicMailControlMetrics.headerControlSize)
                 + ElectronicMailControlMetrics.mailboxHeaderTrailingInset
         } else {
             ElectronicMailControlMetrics.headerControlSize + ElectronicMailControlMetrics.trailingInset
         }
 
-        return ElectronicMailShellHeader(
-            width: width,
-            titleLeading: showsReader
-                ? readerTitleLeading
-                : ElectronicMailControlMetrics.headerTitleLeading,
-            titleTrailingReservation: trailingControlsWidth,
-            trailingSpacing: supplementalDestination == nil && !showsReader
-                ? ElectronicMailControlMetrics.mailboxHeaderControlGap
-                : ElectronicMailControlMetrics.headerControlGap,
-            trailingInset: supplementalDestination == nil && !showsReader
-                ? ElectronicMailControlMetrics.mailboxHeaderTrailingInset
-                : ElectronicMailControlMetrics.trailingInset,
-            leading: {
-                if showsReader {
-                    ShellBackButton(colorScheme: colorScheme, action: closeReader)
-                } else {
-                    ShellMenuButton(
-                        colorScheme: colorScheme,
-                        accessibilityLabel: navigationOpen ? "Hide Navigation" : "Show Navigation",
-                        action: toggleNavigation
-                    )
-                }
-            },
-            title: {
-                if showsReader {
-                    VStack(
-                        alignment: .leading,
-                        spacing: ElectronicMailControlMetrics.readerTwoLineGap
-                    ) {
-                        Text(readerHeaderTitle)
-                            .font(ElectronicMailReaderType.title())
+        return VStack(alignment: .leading, spacing: 0) {
+            ElectronicMailShellHeader(
+                width: width,
+                titleLeading: showsReader
+                    ? readerTitleLeading
+                    : ElectronicMailControlMetrics.headerTitleLeading,
+                titleTrailingReservation: trailingControlsWidth,
+                trailingSpacing: showsMailboxControls && !showsReader
+                    ? ElectronicMailControlMetrics.mailboxHeaderControlGap
+                    : ElectronicMailControlMetrics.headerControlGap,
+                trailingInset: showsMailboxControls && !showsReader
+                    ? ElectronicMailControlMetrics.mailboxHeaderTrailingInset
+                    : ElectronicMailControlMetrics.trailingInset,
+                leading: {
+                    if showsReader {
+                        ShellBackButton(colorScheme: colorScheme, action: closeActiveReader)
+                    } else {
+                        ShellMenuButton(
+                            colorScheme: colorScheme,
+                            accessibilityLabel: navigationOpen ? "Hide Navigation" : "Show Navigation",
+                            action: toggleNavigation
+                        )
+                    }
+                },
+                title: {
+                    if showsReader {
+                        VStack(
+                            alignment: .leading,
+                            spacing: ElectronicMailControlMetrics.readerTwoLineGap
+                        ) {
+                            Group {
+                                Text(readerHeaderTitle)
+                                    .font(ElectronicMailReaderType.title())
+                                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                                    .lineLimit(ElectronicMailControlMetrics.readerSubjectLineLimit)
+                                    .truncationMode(.tail)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .layoutPriority(1)
+
+                                Text(readerHeaderMetadata)
+                                    .font(ElectronicMailReaderType.metadata())
+                                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                                    .lineLimit(1)
+                            }
+                        }
+                        .offset(y: ElectronicMailControlMetrics.readerHeaderContentOffsetY)
+                        .modifier(
+                            AIReaderSubjectScrollEffect(
+                                progress: activeAIMatter == nil ? 0 : aiReaderChromeProgress
+                            )
+                        )
+                        .help(readerHeaderTitle)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityAddTraits(.isHeader)
+                    } else if showsInboxModeSwitch {
+                        ShellInboxModeSwitch(
+                            selection: supplementalDestination == .aiInbox ? .aiInbox : .inbox,
+                            colorScheme: colorScheme,
+                            onSelect: selectPrimaryNavigation
+                        )
+                    } else {
+                        Text(headerTitle)
+                            .font(ElectronicMailType.mailboxHeader())
                             .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                             .lineLimit(1)
                             .truncationMode(.tail)
-
-                        Text(readerHeaderMetadata)
-                            .font(ElectronicMailReaderType.metadata())
-                            .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                            .lineLimit(1)
+                            .help(headerTitle)
+                            .accessibilityAddTraits(.isHeader)
                     }
-                    .offset(y: ElectronicMailControlMetrics.readerHeaderContentOffsetY)
-                    .help(readerHeaderTitle)
-                    .accessibilityElement(children: .combine)
-                    .accessibilityAddTraits(.isHeader)
-                } else {
-                    Text(headerTitle)
-                        .font(ElectronicMailType.mailboxHeader())
-                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .help(headerTitle)
-                        .accessibilityAddTraits(.isHeader)
-                }
-            },
-            trailing: {
-                if showsReader {
-                    readerHeaderActions
-                        .padding(
-                            .trailing,
-                            max(0, readerTitleLeading - ElectronicMailControlMetrics.trailingInset)
-                        )
-                } else {
-                    ShellComposeButton(colorScheme: colorScheme, action: openComposeComposer)
-
-                    if supplementalDestination == nil {
-                        if mailboxSearchOpen {
-                            DebouncedMailboxToolbarSearchField(
-                                query: $mailboxSearchText,
-                                focusRequested: mailboxSearchFocusRequested,
-                                onCancel: closeMailboxSearch,
-                                onFocusLost: closeMailboxSearch
+                },
+                trailing: {
+                    if showsReader {
+                        readerHeaderActions
+                            .padding(
+                                .trailing,
+                                max(0, readerTitleLeading - ElectronicMailControlMetrics.trailingInset)
                             )
-                            .padding(.horizontal, 11)
-                            .frame(width: searchWidth, height: ElectronicMailControlMetrics.headerSearchHeight)
-                            .electronicMailGlassPanel(shape: .capsule)
-                            .transition(searchFieldTransition)
-                        } else {
-                            ShellSearchButton(colorScheme: colorScheme, action: openMailboxSearch)
-                                .transition(searchButtonTransition)
+                    } else {
+                        if supplementalDestination == .aiInbox {
+                            ShellAIInboxSettingsButton(
+                                colorScheme: colorScheme,
+                                action: { aiInboxSettingsOpen = true }
+                            )
+                        }
+
+                        ShellComposeButton(colorScheme: colorScheme, action: openComposeComposer)
+
+                        if showsMailboxControls {
+                            if mailboxSearchOpen {
+                                DebouncedMailboxToolbarSearchField(
+                                    query: $mailboxSearchText,
+                                    focusRequested: mailboxSearchFocusRequested,
+                                    onCancel: closeMailboxSearch,
+                                    onFocusLost: closeMailboxSearch
+                                )
+                                .padding(.horizontal, 11)
+                                .frame(width: searchWidth, height: ElectronicMailControlMetrics.headerSearchHeight)
+                                .electronicMailGlassPanel(shape: .capsule)
+                                .transition(searchFieldTransition)
+                            } else {
+                                ShellSearchButton(colorScheme: colorScheme, action: openMailboxSearch)
+                                    .transition(searchButtonTransition)
+                            }
                         }
                     }
                 }
-            }
-        )
-        .frame(
-            height: ElectronicMailControlMetrics.headerHeight
-                + (showsReader ? ElectronicMailControlMetrics.readerHeaderContentOffsetY : 0),
-            alignment: .top
-        )
+            )
+            .padding(.bottom, showsReader ? ElectronicMailControlMetrics.readerHeaderContentOffsetY : 0)
+        }
         .animation(
             searchAnimation,
             value: mailboxSearchOpen
@@ -477,48 +553,115 @@ public struct SignedInShellView: View {
         static let horizontalPadding: CGFloat = 36
     }
 
+    @ViewBuilder
     private var readerHeaderActions: some View {
-        ElectronicMailGlassGroup(spacing: ElectronicMailControlMetrics.readerActionGap) {
+        if let matter = activeAIMatter {
+            aiMatterHeaderActions(matter)
+        } else {
+            ElectronicMailGlassGroup(spacing: ElectronicMailControlMetrics.readerActionGap) {
+                HStack(spacing: ElectronicMailControlMetrics.readerActionGap) {
+                    ElectronicMailIconControl(
+                        symbol: readerPrimaryActionSymbol,
+                        accessibilityLabel: readerPrimaryActionTitle,
+                        action: performReaderPrimaryAction
+                    )
+
+                    ElectronicMailIconControl(
+                        symbol: readerTrashActionSymbol,
+                        accessibilityLabel: readerTrashActionTitle,
+                        role: store.activeMailboxLabel == .trash ? .destructive : .standard,
+                        action: performReaderTrashAction
+                    )
+
+                    ElectronicMailIconControl(
+                        symbol: readerIsStarred ? ElectronicMailSymbols.starredFilled : ElectronicMailSymbols.starred,
+                        accessibilityLabel: readerIsStarred ? "Unstar Conversation" : "Star Conversation",
+                        action: {
+                            performReaderAction(readerIsStarred ? .unstar : .star)
+                        }
+                    )
+
+                    ElectronicMailIconControl(
+                        symbol: readerIsUnread ? "envelope.open.fill" : "envelope.fill",
+                        accessibilityLabel: readerIsUnread ? "Mark as Read" : "Mark as Unread",
+                        action: {
+                            performReaderAction(readerIsUnread ? .markRead : .markUnread)
+                        }
+                    )
+
+                    ElectronicMailIconControl(
+                        symbol: store.activeMailboxLabel == .spam
+                            ? "checkmark.shield.fill"
+                            : "exclamationmark.octagon.fill",
+                        accessibilityLabel: store.activeMailboxLabel == .spam ? "Not Spam" : "Mark as Spam",
+                        action: {
+                            performReaderAction(store.activeMailboxLabel == .spam ? .notSpam : .markSpam)
+                        }
+                    )
+                    .disabled(store.activeMailboxLabel == .trash)
+                }
+            }
+        }
+    }
+
+    private func aiMatterHeaderActions(_ matter: AIMatterDetail) -> some View {
+        let replyTarget = aiMatterReplyTarget(matter)
+        let isStarred = aiMatterIsStarred(matter)
+
+        return ElectronicMailGlassGroup(spacing: ElectronicMailControlMetrics.readerActionGap) {
             HStack(spacing: ElectronicMailControlMetrics.readerActionGap) {
                 ElectronicMailIconControl(
-                    symbol: readerPrimaryActionSymbol,
-                    accessibilityLabel: readerPrimaryActionTitle,
-                    action: performReaderPrimaryAction
+                    symbol: "square.grid.2x2",
+                    accessibilityLabel: "Organize Matter",
+                    action: { aiInboxOrganizeOpen = true }
                 )
 
                 ElectronicMailIconControl(
-                    symbol: readerTrashActionSymbol,
-                    accessibilityLabel: readerTrashActionTitle,
-                    role: store.activeMailboxLabel == .trash ? .destructive : .standard,
-                    action: performReaderTrashAction
-                )
-
-                ElectronicMailIconControl(
-                    symbol: readerIsStarred ? ElectronicMailSymbols.starredFilled : ElectronicMailSymbols.starred,
-                    accessibilityLabel: readerIsStarred ? "Unstar Conversation" : "Star Conversation",
+                    symbol: ElectronicMailSymbols.reply,
+                    accessibilityLabel: "Reply",
                     action: {
-                        performReaderAction(readerIsStarred ? .unstar : .star)
+                        guard let replyTarget else { return }
+                        openResponseComposer(
+                            threadID: replyTarget.threadID,
+                            mode: .reply,
+                            sourceMessageID: replyTarget.messageID
+                        )
+                    }
+                )
+                .disabled(replyTarget == nil)
+
+                ElectronicMailIconControl(
+                    symbol: "archivebox.fill",
+                    accessibilityLabel: "Archive Matter",
+                    action: {
+                        Task { await performAIMatterAction(.archive, matter: matter) }
                     }
                 )
 
                 ElectronicMailIconControl(
-                    symbol: readerIsUnread ? "envelope.open.fill" : "envelope.fill",
-                    accessibilityLabel: readerIsUnread ? "Mark as Read" : "Mark as Unread",
+                    symbol: "envelope.open.fill",
+                    accessibilityLabel: "Mark Matter as Read",
                     action: {
-                        performReaderAction(readerIsUnread ? .markRead : .markUnread)
+                        Task { await performAIMatterAction(.markRead, matter: matter) }
                     }
                 )
 
                 ElectronicMailIconControl(
-                    symbol: store.activeMailboxLabel == .spam
-                        ? "checkmark.shield.fill"
-                        : "exclamationmark.octagon.fill",
-                    accessibilityLabel: store.activeMailboxLabel == .spam ? "Not Spam" : "Mark as Spam",
+                    symbol: isStarred ? ElectronicMailSymbols.starredFilled : ElectronicMailSymbols.starred,
+                    accessibilityLabel: isStarred ? "Unstar Matter" : "Star Matter",
                     action: {
-                        performReaderAction(store.activeMailboxLabel == .spam ? .notSpam : .markSpam)
+                        Task {
+                            await performAIMatterAction(isStarred ? .unstar : .star, matter: matter)
+                        }
                     }
                 )
-                .disabled(store.activeMailboxLabel == .trash)
+
+                ElectronicMailIconControl(
+                    symbol: "trash.fill",
+                    accessibilityLabel: "Move Matter to Trash",
+                    role: .destructive,
+                    action: { confirmAIMatterTrash = true }
+                )
             }
         }
     }
@@ -551,6 +694,29 @@ public struct SignedInShellView: View {
     @ViewBuilder
     private var destinationContent: some View {
         switch supplementalDestination {
+        case .aiInbox:
+            AIInboxView(
+                store: aiInboxStore,
+                searchText: $mailboxSearchText,
+                showSettings: $aiInboxSettingsOpen,
+                showOrganize: $aiInboxOrganizeOpen,
+                currentUserDisplayName: store.session?.readiness.userDisplayName
+                    ?? store.session?.dashboard.profile?.displayName
+                    ?? store.session?.user.displayName
+                    ?? store.session?.user.firstName,
+                currentUserEmail: store.session?.user.email,
+                onRespond: openResponseComposer,
+                onGmailMutation: { await store.refresh() },
+                onOpenAttachment: { attachment, messageID in
+                    Task { await store.openAttachment(attachment, messageID: messageID) }
+                },
+                isAttachmentDownloading: { attachment, messageID in
+                    store.isAttachmentDownloading(attachment, messageID: messageID)
+                },
+                onReaderChromeProgressChange: { progress in
+                    aiReaderChromeProgress = progress
+                }
+            )
         case .todos:
             TodoHomeView(
                 store: store,
@@ -569,11 +735,20 @@ public struct SignedInShellView: View {
 
     private var headerTitle: String {
         switch supplementalDestination {
+        case .aiInbox:
+            return "AI Inbox"
         case .todos:
             return "To-do's"
         case nil:
             return store.mailboxTitle
         }
+    }
+
+    private var showsInboxModeSwitch: Bool {
+        if supplementalDestination == .aiInbox {
+            return true
+        }
+        return supplementalDestination == nil && selection == .inbox
     }
 
     private var primaryNavigationSelection: ShellPrimaryNavigationDestination? {
@@ -587,14 +762,52 @@ public struct SignedInShellView: View {
         store.readerThread?.messages.last
     }
 
+    private var activeAIMatter: AIMatterDetail? {
+        guard supplementalDestination == .aiInbox else { return nil }
+        return aiInboxStore.detail
+    }
+
+    private func aiMatterReplyTarget(
+        _ matter: AIMatterDetail
+    ) -> (threadID: String, messageID: String)? {
+        let messages = EmailThreadPresentation.orderedMessages(matter.messages)
+        if let latestReplyableMessageID = matter.latestReplyableMessageID,
+           let message = messages.first(where: { $0.id == latestReplyableMessageID }),
+           let threadID = nonEmpty(message.threadID) {
+            return (threadID, message.id)
+        }
+        guard let message = messages.reversed().first(where: { nonEmpty($0.threadID) != nil }),
+              let threadID = nonEmpty(message.threadID) else {
+            return nil
+        }
+        return (threadID, message.id)
+    }
+
+    private func aiMatterIsStarred(_ matter: AIMatterDetail) -> Bool {
+        aiInboxStore.response?.matters.first(where: { $0.id == matter.id })?.starred == true
+    }
+
     private var readerHeaderTitle: String {
-        nonEmpty(store.readerThread?.title)
+        if let matter = activeAIMatter {
+            return matter.title
+        }
+        return nonEmpty(store.readerThread?.title)
             ?? nonEmpty(store.readerThread?.subject)
             ?? nonEmpty(store.readerRow?.title)
             ?? "Email"
     }
 
     private var readerHeaderMetadata: String {
+        if let matter = activeAIMatter {
+            let messages = EmailThreadPresentation.orderedMessages(matter.messages)
+            let count = max(matter.totalMessages, messages.count)
+            let countLabel = count == 1 ? "1 message" : "\(count) messages"
+            guard let receivedAt = messages.last?.receivedAt else {
+                return countLabel
+            }
+            return "\(countLabel) · \(EmailReaderText.dayGrouping(receivedAt))"
+        }
+
         let messages = store.readerThread?.messages ?? []
         let count = max(1, max(messages.count, store.readerRow?.messageCount ?? 1))
         let countLabel = count == 1 ? "1 message" : "\(count) messages"
@@ -668,6 +881,22 @@ public struct SignedInShellView: View {
         }
     }
 
+    @MainActor
+    private func performAIMatterAction(
+        _ action: GmailThreadAction,
+        matter: AIMatterDetail,
+        confirmTrash: Bool = false
+    ) async {
+        let applied = await aiInboxStore.perform(
+            action,
+            matter: matter,
+            confirmMultiThreadTrash: confirmTrash
+        )
+        if applied {
+            await store.refresh()
+        }
+    }
+
     private func toggleNavigation() {
         guard composer == nil else { return }
         withAnimation(reduceMotion ? nil : ShellNavigationMotion.screen) {
@@ -685,8 +914,11 @@ public struct SignedInShellView: View {
 
     private func openMailboxSearch() {
         store.closeReader()
+        aiInboxStore.closeDetail()
         withAnimation(searchAnimation) {
-            supplementalDestination = nil
+            if supplementalDestination == .todos {
+                supplementalDestination = nil
+            }
             navigationOpen = false
             commandPaletteOpen = false
             mailboxSearchOpen = true
@@ -704,9 +936,12 @@ public struct SignedInShellView: View {
     private func selectPrimaryNavigation(_ destination: ShellPrimaryNavigationDestination) {
         pendingCommandThreadID = nil
         store.closeReader()
+        aiInboxStore.closeDetail()
+        mailboxSearchText = ""
 
         withAnimation(reduceMotion ? nil : ShellNavigationMotion.screen) {
             navigationOpen = false
+            mailboxSearchOpen = false
             mailboxSearchFocusRequested = false
             supplementalDestination = destination.supplementalDestination
             if let mailboxDestination = destination.mailboxDestination {
@@ -764,12 +999,20 @@ public struct SignedInShellView: View {
         }
     }
 
-    private func closeReader() {
-        store.closeReader()
+    private func closeActiveReader() {
+        if activeAIMatter != nil {
+            aiReaderChromeProgress = 0
+            aiInboxOrganizeOpen = false
+            aiInboxStore.closeDetail()
+        } else {
+            store.closeReader()
+        }
     }
 
     private func select(_ destination: SignedInDestination) {
         pendingCommandThreadID = nil
+        aiReaderChromeProgress = 0
+        aiInboxStore.closeDetail()
         supplementalDestination = nil
         navigationOpen = false
         mailboxSearchFocusRequested = false
@@ -826,7 +1069,7 @@ public struct SignedInShellView: View {
                 mode: mode,
                 threadID: threadID,
                 sourceMessageID: sourceMessageID,
-                title: store.readerRow?.title ?? mode.title
+                title: activeAIMatter?.title ?? store.readerRow?.title ?? mode.title
             )
         )
     }
@@ -850,15 +1093,34 @@ public struct SignedInShellView: View {
                recoveryAccountUserID: recovery.accountUserID,
                currentAccountUserID: store.session?.user.id
            ) {
-            composer = MailComposerPresentation(
-                mode: recovery.mode,
-                threadID: recovery.threadID,
-                sourceMessageID: recovery.sourceMessageID,
-                title: recovery.title
-            )
+            if recovery.matches(requestedPresentation, accountUserID: store.session?.user.id) {
+                composer = recovery.presentation
+            } else {
+                pendingComposerPresentation = requestedPresentation
+            }
             return
         }
         recoveredComposerSnapshot = nil
+        composer = requestedPresentation
+    }
+
+    private func resumeRecoveredComposer() {
+        guard let recovery = recoveredComposerSnapshot,
+              recovery.belongs(to: store.session?.user.id) else {
+            pendingComposerPresentation = nil
+            return
+        }
+        pendingComposerPresentation = nil
+        composer = recovery.presentation
+    }
+
+    private func discardRecoveryAndPresentRequestedComposer() {
+        guard let requestedPresentation = pendingComposerPresentation else {
+            return
+        }
+        ComposerRecoveryStore.clear()
+        recoveredComposerSnapshot = nil
+        pendingComposerPresentation = nil
         composer = requestedPresentation
     }
 
@@ -874,22 +1136,18 @@ public struct SignedInShellView: View {
         let recovery = await ComposerRecoveryWriter.shared.load()
         guard !Task.isCancelled else { return }
 
-        let recoveredPresentation: MailComposerPresentation?
-        if let recovery, recovery.belongs(to: store.session?.user.id) {
+        if let recovery,
+           recovery.belongs(to: store.session?.user.id),
+           recovery.shouldRestore {
             recoveredComposerSnapshot = recovery
-            recoveredPresentation = MailComposerPresentation(
-                mode: recovery.mode,
-                threadID: recovery.threadID,
-                sourceMessageID: recovery.sourceMessageID,
-                title: recovery.title
-            )
         } else {
-            recoveredPresentation = nil
+            if recovery?.belongs(to: store.session?.user.id) == true {
+                await ComposerRecoveryWriter.shared.clear()
+            }
+            recoveredComposerSnapshot = nil
         }
 
-        let presentation = composerRecoveryLoadGate.complete(
-            recoveredPresentation: recoveredPresentation
-        )
+        let presentation = composerRecoveryLoadGate.complete()
         guard composer == nil, let presentation else { return }
         presentComposerAfterRecoveryLoad(presentation)
     }
@@ -900,10 +1158,13 @@ private enum ShellNavigationMotion {
 }
 
 enum ShellSupplementalDestination: Equatable {
+    case aiInbox
     case todos
 
     var primaryNavigationDestination: ShellPrimaryNavigationDestination {
         switch self {
+        case .aiInbox:
+            return .aiInbox
         case .todos:
             return .todos
         }
@@ -912,6 +1173,7 @@ enum ShellSupplementalDestination: Equatable {
 
 enum ShellPrimaryNavigationDestination: String, CaseIterable, Identifiable {
     case inbox = "Inbox"
+    case aiInbox = "AI Inbox"
     case starred = "Starred"
     case drafts = "Drafts"
     case sent = "Sent"
@@ -927,6 +1189,21 @@ enum ShellPrimaryNavigationDestination: String, CaseIterable, Identifiable {
 
     var title: String {
         rawValue
+    }
+
+    var symbolName: String {
+        switch self {
+        case .inbox: return "tray.full"
+        case .aiInbox: return "sparkles"
+        case .starred: return "star"
+        case .drafts: return "doc.text"
+        case .sent: return "paperplane"
+        case .spam: return "exclamationmark.octagon"
+        case .trash: return "trash"
+        case .archive: return "archivebox"
+        case .all: return "tray.2"
+        case .todos: return "checkmark.circle"
+        }
     }
 
     init?(mailboxDestination: SignedInDestination) {
@@ -968,13 +1245,15 @@ enum ShellPrimaryNavigationDestination: String, CaseIterable, Identifiable {
             return .archive
         case .all:
             return .all
-        case .todos:
+        case .aiInbox, .todos:
             return nil
         }
     }
 
     var supplementalDestination: ShellSupplementalDestination? {
         switch self {
+        case .aiInbox:
+            return .aiInbox
         case .todos:
             return .todos
         case .inbox, .starred, .drafts, .sent, .spam, .trash, .archive, .all:
@@ -982,6 +1261,67 @@ enum ShellPrimaryNavigationDestination: String, CaseIterable, Identifiable {
         }
     }
 
+}
+
+private struct ShellInboxModeSwitch: View {
+    let selection: ShellPrimaryNavigationDestination
+    let colorScheme: ColorScheme
+    let onSelect: (ShellPrimaryNavigationDestination) -> Void
+
+    private let destinations: [ShellPrimaryNavigationDestination] = [.inbox, .aiInbox]
+
+    var body: some View {
+        HStack(spacing: 20) {
+            ForEach(destinations) { destination in
+                let isSelected = selection == destination
+                Button {
+                    onSelect(destination)
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: destination.symbolName)
+                            .font(.system(size: 16, weight: .medium))
+                            .frame(width: 19)
+                            .accessibilityHidden(true)
+
+                        Text(destination.title)
+                            .font(ElectronicMailType.mailboxHeader(weight: isSelected ? .semibold : .medium))
+                    }
+                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                    .opacity(isSelected ? 1 : 0.5)
+                    .frame(width: 112)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Open \(destination.title)")
+                .accessibilityLabel(destination.title)
+                .accessibilityHint(isSelected ? "Currently selected" : "Switches to \(destination.title)")
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Inbox mode")
+    }
+}
+
+private struct AIReaderSubjectScrollEffect: ViewModifier {
+    let progress: CGFloat
+
+    func body(content: Content) -> some View {
+        let resolvedProgress = min(1, max(0, progress))
+        content
+            .offset(y: -18 * resolvedProgress)
+            .opacity(1 - resolvedProgress)
+            .mask {
+                LinearGradient(
+                    colors: [
+                        Color.black.opacity(1 - resolvedProgress),
+                        Color.black,
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+    }
 }
 
 private struct ShellHeaderTitle: View {
@@ -1061,6 +1401,20 @@ private struct ShellComposeButton: View {
     }
 }
 
+private struct ShellAIInboxSettingsButton: View {
+    let colorScheme: ColorScheme
+    let action: () -> Void
+
+    var body: some View {
+        ElectronicMailIconControl(
+            symbol: "gearshape",
+            accessibilityLabel: "AI Inbox Settings",
+            symbolOpacity: ElectronicMailControlMetrics.mailboxHeaderIconOpacity,
+            action: action
+        )
+    }
+}
+
 private struct ShellSearchButton: View {
     let colorScheme: ColorScheme
     let action: () -> Void
@@ -1117,12 +1471,23 @@ private struct ShellNavigationItem: View {
 
     var body: some View {
         Button(action: action) {
-            Text(destination.title)
-                .font(ElectronicMailMailboxType.navigationItem())
-                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                .opacity(isSelected ? 1 : 0.82)
-                .frame(height: ElectronicMailMailboxType.navigationRowHeight)
-                .contentShape(Rectangle())
+            HStack(spacing: 12) {
+                Image(systemName: destination.symbolName)
+                    .font(.system(size: 17, weight: .medium))
+                    .frame(width: 24, alignment: .center)
+                    .accessibilityHidden(true)
+
+                Text(destination.title)
+                    .font(ElectronicMailMailboxType.navigationItem())
+            }
+            .foregroundStyle(
+                isSelected
+                    ? ElectronicMailDesign.appleBlue
+                    : ElectronicMailDesign.primaryText(for: colorScheme)
+            )
+            .opacity(isSelected ? 1 : 0.82)
+            .frame(width: 280, height: ElectronicMailMailboxType.navigationRowHeight, alignment: .leading)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help(destination.title)
@@ -1922,6 +2287,21 @@ private struct MailComposerPresentation: Identifiable, Equatable {
     let threadID: String?
     let sourceMessageID: String?
     let title: String
+
+    var actionTitle: String {
+        switch mode {
+        case .compose:
+            return "Compose"
+        case .reply:
+            return "Reply"
+        case .replyAll:
+            return "Reply All"
+        case .forward:
+            return "Forward"
+        case .draft:
+            return "Open Draft"
+        }
+    }
 }
 
 private struct ComposerRecoverySnapshot: Codable, Equatable, @unchecked Sendable {
@@ -1935,6 +2315,7 @@ private struct ComposerRecoverySnapshot: Codable, Equatable, @unchecked Sendable
     let bccText: String
     let subject: String
     let bodyText: String
+    let bodyHTML: String?
     let clientSendID: String
     let serverSendID: String?
     let unresolvedSendAttempt: Bool?
@@ -1958,6 +2339,46 @@ private struct ComposerRecoverySnapshot: Codable, Equatable, @unchecked Sendable
             && mode == presentation.mode
             && threadID == presentation.threadID
             && sourceMessageID == presentation.sourceMessageID
+    }
+
+    var presentation: MailComposerPresentation {
+        MailComposerPresentation(
+            mode: mode,
+            threadID: threadID,
+            sourceMessageID: sourceMessageID,
+            title: title
+        )
+    }
+
+    var shouldRestore: Bool {
+        let isResponse = MailComposerPolicy.responseMode(for: mode) != nil
+        let hasEditedResponseField = isResponse
+            && (responseFieldProvenance.map { !$0.userEditedFields.isEmpty }
+                ?? legacyResponseFieldsMayContainEdits)
+        let authoredTextFields = isResponse
+            ? [bccText, bodyText]
+            : [toText, ccText, bccText, subject, bodyText]
+        return MailComposerPolicy.shouldRestoreRecovery(
+            mode: mode,
+            hasUnresolvedSendAttempt: unresolvedSendAttempt ?? false,
+            hasGmailDraft: gmailDraftID?.isEmpty == false,
+            hasEditedResponseField: hasEditedResponseField,
+            authoredTextFields: authoredTextFields,
+            attachmentCount: attachments.count + existingDraftAttachments.count
+        )
+    }
+
+    private var legacyResponseFieldsMayContainEdits: Bool {
+        switch mode {
+        case .forward:
+            return [toText, ccText].contains {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+        case .reply, .replyAll:
+            return true
+        case .compose, .draft:
+            return false
+        }
     }
 }
 
@@ -2293,12 +2714,36 @@ private enum ComposerFocusField: Hashable {
     case body
 }
 
+private struct ComposerFormattingCommand: Equatable {
+    let id = UUID()
+    let action: Action
+
+    enum Action: Equatable {
+        case fontName(String)
+        case fontSize(CGFloat)
+        case toggleBold
+        case toggleItalic
+        case toggleUnderline
+        case alignment(ComposerTextAlignment)
+        case bulletList
+    }
+}
+
+private enum ComposerTextAlignment: Equatable {
+    case left
+    case center
+    case right
+}
+
 private enum MailComposerLayout {
     static let contentLeadingInset: CGFloat = 52
     static let canvasHorizontalInset: CGFloat = 28
     static let fieldLabelWidth: CGFloat = 86
     static let fieldSpacing: CGFloat = 10
     static let valueLeadingInset: CGFloat = fieldLabelWidth + fieldSpacing
+    static let toolbarControlGap: CGFloat = 10
+    static let footerBottomInset: CGFloat = 20
+    static let footerReservedHeight: CGFloat = 88
 }
 
 private struct MailComposerSheet: View {
@@ -2316,7 +2761,13 @@ private struct MailComposerSheet: View {
     @State private var showsCopyFields = false
     @State private var subject = ""
     @State private var bodyText = ""
+    @State private var bodyHTML: String?
     @State private var statusText: String?
+    @State private var draftFailureToast: String?
+    @State private var draftFailureToastTask: Task<Void, Never>?
+    @State private var formattingCommand: ComposerFormattingCommand?
+    @State private var selectedFontName = "System"
+    @State private var selectedFontSize = 15
     @State private var sending = false
     @State private var savingDraft = false
     @State private var loadingDraft = false
@@ -2373,12 +2824,6 @@ private struct MailComposerSheet: View {
                 composerHeader(width: proxy.size.width)
 
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(composerHeaderSubtitle)
-                        .font(ElectronicMailComposerType.status())
-                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                        .lineLimit(1)
-                        .padding(.bottom, 14)
-
                 if loadingDraft {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
@@ -2424,15 +2869,13 @@ private struct MailComposerSheet: View {
                         placeholder: "Add recipients",
                         text: $ccText,
                         focus: .cc,
-                        usesTokenFill: true,
                         responseField: .cc
                     )
                     composerField(
                         "Bcc",
                         placeholder: "Add hidden recipients",
                         text: $bccText,
-                        focus: .bcc,
-                        usesTokenFill: true
+                        focus: .bcc
                     )
                 }
                 composerSubjectField
@@ -2454,14 +2897,11 @@ private struct MailComposerSheet: View {
 
                 composerAttachments
                     .padding(.leading, MailComposerLayout.valueLeadingInset)
-
-                composerFooter
-                    .padding(.top, 14)
                 }
                 .padding(.leading, MailComposerLayout.contentLeadingInset)
                 .padding(.horizontal, MailComposerLayout.canvasHorizontalInset)
                 .padding(.top, 18)
-                .padding(.bottom, 20)
+                .padding(.bottom, MailComposerLayout.footerReservedHeight)
                 .frame(
                     maxWidth: ElectronicMailControlMetrics.composerMaxWidth,
                     maxHeight: .infinity,
@@ -2470,8 +2910,22 @@ private struct MailComposerSheet: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+            .overlay(alignment: .bottom) {
+                composerFooter
+                    .padding(.leading, MailComposerLayout.contentLeadingInset)
+                    .padding(.horizontal, MailComposerLayout.canvasHorizontalInset)
+                    .frame(maxWidth: ElectronicMailControlMetrics.composerMaxWidth)
+                    .padding(.bottom, MailComposerLayout.footerBottomInset)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .overlay {
+            if let draftFailureToast {
+                ElectronicMailRefreshFailureToast(message: draftFailureToast)
+                    .padding(.bottom, 66)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(effectiveMode.title) composer")
         .task {
@@ -2495,6 +2949,7 @@ private struct MailComposerSheet: View {
         }
         .onChange(of: subject) { _, _ in scheduleAutosave() }
         .onChange(of: bodyText) { _, _ in scheduleAutosave() }
+        .onChange(of: bodyHTML) { _, _ in scheduleAutosave() }
         .onChange(of: attachments.map(\.id)) { _, _ in scheduleAutosave() }
         .onChange(of: existingDraftAttachments.map(\.id)) { _, _ in scheduleAutosave() }
         .onChange(of: preserveExistingDraftAttachments) { _, _ in scheduleAutosave() }
@@ -2504,6 +2959,7 @@ private struct MailComposerSheet: View {
             autosaveTask?.cancel()
             attachmentLoadTask?.cancel()
             sendTask?.cancel()
+            draftFailureToastTask?.cancel()
             sendTask = nil
             ElectronicMailComposerShutdownCoordinator.shared.unregister(id: shutdownRegistrationID)
             guard !composerResolved else { return }
@@ -2564,50 +3020,12 @@ private struct MailComposerSheet: View {
                 )
             },
             title: {
-                Group {
-                    if isResponseComposer {
-                        HStack(spacing: 8) {
-                            Text(effectiveMode.title)
-                                .font(.system(size: ElectronicMailComposerType.modeSize, weight: .semibold))
-                                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                                .accessibilityAddTraits(.isHeader)
-
-                            Menu {
-                                ForEach(MailComposerResponseTransitionPolicy.modes, id: \.rawValue) { mode in
-                                    Button {
-                                        requestResponseModeChange(mode)
-                                    } label: {
-                                        Label(
-                                            mode.title,
-                                            systemImage: mode == effectiveMode ? "checkmark" : mode.menuSymbol
-                                        )
-                                    }
-                                    .disabled(mode == effectiveMode)
-                                }
-                            } label: {
-                                Image(systemName: "chevron.down")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                                    .frame(
-                                        width: ElectronicMailControlMetrics.headerControlSize,
-                                        height: ElectronicMailControlMetrics.headerControlSize
-                                    )
-                                    .contentShape(Circle())
-                            }
-                            .menuIndicator(.hidden)
-                            .electronicMailGlassButton(role: .standard, shape: .circle)
-                            .disabled(responseModeControlsDisabled)
-                            .help("Choose Reply, Reply All, or Forward")
-                            .accessibilityLabel(Text("Response type, \(effectiveMode.title)"))
-                        }
-                    } else {
-                        Text(composerDisplayTitle)
-                            .font(.system(size: ElectronicMailComposerType.modeSize, weight: .semibold))
-                            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                            .accessibilityAddTraits(.isHeader)
-                    }
-                }
-                .offset(y: ElectronicMailControlMetrics.composerHeaderContentOffsetY)
+                Text(composerDisplayTitle)
+                    .font(.system(size: ElectronicMailComposerType.modeSize, weight: .semibold))
+                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .accessibilityAddTraits(.isHeader)
             },
             trailing: {
                 ElectronicMailIconControl(
@@ -2619,57 +3037,12 @@ private struct MailComposerSheet: View {
                 .disabled(composerControlsDisabled || savingDraft || loadingDraft)
             }
         )
-        .frame(
-            height: ElectronicMailControlMetrics.headerHeight
-                + ElectronicMailControlMetrics.composerHeaderContentOffsetY,
-            alignment: .top
-        )
+        .frame(height: ElectronicMailControlMetrics.headerHeight, alignment: .top)
     }
 
     private var composerDisplayTitle: String {
         let typedSubject = subject.trimmingCharacters(in: .whitespacesAndNewlines)
-        return typedSubject.isEmpty ? presentation.title : typedSubject
-    }
-
-    private var composerHeaderStatus: String {
-        if loadingDraft {
-            return "Loading draft…"
-        }
-        if savingDraft {
-            return "Saving draft…"
-        }
-        return gmailDraftID == nil ? "New draft" : "Saved just now"
-    }
-
-    private var composerHeaderSubtitle: String {
-        guard isResponseComposer,
-              effectiveMode != .forward,
-              let recipient = responseHeaderRecipientName else {
-            return composerHeaderStatus
-        }
-        return "to \(recipient)  ·  \(composerHeaderStatus)"
-    }
-
-    private var responseHeaderRecipientName: String? {
-        let messages = store.readerThread?.messages ?? []
-        guard let message = messages.first(where: { $0.id == presentation.sourceMessageID })
-            ?? messages.max(by: { $0.receivedAt < $1.receivedAt }),
-              let rawValue = message.replyTo ?? message.fromAddress else {
-            return nil
-        }
-
-        let candidate = rawValue
-            .split(separator: "<", maxSplits: 1)
-            .first
-            .map(String.init) ?? rawValue
-        let cleaned = candidate
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        guard !cleaned.isEmpty else { return nil }
-        if cleaned.contains("@") {
-            return cleaned
-        }
-        return cleaned
+        return typedSubject.isEmpty ? "New Mail 1" : typedSubject
     }
 
     private var composerFromField: some View {
@@ -2679,16 +3052,7 @@ private struct MailComposerSheet: View {
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                 .frame(width: MailComposerLayout.fieldLabelWidth, alignment: .leading)
 
-            Circle()
-                .fill(ElectronicMailDesign.readerAvatarFill(for: colorScheme, highlighted: false))
-                .frame(width: 30, height: 30)
-                .overlay {
-                    Text(currentUserInitial)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                }
-
-            Text("You")
+            Text(currentSenderName)
                 .font(ElectronicMailComposerType.value())
                 .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
 
@@ -2700,10 +3064,6 @@ private struct MailComposerSheet: View {
                     .truncationMode(.middle)
             }
 
-            Image(systemName: "chevron.down")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-
             Spacer(minLength: 0)
         }
         .frame(height: ElectronicMailControlMetrics.composerFieldHeight)
@@ -2713,7 +3073,7 @@ private struct MailComposerSheet: View {
                 .frame(height: 1)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("From You, \(store.session?.user.email ?? "")")
+        .accessibilityLabel("From \(currentSenderName), \(store.session?.user.email ?? "")")
     }
 
     private var composerToField: some View {
@@ -2728,23 +3088,8 @@ private struct MailComposerSheet: View {
                 .textFieldStyle(.plain)
                 .font(ElectronicMailComposerType.value())
                 .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                .padding(.horizontal, toText.isEmpty ? 0 : 9)
                 .frame(minWidth: 0, maxWidth: .infinity, minHeight: 30, maxHeight: 30, alignment: .leading)
                 .layoutPriority(1)
-                .background(alignment: .leading) {
-                    if !toText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        GeometryReader { proxy in
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(ElectronicMailDesign.composerTokenFill(for: colorScheme))
-                                .frame(
-                                    width: min(
-                                        recipientFieldWidth(text: toText, placeholder: "Add recipients"),
-                                        proxy.size.width
-                                    )
-                                )
-                        }
-                    }
-                }
                 .accessibilityLabel("To")
                 .focused($focusedField, equals: .to)
                 .onSubmit { advanceFocus(after: .to) }
@@ -2814,12 +3159,11 @@ private struct MailComposerSheet: View {
         }
     }
 
-    private var currentUserInitial: String {
-        let source = store.session?.user.displayName
+    private var currentSenderName: String {
+        store.session?.user.displayName
             ?? store.session?.user.firstName
             ?? store.session?.user.email
             ?? "You"
-        return source.first.map { String($0).uppercased() } ?? "Y"
     }
 
     private var attachmentSummary: String {
@@ -2837,23 +3181,20 @@ private struct MailComposerSheet: View {
                 Text(editorPlaceholder)
                     .font(ElectronicMailComposerType.body())
                     .foregroundStyle(ElectronicMailDesign.tertiaryText(for: colorScheme))
-                    // TextEditor adds five points of native line-fragment
-                    // padding inside our seven-point horizontal inset. Match
-                    // that insertion origin so the placeholder and caret share
-                    // the same first baseline.
                     .padding(.horizontal, ElectronicMailComposerEditorLayout.placeholderHorizontalInset)
                     .padding(.vertical, ElectronicMailComposerEditorLayout.placeholderVerticalInset)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
 
-            TextEditor(text: $bodyText)
-                .focused($focusedField, equals: .body)
-                .font(ElectronicMailComposerType.body())
-                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                .scrollContentBackground(.hidden)
-                .padding(.horizontal, ElectronicMailComposerEditorLayout.textEditorHorizontalInset)
-                .padding(.vertical, ElectronicMailComposerEditorLayout.textEditorVerticalInset)
+            ComposerRichTextEditor(
+                text: $bodyText,
+                html: $bodyHTML,
+                command: formattingCommand,
+                shouldFocus: focusedField == .body,
+                colorScheme: colorScheme,
+                onFocus: { focusedField = .body }
+            )
                 .accessibilityLabel("Message body")
         }
         .frame(minHeight: 220, maxHeight: .infinity)
@@ -2863,94 +3204,40 @@ private struct MailComposerSheet: View {
 
     private var composerFooter: some View {
         HStack(spacing: 12) {
-            if let footerStatusText {
-                Text(footerStatusText == "Draft saved" ? "Saved just now" : footerStatusText)
-                    .font(ElectronicMailComposerType.status())
-                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+            composerFormattingToolbar
+
+            if statusText?.localizedCaseInsensitiveContains("permission") == true {
+                Button {
+                    Task { await reauthorize() }
+                } label: {
+                    if reauthorizing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text("Grant permission")
+                    }
+                }
+                .padding(.horizontal, 16)
+                .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
+                .font(ElectronicMailComposerType.control(weight: .semibold))
+                .electronicMailGlassButton(role: .standard, shape: .capsule)
+                .disabled(reauthorizing)
             }
 
             Spacer(minLength: 12)
 
             ElectronicMailGlassGroup(spacing: ElectronicMailControlMetrics.actionGap) {
                 HStack(spacing: ElectronicMailControlMetrics.actionGap) {
-                    Button {
-                        chooseAttachments()
-                    } label: {
-                        HStack(spacing: 6) {
-                            if loadingAttachments {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Image(systemName: "paperclip")
-                                    .font(.system(size: ElectronicMailControlMetrics.headerSymbolSize, weight: .medium))
-                            }
-                        }
-                        .frame(
-                            width: ElectronicMailControlMetrics.actionHeight,
-                            height: ElectronicMailControlMetrics.actionHeight
-                        )
-                        .contentShape(Circle())
-                    }
-                    .font(ElectronicMailComposerType.control(weight: .semibold))
-                    .electronicMailGlassButton(role: .standard, shape: .circle)
-                    .disabled(composerControlsDisabled || loadingAttachments)
-                    .accessibilityLabel(loadingAttachments ? "Preparing files" : "Attach files")
-                    .help("Attach files")
-
                     Menu {
-                        Button {
-                        } label: {
-                            Label("Plain text", systemImage: "checkmark")
+                        Button("Send now") {
+                            startSend(allowEmptySubject: false)
                         }
-                        .disabled(true)
-                    } label: {
-                        Text("Formatting")
-                            .padding(.horizontal, 16)
-                            .frame(minWidth: 104, minHeight: ElectronicMailControlMetrics.actionHeight)
-                            .contentShape(Capsule())
-                    }
-                    .menuIndicator(.hidden)
-                    .font(ElectronicMailComposerType.control(weight: .medium))
-                    .electronicMailGlassButton(role: .standard, shape: .capsule)
-                    .help("Plain-text message formatting")
-                    .disabled(composerControlsDisabled)
+                        .keyboardShortcut(.return, modifiers: [.command])
 
-                    if statusText?.localizedCaseInsensitiveContains("permission") == true {
-                        Button {
-                            Task { await reauthorize() }
-                        } label: {
-                            if reauthorizing {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Text("Grant permission")
-                            }
+                        Divider()
+
+                        Button("Schedule for later") {
+                            showDraftFailureToast("Scheduled sending is not available yet. Your draft remains saved.")
                         }
-                        .padding(.horizontal, 16)
-                        .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
-                        .font(ElectronicMailComposerType.control(weight: .semibold))
-                        .electronicMailGlassButton(role: .standard, shape: .capsule)
-                        .disabled(reauthorizing)
-                    }
-
-                    Button {
-                        confirmDeleteDraft = true
-                    } label: {
-                        Image(systemName: "trash")
-                            .font(.system(size: 16, weight: .medium))
-                            .frame(
-                                width: ElectronicMailControlMetrics.actionHeight,
-                                height: ElectronicMailControlMetrics.actionHeight
-                            )
-                            .contentShape(Circle())
-                    }
-                    .electronicMailGlassButton(role: .standard, shape: .circle)
-                    .help("Delete draft")
-                    .accessibilityLabel("Delete draft")
-                    .disabled(composerControlsDisabled || savingDraft || loadingDraft)
-
-                    Button {
-                        startSend(allowEmptySubject: false)
                     } label: {
                         if sending {
                             ProgressView().controlSize(.small)
@@ -2962,14 +3249,14 @@ private struct MailComposerSheet: View {
                                     .font(.system(size: 10, weight: .semibold))
                             }
                             .padding(.horizontal, 18)
-                            .frame(minWidth: 88, minHeight: ElectronicMailControlMetrics.actionHeight)
+                            .frame(minWidth: 96, minHeight: ElectronicMailControlMetrics.actionHeight)
                             .contentShape(Capsule())
                         }
                     }
+                    .menuIndicator(.hidden)
                     .font(ElectronicMailComposerType.control(weight: .semibold))
                     .electronicMailGlassButton(role: .prominent, shape: .capsule)
                     .disabled(!canSend)
-                    .keyboardShortcut(.return, modifiers: [.command])
                 }
             }
         }
@@ -2980,6 +3267,146 @@ private struct MailComposerSheet: View {
                 .fill(ElectronicMailDesign.divider(for: colorScheme))
                 .frame(height: 1)
         }
+    }
+
+    private var composerFormattingToolbar: some View {
+        ElectronicMailGlassGroup(spacing: MailComposerLayout.toolbarControlGap) {
+            HStack(spacing: MailComposerLayout.toolbarControlGap) {
+                Menu {
+                    ForEach(["System", "Helvetica Neue", "Arial", "Georgia", "Courier New"], id: \.self) { name in
+                        Button {
+                            selectedFontName = name
+                            issueFormattingCommand(.fontName(name))
+                        } label: {
+                            Label(name, systemImage: name == selectedFontName ? "checkmark" : "textformat")
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Text(selectedFontName == "Helvetica Neue" ? "Helvetica" : selectedFontName)
+                            .lineLimit(1)
+
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .font(.system(size: 13, weight: .semibold))
+                    .padding(.horizontal, 14)
+                    .frame(minWidth: 96, minHeight: ElectronicMailControlMetrics.actionHeight)
+                    .contentShape(Capsule())
+                }
+                .menuIndicator(.hidden)
+                .electronicMailGlassControlSurface(shape: .capsule)
+                .help("Font family")
+                .accessibilityLabel("Font family, \(selectedFontName)")
+
+                Menu {
+                    ForEach([12, 14, 15, 16, 18, 24], id: \.self) { size in
+                        Button {
+                            selectedFontSize = size
+                            issueFormattingCommand(.fontSize(CGFloat(size)))
+                        } label: {
+                            Label("\(size) pt", systemImage: size == selectedFontSize ? "checkmark" : "textformat.size")
+                        }
+                    }
+                } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: 0) {
+                        Text("A")
+                            .font(.system(size: composerToolbarSymbolSize, weight: .semibold))
+                        Text("a")
+                            .font(.system(size: composerToolbarSymbolSize - 6, weight: .semibold))
+                    }
+                    .frame(
+                        width: ElectronicMailControlMetrics.actionHeight,
+                        height: ElectronicMailControlMetrics.actionHeight
+                    )
+                    .contentShape(Circle())
+                }
+                .menuIndicator(.hidden)
+                .electronicMailGlassControlSurface(shape: .circle)
+                .help("Font size: \(selectedFontSize) points")
+                .accessibilityLabel("Font size, \(selectedFontSize) points")
+
+                formattingButton(symbol: "bold", label: "Bold", action: .toggleBold)
+                formattingButton(symbol: "italic", label: "Italic", action: .toggleItalic)
+                formattingButton(symbol: "underline", label: "Underline", action: .toggleUnderline)
+
+                Menu {
+                    Button("Align Left") { issueFormattingCommand(.alignment(.left)) }
+                    Button("Align Center") { issueFormattingCommand(.alignment(.center)) }
+                    Button("Align Right") { issueFormattingCommand(.alignment(.right)) }
+                } label: {
+                    Image(systemName: "text.alignleft")
+                        .font(.system(size: composerToolbarSymbolSize, weight: .semibold))
+                        .symbolRenderingMode(.monochrome)
+                        .frame(
+                            width: ElectronicMailControlMetrics.actionHeight,
+                            height: ElectronicMailControlMetrics.actionHeight
+                        )
+                        .contentShape(Circle())
+                }
+                .menuIndicator(.hidden)
+                .electronicMailGlassControlSurface(shape: .circle)
+                .help("Alignment")
+                .accessibilityLabel("Text alignment")
+
+                formattingButton(symbol: "list.bullet", label: "Bulleted list", action: .bulletList)
+
+                Button {
+                    chooseAttachments()
+                } label: {
+                    ZStack {
+                        if loadingAttachments {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "paperclip")
+                                .font(.system(size: composerToolbarSymbolSize, weight: .semibold))
+                                .symbolRenderingMode(.monochrome)
+                        }
+                    }
+                    .frame(
+                        width: ElectronicMailControlMetrics.actionHeight,
+                        height: ElectronicMailControlMetrics.actionHeight
+                    )
+                    .contentShape(Circle())
+                }
+                .electronicMailGlassControlSurface(shape: .circle)
+                .disabled(composerControlsDisabled || loadingAttachments)
+                .help("Attach files")
+                .accessibilityLabel(loadingAttachments ? "Preparing files" : "Attach files")
+            }
+        }
+        .disabled(composerControlsDisabled)
+    }
+
+    private var composerToolbarSymbolSize: CGFloat {
+        ElectronicMailControlMetrics.headerSymbolSize
+    }
+
+    private func formattingButton(
+        symbol: String,
+        label: String,
+        action: ComposerFormattingCommand.Action
+    ) -> some View {
+        Button {
+            issueFormattingCommand(action)
+        } label: {
+            Image(systemName: symbol)
+                .font(.system(size: composerToolbarSymbolSize, weight: .semibold))
+                .symbolRenderingMode(.monochrome)
+                .frame(
+                    width: ElectronicMailControlMetrics.actionHeight,
+                    height: ElectronicMailControlMetrics.actionHeight
+                )
+                .contentShape(Circle())
+        }
+        .electronicMailGlassControlSurface(shape: .circle)
+        .help(label)
+        .accessibilityLabel(label)
+    }
+
+    private func issueFormattingCommand(_ action: ComposerFormattingCommand.Action) {
+        formattingCommand = ComposerFormattingCommand(action: action)
+        focusedField = .body
     }
 
     private var effectiveMode: MailComposerMode {
@@ -2997,19 +3424,6 @@ private struct MailComposerSheet: View {
     private var responseModeControlsDisabled: Bool {
         composerControlsDisabled
             || unresolvedSendAttempt
-    }
-
-    private var footerStatusText: String? {
-        if savingDraft {
-            return "Saving…"
-        }
-        if let statusText, !statusText.isEmpty {
-            return statusText
-        }
-        if gmailDraftID != nil {
-            return "Draft saved"
-        }
-        return nil
     }
 
     private var editorPlaceholder: String {
@@ -3053,6 +3467,7 @@ private struct MailComposerSheet: View {
             bccText,
             subject,
             bodyText,
+            bodyHTML ?? "",
             attachments.map { "\($0.upload.filename):\($0.byteCount)" }.joined(separator: "|"),
             existingDraftAttachments.map(\.attachmentID).joined(separator: "|"),
             preserveExistingDraftAttachments ? "preserve" : "replace",
@@ -3090,7 +3505,6 @@ private struct MailComposerSheet: View {
         placeholder: String,
         text: Binding<String>,
         focus: ComposerFocusField,
-        usesTokenFill: Bool = false,
         responseField: MailComposerResponseField? = nil
     ) -> some View {
         HStack(alignment: .center, spacing: MailComposerLayout.fieldSpacing) {
@@ -3103,23 +3517,8 @@ private struct MailComposerSheet: View {
                 .textFieldStyle(.plain)
                 .font(ElectronicMailComposerType.value())
                 .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                .padding(.horizontal, usesTokenFill ? 9 : 0)
                 .frame(minWidth: 0, maxWidth: .infinity, minHeight: 28, maxHeight: 28, alignment: .leading)
                 .layoutPriority(1)
-                .background(alignment: .leading) {
-                    if usesTokenFill, !text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        GeometryReader { proxy in
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(ElectronicMailDesign.composerTokenFill(for: colorScheme))
-                                .frame(
-                                    width: min(
-                                        recipientFieldWidth(text: text.wrappedValue, placeholder: placeholder),
-                                        proxy.size.width
-                                    )
-                                )
-                        }
-                    }
-                }
                 .accessibilityLabel(label)
                 .focused($focusedField, equals: focus)
                 .onSubmit { advanceFocus(after: focus) }
@@ -3193,11 +3592,6 @@ private struct MailComposerSheet: View {
                 }
             }
         )
-    }
-
-    private func recipientFieldWidth(text: String, placeholder: String) -> CGFloat {
-        let source = text.isEmpty ? placeholder : text
-        return min(max(CGFloat(source.count) * 7.4 + 24, 150), 460)
     }
 
     private func advanceFocus(after field: ComposerFocusField) {
@@ -3382,6 +3776,7 @@ private struct MailComposerSheet: View {
                 bccText = draft.bcc.joined(separator: ", ")
                 subject = MailComposerPolicy.sanitizedSubject(draft.subject)
                 bodyText = draft.bodyText
+                bodyHTML = draft.bodyHTML
                 existingDraftAttachments = draft.attachments
                 statusText = "Draft loaded."
                 draftChangeTracker.synchronize(fingerprint: draftFingerprint)
@@ -3421,6 +3816,7 @@ private struct MailComposerSheet: View {
         bccText = recovery.bccText
         subject = MailComposerPolicy.sanitizedSubject(recovery.subject)
         bodyText = recovery.bodyText
+        bodyHTML = recovery.bodyHTML
         clientSendID = recovery.clientSendID
         serverSendID = recovery.serverSendID
         unresolvedSendAttempt = recovery.unresolvedSendAttempt ?? false
@@ -3482,6 +3878,7 @@ private struct MailComposerSheet: View {
             bccText: bccText,
             subject: MailComposerPolicy.sanitizedSubject(subject),
             bodyText: bodyText,
+            bodyHTML: bodyHTML,
             clientSendID: clientSendID,
             serverSendID: serverSendID,
             unresolvedSendAttempt: unresolvedSendAttempt,
@@ -3574,7 +3971,7 @@ private struct MailComposerSheet: View {
                     bcc: parsedAddresses(bccText),
                     subject: MailComposerPolicy.sanitizedSubject(subject),
                     bodyText: bodyText,
-                    bodyHTML: nil,
+                    bodyHTML: bodyHTML,
                     attachments: draftAttachmentPayload,
                     retainedAttachmentIDs: retainedDraftAttachmentIDs,
                     responseMode: responseMode,
@@ -3587,7 +3984,11 @@ private struct MailComposerSheet: View {
             )
             guard MailComposerPolicy.shouldApplyDraftSaveResponse(state: response.state) else {
                 if !sending {
-                    statusText = response.error ?? "Draft save failed."
+                    let message = response.error ?? "Draft could not be saved."
+                    statusText = message
+                    if response.state == .failed {
+                        showDraftFailureToast(message)
+                    }
                 }
                 return response
             }
@@ -3610,8 +4011,25 @@ private struct MailComposerSheet: View {
             return nil
         } catch {
             guard !Task.isCancelled else { return nil }
-            statusText = "Draft was not saved: \(error.localizedDescription)"
+            let message = "Draft could not be saved. \(error.localizedDescription)"
+            statusText = message
+            showDraftFailureToast(message)
             return nil
+        }
+    }
+
+    @MainActor
+    private func showDraftFailureToast(_ message: String) {
+        draftFailureToastTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.15)) {
+            draftFailureToast = message
+        }
+        draftFailureToastTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(8))
+            guard !Task.isCancelled, draftFailureToast == message else { return }
+            withAnimation(.easeInOut(duration: 0.15)) {
+                draftFailureToast = nil
+            }
         }
     }
 
@@ -4136,6 +4554,282 @@ private extension MailComposerMode {
         }
     }
 
+}
+
+private struct ComposerRichTextEditor: NSViewRepresentable {
+    @Binding var text: String
+    @Binding var html: String?
+    let command: ComposerFormattingCommand?
+    let shouldFocus: Bool
+    let colorScheme: ColorScheme
+    let onFocus: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+
+        let textView = NSTextView()
+        textView.delegate = context.coordinator
+        textView.isRichText = true
+        textView.importsGraphics = false
+        textView.allowsUndo = true
+        textView.drawsBackground = false
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainerInset = NSSize(
+            width: ElectronicMailComposerEditorLayout.placeholderHorizontalInset,
+            height: ElectronicMailComposerEditorLayout.placeholderVerticalInset
+        )
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.font = NSFont.systemFont(ofSize: ElectronicMailComposerType.bodySize)
+        textView.textColor = .textColor
+        textView.insertionPointColor = .textColor
+
+        scrollView.documentView = textView
+        context.coordinator.textView = textView
+        context.coordinator.loadModel(text: text, html: html)
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+        context.coordinator.parent = self
+        textView.textColor = .textColor
+        textView.insertionPointColor = .textColor
+
+        let signature = Coordinator.ModelSignature(text: text, html: html)
+        if signature != context.coordinator.modelSignature {
+            context.coordinator.loadModel(text: text, html: html)
+        }
+
+        if let command,
+           command.id != context.coordinator.lastCommandID {
+            context.coordinator.lastCommandID = command.id
+            context.coordinator.apply(command.action)
+        }
+
+        if shouldFocus, textView.window?.firstResponder !== textView {
+            Task { @MainActor in
+                textView.window?.makeFirstResponder(textView)
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        struct ModelSignature: Equatable {
+            let text: String
+            let html: String?
+        }
+
+        var parent: ComposerRichTextEditor
+        weak var textView: NSTextView?
+        var modelSignature: ModelSignature?
+        var lastCommandID: UUID?
+        private var applyingModel = false
+
+        init(parent: ComposerRichTextEditor) {
+            self.parent = parent
+        }
+
+        func loadModel(text: String, html: String?) {
+            guard let textView else { return }
+            applyingModel = true
+            defer { applyingModel = false }
+
+            let attributedText: NSAttributedString
+            if let html,
+               !html.isEmpty,
+               let data = html.data(using: .utf8),
+               let decoded = try? NSAttributedString(
+                   data: data,
+                   options: [
+                       .documentType: NSAttributedString.DocumentType.html,
+                       .characterEncoding: String.Encoding.utf8.rawValue,
+                   ],
+                   documentAttributes: nil
+               ) {
+                attributedText = decoded
+            } else {
+                attributedText = NSAttributedString(
+                    string: text,
+                    attributes: [.font: NSFont.systemFont(ofSize: ElectronicMailComposerType.bodySize)]
+                )
+            }
+
+            let displayText = NSMutableAttributedString(attributedString: attributedText)
+            if displayText.length > 0 {
+                let fullRange = NSRange(location: 0, length: displayText.length)
+                displayText.removeAttribute(.foregroundColor, range: fullRange)
+                displayText.addAttribute(.foregroundColor, value: NSColor.textColor, range: fullRange)
+            }
+            textView.textStorage?.setAttributedString(displayText)
+            textView.typingAttributes[.font] = NSFont.systemFont(ofSize: ElectronicMailComposerType.bodySize)
+            textView.setSelectedRange(NSRange(location: attributedText.length, length: 0))
+            modelSignature = ModelSignature(text: text, html: html)
+        }
+
+        func textDidBeginEditing(_ notification: Notification) {
+            parent.onFocus()
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard !applyingModel else { return }
+            synchronizeModel()
+        }
+
+        func apply(_ action: ComposerFormattingCommand.Action) {
+            guard let textView else { return }
+            textView.window?.makeFirstResponder(textView)
+
+            switch action {
+            case .fontName(let name):
+                transformFonts { font in
+                    if name == "System" {
+                        return NSFont.systemFont(ofSize: font.pointSize)
+                    }
+                    return NSFont(name: name, size: font.pointSize) ?? font
+                }
+            case .fontSize(let size):
+                transformFonts { font in
+                    NSFontManager.shared.convert(font, toSize: size)
+                }
+            case .toggleBold:
+                toggleFontTrait(.boldFontMask)
+            case .toggleItalic:
+                toggleFontTrait(.italicFontMask)
+            case .toggleUnderline:
+                toggleUnderline()
+            case .alignment(let alignment):
+                switch alignment {
+                case .left:
+                    textView.alignLeft(nil)
+                case .center:
+                    textView.alignCenter(nil)
+                case .right:
+                    textView.alignRight(nil)
+                }
+            case .bulletList:
+                toggleBulletList()
+            }
+            synchronizeModel()
+        }
+
+        private func transformFonts(_ transform: (NSFont) -> NSFont) {
+            guard let textView, let storage = textView.textStorage else { return }
+            let selectedRange = textView.selectedRange()
+            if selectedRange.length == 0 {
+                let current = textView.typingAttributes[.font] as? NSFont
+                    ?? textView.font
+                    ?? NSFont.systemFont(ofSize: ElectronicMailComposerType.bodySize)
+                textView.typingAttributes[.font] = transform(current)
+                return
+            }
+
+            var updates: [(NSRange, NSFont)] = []
+            storage.enumerateAttribute(.font, in: selectedRange) { value, range, _ in
+                let font = value as? NSFont
+                    ?? NSFont.systemFont(ofSize: ElectronicMailComposerType.bodySize)
+                updates.append((range, transform(font)))
+            }
+            storage.beginEditing()
+            for (range, font) in updates {
+                storage.addAttribute(.font, value: font, range: range)
+            }
+            storage.endEditing()
+        }
+
+        private func toggleFontTrait(_ trait: NSFontTraitMask) {
+            let manager = NSFontManager.shared
+            transformFonts { font in
+                if manager.traits(of: font).contains(trait) {
+                    return manager.convert(font, toNotHaveTrait: trait)
+                }
+                return manager.convert(font, toHaveTrait: trait)
+            }
+        }
+
+        private func toggleUnderline() {
+            guard let textView, let storage = textView.textStorage else { return }
+            let selectedRange = textView.selectedRange()
+            if selectedRange.length == 0 {
+                let current = textView.typingAttributes[.underlineStyle] as? Int ?? 0
+                textView.typingAttributes[.underlineStyle] = current == 0
+                    ? NSUnderlineStyle.single.rawValue
+                    : 0
+                return
+            }
+            let current = storage.attribute(
+                .underlineStyle,
+                at: selectedRange.location,
+                effectiveRange: nil
+            ) as? Int ?? 0
+            storage.addAttribute(
+                .underlineStyle,
+                value: current == 0 ? NSUnderlineStyle.single.rawValue : 0,
+                range: selectedRange
+            )
+        }
+
+        private func toggleBulletList() {
+            guard let textView else { return }
+            let source = textView.string as NSString
+            let selection = textView.selectedRange()
+            let paragraphRange = source.paragraphRange(for: selection)
+            let paragraph = source.substring(with: paragraphRange)
+            let lines = paragraph.split(separator: "\n", omittingEmptySubsequences: false)
+            let allBulleted = lines.allSatisfy { $0.hasPrefix("• ") || $0.isEmpty }
+            let replacement = lines.map { line -> String in
+                if line.isEmpty { return "" }
+                if allBulleted { return String(line.dropFirst(2)) }
+                return line.hasPrefix("• ") ? String(line) : "• \(line)"
+            }
+            .joined(separator: "\n")
+            textView.insertText(replacement, replacementRange: paragraphRange)
+        }
+
+        private func synchronizeModel() {
+            guard let textView else { return }
+            let plainText = textView.string
+            let html = exportedHTML(from: textView.attributedString())
+            modelSignature = ModelSignature(text: plainText, html: html)
+            if parent.text != plainText {
+                parent.text = plainText
+            }
+            if parent.html != html {
+                parent.html = html
+            }
+        }
+
+        private func exportedHTML(from attributedString: NSAttributedString) -> String? {
+            guard attributedString.length > 0 else { return nil }
+            let exportCopy = NSMutableAttributedString(attributedString: attributedString)
+            exportCopy.removeAttribute(
+                .foregroundColor,
+                range: NSRange(location: 0, length: exportCopy.length)
+            )
+            guard let data = try? exportCopy.data(
+                      from: NSRange(location: 0, length: exportCopy.length),
+                      documentAttributes: [
+                          .documentType: NSAttributedString.DocumentType.html,
+                          .characterEncoding: String.Encoding.utf8.rawValue,
+                      ]
+                  ) else {
+                return nil
+            }
+            return String(data: data, encoding: .utf8)
+        }
+    }
 }
 
 private struct ComposerKeyboardCapture: NSViewRepresentable {

@@ -148,6 +148,8 @@ public enum ElectronicMailControlMetrics {
     /// centered window before the ready inbox unfolds into the main workspace.
     public static let onboardingWindowWidth: CGFloat = 680
     public static let onboardingWindowHeight: CGFloat = 520
+    public static let mainWindowWidth: CGFloat = 1512
+    public static let mainWindowHeight: CGFloat = 918
     public static let mainWindowBackdropInset: CGFloat = 24
     public static let headerHeight: CGFloat = 64
     public static let headerCenterY: CGFloat = headerHeight / 2
@@ -174,11 +176,30 @@ public enum ElectronicMailControlMetrics {
     /// Shared vertical gap for the Reader's two-line information groups:
     /// subject/metadata and sender/date.
     public static let readerTwoLineGap: CGFloat = 6
-    /// The Reader subject begins below the toolbar controls instead of sharing
-    /// their upper edge. Back and action controls keep their existing position.
-    public static let readerHeaderContentOffsetY: CGFloat = 14
-    /// Compose uses the same page-start rhythm as the Reader.
-    public static let composerHeaderContentOffsetY: CGFloat = readerHeaderContentOffsetY
+    /// Reader subjects may wrap when the action rail leaves insufficient room,
+    /// but remain compact enough to preserve the conversation hierarchy.
+    public static let readerSubjectLineLimit = 2
+    /// The subject's first text line begins on the toolbar controls' optical
+    /// center line, matching the Reader's original composition.
+    public static let readerHeaderContentOffsetY: CGFloat = 10
+    public static let readerResponseTopSpacing: CGFloat = 28
+    public static let readerResponseBottomSpacing: CGFloat = 48
+    /// Reader response controls are viewport chrome, not message content.
+    /// Keep the group a stable distance from the lower window edge.
+    public static let readerFloatingActionsBottomInset: CGFloat = 40
+    public static let readerFixedActionsReservedHeight: CGFloat =
+        actionHeight + readerResponseTopSpacing + readerResponseBottomSpacing
+    /// The Details disclosure belongs to sender metadata, so it is quieter
+    /// than the adjacent date instead of reading as an accent-colored action.
+    public static let readerDetailsLabelOpacity: CGFloat = 5.0 / 7.0
+    /// Once conversation content starts moving beneath the fixed reader
+    /// header, soften the clipped edge instead of letting rows disappear on a
+    /// hard horizontal line.
+    public static let readerScrollFadeHeight: CGFloat = 72
+    public static let readerScrollFadeActivationDistance: CGFloat = 16
+    public static let readerScrollFadeTopInset: CGFloat =
+        headerHeight + readerHeaderContentOffsetY
+    public static let composerHeaderContentOffsetY: CGFloat = 14
     /// Reader content begins below the fixed toolbar, with enough breathing
     /// room that the subject reads as page content instead of another control.
     public static let readerContentTop: CGFloat = 20
@@ -209,6 +230,12 @@ public enum ElectronicMailControlMetrics {
         let availableWidth = max(1, containerWidth - horizontalPadding * 2)
         let contentWidth = min(maxContentWidth, availableWidth)
         return max(headerTitleLeading, (containerWidth - contentWidth) / 2 + contentInset)
+    }
+
+    public static func readerActionRailWidth(controlCount: Int) -> CGFloat {
+        guard controlCount > 0 else { return 0 }
+        return CGFloat(controlCount) * headerControlSize
+            + CGFloat(controlCount - 1) * readerActionGap
     }
 }
 
@@ -424,6 +451,16 @@ extension View {
         modifier(ElectronicMailGlassButtonModifier(role: role, shape: shape))
     }
 
+    /// Applies one explicit interactive glass surface to mixed control types.
+    /// Unlike `GlassButtonStyle`, this keeps `Menu` triggers and `Button`s
+    /// visually identical because the effect is resolved from the laid-out
+    /// control geometry instead of the control's platform context.
+    func electronicMailGlassControlSurface(
+        shape: ElectronicMailGlassShape
+    ) -> some View {
+        modifier(ElectronicMailGlassControlSurfaceModifier(shape: shape))
+    }
+
     func electronicMailGlassPanel(
         shape: ElectronicMailGlassShape = .panel(radius: 16)
     ) -> some View {
@@ -432,6 +469,77 @@ extension View {
 
     func electronicMailFloatingAction(role: ElectronicMailFloatingActionRole) -> some View {
         electronicMailGlassButton(role: role, shape: .capsule)
+    }
+}
+
+private struct ElectronicMailGlassControlSurfaceModifier: ViewModifier {
+    let shape: ElectronicMailGlassShape
+    @Environment(\.electronicMailGlassRenderingMode) private var renderingMode
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.isEnabled) private var isEnabled
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *), usesNativeGlass {
+            nativeBody(content: content)
+        } else {
+            content
+                .buttonStyle(.plain)
+                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                .background {
+                    ElectronicMailFallbackGlassFill(
+                        role: .standard,
+                        shape: shape,
+                        colorScheme: colorScheme,
+                        reduceTransparency: reduceTransparency
+                    )
+                }
+                .overlay {
+                    ElectronicMailGlassShapeStroke(
+                        shape: shape,
+                        style: ElectronicMailDesign.panelBorder(for: colorScheme),
+                        lineWidth: contrast == .increased ? 1.5 : 1
+                    )
+                }
+                .contentShape(ElectronicMailGlassContentShape(shape: shape))
+                .opacity(isEnabled ? 1 : 0.46)
+        }
+    }
+
+    private var usesNativeGlass: Bool {
+        renderingMode.usesNativeGlass(
+            osMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+            reduceTransparency: reduceTransparency
+        )
+    }
+
+    @available(macOS 26.0, *)
+    @ViewBuilder
+    private func nativeBody(content: Content) -> some View {
+        switch shape {
+        case .circle:
+            nativeContent(content: content)
+                .glassEffect(.regular.interactive(isEnabled), in: Circle())
+        case .capsule:
+            nativeContent(content: content)
+                .glassEffect(.regular.interactive(isEnabled), in: Capsule())
+        case .panel(let radius):
+            nativeContent(content: content)
+                .glassEffect(
+                    .regular.interactive(isEnabled),
+                    in: RoundedRectangle(cornerRadius: radius, style: .continuous)
+                )
+        }
+    }
+
+    @available(macOS 26.0, *)
+    private func nativeContent(content: Content) -> some View {
+        content
+            .buttonStyle(.plain)
+            .foregroundStyle(.primary)
+            .opacity(isEnabled ? 1 : 0.46)
     }
 }
 
@@ -828,8 +936,8 @@ public enum ElectronicMailMailboxType {
     public static let sidebarItemSize: CGFloat = 13
     public static let sidebarAccountSize: CGFloat = 12
     /// Navigation expands directly from the shell title, so its labels use the
-    /// same type role and a compact, menu-like vertical rhythm.
-    public static let navigationRowHeight: CGFloat = 32
+    /// exact same 20-point semibold type role with a comfortably sized hit area.
+    public static let navigationRowHeight: CGFloat = 36
     public static let sectionSize: CGFloat = 17
     public static let sectionOpacity: CGFloat = 0.50
     public static let senderSize: CGFloat = 15
@@ -845,7 +953,7 @@ public enum ElectronicMailMailboxType {
     }
 
     public static func navigationItem() -> Font {
-        ElectronicMailType.headerTitle(weight: .semibold)
+        ElectronicMailType.mailboxHeader(weight: .semibold)
     }
 
     public static func sidebarAccount() -> Font {
@@ -866,6 +974,25 @@ public enum ElectronicMailMailboxType {
 
     public static func metadata(unread _: Bool = false) -> Font {
         .system(size: metadataSize, weight: .regular)
+    }
+}
+
+/// Pure window geometry keeps launch presentation deterministic and unit-testable
+/// without requiring an attached AppKit window or a particular display.
+public enum ElectronicMailWindowLayout {
+    public static func mainFrame(in visibleFrame: CGRect) -> CGRect {
+        let margin = ElectronicMailControlMetrics.mainWindowBackdropInset
+        let availableWidth = max(1, visibleFrame.width - margin * 2)
+        let availableHeight = max(1, visibleFrame.height - margin * 2)
+        let width = min(ElectronicMailControlMetrics.mainWindowWidth, availableWidth)
+        let height = min(ElectronicMailControlMetrics.mainWindowHeight, availableHeight)
+
+        return CGRect(
+            x: visibleFrame.midX - width / 2,
+            y: visibleFrame.midY - height / 2,
+            width: width,
+            height: height
+        )
     }
 }
 

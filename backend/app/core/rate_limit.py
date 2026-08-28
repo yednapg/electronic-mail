@@ -107,6 +107,9 @@ def _rule_for(method: str, path: str) -> tuple[str, int, int] | None:
     if method in {"POST", "PUT", "PATCH", "DELETE"} and (
         path == "/v1/mailbox/compose"
         or path == "/v1/mailbox/thread-actions"
+        or path == "/v1/mailbox/entity-actions"
+        or path == "/v1/matter-decisions"
+        or path.startswith("/v1/ai-organization/")
         or "/reply" in path
         or "/draft" in path
     ):
@@ -114,6 +117,8 @@ def _rule_for(method: str, path: str) -> tuple[str, int, int] | None:
     if method == "GET" and "/attachments/" in path:
         return ("attachment-download", 120, 60)
     if method == "GET" and path == "/v1/mailbox/search":
+        return ("mailbox-search", 120, 60)
+    if method == "GET" and path == "/v1/ai-inbox/search":
         return ("mailbox-search", 120, 60)
     if method == "GET" and path == "/v1/events/mailbox":
         return ("mailbox-sse", 12, 60)
