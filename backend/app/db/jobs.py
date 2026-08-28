@@ -14,7 +14,7 @@ from app.db.repository import get_engine
 from app.db.user_mail_guard import user_mail_write_transaction
 
 ACTIVE_STATUSES = {"queued", "running"}
-REQUIRED_RUNTIME_QUEUES = ("critical", "reader", "default", "slow", "gmail_poll")
+REQUIRED_RUNTIME_QUEUES = ("critical", "reader", "default", "slow", "ai", "gmail_poll")
 FRESH_WORKER_SECONDS = 120
 
 

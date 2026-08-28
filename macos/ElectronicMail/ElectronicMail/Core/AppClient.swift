@@ -167,6 +167,14 @@ public protocol AppClient: AnyObject {
     func createTask(_ request: TaskCreateRequest) async throws -> TaskResponse
     func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse
     func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse
+    func aiInbox(query: String?) async throws -> AIInboxResponse
+    func aiOrganizationProfile() async throws -> AIOrganizationProfile
+    func updateAIOrganizationProfile(_ patch: AIOrganizationProfilePatch) async throws -> AIOrganizationProfile
+    func aiMatter(_ matterID: String) async throws -> AIMatterDetail
+    func aiGroupingExplanation(matterID: String, messageID: String) async throws -> AIGroupingExplanation
+    func applyMatterDecision(_ request: MatterDecisionRequest) async throws -> MatterDecisionResponse
+    func applyMatterAction(_ request: MatterEntityActionRequest) async throws -> MatterEntityActionResponse
+    func deleteAIOrganizationData() async throws
 }
 
 public extension AppClient {
@@ -258,6 +266,38 @@ public extension AppClient {
     }
 
     func downloadAttachment(messageID: String, attachment: ThreadAttachment) async throws -> DownloadedAttachment {
+        throw APIError.httpStatus(501)
+    }
+
+    func aiInbox(query: String? = nil) async throws -> AIInboxResponse {
+        throw APIError.httpStatus(501)
+    }
+
+    func aiOrganizationProfile() async throws -> AIOrganizationProfile {
+        throw APIError.httpStatus(501)
+    }
+
+    func updateAIOrganizationProfile(_ patch: AIOrganizationProfilePatch) async throws -> AIOrganizationProfile {
+        throw APIError.httpStatus(501)
+    }
+
+    func aiMatter(_ matterID: String) async throws -> AIMatterDetail {
+        throw APIError.httpStatus(501)
+    }
+
+    func aiGroupingExplanation(matterID: String, messageID: String) async throws -> AIGroupingExplanation {
+        throw APIError.httpStatus(501)
+    }
+
+    func applyMatterDecision(_ request: MatterDecisionRequest) async throws -> MatterDecisionResponse {
+        throw APIError.httpStatus(501)
+    }
+
+    func applyMatterAction(_ request: MatterEntityActionRequest) async throws -> MatterEntityActionResponse {
+        throw APIError.httpStatus(501)
+    }
+
+    func deleteAIOrganizationData() async throws {
         throw APIError.httpStatus(501)
     }
 }
@@ -489,6 +529,49 @@ public final class LiveBackendAppClient: AppClient {
     public func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse {
         let body = try JSONEncoder.backend.encode(request)
         return try await self.request(path: "/v1/entities/\(entityID.urlPathEncoded)/complete", method: "POST", body: body)
+    }
+
+    public func aiInbox(query: String? = nil) async throws -> AIInboxResponse {
+        if let query, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return try await request(
+                path: "/v1/ai-inbox/search",
+                queryItems: [URLQueryItem(name: "q", value: query)]
+            )
+        }
+        return try await request(path: "/v1/ai-inbox")
+    }
+
+    public func aiOrganizationProfile() async throws -> AIOrganizationProfile {
+        try await request(path: "/v1/ai-organization/profile")
+    }
+
+    public func updateAIOrganizationProfile(_ patch: AIOrganizationProfilePatch) async throws -> AIOrganizationProfile {
+        let body = try JSONEncoder.backend.encode(patch)
+        return try await request(path: "/v1/ai-organization/profile", method: "PATCH", body: body)
+    }
+
+    public func aiMatter(_ matterID: String) async throws -> AIMatterDetail {
+        try await request(path: "/v1/matters/\(matterID.urlPathEncoded)")
+    }
+
+    public func aiGroupingExplanation(matterID: String, messageID: String) async throws -> AIGroupingExplanation {
+        try await request(
+            path: "/v1/matters/\(matterID.urlPathEncoded)/messages/\(messageID.urlPathEncoded)/grouping-reason"
+        )
+    }
+
+    public func applyMatterDecision(_ request: MatterDecisionRequest) async throws -> MatterDecisionResponse {
+        let body = try JSONEncoder.backend.encode(request)
+        return try await self.request(path: "/v1/matter-decisions", method: "POST", body: body)
+    }
+
+    public func applyMatterAction(_ request: MatterEntityActionRequest) async throws -> MatterEntityActionResponse {
+        let body = try JSONEncoder.backend.encode(request)
+        return try await self.request(path: "/v1/mailbox/entity-actions", method: "POST", body: body)
+    }
+
+    public func deleteAIOrganizationData() async throws {
+        try await emptyRequest(path: "/v1/ai-organization/data", method: "DELETE")
     }
 
     private func request<Response: Decodable>(

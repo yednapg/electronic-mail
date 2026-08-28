@@ -96,7 +96,8 @@ def parse_gmail_message(
         inline_attachment_resolver=inline_attachment_resolver,
     )
     extracted_text = html_to_text(html_body) if html_body and not html_is_rich else text_body or html_to_text(html_body or "")
-    cleaned_text = clean_ai_text(extracted_text) or compact_text(extracted_text)
+    reader_text = _reader_text_from_plain(extracted_text)
+    cleaned_text = clean_ai_text(reader_text) or compact_text(reader_text)
     snippet_text = compact_text(str(payload.get("snippet") or ""))
     signal_text = cleaned_text or snippet_text
     subject = headers.get("subject")
@@ -122,7 +123,9 @@ def parse_gmail_message(
         "raw_payload": payload,
         "html_body_sanitized": sanitized_html,
         "html_render_document": render_document,
-        "text_body": cleaned_text or None,
+        # Reader text is presentation data, so preserve Gmail's paragraph and
+        # header boundaries. Search/grouping signals use the compact copy above.
+        "text_body": reader_text or None,
         "extracted_signals": extract_signals(subject=subject, sender=sender, text=signal_text, headers=headers),
         "body_hash": body_hash,
     }
@@ -168,6 +171,17 @@ def build_thread_message_reader(
     html_source = html_render_document or html_body
     source_text = _reader_text_from_html(html_source) if html_source else _reader_text_from_plain(text_body or snippet or "")
     parts = _split_reader_text(source_text)
+    if _looks_like_mailing_list_digest(source_text, headers or {}):
+        # A list digest embeds RFC-style From/Subject/To headers for each
+        # article. Those are message content, not a quoted reply boundary.
+        # Keep the complete digest readable in the primary conversation body.
+        parts = {
+            "primary_text": _normalize_reader_text(source_text).strip(),
+            "markers": parts["markers"],
+            "signature_text": "",
+            "quoted_text": "",
+            "footer_text": "",
+        }
     primary_text = parts["primary_text"] or _reader_text_from_plain(text_body or snippet or "")
     primary_text = primary_text or compact_text(snippet)
     html_is_rich = _is_rich_email_html(html_source or "") if html_source else False
@@ -475,6 +489,18 @@ def _split_reader_text(value: str) -> dict[str, Any]:
     }
 
 
+def _looks_like_mailing_list_digest(value: str, headers: dict[str, str]) -> bool:
+    """Distinguish embedded digest articles from reply/forward history."""
+    if not str(headers.get("list-id") or "").strip():
+        return False
+    normalized = _normalize_reader_text(value)
+    return bool(
+        re.search(r"(?im)^today(?:'|’)?s topics:\s*$", normalized)
+        and re.search(r"(?im)^message:\s*\d+\s*$", normalized)
+        and re.search(r"(?im)^subject:\s*\S", normalized)
+    )
+
+
 def _append_blank_for_mode(mode: str, primary: list[str], signature: list[str], quoted: list[str], footer: list[str]) -> None:
     target = {"primary": primary, "signature": signature, "quoted": quoted, "footer": footer}.get(mode, primary)
     if target and target[-1] != "":
@@ -532,6 +558,13 @@ def _is_rich_email_html(value: str) -> bool:
     if table_element_count >= 2 and table_tag_count >= 4 and source_is_document_sized:
         return True
     if table_element_count >= 2 and table_tag_count >= 2 and (style_count >= 1 or class_count >= 1) and len(value) > max(500, text_length * 2):
+        return True
+    if (
+        table_element_count == 1
+        and table_tag_count >= 4
+        and style_count + class_count >= 4
+        and len(value) > max(900, text_length * 2)
+    ):
         return True
     if layout_tag_count >= 2 and (style_count >= 1 or class_count >= 1) and source_is_document_sized:
         return True

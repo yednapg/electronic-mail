@@ -19,6 +19,7 @@ SCHEMA_PROBE_TRANSACTION_TIMEOUT_MS = 20_000
 ALEMBIC_REVISION_PROBE = (
     "SELECT MIN(version_num) FROM alembic_version HAVING COUNT(*) = 1"
 )
+VECTOR_EXTENSION_PROBE = "SELECT COUNT(*) FROM pg_extension WHERE extname = 'vector'"
 REQUIRED_SCHEMA_PROBES = (
     (
         "SELECT body_fetch_status, body_fetch_updated_at, render_doc_bytes, "
@@ -52,6 +53,27 @@ REQUIRED_SCHEMA_PROBES = (
         "FROM gmail_initial_window_entries LIMIT 1"
     ),
     "SELECT release_sha FROM worker_heartbeats LIMIT 1",
+    (
+        "SELECT consented_at, enabled, grouping_style, rollout_mode, "
+        "active_generation_id, revision FROM matter_profiles LIMIT 1"
+    ),
+    "SELECT prompt_version, embedding_model, classifier_model, review_model FROM matter_generations LIMIT 1",
+    (
+        "SELECT content_revision, reference_tokens, embedding, processing_state "
+        "FROM message_semantics LIMIT 1"
+    ),
+    "SELECT extracted_text, status, truncated FROM attachment_text_extractions LIMIT 1",
+    (
+        "SELECT stable_goal, dynamic_title, summary, status, evidence_message_ids, "
+        "confidence_state, revision FROM matters LIMIT 1"
+    ),
+    "SELECT matter_id, message_id, membership_locked FROM matter_members LIMIT 1",
+    (
+        "SELECT canonical_key, goal, status, latest_development, revision "
+        "FROM matter_subgoals LIMIT 1"
+    ),
+    "SELECT decision_type, constraints_json, idempotency_key FROM matter_decisions LIMIT 1",
+    "SELECT model, latency_ms, estimated_cost_usd, error_code FROM ai_usage_events LIMIT 1",
 )
 
 
@@ -87,6 +109,8 @@ def schema_is_current(settings: Settings) -> bool:
         with schema_probe_connection(settings) as connection:
             revision = connection.exec_driver_sql(ALEMBIC_REVISION_PROBE).scalar()
             if revision != ALEMBIC_HEAD_REVISION:
+                return False
+            if connection.exec_driver_sql(VECTOR_EXTENSION_PROBE).scalar() != 1:
                 return False
             for query in REQUIRED_SCHEMA_PROBES:
                 connection.exec_driver_sql(query)

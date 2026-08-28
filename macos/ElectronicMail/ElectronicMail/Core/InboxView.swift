@@ -287,7 +287,7 @@ private struct InboxRenderSnapshot: Equatable {
         self.chronologyLocaleIdentifier = locale.identifier
         self.mailboxPresentationReady = store.mailboxPresentationReady
         if mailboxPresentationReady {
-            self.sections = InboxChronologyPresenter.sections(
+            let presentedSections = InboxChronologyPresenter.sections(
                 from: store.sections,
                 cacheOwner: store,
                 revision: self.revision,
@@ -295,7 +295,8 @@ private struct InboxRenderSnapshot: Equatable {
                 calendar: calendar,
                 locale: locale
             )
-            self.flatRows = store.flatRows
+            self.sections = presentedSections
+            self.flatRows = presentedSections.flatMap(\.rows)
         } else {
             self.sections = []
             self.flatRows = []
@@ -741,7 +742,9 @@ enum InboxChronologyPresenter {
             calendar: calendar,
             locale: locale
         )
+        var parentGroups: [ParentGroup] = []
         var presentedSections: [PresentedSection] = []
+        var ordinal = 0
 
         for sourceSection in sourceSections where !sourceSection.rows.isEmpty {
             var parentGroup: ParentGroup?
@@ -750,44 +753,65 @@ enum InboxChronologyPresenter {
                     if parentGroup != nil {
                         parentGroup?.rows.append(row)
                     } else {
-                        append(
-                            rows: [row],
-                            bucket: Bucket(
+                        parentGroups.append(
+                            ParentGroup(
+                                sourceSectionID: sourceSection.id,
+                                sourceTitle: sourceSection.title,
+                                ordinal: ordinal,
+                                rows: [row],
+                                bucketOverride: Bucket(
                                 id: "fallback::\(sourceSection.id)",
                                 title: sourceSection.title
-                            ),
-                            context: context,
-                            to: &presentedSections
+                                )
+                            )
                         )
+                        ordinal += 1
                     }
                     continue
                 }
 
-                appendParentGroup(
-                    parentGroup,
-                    context: context,
-                    to: &presentedSections
-                )
+                if let parentGroup {
+                    parentGroups.append(parentGroup)
+                }
                 parentGroup = ParentGroup(
                     sourceSectionID: sourceSection.id,
                     sourceTitle: sourceSection.title,
+                    ordinal: ordinal,
                     rows: [row]
                 )
+                ordinal += 1
             }
+            if let parentGroup {
+                parentGroups.append(parentGroup)
+            }
+        }
+
+        parentGroups.sort { lhs, rhs in
+            let lhsDate = lhs.rows.first.flatMap { context.date(from: $0.receivedAt) }
+            let rhsDate = rhs.rows.first.flatMap { context.date(from: $0.receivedAt) }
+            switch (lhsDate, rhsDate) {
+            case let (lhsDate?, rhsDate?) where lhsDate != rhsDate:
+                return lhsDate > rhsDate
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            default:
+                return lhs.ordinal < rhs.ordinal
+            }
+        }
+
+        for group in parentGroups {
             appendParentGroup(
-                parentGroup,
+                group,
                 context: context,
                 to: &presentedSections
             )
         }
 
-        var runCountByBucketID: [String: Int] = [:]
         return presentedSections.enumerated().map { index, section in
-            let runCount = runCountByBucketID[section.bucket.id, default: 0] + 1
-            runCountByBucketID[section.bucket.id] = runCount
-            let runSuffix = runCount == 1 ? "" : "::run-\(runCount)"
             return InboxRenderSection(
-                id: "chronology::\(section.bucket.id)\(runSuffix)",
+                id: "chronology::\(section.bucket.id)",
                 title: section.bucket.title,
                 isFirstSection: index == presentedSections.startIndex,
                 rows: section.rows
@@ -804,7 +828,7 @@ enum InboxChronologyPresenter {
             return
         }
 
-        let bucket = bucket(
+        let bucket = group.bucketOverride ?? bucket(
             for: parent.receivedAt,
             fallback: group.sourceTitle,
             fallbackID: group.sourceSectionID,
@@ -988,7 +1012,9 @@ enum InboxChronologyPresenter {
     private struct ParentGroup {
         let sourceSectionID: String
         let sourceTitle: String
+        let ordinal: Int
         var rows: [InboxRowViewModel]
+        var bucketOverride: Bucket? = nil
     }
 }
 

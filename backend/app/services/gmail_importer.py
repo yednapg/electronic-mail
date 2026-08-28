@@ -2146,6 +2146,25 @@ def _persist_hydrated_body_messages(
     updated_messages = [message for message in messages if message.message_id in updated_message_ids]
     if not updated_messages:
         return 0
+    # AI Inbox is an independent post-sync consumer. Queueing is best-effort;
+    # raw Gmail hydration has already committed and must never be rolled back
+    # or reported as failed because AI is unavailable.
+    try:
+        from app.services.ai_inbox import enqueue_message_organization
+
+        for updated_message in updated_messages:
+            enqueue_message_organization(
+                settings,
+                user_id=user_id,
+                message_id=updated_message.message_id,
+                content_revision=updated_message.content_revision,
+            )
+    except Exception as exc:
+        logger.warning(
+            "AI Inbox organization could not be queued user_id=%s error=%s",
+            user_id,
+            type(exc).__name__,
+        )
     rebuild_touched_mail_groups(settings, user_id=user_id, message_ids=[message.message_id for message in updated_messages], use_ai=False)
     if _ai_grouping_enabled(settings):
         enqueue_projection_refresh(settings, user_id=user_id)

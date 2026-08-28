@@ -86,6 +86,25 @@ class Settings:
     openai_required: bool
     openai_debug_logs: bool
     ai_grouping_enabled: bool
+    ai_inbox_enabled: bool
+    ai_inbox_local_shadow_preview: bool
+    ai_inbox_text_provider: Literal["openai", "codex"]
+    ai_inbox_embedding_provider: Literal["openai", "local"]
+    ai_inbox_classifier_model: str
+    ai_inbox_review_model: str
+    ai_inbox_embedding_model: str
+    ai_inbox_embedding_dimensions: int
+    ai_inbox_codex_service_tier: Literal["default", "fast"]
+    ai_inbox_codex_timeout_seconds: float
+    ai_inbox_prompt_version: str
+    ai_inbox_job_cost_limit_usd: float
+    ai_inbox_user_monthly_cost_limit_usd: float
+    ai_inbox_project_monthly_cost_limit_usd: float
+    ai_inbox_classifier_input_usd_per_million: float
+    ai_inbox_classifier_output_usd_per_million: float
+    ai_inbox_review_input_usd_per_million: float
+    ai_inbox_review_output_usd_per_million: float
+    ai_inbox_embedding_usd_per_million: float
     log_level: str
     release_sha: str
     rate_limit_enabled: bool
@@ -98,6 +117,15 @@ class Settings:
     @property
     def openai_configured(self) -> bool:
         return bool(self.openai_api_key)
+
+    @property
+    def ai_inbox_configured(self) -> bool:
+        """Return whether the selected AI Inbox providers can run here."""
+        if self.ai_inbox_text_provider == "codex" and self.app_env != "local":
+            return False
+        text_ready = self.ai_inbox_text_provider == "codex" or self.openai_configured
+        embedding_ready = self.ai_inbox_embedding_provider == "local" or self.openai_configured
+        return bool(text_ready and embedding_ready)
 
     @property
     def is_production_like(self) -> bool:
@@ -170,8 +198,24 @@ class Settings:
                 errors.append("GMAIL_PUBSUB_SUBSCRIPTION is required")
             if not self.gmail_pubsub_push_service_account_email:
                 errors.append("GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL is required")
-            if self.ai_grouping_enabled or self.openai_required or self.openai_configured or self.openai_debug_logs:
-                errors.append("AI/OpenAI configuration must remain disabled for the no-AI production release")
+            if self.ai_grouping_enabled:
+                errors.append("Legacy AI_GROUPING_ENABLED must remain false; AI Inbox uses its own isolated projection")
+            if self.openai_debug_logs:
+                errors.append("OPENAI_DEBUG_LOGS must remain false so email content cannot enter logs")
+            if self.ai_inbox_text_provider != "openai":
+                errors.append("AI_INBOX_TEXT_PROVIDER=openai is required outside local development")
+            if self.ai_inbox_embedding_provider != "openai":
+                errors.append("AI_INBOX_EMBEDDING_PROVIDER=openai is required outside local development")
+            if self.ai_inbox_local_shadow_preview:
+                errors.append("AI_INBOX_LOCAL_SHADOW_PREVIEW must remain false outside local development")
+            if self.ai_inbox_enabled and not self.ai_inbox_configured:
+                errors.append("OPENAI_API_KEY is required when AI_INBOX_ENABLED=true")
+            if self.openai_required and not self.ai_inbox_enabled:
+                errors.append("OPENAI_REQUIRED may only be true when AI_INBOX_ENABLED=true")
+            if self.ai_inbox_embedding_dimensions != 1024:
+                errors.append("AI_INBOX_EMBEDDING_DIMENSIONS must be 1024")
+            if self.ai_inbox_job_cost_limit_usd <= 0:
+                errors.append("AI_INBOX_JOB_COST_LIMIT_USD must be greater than zero")
             try:
                 google_redirect = urlparse(self.google_redirect_uri)
             except ValueError:
@@ -279,6 +323,8 @@ def load_settings() -> Settings:
     """Load environment variables once and expose a typed settings object."""
     database_url = os.getenv("DATABASE_URL", "").strip().strip("\"'")
     app_env = os.getenv("APP_ENV", "local").strip().lower() or "local"
+    ai_inbox_text_provider = _resolve_ai_inbox_text_provider()
+    ai_inbox_embedding_provider = _resolve_ai_inbox_embedding_provider()
     web_app_url = os.getenv("WEB_APP_URL", os.getenv("CORS_ORIGIN", "http://localhost:5173"))
     configured_release_sha = os.getenv("RELEASE_SHA", "")
     railway_release_sha = os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
@@ -319,11 +365,39 @@ def load_settings() -> Settings:
         ),
         mobile_redirect_uri=os.getenv("MOBILE_REDIRECT_URI", "electronicmail://auth/callback").strip(),
         openai_api_key=os.getenv("OPENAI_API_KEY", "").strip().strip("\"'"),
-        openai_model=os.getenv("OPENAI_MODEL", "gpt-5.4-mini").strip().strip("\"'") or "gpt-5.4-mini",
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip().strip("\"'") or "gpt-5.6-luna",
         openai_reasoning_effort=_resolve_openai_reasoning_effort(),
         openai_required=os.getenv("OPENAI_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"},
         openai_debug_logs=os.getenv("OPENAI_DEBUG_LOGS", "").strip().lower() in {"1", "true", "yes", "on"},
         ai_grouping_enabled=os.getenv("AI_GROUPING_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"},
+        ai_inbox_enabled=_resolve_boolean("AI_INBOX_ENABLED", default=False),
+        ai_inbox_local_shadow_preview=_resolve_boolean("AI_INBOX_LOCAL_SHADOW_PREVIEW", default=False),
+        ai_inbox_text_provider=ai_inbox_text_provider,
+        ai_inbox_embedding_provider=ai_inbox_embedding_provider,
+        ai_inbox_classifier_model=os.getenv("AI_INBOX_CLASSIFIER_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna",
+        ai_inbox_review_model=os.getenv("AI_INBOX_REVIEW_MODEL", "gpt-5.6-terra").strip() or "gpt-5.6-terra",
+        ai_inbox_embedding_model=(
+            "local-hash-v1"
+            if ai_inbox_embedding_provider == "local"
+            else os.getenv("AI_INBOX_EMBEDDING_MODEL", "text-embedding-3-large").strip()
+            or "text-embedding-3-large"
+        ),
+        ai_inbox_embedding_dimensions=int(os.getenv("AI_INBOX_EMBEDDING_DIMENSIONS", "1024")),
+        ai_inbox_codex_service_tier=_resolve_ai_inbox_codex_service_tier(),
+        ai_inbox_codex_timeout_seconds=_resolve_positive_float("AI_INBOX_CODEX_TIMEOUT_SECONDS", default=90.0),
+        ai_inbox_prompt_version=os.getenv(
+            "AI_INBOX_PROMPT_VERSION",
+            "matter-v6-event-chain-counterpart-identity",
+        ).strip()
+        or "matter-v6-event-chain-counterpart-identity",
+        ai_inbox_job_cost_limit_usd=float(os.getenv("AI_INBOX_JOB_COST_LIMIT_USD", "0.10")),
+        ai_inbox_user_monthly_cost_limit_usd=float(os.getenv("AI_INBOX_USER_MONTHLY_COST_LIMIT_USD", "25")),
+        ai_inbox_project_monthly_cost_limit_usd=float(os.getenv("AI_INBOX_PROJECT_MONTHLY_COST_LIMIT_USD", "250")),
+        ai_inbox_classifier_input_usd_per_million=float(os.getenv("AI_INBOX_CLASSIFIER_INPUT_USD_PER_MILLION", "0.20")),
+        ai_inbox_classifier_output_usd_per_million=float(os.getenv("AI_INBOX_CLASSIFIER_OUTPUT_USD_PER_MILLION", "1.20")),
+        ai_inbox_review_input_usd_per_million=float(os.getenv("AI_INBOX_REVIEW_INPUT_USD_PER_MILLION", "2.00")),
+        ai_inbox_review_output_usd_per_million=float(os.getenv("AI_INBOX_REVIEW_OUTPUT_USD_PER_MILLION", "12.00")),
+        ai_inbox_embedding_usd_per_million=float(os.getenv("AI_INBOX_EMBEDDING_USD_PER_MILLION", "0.13")),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         release_sha=release_sha,
         rate_limit_enabled=_resolve_boolean("RATE_LIMIT_ENABLED", default=app_env in {"staging", "production"}),
@@ -342,6 +416,38 @@ def _resolve_openai_reasoning_effort() -> Literal["low", "medium", "high"]:
         return value
 
     return "medium"
+
+
+def _resolve_ai_inbox_text_provider() -> Literal["openai", "codex"]:
+    value = os.getenv("AI_INBOX_TEXT_PROVIDER", "openai").strip().strip("\"'").lower()
+    if value not in {"openai", "codex"}:
+        raise ValueError("AI_INBOX_TEXT_PROVIDER must be openai or codex")
+    return value  # type: ignore[return-value]
+
+
+def _resolve_ai_inbox_embedding_provider() -> Literal["openai", "local"]:
+    value = os.getenv("AI_INBOX_EMBEDDING_PROVIDER", "openai").strip().strip("\"'").lower()
+    if value not in {"openai", "local"}:
+        raise ValueError("AI_INBOX_EMBEDDING_PROVIDER must be openai or local")
+    return value  # type: ignore[return-value]
+
+
+def _resolve_positive_float(name: str, *, default: float) -> float:
+    raw_value = os.getenv(name, str(default)).strip().strip("\"'")
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive number") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0")
+    return value
+
+
+def _resolve_ai_inbox_codex_service_tier() -> Literal["default", "fast"]:
+    value = os.getenv("AI_INBOX_CODEX_SERVICE_TIER", "default").strip().strip("\"'").lower()
+    if value not in {"default", "fast"}:
+        raise ValueError("AI_INBOX_CODEX_SERVICE_TIER must be default or fast")
+    return value  # type: ignore[return-value]
 
 
 def _resolve_session_cookie_samesite() -> Literal["lax", "strict", "none"]:
@@ -384,8 +490,8 @@ def _explicit_runtime_configuration_errors(
 
     Boolean convenience parsing is useful during local development, but a
     missing value or typo must not silently become the launch configuration.
-    In particular, the no-AI release requires an explicit reviewed assertion
-    that every AI switch is disabled and that no OpenAI key is present.
+    The legacy grouping switch stays disabled. AI Inbox has a separate explicit
+    kill switch and may hold an OpenAI key only when that switch is enabled.
     """
     if app_env not in {"staging", "production"}:
         return ()
@@ -396,10 +502,18 @@ def _explicit_runtime_configuration_errors(
         if raw_value != "false":
             errors.append(f"{name} must be explicitly set to false outside local development")
 
+    if environment.get("AI_INBOX_ENABLED") not in {"true", "false"}:
+        errors.append("AI_INBOX_ENABLED must be explicitly set to true or false outside local development")
+
     if "OPENAI_API_KEY" not in environment:
-        errors.append("OPENAI_API_KEY must be explicitly set to an empty value outside local development")
-    elif environment["OPENAI_API_KEY"] != "":
-        errors.append("OPENAI_API_KEY must be empty outside local development")
+        if environment.get("AI_INBOX_ENABLED") == "true":
+            errors.append("OPENAI_API_KEY must be set when AI_INBOX_ENABLED=true")
+        else:
+            errors.append("OPENAI_API_KEY must be explicitly set to an empty value outside local development")
+    elif environment.get("AI_INBOX_ENABLED") == "true" and not environment["OPENAI_API_KEY"].strip():
+        errors.append("OPENAI_API_KEY must be set when AI_INBOX_ENABLED=true")
+    elif environment.get("AI_INBOX_ENABLED") != "true" and environment["OPENAI_API_KEY"] != "":
+        errors.append("OPENAI_API_KEY must be empty outside local development when AI Inbox is disabled")
 
     if environment.get("RATE_LIMIT_ENABLED") != "true":
         errors.append("RATE_LIMIT_ENABLED must be explicitly set to true outside local development")

@@ -56,10 +56,13 @@ from app.services.mail_groups import (
     refresh_visible_mail_projection,
 )
 from app.workers.retry_policy import gmail_is_authorization_failure, gmail_retry_delay_seconds
+from app.services.ai_inbox import finalize_generation, organize_message, run_generation_bootstrap
+from app.services.ai_inbox_actions import run_matter_action
 
 STOP = False
 logger = logging.getLogger(__name__)
 LOOP_ERROR_BACKOFF_SECONDS = 5.0
+AI_SPEND_LIMIT_RETRY_DELAY_SECONDS = 3600
 _PROGRESSIVE_GMAIL_JOB_KINDS = {
     "gmail_import_batch",
     "gmail_backfill",
@@ -179,6 +182,8 @@ def _run_worker_cycle(settings, *, worker_id: str, queues: list[str], heartbeat_
             exc,
             exponential_delay_seconds=retry_backoff_seconds(job.attempt_count),
         )
+        if retry_delay_seconds is None:
+            retry_delay_seconds = _ai_retry_delay_seconds(job.kind, exc)
         failed = fail_job(
             database_url,
             job,
@@ -220,6 +225,23 @@ def _run_worker_cycle(settings, *, worker_id: str, queues: list[str], heartbeat_
             release_sha=settings.release_sha,
         )
     return True
+
+
+def _ai_retry_delay_seconds(job_kind: str, error: BaseException) -> int | None:
+    """Avoid hot-looping queued mail when the OpenAI project budget is exhausted."""
+    if not job_kind.startswith("ai_"):
+        return None
+    current: BaseException | None = error
+    for _ in range(4):
+        if getattr(current, "code", None) in {
+            "project_spend_limit_exceeded",
+            "insufficient_quota",
+        }:
+            return AI_SPEND_LIMIT_RETRY_DELAY_SECONDS
+        current = current.__cause__ if current is not None else None
+        if current is None:
+            break
+    return None
 
 
 def _job_queue_wait_ms(created_at: str, started_at: str | None) -> int | None:
@@ -437,6 +459,50 @@ def _run_job(settings, job) -> None:
         if not isinstance(user_id, str):
             raise RuntimeError("gmail_send_message missing user_id")
         run_pending_send(settings, user_id=user_id, server_send_id=str(payload.get("server_send_id") or ""))
+        return
+    if job.kind == "ai_message_organize":
+        if not isinstance(user_id, str):
+            raise RuntimeError("ai_message_organize missing user_id")
+        organize_message(
+            settings,
+            user_id=user_id,
+            generation_id=str(payload.get("generation_id") or ""),
+            message_id=str(payload.get("message_id") or ""),
+            content_revision=int(payload.get("content_revision") or 1),
+        )
+        return
+    if job.kind == "ai_generation_bootstrap":
+        if not isinstance(user_id, str):
+            raise RuntimeError("ai_generation_bootstrap missing user_id")
+        run_generation_bootstrap(
+            settings,
+            user_id=user_id,
+            generation_id=str(payload.get("generation_id") or ""),
+            recent=bool(payload.get("recent", True)),
+            offset=int(payload.get("offset") or 0),
+            include_history=bool(payload.get("include_history", True)),
+            chronological_all=bool(payload.get("chronological_all", False)),
+        )
+        return
+    if job.kind == "ai_generation_finalize":
+        if not isinstance(user_id, str):
+            raise RuntimeError("ai_generation_finalize missing user_id")
+        finalize_generation(
+            settings,
+            user_id=user_id,
+            generation_id=str(payload.get("generation_id") or ""),
+        )
+        return
+    if job.kind == "ai_matter_action":
+        if not isinstance(user_id, str):
+            raise RuntimeError("ai_matter_action missing user_id")
+        run_matter_action(
+            settings,
+            user_id=user_id,
+            matter_id=str(payload.get("matter_id") or ""),
+            action=str(payload.get("action") or ""),
+            message_ids=[str(item) for item in payload.get("message_ids", [])],
+        )
         return
     if job.kind == "mail_group_candidates":
         if not isinstance(user_id, str):
