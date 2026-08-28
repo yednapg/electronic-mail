@@ -119,6 +119,165 @@ public final class DemoAppClient: AppClient {
         )
     }
 
+    public func aiOrganizationProfile() async throws -> AIOrganizationProfile {
+        AIOrganizationProfile(
+            consented: true,
+            enabled: true,
+            available: true,
+            groupingStyle: .focused,
+            rolloutMode: "live",
+            activeGenerationID: "demo-generation",
+            revision: 1
+        )
+    }
+
+    public func updateAIOrganizationProfile(_ patch: AIOrganizationProfilePatch) async throws -> AIOrganizationProfile {
+        try await aiOrganizationProfile()
+    }
+
+    public func aiInbox(query: String? = nil) async throws -> AIInboxResponse {
+        let rows = [
+            AIMatterRow(
+                id: "demo-matter",
+                title: "Your branch-linking request has been processed",
+                summary: "You asked the bank to move your customer relationship to a different branch. The bank confirmed that the request was processed; no next action is currently required.",
+                status: .completed,
+                confidenceState: .confirmed,
+                confidence: 0.99,
+                latestMessageAt: "2026-08-24T10:00:00+00:00",
+                messageCount: 4,
+                unread: true,
+                starred: false,
+                participants: ["Bank Support", "You"],
+                counterpartEntities: ["HSBC"],
+                evidenceMessageIDs: ["demo-message"],
+                revision: 3,
+                openSubgoalCount: 0,
+                reviewCount: 0,
+                matchingMessageIDs: []
+            ),
+            AIMatterRow(
+                id: "demo-provisional",
+                title: "Credit-card limit request is being reviewed",
+                summary: "A limit increase was requested and a new response may belong to the same case. Check the grouping before making it permanent.",
+                status: .waitingOnOthers,
+                confidenceState: .provisional,
+                confidence: 0.81,
+                latestMessageAt: "2026-08-23T08:30:00+00:00",
+                messageCount: 3,
+                unread: false,
+                starred: false,
+                participants: ["Card Services", "You"],
+                counterpartEntities: ["HDFC"],
+                evidenceMessageIDs: [],
+                revision: 1,
+                openSubgoalCount: 1,
+                reviewCount: 1,
+                matchingMessageIDs: []
+            )
+        ]
+        let normalized = query?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let filtered = normalized.isEmpty ? rows : rows.filter {
+            $0.title.lowercased().contains(normalized) || $0.summary.lowercased().contains(normalized)
+        }
+        return AIInboxResponse(
+            profile: try await aiOrganizationProfile(),
+            generationID: "demo-generation",
+            revision: "1:demo-generation:3",
+            stale: false,
+            staleReason: nil,
+            matters: filtered,
+            organizing: [
+                AIOrganizingRow(
+                    id: "organizing:demo-thread",
+                    gmailThreadID: "demo-thread",
+                    title: "A newly arrived email",
+                    sender: "support@example.com",
+                    counterpartEntities: ["Porkbun"],
+                    snippet: "This remains available in Inbox while it is organized.",
+                    latestMessageAt: "2026-08-24T11:00:00+00:00",
+                    messageCount: 1,
+                    state: "organizing",
+                    error: nil,
+                    matchingMessageIDs: []
+                )
+            ],
+            generatedAt: "2026-08-24T11:00:00+00:00"
+        )
+    }
+
+    public func aiMatter(_ matterID: String) async throws -> AIMatterDetail {
+        guard let thread = threads.values.first else { throw APIError.httpStatus(404) }
+        return AIMatterDetail(
+            id: matterID,
+            title: matterID == "demo-provisional"
+                ? "Credit-card limit request is being reviewed"
+                : "Your branch-linking request has been processed",
+            stableGoal: "Resolve the account service request",
+            summary: "The request, responses, current outcome, and next action are summarized here across the original Gmail messages.",
+            status: matterID == "demo-provisional" ? .waitingOnOthers : .completed,
+            confidenceState: matterID == "demo-provisional" ? .provisional : .confirmed,
+            confidence: matterID == "demo-provisional" ? 0.81 : 0.99,
+            evidenceMessageIDs: thread.messages.map(\.id),
+            revision: 3,
+            latestReplyableMessageID: thread.messages.last?.id,
+            totalMessages: thread.messages.count,
+            matterMessageIDs: thread.messages.map(\.id),
+            reviewProposals: matterID == "demo-provisional" ? thread.messages.last.map { message in
+                [AIReviewProposal(
+                    id: "demo-proposal",
+                    messageID: message.id,
+                    subject: message.subject ?? "No subject",
+                    sender: message.fromAddress,
+                    occurredAt: message.receivedAt,
+                    recommendedAction: "add_to_matter",
+                    eventRole: "processing",
+                    verdict: "possible_continuation",
+                    explanation: "The content advances the same request, but the account identity is not explicit.",
+                    supportingFactors: ["Same specific request", "Chronologically plausible next event"],
+                    conflictingFactors: ["No explicit account identifier"],
+                    evidenceMessageIDs: [message.id]
+                )]
+            } ?? [] : [],
+            messages: thread.messages
+        )
+    }
+
+    public func aiGroupingExplanation(matterID: String, messageID: String) async throws -> AIGroupingExplanation {
+        AIGroupingExplanation(
+            messageID: messageID,
+            eventRole: "processing",
+            verdict: "strong_continuation",
+            explanation: "This email advances the same unresolved account-service request.",
+            supportingFactors: ["Same concrete purpose", "Causally valid next event"],
+            conflictingFactors: [],
+            evidenceMessageIDs: [messageID]
+        )
+    }
+
+    public func applyMatterDecision(_ request: MatterDecisionRequest) async throws -> MatterDecisionResponse {
+        MatterDecisionResponse(
+            clientDecisionID: request.clientDecisionID,
+            decisionID: "demo-decision",
+            matterIDs: [request.matterID],
+            revision: "2",
+            state: "applied"
+        )
+    }
+
+    public func applyMatterAction(_ request: MatterEntityActionRequest) async throws -> MatterEntityActionResponse {
+        MatterEntityActionResponse(
+            clientActionID: request.clientActionID,
+            matterID: request.matterID,
+            action: request.action,
+            targetMessageIDs: [],
+            affectedThreadCount: 1,
+            state: "queued"
+        )
+    }
+
+    public func deleteAIOrganizationData() async throws {}
+
     public func sendCompose(_ request: MailComposeRequest) async throws -> MailSendResponse {
         MailSendResponse(
             clientSendID: request.clientSendID,

@@ -175,6 +175,67 @@ class EmailExtractionTests(unittest.TestCase):
         self.assertEqual(parsed["text_body"], "Complete large plain-text body")
         self.assertFalse(gmail_payload_has_unresolved_text_body(parsed["raw_payload"]))
 
+    def test_plain_text_body_preserves_reader_paragraphs_and_header_lines(self) -> None:
+        body = (
+            "Mailing list introduction\n\n"
+            "From: Speaker <speaker@example.com>\n"
+            "Subject: Conference proposal\n"
+            "To: list@example.com\n"
+            "Content-Type: text/plain; charset=utf-8\n\n"
+            "Hi all,\n\n"
+            "The proposal deadline is next week.\n"
+        )
+        parsed = parse_gmail_message(
+            {
+                "id": "msg-structured-plain",
+                "threadId": "thread-structured-plain",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "body": {"data": encoded(body)},
+                },
+            },
+            user_id="user-1",
+        )
+
+        self.assertEqual(parsed["text_body"], body.strip())
+        reader = build_thread_message_reader(
+            html_render_document=None,
+            html_body=None,
+            text_body=parsed["text_body"],
+            snippet=None,
+            headers={},
+        )
+        self.assertIn("Mailing list introduction", reader["primary_text"])
+        self.assertIn("From: Speaker", reader["quoted_text"] or "")
+        self.assertIn("Hi all,", reader["quoted_text"] or "")
+
+    def test_mailing_list_digest_keeps_embedded_message_visible(self) -> None:
+        body = (
+            "Send Example List submissions to list@example.org\n\n"
+            "Today's Topics:\n\n"
+            "1. Conference proposal (Speaker)\n\n"
+            "Message: 1\n"
+            "Date: Friday\n"
+            "From: Speaker <speaker@example.com>\n"
+            "Subject: Conference proposal\n"
+            "To: list@example.org\n\n"
+            "Hi all,\n\n"
+            "The proposal deadline is next week.\n"
+        )
+
+        reader = build_thread_message_reader(
+            html_render_document=None,
+            html_body=None,
+            text_body=body,
+            snippet=None,
+            headers={"list-id": "<example-list.example.org>"},
+        )
+
+        self.assertFalse(reader["quote_detected"])
+        self.assertIsNone(reader["quoted_text"])
+        self.assertIn("From: Speaker", reader["primary_text"])
+        self.assertIn("The proposal deadline is next week.", reader["primary_text"])
+
     def test_failed_large_text_body_resolution_remains_incomplete(self) -> None:
         parsed = parse_gmail_message(
             {
@@ -548,6 +609,33 @@ class EmailExtractionTests(unittest.TestCase):
             html_body=html,
             text_body=None,
             snippet=None,
+            headers={},
+        )
+
+        self.assertEqual(reader["render_mode"], "rich_html")
+        self.assertTrue(reader["html_is_rich"])
+
+    def test_thread_message_reader_classifies_styled_single_table_notice_as_rich_html(self) -> None:
+        html = """
+        <!doctype html>
+        <html><body style="margin:0;background:#f5f5f5">
+          <table class="renewal-card" width="100%" role="presentation" style="max-width:640px;margin:0 auto;background:#ffffff">
+            <tbody>
+              <tr><td class="eyebrow" style="padding:24px 32px 8px;color:#666;letter-spacing:1px">RENEWAL NOTICE</td></tr>
+              <tr><td class="headline" style="padding:0 32px;font-size:30px;line-height:36px">Your domains need attention</td></tr>
+              <tr><td class="body-copy" style="padding:20px 32px;font-size:16px;line-height:24px">Some domains in your account have expired and are about to be suspended. Renew them to keep your websites and services online.</td></tr>
+              <tr><td class="callout" style="padding:16px 32px;background:#fff4d6">Review the expiration dates and renewal status for each affected domain.</td></tr>
+              <tr><td class="button-row" style="padding:24px 32px 32px"><a href="https://porkbun.example/account" style="display:inline-block;padding:12px 18px;background:#ef476f;color:#fff">Review domains</a></td></tr>
+            </tbody>
+          </table>
+        </body></html>
+        """
+
+        reader = build_thread_message_reader(
+            html_render_document=html,
+            html_body=html,
+            text_body=None,
+            snippet="RENEWAL NOTICE Your domains need attention.",
             headers={},
         )
 

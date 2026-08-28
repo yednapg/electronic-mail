@@ -24,7 +24,7 @@ class SystemRouteTests(unittest.TestCase):
             database_backend="sqlite",
             google_configured=False,
             openai_configured=False,
-            openai_model="gpt-5.4-mini",
+            openai_model="gpt-5.6-luna",
             openai_reasoning_effort="medium",
             readiness_errors=lambda: [],
         )
@@ -42,7 +42,7 @@ class SystemRouteTests(unittest.TestCase):
             database_backend="postgres",
             google_configured=False,
             openai_configured=False,
-            openai_model="gpt-5.4-mini",
+            openai_model="gpt-5.6-luna",
             openai_reasoning_effort="medium",
             readiness_errors=lambda: ["GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required"],
         )
@@ -68,7 +68,7 @@ class SystemRouteTests(unittest.TestCase):
             database_backend="postgres",
             google_configured=True,
             openai_configured=True,
-            openai_model="gpt-5.4-mini",
+            openai_model="gpt-5.6-luna",
             openai_reasoning_effort="medium",
             readiness_errors=lambda: [],
         )
@@ -122,7 +122,7 @@ class SystemRouteTests(unittest.TestCase):
             database_backend="postgres",
             google_configured=True,
             openai_configured=True,
-            openai_model="gpt-5.4-mini",
+            openai_model="gpt-5.6-luna",
             openai_reasoning_effort="medium",
             readiness_errors=lambda: [],
         )

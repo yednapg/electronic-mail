@@ -59,6 +59,7 @@ def production_environment(**overrides: str) -> dict[str, str]:
         "OPENAI_REQUIRED": "false",
         "OPENAI_DEBUG_LOGS": "false",
         "AI_GROUPING_ENABLED": "false",
+        "AI_INBOX_ENABLED": "false",
         "RATE_LIMIT_ENABLED": "true",
         "RELEASE_SHA": "0123456789abcdef0123456789abcdef01234567",
         "OPS_ADMIN_EMAILS": "launch@mail-launch.co",
@@ -68,6 +69,71 @@ def production_environment(**overrides: str) -> dict[str, str]:
 
 
 class ReleaseReadinessTests(unittest.TestCase):
+    def test_local_codex_provider_does_not_require_a_platform_api_key(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "APP_ENV": "local",
+                "AI_INBOX_ENABLED": "true",
+                "AI_INBOX_LOCAL_SHADOW_PREVIEW": "true",
+                "AI_INBOX_TEXT_PROVIDER": "codex",
+                "AI_INBOX_EMBEDDING_PROVIDER": "local",
+                "AI_INBOX_CLASSIFIER_MODEL": "gpt-5.6-sol",
+                "AI_INBOX_REVIEW_MODEL": "gpt-5.6-sol",
+                "AI_INBOX_CODEX_SERVICE_TIER": "fast",
+                "OPENAI_API_KEY": "",
+            },
+            clear=True,
+        ):
+            settings = load_settings()
+
+        self.assertTrue(settings.ai_inbox_configured)
+        self.assertEqual(settings.ai_inbox_text_provider, "codex")
+        self.assertEqual(settings.ai_inbox_embedding_provider, "local")
+        self.assertEqual(settings.ai_inbox_classifier_model, "gpt-5.6-sol")
+        self.assertEqual(settings.ai_inbox_review_model, "gpt-5.6-sol")
+        self.assertEqual(settings.ai_inbox_codex_service_tier, "fast")
+        self.assertTrue(settings.ai_inbox_local_shadow_preview)
+
+    def test_production_rejects_local_codex_providers(self) -> None:
+        with patch.dict(
+            os.environ,
+            production_environment(
+                AI_INBOX_TEXT_PROVIDER="codex",
+                AI_INBOX_EMBEDDING_PROVIDER="local",
+                AI_INBOX_LOCAL_SHADOW_PREVIEW="true",
+            ),
+            clear=True,
+        ):
+            errors = load_settings().readiness_errors()
+
+        self.assertIn(
+            "AI_INBOX_TEXT_PROVIDER=openai is required outside local development",
+            errors,
+        )
+        self.assertIn(
+            "AI_INBOX_EMBEDDING_PROVIDER=openai is required outside local development",
+            errors,
+        )
+        self.assertIn(
+            "AI_INBOX_LOCAL_SHADOW_PREVIEW must remain false outside local development",
+            errors,
+        )
+
+    def test_codex_timeout_must_be_positive(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "APP_ENV": "local",
+                "AI_INBOX_TEXT_PROVIDER": "codex",
+                "AI_INBOX_EMBEDDING_PROVIDER": "local",
+                "AI_INBOX_CODEX_TIMEOUT_SECONDS": "0",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "AI_INBOX_CODEX_TIMEOUT_SECONDS must be greater than 0"):
+                load_settings()
+
     def test_valid_allowlisted_production_configuration_is_ready(self) -> None:
         with patch.dict(os.environ, production_environment(), clear=True):
             self.assertEqual(load_settings().readiness_errors(), [])
@@ -99,7 +165,7 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertTrue(any("GMAIL_SYNC_SCOPE=full" in error for error in errors))
         self.assertTrue(any("APP_SESSION_SECRET" in error for error in errors))
         self.assertTrue(any("APP_ENCRYPTION_KEY" in error for error in errors))
-        self.assertTrue(any("AI/OpenAI" in error for error in errors))
+        self.assertTrue(any("OPENAI_API_KEY" in error for error in errors))
 
     def test_production_requires_explicit_canonical_no_ai_configuration(self) -> None:
         cases = (
@@ -125,7 +191,7 @@ class ReleaseReadinessTests(unittest.TestCase):
             ),
             (
                 {"OPENAI_API_KEY": "configured-but-unused"},
-                "OPENAI_API_KEY must be empty outside local development",
+                "OPENAI_API_KEY must be empty outside local development when AI Inbox is disabled",
             ),
             (
                 {"RATE_LIMIT_ENABLED": "yes"},
@@ -597,6 +663,20 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(responses[12].status_code, 429)
         self.assertIn("retry-after", responses[12].headers)
 
+    def test_ai_inbox_corrections_share_the_authenticated_mail_write_limit(self) -> None:
+        limited_app = FastAPI()
+        limited_app.add_middleware(RateLimitMiddleware, enabled=True)
+
+        @limited_app.post("/v1/matter-decisions")
+        def matter_decision() -> dict[str, str]:
+            return {"status": "ok"}
+
+        client = TestClient(limited_app)
+        responses = [client.post("/v1/matter-decisions") for _ in range(91)]
+
+        self.assertTrue(all(response.status_code == 200 for response in responses[:90]))
+        self.assertEqual(responses[90].status_code, 429)
+
     def test_public_mobile_exchange_cannot_bypass_limit_by_rotating_fake_credentials(self) -> None:
         limited_app = FastAPI()
         limited_app.add_middleware(RateLimitMiddleware, enabled=True)
@@ -822,6 +902,7 @@ class ReleaseReadinessTests(unittest.TestCase):
             backend_dir / "railway.worker-reader.json",
             backend_dir / "railway.worker-slow.json",
             backend_dir / "railway.worker-poller.json",
+            backend_dir / "railway.worker-ai.json",
         ]
 
         for path in config_paths:
@@ -874,6 +955,10 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertTrue(any("started_epoch FROM oauth_login_sessions" in query for query in connection.queries))
         self.assertTrue(any("google_subject_deletion_tombstones" in query for query in connection.queries))
         self.assertTrue(any("release_sha FROM worker_heartbeats" in query for query in connection.queries))
+        self.assertTrue(any("matter_profiles" in query for query in connection.queries))
+        self.assertTrue(any("message_semantics" in query for query in connection.queries))
+        self.assertTrue(any("membership_locked" in query for query in connection.queries))
+        self.assertIn(schema_check.VECTOR_EXTENSION_PROBE, connection.queries)
         self.assertIn(
             f"SET LOCAL lock_timeout = '{schema_check.SCHEMA_PROBE_LOCK_TIMEOUT_MS}ms'",
             connection.queries,
@@ -914,7 +999,11 @@ class _SchemaConnection:
 
     def exec_driver_sql(self, query: str) -> _SchemaResult:
         self.queries.append(query)
-        return _SchemaResult(self.revision if "alembic_version" in query else None)
+        if "alembic_version" in query:
+            return _SchemaResult(self.revision)
+        if "pg_extension" in query:
+            return _SchemaResult(1)
+        return _SchemaResult(None)
 
 
 if __name__ == "__main__":

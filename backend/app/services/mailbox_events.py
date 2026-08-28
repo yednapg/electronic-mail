@@ -17,6 +17,9 @@ HEARTBEAT = "heartbeat"
 MAILBOX_SEARCH_HYDRATED = "mailbox-search-hydrated"
 THREAD_CONTENT_HYDRATED = "thread-content-hydrated"
 MAILBOX_SYNC_PROGRESS = "mailbox-sync-progress"
+AI_INBOX_CHANGED = "ai-inbox-changed"
+AI_PROFILE_CHANGED = "ai-profile-changed"
+AI_PROCESSING_PROGRESS = "ai-processing-progress"
 
 
 def emit_mailbox_event(

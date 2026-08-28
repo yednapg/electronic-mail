@@ -120,7 +120,7 @@ class SpeedPipelineTests(unittest.TestCase):
             database_path="postgresql://example/db",
             google_configured=True,
             openai_configured=False,
-            openai_model="gpt-5.4-mini",
+            openai_model="gpt-5.6-luna",
             gmail_pubsub_topic="projects/example/topics/gmail",
             gmail_watch_renewal_hours=24,
             gmail_recent_days=90,

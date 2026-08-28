@@ -34,73 +34,91 @@ struct EmailReaderView: View {
             let activeMessage = presentation.items.first(where: { $0.id == selectedKey })?.message
                 ?? messages.first
 
-            ScrollViewReader { scrollProxy in
-                ZStack(alignment: .bottom) {
-                    ScrollView(.vertical, showsIndicators: true) {
-                        EmailReaderChrome(contentWidth: contentWidth) {
-                            if resolvedMessageCount <= 1 {
-                                SingleEmailContent(
-                                    threadID: threadID,
-                                    message: messages.first,
-                                    row: row,
-                                    errorMessage: errorMessage,
-                                    currentUserDisplayName: currentUserDisplayName,
-                                    currentUserEmail: currentUserEmail,
-                                    colorScheme: colorScheme,
-                                    mailboxLabel: mailboxLabel,
-                                    onRetry: onRetry,
-                                    onRespond: onRespond,
-                                    onThreadAction: onThreadAction,
-                                    onOpenAttachment: onOpenAttachment,
-                                    isAttachmentDownloading: isAttachmentDownloading
-                                )
-                            } else {
-                                GroupedEmailContent(
-                                    threadID: threadID,
-                                    messages: messages,
-                                    expectedMessageCount: resolvedMessageCount,
-                                    focusedMessageID: focusedMessageID,
-                                    errorMessage: errorMessage,
-                                    currentUserDisplayName: currentUserDisplayName,
-                                    currentUserEmail: currentUserEmail,
-                                    colorScheme: colorScheme,
-                                    mailboxLabel: mailboxLabel,
-                                    expandedMessageKeys: $expandedMessageKeys,
-                                    activeMessageKey: $activeMessageKey,
-                                    expansionInitializedThreadID: $expansionInitializedThreadID,
-                                    onRetry: onRetry,
-                                    onRespond: onRespond,
-                                    onThreadAction: onThreadAction,
-                                    onOpenAttachment: onOpenAttachment,
-                                    isAttachmentDownloading: isAttachmentDownloading,
-                                    onFocusedMessageKey: { messageKey in
-                                        scrollProxy.scrollTo(messageKey, anchor: .center)
-                                    }
-                                )
+            ZStack(alignment: .bottom) {
+                ScrollViewReader { scrollProxy in
+                    ElectronicMailReaderFadingScrollView(
+                        colorScheme: colorScheme,
+                        showsIndicators: true,
+                        scrollIdentity: threadID
+                    ) {
+                        VStack(alignment: .center, spacing: 0) {
+                            EmailReaderChrome(contentWidth: contentWidth) {
+                                if resolvedMessageCount <= 1 {
+                                    SingleEmailContent(
+                                        threadID: threadID,
+                                        message: messages.first,
+                                        row: row,
+                                        errorMessage: errorMessage,
+                                        currentUserDisplayName: currentUserDisplayName,
+                                        currentUserEmail: currentUserEmail,
+                                        colorScheme: colorScheme,
+                                        mailboxLabel: mailboxLabel,
+                                        onRetry: onRetry,
+                                        onRespond: onRespond,
+                                        onThreadAction: onThreadAction,
+                                        onOpenAttachment: onOpenAttachment,
+                                        isAttachmentDownloading: isAttachmentDownloading
+                                    )
+                                } else {
+                                    GroupedEmailContent(
+                                        threadID: threadID,
+                                        messages: messages,
+                                        expectedMessageCount: resolvedMessageCount,
+                                        focusedMessageID: focusedMessageID,
+                                        errorMessage: errorMessage,
+                                        currentUserDisplayName: currentUserDisplayName,
+                                        currentUserEmail: currentUserEmail,
+                                        colorScheme: colorScheme,
+                                        mailboxLabel: mailboxLabel,
+                                        expandedMessageKeys: $expandedMessageKeys,
+                                        activeMessageKey: $activeMessageKey,
+                                        expansionInitializedThreadID: $expansionInitializedThreadID,
+                                        onRetry: onRetry,
+                                        onRespond: onRespond,
+                                        onThreadAction: onThreadAction,
+                                        onOpenAttachment: onOpenAttachment,
+                                        isAttachmentDownloading: isAttachmentDownloading,
+                                        onInitialMessageKey: { messageKey, explicitlyFocused in
+                                            DispatchQueue.main.async {
+                                                scrollProxy.scrollTo(
+                                                    messageKey,
+                                                    anchor: explicitlyFocused ? .center : .top
+                                                )
+                                            }
+                                        }
+                                    )
+                                }
+                            }
+                            .padding(.top, EmailReaderMetrics.contentTop)
+                            .frame(maxWidth: .infinity)
+
+                            if activeMessage != nil, errorMessage == nil {
+                                Color.clear
+                                    .frame(height: ElectronicMailControlMetrics.readerFixedActionsReservedHeight)
+                                    .accessibilityHidden(true)
+                            }
+
+                            if resolvedMessageCount > 1 {
+                                Color.clear
+                                    .frame(height: max(0, proxy.size.height - 120))
+                                    .accessibilityHidden(true)
                             }
                         }
-                        .padding(.top, EmailReaderMetrics.contentTop)
-                        .padding(.bottom, EmailReaderMetrics.actionOverlayClearance)
                         .frame(maxWidth: .infinity)
                     }
+                }
 
-                    if let activeMessage, errorMessage == nil {
-                        ReaderActionBubbles(
-                            onReply: { onRespond(.reply, activeMessage.id) },
-                            onReplyAll: { onRespond(.replyAll, activeMessage.id) },
-                            onForward: { onRespond(.forward, activeMessage.id) }
-                        )
-                        .frame(width: contentWidth)
-                        .padding(.bottom, EmailReaderMetrics.actionOverlayBottom)
-                        .zIndex(2)
-                    }
+                if let activeMessage, errorMessage == nil {
+                    ReaderActionBubbles(
+                        onReply: { onRespond(.reply, activeMessage.id) },
+                        onReplyAll: { onRespond(.replyAll, activeMessage.id) },
+                        onForward: { onRespond(.forward, activeMessage.id) }
+                    )
+                    .frame(width: contentWidth)
+                    .padding(.bottom, ElectronicMailControlMetrics.readerFloatingActionsBottomInset)
+                    .zIndex(2)
                 }
             }
-        }
-        .onChange(of: threadID) { _, _ in
-            expandedMessageKeys.removeAll()
-            activeMessageKey = nil
-            expansionInitializedThreadID = nil
         }
     }
 
@@ -134,6 +152,235 @@ struct EmailReaderView: View {
         return presentation.latestMessageKey
     }
 
+}
+
+/// Shared reader scroll surface. A measured top marker drives one lightweight
+/// gradient, so every message shape fades consistently beneath the fixed
+/// subject/header area without adding per-row state or animations.
+struct ElectronicMailReaderFadingScrollView<Content: View>: View {
+    let colorScheme: ColorScheme
+    let showsIndicators: Bool
+    let scrollIdentity: AnyHashable?
+    let offsetReadRequest: AnyHashable?
+    let fadeTopInset: CGFloat
+    let onScrollOffsetChange: (CGFloat) -> Void
+    let content: Content
+
+    @State private var scrollOffset: CGFloat = 0
+    @State private var initialScrollOffset: CGFloat?
+
+    init(
+        colorScheme: ColorScheme,
+        showsIndicators: Bool,
+        scrollIdentity: AnyHashable? = nil,
+        offsetReadRequest: AnyHashable? = nil,
+        fadeTopInset: CGFloat = ElectronicMailControlMetrics.readerScrollFadeTopInset,
+        onScrollOffsetChange: @escaping (CGFloat) -> Void = { _ in },
+        @ViewBuilder content: () -> Content
+    ) {
+        self.colorScheme = colorScheme
+        self.showsIndicators = showsIndicators
+        self.scrollIdentity = scrollIdentity
+        self.offsetReadRequest = offsetReadRequest
+        self.fadeTopInset = fadeTopInset
+        self.onScrollOffsetChange = onScrollOffsetChange
+        self.content = content()
+    }
+
+    var body: some View {
+        ScrollView(.vertical, showsIndicators: showsIndicators) {
+            content
+                .background(alignment: .top) {
+                    ElectronicMailReaderScrollObserver(
+                        identity: scrollIdentity,
+                        offsetReadRequest: offsetReadRequest,
+                        onOffsetChange: recordScrollOffset
+                    )
+                }
+        }
+        .onChange(of: scrollIdentity) { _, _ in
+            initialScrollOffset = nil
+            scrollOffset = 0
+        }
+        .environment(\.electronicMailReaderFadeTopInset, fadeTopInset)
+        .mask {
+            ElectronicMailReaderFadeMask(
+                progress: ElectronicMailReaderScrollFade.progress(
+                    forContentTop: scrollOffset,
+                    initialContentTop: initialScrollOffset ?? scrollOffset
+                )
+            )
+        }
+    }
+
+    private func recordScrollOffset(_ nextOffset: CGFloat) {
+        if initialScrollOffset == nil {
+            initialScrollOffset = nextOffset
+            scrollOffset = nextOffset
+            onScrollOffsetChange(nextOffset)
+            return
+        }
+        guard abs(nextOffset - scrollOffset) > 0.25 else {
+            return
+        }
+        scrollOffset = nextOffset
+        onScrollOffsetChange(nextOffset)
+    }
+}
+
+/// Mask the complete scroll surface rather than painting above it. That makes
+/// rich WKWebView bodies and native SwiftUI message rows fade through the same
+/// top edge even when AppKit composites the web view in a separate layer.
+private struct ElectronicMailReaderFadeMask: View {
+    let progress: CGFloat
+
+    var body: some View {
+        let clampedProgress = min(1, max(0, progress))
+        VStack(spacing: 0) {
+            LinearGradient(
+                colors: [
+                    Color.black.opacity(1 - clampedProgress),
+                    Color.black,
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: ElectronicMailControlMetrics.readerScrollFadeHeight)
+
+            Color.black
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+enum ElectronicMailReaderScrollFade {
+    static func progress(
+        forContentTop contentTop: CGFloat,
+        initialContentTop: CGFloat = 0
+    ) -> CGFloat {
+        let travel = abs(initialContentTop - contentTop)
+        return min(
+            1,
+            max(
+                0,
+                travel / ElectronicMailControlMetrics.readerScrollFadeActivationDistance
+            )
+        )
+    }
+}
+
+private struct ElectronicMailReaderScrollObserver: NSViewRepresentable {
+    let identity: AnyHashable?
+    let offsetReadRequest: AnyHashable?
+    let onOffsetChange: (CGFloat) -> Void
+
+    func makeNSView(context _: Context) -> ObserverView {
+        let view = ObserverView()
+        view.identity = identity
+        view.offsetReadRequest = offsetReadRequest
+        view.onOffsetChange = onOffsetChange
+        return view
+    }
+
+    func updateNSView(_ nsView: ObserverView, context _: Context) {
+        nsView.onOffsetChange = onOffsetChange
+        nsView.identity = identity
+        nsView.offsetReadRequest = offsetReadRequest
+        nsView.installObservationIfPossible()
+    }
+
+    final class ObserverView: NSView {
+        var identity: AnyHashable? {
+            didSet {
+                guard identity != oldValue else { return }
+                DispatchQueue.main.async { [weak self] in
+                    self?.publishCurrentOffset()
+                }
+            }
+        }
+        var offsetReadRequest: AnyHashable? {
+            didSet {
+                guard offsetReadRequest != oldValue else { return }
+                DispatchQueue.main.async { [weak self] in
+                    self?.installObservationIfPossible()
+                    self?.publishCurrentOffset()
+                }
+            }
+        }
+        var onOffsetChange: (CGFloat) -> Void = { _ in }
+        private weak var observedScrollView: NSScrollView?
+        private var boundsObserver: NSObjectProtocol?
+
+        override func viewDidMoveToSuperview() {
+            super.viewDidMoveToSuperview()
+            installObservationIfPossible()
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            installObservationIfPossible()
+        }
+
+        deinit {
+            removeObservation()
+        }
+
+        func installObservationIfPossible() {
+            guard window != nil, let scrollView = enclosingScrollView() else { return }
+            if observedScrollView === scrollView {
+                publishCurrentOffset()
+                return
+            }
+
+            removeObservation()
+            observedScrollView = scrollView
+            let clipView = scrollView.contentView
+            clipView.postsBoundsChangedNotifications = true
+            boundsObserver = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification,
+                object: clipView,
+                queue: .main
+            ) { [weak self] _ in
+                self?.publishCurrentOffset()
+            }
+            publishCurrentOffset()
+        }
+
+        private func enclosingScrollView() -> NSScrollView? {
+            var candidate = superview
+            while let current = candidate {
+                if let scrollView = current as? NSScrollView {
+                    return scrollView
+                }
+                candidate = current.superview
+            }
+            return nil
+        }
+
+        private func publishCurrentOffset() {
+            guard let observedScrollView else { return }
+            onOffsetChange(observedScrollView.contentView.bounds.origin.y)
+        }
+
+        private func removeObservation() {
+            if let boundsObserver {
+                NotificationCenter.default.removeObserver(boundsObserver)
+            }
+            boundsObserver = nil
+            observedScrollView = nil
+        }
+    }
+}
+
+private struct ElectronicMailReaderFadeTopInsetEnvironmentKey: EnvironmentKey {
+    static let defaultValue = ElectronicMailControlMetrics.readerScrollFadeTopInset
+}
+
+private extension EnvironmentValues {
+    var electronicMailReaderFadeTopInset: CGFloat {
+        get { self[ElectronicMailReaderFadeTopInsetEnvironmentKey.self] }
+        set { self[ElectronicMailReaderFadeTopInsetEnvironmentKey.self] = newValue }
+    }
 }
 
 private struct EmailReaderChrome<Content: View>: View {
@@ -191,6 +438,8 @@ private struct SingleEmailContent: View {
                     onThreadAction: onThreadAction,
                     onOpenAttachment: onOpenAttachment,
                     isAttachmentDownloading: isAttachmentDownloading,
+                    groupingDetails: nil,
+                    onOpenDetails: nil,
                     onToggle: {}
                 )
                 .padding(.top, EmailReaderMetrics.headerToConversation)
@@ -220,7 +469,7 @@ private struct GroupedEmailContent: View {
     let onThreadAction: (GmailThreadAction, String?) -> Void
     let onOpenAttachment: (ThreadAttachment, String) -> Void
     let isAttachmentDownloading: (ThreadAttachment, String) -> Bool
-    let onFocusedMessageKey: (EmailThreadPresentationItem.ID) -> Void
+    let onInitialMessageKey: (EmailThreadPresentationItem.ID, Bool) -> Void
 
     var body: some View {
         let presentation = EmailThreadPresentation.snapshot(from: messages)
@@ -260,7 +509,9 @@ private struct GroupedEmailContent: View {
                             onRespond: onRespond,
                             onThreadAction: onThreadAction,
                             onOpenAttachment: onOpenAttachment,
-                            isAttachmentDownloading: isAttachmentDownloading
+                            isAttachmentDownloading: isAttachmentDownloading,
+                            groupingDetails: nil,
+                            onOpenDetails: nil
                         ) {
                             toggle(item.id, in: presentation)
                         }
@@ -319,15 +570,20 @@ private struct GroupedEmailContent: View {
         let validKeys = Set(presentation.items.map(\.id))
         expandedMessageKeys.formIntersection(validKeys)
 
-        let focused = focusedMessageID.flatMap { focusedMessageID in
-            presentation.items.first(where: { $0.message.id == focusedMessageID })
-        }
+        let initialTarget = EmailReaderInitialMessagePolicy.target(
+            focusedMessageID: focusedMessageID,
+            in: presentation
+        )
 
         if expansionInitializedThreadID != threadID,
-           let initialMessageKey = focused?.id ?? presentation.latestMessageKey {
-            expandedMessageKeys = [initialMessageKey]
-            activeMessageKey = initialMessageKey
+           let initialTarget {
+            expandedMessageKeys = [initialTarget.messageKey]
+            activeMessageKey = initialTarget.messageKey
             expansionInitializedThreadID = threadID
+            DispatchQueue.main.async {
+                onInitialMessageKey(initialTarget.messageKey, initialTarget.explicitlyFocused)
+            }
+            return
         }
 
         if let activeMessageKey, !validKeys.contains(activeMessageKey) {
@@ -337,13 +593,14 @@ private struct GroupedEmailContent: View {
         }
 
         guard scrollToFocus,
-              let focused else {
+              let focused = initialTarget,
+              focused.explicitlyFocused else {
             return
         }
-        expandedMessageKeys.insert(focused.id)
-        activeMessageKey = focused.id
+        expandedMessageKeys.insert(focused.messageKey)
+        activeMessageKey = focused.messageKey
         DispatchQueue.main.async {
-            onFocusedMessageKey(focused.id)
+            onInitialMessageKey(focused.messageKey, true)
         }
     }
 }
@@ -463,11 +720,26 @@ private struct ReaderIconButton: View {
     }
 }
 
-private struct ReaderActionBubbles: View {
+struct ReaderActionBubbles: View {
     let onReply: () -> Void
     let onReplyAll: () -> Void
     let onForward: () -> Void
-    @Environment(\.colorScheme) private var colorScheme
+    let onCompletion: (() -> Void)?
+    let completionHelp: String?
+
+    init(
+        onReply: @escaping () -> Void,
+        onReplyAll: @escaping () -> Void,
+        onForward: @escaping () -> Void,
+        onCompletion: (() -> Void)? = nil,
+        completionHelp: String? = nil
+    ) {
+        self.onReply = onReply
+        self.onReplyAll = onReplyAll
+        self.onForward = onForward
+        self.onCompletion = onCompletion
+        self.completionHelp = completionHelp
+    }
 
     var body: some View {
         ElectronicMailFloatingActionGroup(spacing: ElectronicMailControlMetrics.readerActionGap) {
@@ -492,14 +764,16 @@ private struct ReaderActionBubbles: View {
                     role: .standard,
                     action: onForward
                 )
+
+                if let onCompletion, let completionHelp {
+                    actionButton(
+                        title: completionHelp,
+                        symbol: "checkmark",
+                        role: .standard,
+                        action: onCompletion
+                    )
+                }
             }
-        }
-        .background {
-            ReaderActionFocusBackdrop(colorScheme: colorScheme)
-                .frame(
-                    width: EmailReaderMetrics.actionFocusBackdropWidth,
-                    height: EmailReaderMetrics.actionFocusBackdropHeight
-                )
         }
         .frame(maxWidth: .infinity, alignment: .center)
     }
@@ -520,42 +794,6 @@ private struct ReaderActionBubbles: View {
         )
         .help(title)
         .accessibilityLabel(title)
-    }
-}
-
-private struct ReaderActionFocusBackdrop: View {
-    let colorScheme: ColorScheme
-
-    var body: some View {
-        Capsule()
-            .fill(
-                LinearGradient(
-                    colors: [
-                        backdropColor.opacity(0),
-                        backdropColor.opacity(0.32),
-                        backdropColor.opacity(0.54),
-                        backdropColor.opacity(0.32),
-                        backdropColor.opacity(0),
-                    ],
-                    startPoint: .leading,
-                    endPoint: .trailing
-                )
-            )
-            .blur(radius: 18)
-            .mask {
-                LinearGradient(
-                    colors: [.clear, .black, .black, .clear],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            }
-            .blur(radius: 8)
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-    }
-
-    private var backdropColor: Color {
-        ElectronicMailDesign.background(for: colorScheme)
     }
 }
 
@@ -643,6 +881,7 @@ private struct EmailBodyContent: View, Equatable {
     private let resolutionID: EmailBodyResolutionID
     @State private var resolvedBody: EmailPreparedBody?
     @State private var resolvedBodyID: EmailBodyResolutionID?
+    @State private var showsQuotedContent = false
 
     init(
         threadID: String,
@@ -657,7 +896,8 @@ private struct EmailBodyContent: View, Equatable {
         let resolutionID = EmailBodyResolutionID(
             messageKey: message?.id ?? threadID,
             renderRevision: message?.renderRevision ?? 0,
-            usesDarkMode: colorScheme == .dark
+            usesDarkMode: colorScheme == .dark,
+            presentationVersion: EmailHTMLConversationPolicy.presentationVersion
         )
         self.resolutionID = resolutionID
 
@@ -684,15 +924,27 @@ private struct EmailBodyContent: View, Equatable {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             switch resolvedBody {
-            case .some(.html(let preparedDocument, let fallbackText)):
+            case .some(.html(let presentation, let fallbackText)):
                 EmailOriginalBodyView(
-                    preparedDocument: preparedDocument,
+                    preparedDocument: showsQuotedContent
+                        ? presentation.originalDocument
+                        : presentation.primaryDocument,
                     fallbackText: fallbackText,
                     threadID: threadID,
                     messageID: message?.id,
                     colorScheme: colorScheme,
-                    renderRevision: resolutionID.renderRevision
+                    renderRevision: resolutionID.renderRevision,
+                    presentationMode: showsQuotedContent ? "original" : "conversation"
                 )
+
+                if presentation.hidesQuotedContent {
+                    EmailQuotedContentButton(
+                        expanded: showsQuotedContent,
+                        colorScheme: colorScheme
+                    ) {
+                        showsQuotedContent.toggle()
+                    }
+                }
             case .some(.text(let attributedText)):
                 if !markers.isEmpty {
                     EmailReaderMarkerRow(markers: markers, colorScheme: colorScheme)
@@ -702,6 +954,16 @@ private struct EmailBodyContent: View, Equatable {
                     attributedText: attributedText,
                     colorScheme: colorScheme
                 )
+
+                if let quotedText = EmailReaderBodyResolver.quotedTextForDisclosure(from: message) {
+                    EmailReaderDetailDisclosure(
+                        title: "quoted content",
+                        bodyText: quotedText,
+                        colorScheme: colorScheme,
+                        renderRevision: resolutionID.renderRevision
+                    )
+                    .id("\(resolutionID.messageKey)-quoted-content")
+                }
             case .none:
                 HStack(spacing: 10) {
                     ProgressView().controlSize(.small)
@@ -714,6 +976,7 @@ private struct EmailBodyContent: View, Equatable {
         }
         .task(id: resolutionID) {
             guard resolvedBodyID != resolutionID else { return }
+            showsQuotedContent = false
             resolvedBody = nil
             resolvedBodyID = nil
             let input = EmailBodyResolutionInput(
@@ -733,14 +996,31 @@ private struct EmailBodyContent: View, Equatable {
 
                 switch bodyKind {
                 case .html(let sourceHTML, let fallbackText):
-                    let renderable = EmailHTMLDocument.renderableDocument(
+                    let sourcePresentation = EmailHTMLConversationPolicy.presentation(
                         from: sourceHTML,
+                        quoteDetected: input.message?.reader?.quoteDetected
+                    )
+                    let primaryRenderable = EmailHTMLDocument.renderableDocument(
+                        from: sourcePresentation.primaryHTML,
                         colorScheme: input.usesDarkMode ? .dark : .light
                     )
                     guard !Task.isCancelled else { return nil }
+                    let originalRenderable = sourcePresentation.hasHiddenQuotedContent
+                        ? EmailHTMLDocument.renderableDocument(
+                            from: sourcePresentation.originalHTML,
+                            colorScheme: input.usesDarkMode ? .dark : .light
+                        )
+                        : primaryRenderable
+                    guard !Task.isCancelled else { return nil }
                     return .html(
-                        EmailHTMLPreparedDocument(
-                            remoteImagesDocument: EmailRemoteImagePolicy.renderDocument(from: renderable)
+                        EmailHTMLPreparedConversation(
+                            primaryDocument: EmailHTMLPreparedDocument(
+                                remoteImagesDocument: EmailRemoteImagePolicy.renderDocument(from: primaryRenderable)
+                            ),
+                            originalDocument: EmailHTMLPreparedDocument(
+                                remoteImagesDocument: EmailRemoteImagePolicy.renderDocument(from: originalRenderable)
+                            ),
+                            hidesQuotedContent: sourcePresentation.hasHiddenQuotedContent
                         ),
                         fallbackText: fallbackText
                     )
@@ -775,6 +1055,7 @@ private struct EmailBodyResolutionID: Hashable {
     let messageKey: String
     let renderRevision: UInt64
     let usesDarkMode: Bool
+    let presentationVersion: Int
 }
 
 private struct EmailBodyResolutionInput: @unchecked Sendable {
@@ -785,8 +1066,14 @@ private struct EmailBodyResolutionInput: @unchecked Sendable {
 }
 
 private enum EmailPreparedBody: @unchecked Sendable {
-    case html(EmailHTMLPreparedDocument, fallbackText: String)
+    case html(EmailHTMLPreparedConversation, fallbackText: String)
     case text(AttributedString)
+}
+
+private struct EmailHTMLPreparedConversation: @unchecked Sendable {
+    let primaryDocument: EmailHTMLPreparedDocument
+    let originalDocument: EmailHTMLPreparedDocument
+    let hidesQuotedContent: Bool
 }
 
 enum EmailReaderBodyKind: Equatable, Sendable {
@@ -821,7 +1108,7 @@ enum EmailReaderBodyResolver {
                 return .html(html, fallbackText: fallback)
             }
 
-            if let primaryText = nonEmpty(message?.reader?.primaryText) {
+            if let primaryText = preferredReaderText(from: message) {
                 logClassification(
                     threadID: threadID,
                     messageID: message?.id,
@@ -846,7 +1133,7 @@ enum EmailReaderBodyResolver {
             return .text(fallback)
         }
 
-        if let primaryText = nonEmpty(message?.reader?.primaryText) {
+        if let primaryText = preferredReaderText(from: message) {
             logClassification(
                 threadID: threadID,
                 messageID: message?.id,
@@ -881,7 +1168,10 @@ enum EmailReaderBodyResolver {
     static func immediatePlainText(message: ThreadMessage?, fallbackText: String) -> String? {
         let renderMode = message?.reader?.renderMode
         if renderMode == "plain_conversation" || renderMode == "mixed" {
-            return nonEmpty(message?.reader?.primaryText)
+            guard !shouldReconsiderPlainConversationHTML(message) else {
+                return nil
+            }
+            return preferredReaderText(from: message)
                 ?? nonEmpty(message?.body).map(readableBodyText)
                 ?? nonEmpty(fallbackText).map(readableBodyText)
         }
@@ -891,9 +1181,21 @@ enum EmailReaderBodyResolver {
             return nil
         }
 
-        return nonEmpty(message?.reader?.primaryText)
+        return preferredReaderText(from: message)
             ?? nonEmpty(message?.body).map(readableBodyText)
             ?? nonEmpty(fallbackText).map(readableBodyText)
+    }
+
+    static func quotedTextForDisclosure(from message: ThreadMessage?) -> String? {
+        guard let quotedText = nonEmpty(message?.reader?.quotedText) else {
+            return nil
+        }
+        guard let primaryText = nonEmpty(message?.reader?.primaryText) else {
+            return nil
+        }
+        return normalizedForComparison(primaryText) == normalizedForComparison(quotedText)
+            ? nil
+            : quotedText
     }
 
     static func renderableHTML(from message: ThreadMessage?) -> String? {
@@ -919,11 +1221,47 @@ enum EmailReaderBodyResolver {
         switch message?.reader?.renderMode {
         case "rich_html":
             return true
-        case "plain_conversation", "mixed":
+        case "plain_conversation":
+            // Older cached reader payloads can classify designed transactional
+            // mail as plain text. Recover only when there is no quoted-history
+            // signal and the HTML itself is clearly layout-bearing.
+            return message?.reader?.quoteDetected != true && analysis.isRich
+        case "mixed":
             return false
         default:
-            return message?.reader?.htmlIsRich ?? analysis.isRich
+            return message?.reader?.htmlIsRich == true || analysis.isRich
         }
+    }
+
+    private static func shouldReconsiderPlainConversationHTML(_ message: ThreadMessage?) -> Bool {
+        guard message?.reader?.quoteDetected != true,
+              let html = nonEmpty(message?.htmlRenderDocument) ?? nonEmpty(message?.htmlBody)
+        else {
+            return false
+        }
+
+        let primaryLength = preferredReaderText(from: message)?.utf16.count ?? 0
+        return html.utf16.count > max(900, max(1, primaryLength) * 3)
+    }
+
+    private static func preferredReaderText(from message: ThreadMessage?) -> String? {
+        let primaryText = nonEmpty(message?.reader?.primaryText).map(readableBodyText)
+        guard message?.reader?.quoteDetected == true,
+              let quotedText = nonEmpty(message?.reader?.quotedText).map(readableBodyText) else {
+            return primaryText
+        }
+        guard let primaryText else {
+            return quotedText
+        }
+        return normalizedForComparison(primaryText) == normalizedForComparison(quotedText)
+            ? quotedText
+            : primaryText
+    }
+
+    private static func normalizedForComparison(_ value: String) -> String {
+        EmailReaderText.decodingHTML(value)
+            .lowercased()
+            .filter { !$0.isWhitespace }
     }
 
     private static func analyzeHTML(_ value: String) -> HTMLBodyAnalysis {
@@ -1008,11 +1346,12 @@ enum EmailReaderBodyResolver {
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard normalized.count > 180, normalized.contains("\n") == false else {
-            return normalized
+        let structured = restoringCompactedHeaderLines(in: normalized)
+        guard structured.count > 180, normalized.contains("\n") == false else {
+            return structured
         }
 
-        return normalized
+        return structured
             .replacingOccurrences(
                 of: #"(?i)^((?:hi|hello|hey|dear)\b[^,]{0,80},)\s+"#,
                 with: "$1\n\n",
@@ -1028,6 +1367,51 @@ enum EmailReaderBodyResolver {
                 with: "\n\n$1 ",
                 options: .regularExpression
             )
+    }
+
+    /// Older local rows were stored after signal normalization collapsed every
+    /// line. Recover obvious RFC-style header runs without changing ordinary
+    /// one-line messages that happen to contain a single "Subject:" token.
+    private static func restoringCompactedHeaderLines(in value: String) -> String {
+        guard value.filter({ $0 == "\n" }).count < 2,
+              let regex = try? NSRegularExpression(
+                pattern: #"(?i)(?:^|\s)(From|Sent|Date|To|Cc|Bcc|Reply-To|Subject|Message-ID|Content-Type):\s"#
+              ) else {
+            return value
+        }
+
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        let labels = Set(regex.matches(in: value, range: range).compactMap { match -> String? in
+            guard match.numberOfRanges > 1,
+                  let labelRange = Range(match.range(at: 1), in: value) else {
+                return nil
+            }
+            return value[labelRange].lowercased()
+        })
+        guard labels.count >= 4,
+              labels.contains("from"),
+              labels.contains("subject"),
+              labels.contains("to"),
+              labels.contains("message-id") || labels.contains("content-type") else {
+            return value
+        }
+
+        var formatted = value.replacingOccurrences(
+            of: #"(?i)\h+(?=(?:From|Sent|Date|To|Cc|Bcc|Reply-To|Subject|Message-ID|Content-Type):\h)"#,
+            with: "\n",
+            options: .regularExpression
+        )
+        formatted = formatted.replacingOccurrences(
+            of: #"\n(?=From:\h)"#,
+            with: "\n\n",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        formatted = formatted.replacingOccurrences(
+            of: #"(?i)(Content-Type:\h*[^\s;]+(?:\h*;\h*charset\h*=\h*(?:\"[^\"]*\"|'[^']*'|[^\s]+))?)\h+"#,
+            with: "$1\n\n",
+            options: .regularExpression
+        )
+        return formatted
     }
 
     private static func looksLikeHTML(_ value: String) -> Bool {
@@ -1225,6 +1609,12 @@ enum EmailReaderBodyResolver {
             if tableCount >= 2 && tableTagCount >= 2 && (styleCount >= 1 || classCount >= 1) && sourceLength > max(500, visibleTextLength * 2) {
                 return true
             }
+            if tableCount == 1,
+               tableTagCount >= 4,
+               styleCount + classCount >= 4,
+               sourceLength > max(900, visibleTextLength * 2) {
+                return true
+            }
             if layoutTagCount >= 2 && (styleCount >= 1 || classCount >= 1) && sourceIsDocumentSized {
                 return true
             }
@@ -1399,7 +1789,7 @@ private struct EmailReaderDetailDisclosure: View {
                 HStack(spacing: 7) {
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
                         .font(.system(size: 11, weight: .semibold))
-                    Text(title)
+                    Text("\(expanded ? "Hide" : "Show") \(title)")
                         .font(EmailReaderTypography.metadata(weight: .medium))
                 }
                 .foregroundStyle(ElectronicMailDesign.appleBlue)
@@ -1425,6 +1815,40 @@ private struct EmailReaderDetailDisclosure: View {
     }
 }
 
+private struct EmailQuotedContentButton: View {
+    let expanded: Bool
+    let colorScheme: ColorScheme
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(systemName: expanded ? "chevron.up" : "ellipsis")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 14)
+
+                Text(expanded ? "Hide quoted content" : "Show quoted content")
+                    .font(EmailReaderTypography.metadata(weight: .medium))
+            }
+            .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule()
+                    .fill(ElectronicMailDesign.controlFill(for: colorScheme))
+            )
+            .overlay {
+                Capsule()
+                    .stroke(ElectronicMailDesign.panelBorder(for: colorScheme), lineWidth: 0.75)
+            }
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(expanded ? "Hide the earlier messages quoted inside this email" : "Show the earlier messages quoted inside this email")
+        .accessibilityLabel(expanded ? "Hide quoted content" : "Show quoted content")
+    }
+}
+
 private struct EmailOriginalBodyView: View {
     let preparedDocument: EmailHTMLPreparedDocument
     let fallbackText: String
@@ -1432,6 +1856,7 @@ private struct EmailOriginalBodyView: View {
     let messageID: String?
     let colorScheme: ColorScheme
     let renderRevision: UInt64
+    let presentationMode: String
 
     var body: some View {
         EmailHTMLBodyView(
@@ -1442,7 +1867,7 @@ private struct EmailOriginalBodyView: View {
             colorScheme: colorScheme,
             renderRevision: renderRevision
         )
-        .id("\(renderRevision)-\(colorScheme == .dark ? "dark" : "light")")
+        .id("\(renderRevision)-\(colorScheme == .dark ? "dark" : "light")-\(presentationMode)")
         .background(ElectronicMailDesign.background(for: colorScheme))
         .padding(16)
     }
@@ -1481,7 +1906,7 @@ private struct EmailHTMLBodyView: View {
                         }
                     }
                     .frame(maxWidth: .infinity)
-                    .frame(height: max(EmailReaderMetrics.htmlBodyMinHeight, min(contentHeight, EmailReaderMetrics.htmlBodyMaxHeight)))
+                    .frame(height: max(EmailReaderMetrics.htmlBodyMinHeight, contentHeight))
                 }
             }
         }
@@ -1604,6 +2029,7 @@ enum EmailHTMLDarkModePolicy {
 }
 
 private struct EmailHTMLWebView: NSViewRepresentable {
+    @Environment(\.electronicMailReaderFadeTopInset) private var readerFadeTopInset
     let html: String
     let colorScheme: ColorScheme
     @Binding var contentHeight: CGFloat
@@ -1624,6 +2050,7 @@ private struct EmailHTMLWebView: NSViewRepresentable {
         configuration.userContentController.addUserScript(Coordinator.contentSizeUserScript)
 
         let webView = EmailScrollPassthroughWebView(frame: .zero, configuration: configuration)
+        webView.readerFadeTopInset = readerFadeTopInset
         updateAppearance(of: webView)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
@@ -1632,6 +2059,7 @@ private struct EmailHTMLWebView: NSViewRepresentable {
 
     func updateNSView(_ webView: WKWebView, context: Context) {
         context.coordinator.onRenderResult = onRenderResult
+        (webView as? EmailScrollPassthroughWebView)?.readerFadeTopInset = readerFadeTopInset
         updateAppearance(of: webView)
         guard context.coordinator.currentHTML != html else {
             return
@@ -1884,11 +2312,39 @@ private struct EmailHTMLRenderResult {
 }
 
 private final class EmailScrollPassthroughWebView: WKWebView {
+    var readerFadeTopInset = ElectronicMailControlMetrics.readerScrollFadeTopInset {
+        didSet {
+            guard abs(readerFadeTopInset - oldValue) > 0.25 else { return }
+            updateReaderFadeMask()
+        }
+    }
     private weak var parentScrollView: NSScrollView?
+    private var parentBoundsObserver: NSObjectProtocol?
+    private var initialParentBoundsY: CGFloat?
+    private weak var readerFadeOverlay: EmailReaderFadeOverlayView?
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        if window != nil {
+            installParentScrollObservation()
+        }
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        parentScrollView = enclosingScrollView()
+        installParentScrollObservation()
+    }
+
+    override func layout() {
+        super.layout()
+        if parentScrollView == nil, window != nil {
+            installParentScrollObservation()
+        }
+        updateReaderFadeMask()
+    }
+
+    deinit {
+        removeParentScrollObservation()
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -1909,6 +2365,171 @@ private final class EmailScrollPassthroughWebView: WKWebView {
             candidate = current.superview
         }
         return nil
+    }
+
+    private func installParentScrollObservation() {
+        removeParentScrollObservation()
+        guard window != nil, let scrollView = enclosingScrollView() else {
+            parentScrollView = nil
+            initialParentBoundsY = nil
+            layer?.mask = nil
+            readerFadeOverlay?.isHidden = true
+            return
+        }
+
+        parentScrollView = scrollView
+        let clipView = scrollView.contentView
+        readerFadeOverlay = EmailReaderFadeOverlayView.install(in: clipView)
+        initialParentBoundsY = clipView.bounds.origin.y
+        clipView.postsBoundsChangedNotifications = true
+        parentBoundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: clipView,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateReaderFadeMask()
+        }
+        updateReaderFadeMask()
+    }
+
+    private func removeParentScrollObservation() {
+        if let parentBoundsObserver {
+            NotificationCenter.default.removeObserver(parentBoundsObserver)
+        }
+        parentBoundsObserver = nil
+    }
+
+    private func updateReaderFadeMask() {
+        guard let scrollView = parentScrollView, window != nil else {
+            layer?.mask = nil
+            readerFadeOverlay?.isHidden = true
+            return
+        }
+
+        let clipView = scrollView.contentView
+        let initialBoundsY = initialParentBoundsY ?? clipView.bounds.origin.y
+        let upwardTravel = abs(clipView.bounds.origin.y - initialBoundsY)
+        let progress = ElectronicMailReaderScrollFade.progress(
+            forContentTop: -upwardTravel
+        )
+        let overlay = readerFadeOverlay ?? EmailReaderFadeOverlayView.install(in: clipView)
+        readerFadeOverlay = overlay
+        overlay.update(progress: progress, in: clipView, topInset: readerFadeTopInset)
+
+        // WKWebView's remote content can bypass a SwiftUI or ancestor layer
+        // mask. The native overlay above the clip view is the authoritative
+        // fade; clear any stale mask left by an earlier render.
+        layer?.mask = nil
+    }
+}
+
+private final class EmailReaderFadeOverlayView: NSView {
+    private static let sharedIdentifier = NSUserInterfaceItemIdentifier(
+        "electronic-mail-reader-fade-overlay"
+    )
+    private let gradientLayer = CAGradientLayer()
+
+    static func install(in clipView: NSClipView) -> EmailReaderFadeOverlayView {
+        let container = clipView.enclosingScrollView?.superview
+            ?? clipView.superview
+            ?? clipView
+        if let existing = container.subviews.first(where: {
+            $0.identifier == sharedIdentifier
+        }) as? EmailReaderFadeOverlayView {
+            container.addSubview(existing, positioned: .above, relativeTo: nil)
+            return existing
+        }
+
+        let overlay = EmailReaderFadeOverlayView(frame: .zero)
+        overlay.identifier = sharedIdentifier
+        container.addSubview(overlay, positioned: .above, relativeTo: nil)
+        return overlay
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer = gradientLayer
+        gradientLayer.isGeometryFlipped = false
+        gradientLayer.startPoint = CGPoint(x: 0.5, y: 0)
+        gradientLayer.endPoint = CGPoint(x: 0.5, y: 1)
+        gradientLayer.locations = [0, 1]
+        isHidden = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    func update(progress: CGFloat, in clipView: NSClipView, topInset: CGFloat) {
+        let clampedProgress = min(1, max(0, progress))
+        guard clampedProgress > 0 else {
+            isHidden = true
+            return
+        }
+
+        guard let container = superview else {
+            isHidden = true
+            return
+        }
+        let viewport = clipView.convert(clipView.bounds, to: container)
+        let height = min(
+            ElectronicMailControlMetrics.readerScrollFadeHeight,
+            viewport.height
+        )
+        // AppKit views normally measure upward from the bottom, while flipped
+        // containers measure downward from the top. Anchor the overlay to the
+        // visual top in either coordinate system, then place it immediately
+        // beneath the fixed reader header.
+        let y = container.isFlipped
+            ? viewport.minY + topInset
+            : viewport.maxY
+                - height
+                - topInset
+        frame = NSRect(
+            x: viewport.minX,
+            y: y,
+            width: viewport.width,
+            height: height
+        )
+
+        let background = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor.black
+            : NSColor.white
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        gradientLayer.frame = bounds
+        gradientLayer.colors = [
+            background.withAlphaComponent(clampedProgress).cgColor,
+            background.withAlphaComponent(0).cgColor,
+        ]
+        CATransaction.commit()
+        isHidden = false
+    }
+}
+
+enum ElectronicMailReaderWebFade {
+    static func alpha(
+        atWindowY y: CGFloat,
+        fadeTop: CGFloat,
+        fadeBottom: CGFloat,
+        progress: CGFloat
+    ) -> CGFloat {
+        let clampedProgress = min(1, max(0, progress))
+        let baseAlpha: CGFloat
+        if y >= fadeTop {
+            baseAlpha = 0
+        } else if y <= fadeBottom {
+            baseAlpha = 1
+        } else {
+            baseAlpha = (fadeTop - y) / max(1, fadeTop - fadeBottom)
+        }
+        return 1 - clampedProgress * (1 - baseAlpha)
     }
 }
 
@@ -1935,6 +2556,36 @@ struct EmailThreadPresentationDuplicateDiscriminator: Hashable {
 struct EmailThreadPresentationSnapshot: Equatable {
     let items: [EmailThreadPresentationItem]
     let latestMessageKey: EmailThreadPresentationItem.ID?
+}
+
+struct EmailReaderInitialMessageTarget: Equatable {
+    let messageKey: EmailThreadPresentationItem.ID
+    let explicitlyFocused: Bool
+}
+
+enum EmailReaderInitialMessagePolicy {
+    static func target(
+        focusedMessageID: String?,
+        in presentation: EmailThreadPresentationSnapshot
+    ) -> EmailReaderInitialMessageTarget? {
+        if let focusedMessageID,
+           let focused = presentation.items.first(where: {
+               $0.message.id == focusedMessageID
+           }) {
+            return EmailReaderInitialMessageTarget(
+                messageKey: focused.id,
+                explicitlyFocused: true
+            )
+        }
+
+        guard let latestMessageKey = presentation.latestMessageKey else {
+            return nil
+        }
+        return EmailReaderInitialMessageTarget(
+            messageKey: latestMessageKey,
+            explicitlyFocused: false
+        )
+    }
 }
 
 enum EmailThreadPresentation {
@@ -2037,6 +2688,154 @@ private struct EmailThreadPresentationDuplicateKey: Hashable {
     let receivedAt: String
 }
 
+struct EmailHTMLConversationPresentation: Equatable, Sendable {
+    let primaryHTML: String
+    let originalHTML: String
+    let hasHiddenQuotedContent: Bool
+}
+
+enum EmailHTMLConversationPolicy {
+    static let presentationVersion = 2
+
+    private static let namedQuoteContainerPattern = #"(?is)<(?:div|blockquote|section|table)\b[^>]*(?:id|class)\s*=\s*["'][^"']*(?:gmail_quote|yahoo_quoted|protonmail_quote|moz-cite-prefix|moz-forward-container|replyForwardMsg|divRplyFwdMsg)[^"']*["'][^>]*>"#
+    private static let citeBlockquotePattern = #"(?is)<blockquote\b[^>]*\btype\s*=\s*(?:["']\s*)?cite\b[^>]*>"#
+    private static let genericBlockquotePattern = #"(?is)<blockquote\b[^>]*>"#
+    private static let outlookBoundaryPattern = #"(?is)<div\b[^>]*\bstyle\s*=\s*["'][^"']*border-top\s*:\s*solid[^"']*["'][^>]*>"#
+    private static let originalMessageMarkerPattern = #"(?is)(?:-{2,}\s*)?(?:begin\s+)?(?:original|forwarded)\s+message\s*:?(?:\s*-{2,})?"#
+
+    static func presentation(
+        from html: String,
+        quoteDetected: Bool?
+    ) -> EmailHTMLConversationPresentation {
+        let original = html.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !original.isEmpty, quoteDetected != false else {
+            return unmodified(original)
+        }
+
+        var candidates: [String.Index] = []
+        appendFirstMatch(namedQuoteContainerPattern, in: original, to: &candidates)
+        appendFirstMatch(citeBlockquotePattern, in: original, to: &candidates)
+        appendFirstMatch(outlookBoundaryPattern, in: original, to: &candidates, requiringOutlookHeaders: true)
+        appendFirstMatch(originalMessageMarkerPattern, in: original, to: &candidates)
+
+        if quoteDetected == true {
+            appendFirstMatch(genericBlockquotePattern, in: original, to: &candidates)
+        }
+
+        guard let quoteStart = candidates
+            .sorted()
+            .first(where: { hasVisiblePrimaryContent(in: original, before: $0) }) else {
+            return unmodified(original)
+        }
+
+        let bodyEnd = original.range(
+            of: #"(?is)</body\s*>"#,
+            options: [.regularExpression, .backwards]
+        )?.lowerBound
+        let suffixStart = bodyEnd.map { max($0, quoteStart) } ?? original.endIndex
+        let collapsed = String(original[..<quoteStart])
+            + "\n<!-- Electronic Mail collapsed quoted conversation history. -->\n"
+            + String(original[suffixStart...])
+
+        guard collapsed != original else {
+            return unmodified(original)
+        }
+        return EmailHTMLConversationPresentation(
+            primaryHTML: collapsed,
+            originalHTML: original,
+            hasHiddenQuotedContent: true
+        )
+    }
+
+    private static func unmodified(_ html: String) -> EmailHTMLConversationPresentation {
+        EmailHTMLConversationPresentation(
+            primaryHTML: html,
+            originalHTML: html,
+            hasHiddenQuotedContent: false
+        )
+    }
+
+    private static func appendFirstMatch(
+        _ pattern: String,
+        in html: String,
+        to candidates: inout [String.Index],
+        requiringOutlookHeaders: Bool = false
+    ) {
+        guard let range = html.range(of: pattern, options: .regularExpression) else {
+            return
+        }
+        if requiringOutlookHeaders,
+           !containsOutlookHeaderSequence(in: html, after: range.lowerBound) {
+            return
+        }
+        candidates.append(range.lowerBound)
+    }
+
+    private static func containsOutlookHeaderSequence(
+        in html: String,
+        after start: String.Index
+    ) -> Bool {
+        let end = html.index(start, offsetBy: 6_000, limitedBy: html.endIndex) ?? html.endIndex
+        let text = visibleText(in: String(html[start..<end])).lowercased()
+        let fields = ["from:", "sent:", "to:", "subject:"]
+        var cursor = text.startIndex
+        for field in fields {
+            guard let range = text.range(of: field, range: cursor..<text.endIndex) else {
+                return false
+            }
+            cursor = range.upperBound
+        }
+        return true
+    }
+
+    private static func hasVisiblePrimaryContent(
+        in html: String,
+        before quoteStart: String.Index
+    ) -> Bool {
+        let bodyStart = html.range(of: #"(?is)<body\b[^>]*>"#, options: .regularExpression)?.upperBound
+            ?? html.startIndex
+        guard bodyStart < quoteStart else {
+            return false
+        }
+        let prefix = String(html[bodyStart..<quoteStart])
+        let visibleCharacters = visibleText(in: prefix).filter { !$0.isWhitespace }
+        return visibleCharacters.count >= 2
+            || prefix.range(of: #"(?is)<img\b[^>]*>"#, options: .regularExpression) != nil
+    }
+
+    private static func visibleText(in html: String) -> String {
+        let withoutHiddenBlocks = html
+            .replacingOccurrences(
+                of: #"(?is)<!--.*?-->"#,
+                with: " ",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"(?is)<\s*(script|style)\b[^>]*>.*?</\s*\1\s*>"#,
+                with: " ",
+                options: .regularExpression
+            )
+        let withBreaks = withoutHiddenBlocks
+            .replacingOccurrences(
+                of: #"(?is)<\s*br\s*/?\s*>"#,
+                with: "\n",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"(?is)</\s*(div|p|tr|table|li|h[1-6])\s*>"#,
+                with: "\n",
+                options: .regularExpression
+            )
+        return EmailReaderText.decodingHTML(
+            withBreaks.replacingOccurrences(
+                of: #"(?is)<[^>]+>"#,
+                with: " ",
+                options: .regularExpression
+            )
+        )
+    }
+}
+
 enum EmailHTMLDocument {
     static func renderableDocument(from html: String, colorScheme: ColorScheme) -> String {
         guard !Task.isCancelled else { return "" }
@@ -2079,13 +2878,37 @@ enum EmailHTMLDocument {
     html, body {
       -webkit-text-size-adjust: 100%;
       background: transparent !important;
+      box-sizing: border-box;
+      max-width: 100%;
     }
     body {
       margin: 0;
+      min-width: 0;
+      overflow-wrap: anywhere;
       font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
       font-size: 15px;
       line-height: 1.45;
       color: \(textColor);
+    }
+    body > table,
+    body > center > table,
+    body > div[width],
+    body > div[style*="width" i],
+    body > div[style*="max-width" i] {
+      margin-left: auto !important;
+      margin-right: auto !important;
+    }
+    table {
+      max-width: 100% !important;
+    }
+    img {
+      max-width: 100% !important;
+      height: auto !important;
+    }
+    pre {
+      max-width: 100%;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
     }
     a {
       color: \(linkColor);
@@ -2242,7 +3065,14 @@ enum EmailHTMLDocument {
     }
 }
 
-private struct EmailMessageCard: View {
+struct EmailMessageGroupingDetails: Equatable {
+    let explanation: String?
+    let supportingFactors: [String]
+    let conflictingFactors: [String]
+    let isLoading: Bool
+}
+
+struct EmailMessageCard: View {
     let threadID: String
     let message: ThreadMessage
     let expanded: Bool
@@ -2255,6 +3085,8 @@ private struct EmailMessageCard: View {
     let onThreadAction: (GmailThreadAction, String?) -> Void
     let onOpenAttachment: (ThreadAttachment, String) -> Void
     let isAttachmentDownloading: (ThreadAttachment, String) -> Bool
+    let groupingDetails: EmailMessageGroupingDetails?
+    let onOpenDetails: (() -> Void)?
     let onToggle: () -> Void
 
     @State private var detailsExpanded = false
@@ -2271,6 +3103,16 @@ private struct EmailMessageCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
+        .onChange(of: expanded) { _, isExpanded in
+            if !isExpanded {
+                detailsExpanded = false
+            }
+        }
+        .onChange(of: detailsExpanded) { _, isExpanded in
+            if isExpanded {
+                onOpenDetails?()
+            }
+        }
     }
 
     private var messageHeader: some View {
@@ -2296,7 +3138,8 @@ private struct EmailMessageCard: View {
                     message: message,
                     currentUserDisplayName: currentUserDisplayName,
                     currentUserEmail: currentUserEmail,
-                    colorScheme: colorScheme
+                    colorScheme: colorScheme,
+                    groupingDetails: groupingDetails
                 )
                     .padding(.top, EmailReaderMetrics.messageHeaderToDetails)
                     .padding(.bottom, 16)
@@ -2307,7 +3150,7 @@ private struct EmailMessageCard: View {
                 .frame(height: 1)
 
             EmailBodyContent(
-                threadID: threadID,
+                threadID: bodyThreadID,
                 message: message,
                 fallbackText: message.body.isEmpty ? EmailReaderText.loadingFullEmail : message.body,
                 colorScheme: colorScheme
@@ -2338,6 +3181,11 @@ private struct EmailMessageCard: View {
         return hasHTML
             ? EmailReaderMetrics.htmlDisclosureMeasurementDelay
             : EmailReaderMetrics.textDisclosureMeasurementDelay
+    }
+
+    private var bodyThreadID: String {
+        let messageThreadID = message.threadID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return messageThreadID?.isEmpty == false ? messageThreadID! : threadID
     }
 }
 
@@ -2583,7 +3431,10 @@ private struct EmailMessageHeader: View {
                                 .font(.system(size: 9, weight: .semibold))
                         }
                         .font(EmailReaderTypography.metadata(weight: .medium))
-                        .foregroundStyle(ElectronicMailDesign.appleBlue)
+                        .foregroundStyle(
+                            ElectronicMailDesign.secondaryText(for: colorScheme)
+                                .opacity(ElectronicMailControlMetrics.readerDetailsLabelOpacity)
+                        )
                         .padding(.vertical, 3)
                         .contentShape(Rectangle())
                     }
@@ -2709,6 +3560,7 @@ private struct EmailMessageDetailsStrip: View {
     let currentUserDisplayName: String?
     let currentUserEmail: String?
     let colorScheme: ColorScheme
+    let groupingDetails: EmailMessageGroupingDetails?
 
     var body: some View {
         VStack(alignment: .leading, spacing: EmailReaderMetrics.detailRowSpacing) {
@@ -2725,6 +3577,13 @@ private struct EmailMessageDetailsStrip: View {
             ForEach(message.reader?.markers.uniquedPreservingOrder() ?? []) { marker in
                 detailRow(marker.label, value: marker.text)
             }
+            if let groupingDetails {
+                Divider()
+                    .padding(.vertical, 4)
+                detailRow("AI matter") {
+                    groupingExplanation(groupingDetails)
+                }
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, EmailReaderMetrics.detailPanelVerticalPadding)
@@ -2736,6 +3595,38 @@ private struct EmailMessageDetailsStrip: View {
         .overlay {
             RoundedRectangle(cornerRadius: 7, style: .continuous)
                 .stroke(ElectronicMailDesign.panelBorder(for: colorScheme).opacity(0.72), lineWidth: 0.75)
+        }
+    }
+
+    @ViewBuilder
+    private func groupingExplanation(_ details: EmailMessageGroupingDetails) -> some View {
+        if let explanation = clean(details.explanation) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(explanation)
+                    .font(EmailReaderTypography.metadata())
+                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                ForEach(details.supportingFactors, id: \.self) { factor in
+                    Label(factor, systemImage: "checkmark.circle")
+                        .font(EmailReaderTypography.metadata())
+                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                }
+
+                ForEach(details.conflictingFactors, id: \.self) { factor in
+                    Label(factor, systemImage: "exclamationmark.circle")
+                        .font(EmailReaderTypography.metadata())
+                        .foregroundStyle(Color.orange)
+                }
+            }
+        } else {
+            HStack(spacing: 7) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(details.isLoading ? "Loading grouping details…" : "Grouping details are unavailable.")
+                    .font(EmailReaderTypography.metadata())
+                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+            }
         }
     }
 
@@ -2984,13 +3875,10 @@ private enum EmailReaderMetrics {
     static let expandedMessageBottomSpacing: CGFloat = 28
     static let avatarSize: CGFloat = 36
     static let actionBubbleHeight = ElectronicMailControlMetrics.actionHeight
-    static let actionOverlayBottom: CGFloat = 76
-    static let actionOverlayClearance: CGFloat = 188
-    static let actionFocusBackdropWidth: CGFloat = 580
-    static let actionFocusBackdropHeight: CGFloat = 112
+    static let actionSectionTopSpacing = ElectronicMailControlMetrics.readerResponseTopSpacing
+    static let actionSectionBottomSpacing = ElectronicMailControlMetrics.readerResponseBottomSpacing
     static let cardRadius: CGFloat = 7
     static let htmlBodyMinHeight: CGFloat = 360
-    static let htmlBodyMaxHeight: CGFloat = 6000
     static let maximumImmediateBodyCharacters = 20_000
     static let disclosureDuration: TimeInterval = 0.22
     static let detailDisclosureDuration: TimeInterval = 0.18

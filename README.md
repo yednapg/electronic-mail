@@ -1,6 +1,6 @@
 # Electronic Mail
 
-Electronic Mail is a focused native macOS Gmail client. The launch build provides standard mail workflows—sign-in, mailbox folders, full synchronization, reading and search, compose/reply/forward, drafts, attachments, and Gmail actions—without AI features. The web service is limited to the native download page, OAuth completion, privacy, terms, and support; it is not a second email client.
+Electronic Mail is a focused native macOS Gmail client. It keeps the normal Gmail Inbox intact and offers an optional, separately cached AI Inbox that organizes related messages into backend-owned matters. Standard mail workflows remain available without AI, and every Gmail action reconciles into both views. The web service is limited to the native download page, OAuth completion, privacy, terms, and support; it is not a second email client.
 
 ## Private source beta
 
@@ -26,6 +26,26 @@ npm run dev:macos
 ```
 
 See `macos/ElectronicMail/README.md` for native build details. Never use production Google, database, signing, or notarization credentials in local `.env` files.
+
+### Local AI Inbox testing with Codex
+
+Local manual testing can run AI Inbox classification and review through the signed-in Codex app instead of the usage-billed API. Install the local-only adapter and configure `backend/.env`:
+
+```bash
+./.venv/bin/python -m pip install -r backend/requirements.local-ai.txt
+
+AI_INBOX_ENABLED=true
+AI_INBOX_LOCAL_SHADOW_PREVIEW=true
+AI_INBOX_TEXT_PROVIDER=codex
+AI_INBOX_EMBEDDING_PROVIDER=local
+AI_INBOX_CLASSIFIER_MODEL=gpt-5.6-sol
+AI_INBOX_REVIEW_MODEL=gpt-5.6-sol
+AI_INBOX_CODEX_SERVICE_TIER=fast
+AI_INBOX_CODEX_TIMEOUT_SECONDS=90
+AI_INBOX_EMBEDDING_MODEL=local-hash-v1
+```
+
+The local shadow-preview switch lets the normal AI Inbox tab display the newest local test generation without promoting it. The Codex path is deliberately local-only, uses a fresh ephemeral read-only turn for each decision, and requires ChatGPT authentication. Automated tests mock the provider and do not consume Codex or API usage. Staging and production reject this configuration and continue to require the OpenAI Responses and Embeddings APIs.
 
 ## Verification
 

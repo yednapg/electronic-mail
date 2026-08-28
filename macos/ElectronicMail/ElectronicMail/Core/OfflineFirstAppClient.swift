@@ -598,6 +598,43 @@ public final class OfflineFirstAppClient: AppClient {
         }
     }
 
+    public func aiInbox(query: String? = nil) async throws -> AIInboxResponse {
+        try await accountScopedResponse { try await self.backend.aiInbox(query: query) }
+    }
+
+    public func aiOrganizationProfile() async throws -> AIOrganizationProfile {
+        try await accountScopedResponse { try await self.backend.aiOrganizationProfile() }
+    }
+
+    public func updateAIOrganizationProfile(_ patch: AIOrganizationProfilePatch) async throws -> AIOrganizationProfile {
+        try await accountScopedResponse { try await self.backend.updateAIOrganizationProfile(patch) }
+    }
+
+    public func aiMatter(_ matterID: String) async throws -> AIMatterDetail {
+        try await accountScopedResponse { try await self.backend.aiMatter(matterID) }
+    }
+
+    public func aiGroupingExplanation(matterID: String, messageID: String) async throws -> AIGroupingExplanation {
+        try await accountScopedResponse {
+            try await self.backend.aiGroupingExplanation(matterID: matterID, messageID: messageID)
+        }
+    }
+
+    public func applyMatterDecision(_ request: MatterDecisionRequest) async throws -> MatterDecisionResponse {
+        try await accountScopedResponse { try await self.backend.applyMatterDecision(request) }
+    }
+
+    public func applyMatterAction(_ request: MatterEntityActionRequest) async throws -> MatterEntityActionResponse {
+        try await accountScopedResponse { try await self.backend.applyMatterAction(request) }
+    }
+
+    public func deleteAIOrganizationData() async throws {
+        _ = try await accountScopedResponse { () async throws -> Bool in
+            try await self.backend.deleteAIOrganizationData()
+            return true
+        }
+    }
+
     private func enqueueOrStoreThreadAction(threadID: String, action: GmailThreadAction) async throws -> GmailThreadMutationResponse {
         let request = QueuedThreadActionRequest(
             clientActionID: UUID().uuidString,

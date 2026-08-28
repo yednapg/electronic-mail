@@ -1,6 +1,6 @@
 # Production runbook
 
-Electronic Mail is a native client backed by a FastAPI service, Postgres, three durable queue-worker services serving four queues, one Gmail recovery poller, and Google Pub/Sub. For the no-AI launch, explicitly disable the AI flags and leave `OPENAI_API_KEY` empty.
+Electronic Mail is a native client backed by a FastAPI service, a Postgres 17-compatible pgvector service, four durable queue-worker services, one Gmail recovery poller, and Google Pub/Sub. AI Inbox is an isolated, kill-switchable projection; the normal Gmail Inbox does not depend on it.
 
 ## Runtime topology
 
@@ -13,10 +13,11 @@ Deploy these processes from the same immutable commit and dependency lock:
 | Critical/default worker | `backend/railway.worker-fast.json` | 1 |
 | Reader worker | `backend/railway.worker-reader.json` | 1 |
 | Slow/backfill worker | `backend/railway.worker-slow.json` | 1 |
+| AI organization worker | `backend/railway.worker-ai.json` | 1 |
 | Gmail recovery poller | `backend/railway.worker-poller.json` | 1 |
-| Postgres | Managed Postgres 17 with PITR | Managed HA |
+| Postgres + pgvector | Pinned Postgres 17-compatible pgvector service with PITR | Managed HA |
 
-For every Railway API/worker service, set **Root Directory** to `/backend` and point **Config as Code** at its corresponding `railway*.json`. Every backend config builds `backend/Dockerfile`, so API and worker services run the same non-root Python 3.12 image installed from `requirements.lock`; only their start commands differ. The shared image health check is **process liveness only**: it gives the schema startup gate its full wait window, verifies the API over its local `/health` endpoint, and recognizes the reviewed worker/poller PID 1 entrypoints without incorrectly probing an HTTP port they do not serve. It is not a worker promotion gate. Worker operational readiness comes exclusively from fresh database heartbeats, exact release parity, exact fast/reader/slow/poller queue-role coverage, and the authenticated `/v1/ops/health` gate. The public web service instead uses repository root, `railway.web.json`, and `Dockerfile.web`.
+For every Railway API/worker service, set **Root Directory** to `/backend` and point **Config as Code** at its corresponding `railway*.json`. Every backend config builds `backend/Dockerfile`, so API and worker services run the same non-root Python 3.12 image installed from `requirements.lock`; only their start commands differ. The shared image health check is **process liveness only**: it gives the schema startup gate its full wait window, verifies the API over its local `/health` endpoint, and recognizes the reviewed worker/poller PID 1 entrypoints without incorrectly probing an HTTP port they do not serve. It is not a worker promotion gate. Worker operational readiness comes exclusively from fresh database heartbeats, exact release parity, exact fast/reader/slow/AI/poller queue-role coverage, and the authenticated `/v1/ops/health` gate. The public web service instead uses repository root, `railway.web.json`, and `Dockerfile.web`.
 
 GitHub-triggered Railway deployments expose `RAILWAY_GIT_COMMIT_SHA`; the backend uses that immutable value as `release_sha` in the API and every heartbeat. Do not manually copy `RELEASE_SHA` into Railway. If both variables exist and disagree, startup fails. Non-Railway production platforms must set a full immutable `RELEASE_SHA` themselves.
 
@@ -36,7 +37,8 @@ The deployment guard refuses to start unless:
 
 - Postgres, HTTPS origins, Google OAuth, authenticated Pub/Sub, and secure cookie settings are present;
 - the API and public web share the configured cookie domain and `SESSION_COOKIE_SAMESITE=lax`, which supports the top-level OAuth return while withholding the session from cross-site subrequests;
-- `GMAIL_SYNC_SCOPE=full` and `RATE_LIMIT_ENABLED=true`; `AI_GROUPING_ENABLED=false`, `OPENAI_REQUIRED=false`, and `OPENAI_DEBUG_LOGS=false`; and `OPENAI_API_KEY` is empty;
+- `GMAIL_SYNC_SCOPE=full` and `RATE_LIMIT_ENABLED=true`; the retired `AI_GROUPING_ENABLED`, `OPENAI_REQUIRED`, and `OPENAI_DEBUG_LOGS` flags stay explicitly false;
+- `AI_INBOX_ENABLED` is explicit. When true, an OpenAI key is required; when false, the key must be empty so disabled deployments cannot make provider calls;
 - staging uses `REGISTRATION_MODE=allowlist`; production explicitly chooses `allowlist` or `open`;
 - allowlist mode has at least one `ALLOWED_EMAILS` value.
 
@@ -61,14 +63,16 @@ Digest pins intentionally prevent automatic base-image updates. Review vulnerabi
 
 ## First deployment
 
-1. Provision production Postgres with encryption, automated daily backups, point-in-time recovery, and a tested restore target.
+1. Provision a pinned Postgres 17-compatible service with pgvector, encryption, automated daily backups, point-in-time recovery, and a tested restore target. Railway's default Postgres image does not bundle extensions; use its pgvector extension template or an equivalent managed service.
 2. Configure the production environment on every service.
-3. Apply migrations once from the API pre-deploy hook (`alembic upgrade head`). Do not run schema migrations concurrently from every worker.
-4. Start the three queue-worker services and Gmail poller, then the API.
-5. Configure GitHub repository secrets `PRODUCTION_BACKEND_URL` and `PRODUCTION_OPS_BEARER_TOKEN`; the bearer must be an app session for an `OPS_ADMIN_EMAILS` account and must be rotated like any other privileged credential.
-6. Require `.github/workflows/verify-production-backend.yml` before release promotion. Railway's production `deployment_status=success` event starts the verifier, which waits for three consecutive exact-release snapshots across `/health`, `/ready`, and authenticated `/v1/ops/health`. It proves Postgres/schema readiness, zero dead/stale jobs, bounded queues, fresh heartbeats, all worker releases matching the API, and one or more instances of each exact fast, reader, slow, and poller role. The ops endpoint remains authenticated; no public worker-readiness endpoint is added.
-7. Complete the full manual matrix in `docs/LAUNCH_TEST_MATRIX.md` with a non-owner Gmail test account and record the five accountable approvals in a copy of `docs/launch-acceptance.template.json`.
-8. Run the fail-closed production verifier with that completed acceptance manifest, the reviewed release identity, and complete artifact set, using the exact inputs below.
+3. Restore the latest production backup into an isolated target, apply `alembic upgrade head`, run `python -m app.schema_check`, compare row counts and constraints, and prove that the backup can be restored before changing `DATABASE_URL`. Keep the old database read-only during the rollback window.
+4. Apply migrations once from the API pre-deploy hook (`alembic upgrade head`). Do not run schema migrations concurrently from every worker. Readiness now verifies both the vector extension and every AI Inbox table/column.
+5. Start the four queue-worker services and Gmail poller, then the API. Keep `AI_INBOX_ENABLED=false` until the shadow projection is ready.
+6. Configure GitHub repository secrets `PRODUCTION_BACKEND_URL` and `PRODUCTION_OPS_BEARER_TOKEN`; the bearer must be an app session for an `OPS_ADMIN_EMAILS` account and must be rotated like any other privileged credential.
+7. Require `.github/workflows/verify-production-backend.yml` before release promotion. Railway's production `deployment_status=success` event starts the verifier, which waits for three consecutive exact-release snapshots across `/health`, `/ready`, and authenticated `/v1/ops/health`. It proves Postgres/schema readiness, zero dead/stale jobs, bounded queues, fresh heartbeats, all worker releases matching the API, and one or more instances of each exact fast, reader, slow, AI, and poller role. The ops endpoint remains authenticated; no public worker-readiness endpoint is added.
+8. Process the allowlisted user's latest 30 days into a shadow generation. Promote only after the AI Inbox precision, evidence, cost, latency, and zero-false-merge gates pass. Model, prompt, embedding, or threshold changes require a new shadow generation; never mutate an active projection in place.
+9. Complete the full manual matrix in `docs/LAUNCH_TEST_MATRIX.md` with a non-owner Gmail test account and record the five accountable approvals in a copy of `docs/launch-acceptance.template.json`.
+10. Run the fail-closed production verifier with that completed acceptance manifest, the reviewed release identity, and complete artifact set, using the exact inputs below.
 
 Railway config-as-code currently has a pre-deploy command and HTTP healthcheck path, but no multi-service post-deploy command. GitHub-triggered services also deploy independently. Therefore a worker `healthcheckPath` would be false (workers expose no HTTP server), and no individual service can prove whole-release convergence. The external exact-release workflow is the truthful promotion boundary. A green Railway service status is not production approval; keep download/traffic promotion blocked until this workflow and the complete launch verifier pass. A failed post-deploy gate cannot atomically undo already started Railway containers, so rollback remains an explicit operator action; use an isolated staging environment first when zero exposure before verification is required.
 

@@ -771,11 +771,7 @@ private struct ElectronicMailWindowPresentation: NSViewRepresentable {
             let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame ?? window.frame
             switch stage {
             case .app:
-                let inset = min(
-                    ElectronicMailControlMetrics.mainWindowBackdropInset,
-                    max(0, min(visibleFrame.width, visibleFrame.height) / 10)
-                )
-                return visibleFrame.insetBy(dx: inset, dy: inset)
+                return ElectronicMailWindowLayout.mainFrame(in: visibleFrame)
             case .resolvingSession, .signIn, .setup:
                 let maximumContentSize = NSSize(
                     width: max(1, visibleFrame.width - (ElectronicMailControlMetrics.mainWindowBackdropInset * 2)),

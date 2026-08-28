@@ -26,6 +26,15 @@ from app.db.user_mail_guard import (
 # absent: deleting Gmail-derived data must not sign the user out or delete the account.
 USER_MAIL_DATA_DELETE_ORDER = (
     "google_contact_avatar_cache",
+    "ai_usage_events",
+    "matter_decisions",
+    "matter_members",
+    "matter_subgoals",
+    "matters",
+    "attachment_text_extractions",
+    "message_semantics",
+    "matter_profiles",
+    "matter_generations",
     "app_session_snapshots",
     "gmail_client_drafts",
     "gmail_pending_sends",
@@ -3768,6 +3777,39 @@ def list_messages_by_ids(database_url: str, *, user_id: str, message_ids: list[s
         ).mappings().all()
     by_id = {str(row["message_id"]): _message_from_row(row) for row in rows}
     return [by_id[message_id] for message_id in message_ids if message_id in by_id]
+
+
+def list_messages_by_rfc_message_ids(
+    database_url: str,
+    *,
+    user_id: str,
+    rfc_message_ids: list[str],
+) -> list[GmailMessageRecord]:
+    """Resolve exact RFC Message-IDs, including ancestors split across Gmail threads."""
+    normalized = list(
+        dict.fromkeys(
+            value.strip().casefold()
+            for value in rfc_message_ids
+            if value and value.strip()
+        )
+    )
+    if not normalized:
+        return []
+    with get_engine(database_url).connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT *
+                FROM gmail_messages
+                WHERE user_id = :user_id
+                  AND lower(btrim(COALESCE(headers_json::jsonb ->> 'message-id', '')))
+                      = ANY(:rfc_message_ids)
+                ORDER BY internal_date ASC NULLS LAST, updated_at ASC, message_id ASC
+                """
+            ),
+            {"user_id": user_id, "rfc_message_ids": normalized},
+        ).mappings().all()
+    return [_message_from_row(row) for row in rows]
 
 
 def list_recent_messages(database_url: str, *, user_id: str, limit: int = 500) -> list[GmailMessageRecord]:

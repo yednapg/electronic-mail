@@ -34,6 +34,10 @@ echo "[backend-runtime] starting reader worker for reader queue"
 (cd backend && ../.venv/bin/python -m app.workers.main --queues reader --sleep 1) &
 PIDS+=("$!")
 
+echo "[backend-runtime] starting AI worker for ai queue"
+(cd backend && ../.venv/bin/python -m app.workers.main --queues ai --sleep 1) &
+PIDS+=("$!")
+
 echo "[backend-runtime] starting slow worker for slow queue"
 (cd backend && ../.venv/bin/python -m app.workers.main --queues slow --sleep 5) &
 PIDS+=("$!")

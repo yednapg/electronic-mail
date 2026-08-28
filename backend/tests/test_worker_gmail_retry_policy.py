@@ -177,6 +177,33 @@ class GmailWorkerRetryWiringTests(unittest.TestCase):
         self.assertTrue(worked)
         self.assertIsNone(fail.call_args.kwargs["retry_delay_seconds"])
 
+    def test_worker_pauses_ai_jobs_when_project_spend_limit_is_exhausted(self) -> None:
+        job = _job(kind="ai_message_organize", attempt_count=1)
+        settings = SimpleNamespace(
+            database_path="postgresql://example/db",
+            release_sha="release-1",
+        )
+        error = RuntimeError("provider budget exhausted")
+        error.code = "project_spend_limit_exceeded"  # type: ignore[attr-defined]
+        with (
+            patch.object(worker, "renew_heartbeat"),
+            patch.object(worker, "claim_job", return_value=job),
+            patch.object(worker, "_run_job", side_effect=error),
+            patch.object(worker, "fail_job", return_value=True) as fail,
+        ):
+            worked = worker._run_worker_cycle(
+                settings,
+                worker_id="worker-1",
+                queues=["ai"],
+                heartbeat_interval=30,
+            )
+
+        self.assertTrue(worked)
+        self.assertEqual(
+            fail.call_args.kwargs["retry_delay_seconds"],
+            worker.AI_SPEND_LIMIT_RETRY_DELAY_SECONDS,
+        )
+
     def test_worker_pauses_raw_401_and_requests_reauthorization(self) -> None:
         job = _job(kind="gmail_body_backfill", attempt_count=1)
         settings = SimpleNamespace(database_path="postgresql://example/db", release_sha="release-1")
