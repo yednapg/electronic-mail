@@ -179,9 +179,17 @@ public enum ElectronicMailControlMetrics {
     /// Reader subjects may wrap when the action rail leaves insufficient room,
     /// but remain compact enough to preserve the conversation hierarchy.
     public static let readerSubjectLineLimit = 2
-    /// The subject's first text line begins on the toolbar controls' optical
-    /// center line, matching the Reader's original composition.
-    public static let readerHeaderContentOffsetY: CGFloat = 10
+    /// SwiftUI's text line box contains a small amount of top leading. Lift the
+    /// line box so the first visible subject glyph starts on the controls'
+    /// optical center line. Wrapped lines still grow only downward. Inbox and
+    /// AI Inbox readers share this anchor through `ElectronicMailShellHeader`.
+    public static let readerHeaderTitleOpticalCorrection: CGFloat = 10
+    /// Approved fixed first-line anchor. Keep this independent of the reader's
+    /// computed header height so later wrapping or chrome changes cannot move
+    /// the subject in either Inbox or AI Inbox.
+    public static let readerHeaderTitleTop: CGFloat = 22
+    public static let readerHeaderAdditionalLineHeight: CGFloat = 20
+    public static let readerHeaderBottomInset: CGFloat = 9
     public static let readerResponseTopSpacing: CGFloat = 28
     public static let readerResponseBottomSpacing: CGFloat = 48
     /// Reader response controls are viewport chrome, not message content.
@@ -197,13 +205,21 @@ public enum ElectronicMailControlMetrics {
     /// hard horizontal line.
     public static let readerScrollFadeHeight: CGFloat = 72
     public static let readerScrollFadeActivationDistance: CGFloat = 16
-    public static let readerScrollFadeTopInset: CGFloat =
-        headerHeight + readerHeaderContentOffsetY
+    /// Keep a faint trace of content at the clipped edge. This makes the
+    /// preceding collapsed message discoverable without reading like a second
+    /// active message.
+    public static let readerScrollFadeTopContentOpacity: CGFloat = 0.55
+    /// Reader scroll views already begin below all fixed chrome. The WebKit
+    /// fade overlay therefore belongs at the viewport's own top edge.
+    public static let readerScrollFadeTopInset: CGFloat = 0
     public static let composerHeaderContentOffsetY: CGFloat = 14
     /// Reader content begins below the fixed toolbar, with enough breathing
     /// room that the subject reads as page content instead of another control.
     public static let readerContentTop: CGFloat = 20
     public static let readerHeaderToConversation: CGFloat = 12
+    public static let readerPreviousMessagePeek: CGFloat = 72
+    public static let readerPreviousMessagePeekFadeProgress: CGFloat = 0.78
+    public static let readerPinnedSummaryBottomSpacing: CGFloat = 12
     public static let headerOuterInset: CGFloat = 32
     public static let headerLeadingControlCenter: CGFloat = headerOuterInset + headerControlSize / 2
     /// The title is one outer-inset away from the leading control. This makes
@@ -230,6 +246,31 @@ public enum ElectronicMailControlMetrics {
         let availableWidth = max(1, containerWidth - horizontalPadding * 2)
         let contentWidth = min(maxContentWidth, availableWidth)
         return max(headerTitleLeading, (containerWidth - contentWidth) / 2 + contentInset)
+    }
+
+    public static func readerHeaderHeight(subject: String, availableWidth: CGFloat) -> CGFloat {
+        guard availableWidth > 1 else { return headerHeight }
+        let font = NSFont.systemFont(ofSize: ElectronicMailReaderType.titleSize, weight: .semibold)
+        let lineHeight = max(1, ceil(font.ascender - font.descender + font.leading))
+        let measured = (subject as NSString).boundingRect(
+            with: NSSize(width: availableWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font]
+        )
+        let lineCount = min(
+            readerSubjectLineLimit,
+            max(1, Int(ceil(measured.height / lineHeight)))
+        )
+        let metadataFont = NSFont.systemFont(ofSize: ElectronicMailReaderType.metadataSize)
+        let metadataLineHeight = ceil(
+            metadataFont.ascender - metadataFont.descender + metadataFont.leading
+        )
+        let contentHeight = readerHeaderTitleTop
+            + CGFloat(lineCount) * readerHeaderAdditionalLineHeight
+            + readerTwoLineGap
+            + metadataLineHeight
+            + readerHeaderBottomInset
+        return max(headerHeight, ceil(contentHeight))
     }
 
     public static func readerActionRailWidth(controlCount: Int) -> CGFloat {
@@ -269,8 +310,10 @@ struct ElectronicMailLayoutMetrics: Equatable {
 /// the same anchors on every destination, while each screen supplies context.
 struct ElectronicMailShellHeader<Leading: View, Title: View, Trailing: View>: View {
     let width: CGFloat
+    let height: CGFloat
     let titleLeading: CGFloat
     let titleTrailingReservation: CGFloat
+    let titleAlignment: Alignment
     let trailingSpacing: CGFloat
     let trailingInset: CGFloat
     private let leading: Leading
@@ -279,8 +322,10 @@ struct ElectronicMailShellHeader<Leading: View, Title: View, Trailing: View>: Vi
 
     init(
         width: CGFloat,
+        height: CGFloat = ElectronicMailControlMetrics.headerHeight,
         titleLeading: CGFloat = ElectronicMailControlMetrics.headerTitleLeading,
         titleTrailingReservation: CGFloat = 0,
+        titleAlignment: Alignment = .leading,
         trailingSpacing: CGFloat = ElectronicMailControlMetrics.headerControlGap,
         trailingInset: CGFloat = ElectronicMailControlMetrics.trailingInset,
         @ViewBuilder leading: () -> Leading,
@@ -288,8 +333,10 @@ struct ElectronicMailShellHeader<Leading: View, Title: View, Trailing: View>: Vi
         @ViewBuilder trailing: () -> Trailing
     ) {
         self.width = width
+        self.height = height
         self.titleLeading = titleLeading
         self.titleTrailingReservation = titleTrailingReservation
+        self.titleAlignment = titleAlignment
         self.trailingSpacing = trailingSpacing
         self.trailingInset = trailingInset
         self.leading = leading()
@@ -300,7 +347,7 @@ struct ElectronicMailShellHeader<Leading: View, Title: View, Trailing: View>: Vi
     var body: some View {
         ZStack(alignment: .leading) {
             title
-                .frame(height: ElectronicMailControlMetrics.headerControlSize, alignment: .leading)
+                .frame(height: height, alignment: titleAlignment)
                 .padding(.leading, titleLeading)
                 .padding(.trailing, titleTrailingReservation)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -320,8 +367,17 @@ struct ElectronicMailShellHeader<Leading: View, Title: View, Trailing: View>: Vi
                 trailing
             }
             .padding(.trailing, trailingInset)
+            .frame(
+                width: width,
+                height: ElectronicMailControlMetrics.headerControlSize,
+                alignment: .trailing
+            )
+            .position(
+                x: width / 2,
+                y: ElectronicMailControlMetrics.headerCenterY
+            )
         }
-        .frame(width: width, height: ElectronicMailControlMetrics.headerHeight, alignment: .leading)
+        .frame(width: width, height: height, alignment: .leading)
         .accessibilityElement(children: .contain)
     }
 }
