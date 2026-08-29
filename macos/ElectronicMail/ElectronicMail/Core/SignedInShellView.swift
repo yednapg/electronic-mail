@@ -124,7 +124,7 @@ public struct SignedInShellView: View {
     @State private var confirmPermanentReaderDelete = false
     @State private var confirmAIMatterTrash = false
     @State private var contactPhotoAuthorizationRunning = false
-    @State private var aiReaderChromeProgress: CGFloat = 0
+    @State private var aiReaderChromeState: AIReaderChromeState
     @AppStorage("ElectronicMailContactPhotoPromptDismissed") private var contactPhotoPromptDismissed = false
 
     public init(
@@ -136,6 +136,7 @@ public struct SignedInShellView: View {
     ) {
         self.store = store
         _aiInboxStore = StateObject(wrappedValue: AIInboxStore(client: store.aiInboxClient))
+        _aiReaderChromeState = State(initialValue: AIReaderChromeState())
         self.onReauthorizeGoogle = onReauthorizeGoogle
         self.onSignOut = onSignOut
         self.onDisconnectGoogle = onDisconnectGoogle
@@ -433,14 +434,26 @@ public struct SignedInShellView: View {
         } else {
             ElectronicMailControlMetrics.headerControlSize + ElectronicMailControlMetrics.trailingInset
         }
+        let readerTitleAvailableWidth = max(
+            1,
+            width - readerTitleLeading - trailingControlsWidth
+        )
+        let resolvedHeaderHeight = showsReader
+            ? ElectronicMailControlMetrics.readerHeaderHeight(
+                subject: readerHeaderTitle,
+                availableWidth: readerTitleAvailableWidth
+            )
+            : ElectronicMailControlMetrics.headerHeight
 
         return VStack(alignment: .leading, spacing: 0) {
             ElectronicMailShellHeader(
                 width: width,
+                height: resolvedHeaderHeight,
                 titleLeading: showsReader
                     ? readerTitleLeading
                     : ElectronicMailControlMetrics.headerTitleLeading,
                 titleTrailingReservation: trailingControlsWidth,
+                titleAlignment: showsReader ? .topLeading : .leading,
                 trailingSpacing: showsMailboxControls && !showsReader
                     ? ElectronicMailControlMetrics.mailboxHeaderControlGap
                     : ElectronicMailControlMetrics.headerControlGap,
@@ -479,12 +492,7 @@ public struct SignedInShellView: View {
                                     .lineLimit(1)
                             }
                         }
-                        .offset(y: ElectronicMailControlMetrics.readerHeaderContentOffsetY)
-                        .modifier(
-                            AIReaderSubjectScrollEffect(
-                                progress: activeAIMatter == nil ? 0 : aiReaderChromeProgress
-                            )
-                        )
+                        .padding(.top, ElectronicMailControlMetrics.readerHeaderTitleTop)
                         .help(readerHeaderTitle)
                         .accessibilityElement(children: .combine)
                         .accessibilityAddTraits(.isHeader)
@@ -541,7 +549,6 @@ public struct SignedInShellView: View {
                     }
                 }
             )
-            .padding(.bottom, showsReader ? ElectronicMailControlMetrics.readerHeaderContentOffsetY : 0)
         }
         .animation(
             searchAnimation,
@@ -713,9 +720,7 @@ public struct SignedInShellView: View {
                 isAttachmentDownloading: { attachment, messageID in
                     store.isAttachmentDownloading(attachment, messageID: messageID)
                 },
-                onReaderChromeProgressChange: { progress in
-                    aiReaderChromeProgress = progress
-                }
+                readerChromeState: aiReaderChromeState
             )
         case .todos:
             TodoHomeView(
@@ -935,6 +940,7 @@ public struct SignedInShellView: View {
 
     private func selectPrimaryNavigation(_ destination: ShellPrimaryNavigationDestination) {
         pendingCommandThreadID = nil
+        aiReaderChromeState.reset()
         store.closeReader()
         aiInboxStore.closeDetail()
         mailboxSearchText = ""
@@ -1001,7 +1007,7 @@ public struct SignedInShellView: View {
 
     private func closeActiveReader() {
         if activeAIMatter != nil {
-            aiReaderChromeProgress = 0
+            aiReaderChromeState.reset()
             aiInboxOrganizeOpen = false
             aiInboxStore.closeDetail()
         } else {
@@ -1011,7 +1017,7 @@ public struct SignedInShellView: View {
 
     private func select(_ destination: SignedInDestination) {
         pendingCommandThreadID = nil
-        aiReaderChromeProgress = 0
+        aiReaderChromeState.reset()
         aiInboxStore.closeDetail()
         supplementalDestination = nil
         navigationOpen = false
@@ -1300,27 +1306,6 @@ private struct ShellInboxModeSwitch: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Inbox mode")
-    }
-}
-
-private struct AIReaderSubjectScrollEffect: ViewModifier {
-    let progress: CGFloat
-
-    func body(content: Content) -> some View {
-        let resolvedProgress = min(1, max(0, progress))
-        content
-            .offset(y: -18 * resolvedProgress)
-            .opacity(1 - resolvedProgress)
-            .mask {
-                LinearGradient(
-                    colors: [
-                        Color.black.opacity(1 - resolvedProgress),
-                        Color.black,
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            }
     }
 }
 

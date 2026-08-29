@@ -65,6 +65,39 @@ final class ModelDecodingTests: XCTestCase {
         )
     }
 
+    func testInboxKeyboardNavigationRoutesReturnAndKeypadEnterOutsideTextEditing() {
+        XCTAssertEqual(
+            InboxKeyboardNavigationPolicy.action(
+                keyCode: 36,
+                modifiers: [],
+                isTextEditing: false
+            ),
+            .openSelection
+        )
+        XCTAssertEqual(
+            InboxKeyboardNavigationPolicy.action(
+                keyCode: 76,
+                modifiers: [.numericPad],
+                isTextEditing: false
+            ),
+            .openSelection
+        )
+        XCTAssertNil(
+            InboxKeyboardNavigationPolicy.action(
+                keyCode: 36,
+                modifiers: [.command],
+                isTextEditing: false
+            )
+        )
+        XCTAssertNil(
+            InboxKeyboardNavigationPolicy.action(
+                keyCode: 36,
+                modifiers: [],
+                isTextEditing: true
+            )
+        )
+    }
+
     func testLiquidGlassRenderingModeHonorsAvailabilityAndAccessibility() {
         XCTAssertFalse(ElectronicMailGlassRenderingMode.automatic.usesNativeGlass(osMajorVersion: 25, reduceTransparency: false))
         XCTAssertTrue(ElectronicMailGlassRenderingMode.automatic.usesNativeGlass(osMajorVersion: 26, reduceTransparency: false))
@@ -145,7 +178,10 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(ElectronicMailControlMetrics.readerActionGap, 16)
         XCTAssertEqual(ElectronicMailControlMetrics.readerTwoLineGap, 6)
         XCTAssertEqual(ElectronicMailControlMetrics.readerSubjectLineLimit, 2)
-        XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderContentOffsetY, 10)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderTitleOpticalCorrection, 10)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderTitleTop, 22)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderAdditionalLineHeight, 20)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderBottomInset, 9)
         XCTAssertEqual(ElectronicMailControlMetrics.readerResponseTopSpacing, 28)
         XCTAssertEqual(ElectronicMailControlMetrics.readerResponseBottomSpacing, 48)
         XCTAssertEqual(ElectronicMailControlMetrics.readerFloatingActionsBottomInset, 40)
@@ -157,10 +193,14 @@ final class ModelDecodingTests: XCTestCase {
         )
         XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeHeight, 72)
         XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeActivationDistance, 16)
-        XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeTopInset, 74)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeTopContentOpacity, 0.55)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeTopInset, 0)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerPreviousMessagePeekFadeProgress, 0.78)
         XCTAssertEqual(ElectronicMailControlMetrics.composerHeaderContentOffsetY, 14)
         XCTAssertEqual(ElectronicMailControlMetrics.readerContentTop, 20)
         XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderToConversation, 12)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerPreviousMessagePeek, 72)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerPinnedSummaryBottomSpacing, 12)
         XCTAssertEqual(ElectronicMailControlMetrics.actionHeight, 40)
         XCTAssertEqual(ElectronicMailControlMetrics.actionGap, 32)
         XCTAssertEqual(ElectronicMailControlMetrics.glassMergeSpacing, 0)
@@ -209,6 +249,44 @@ final class ModelDecodingTests: XCTestCase {
                 initialContentTop: 100
             ),
             0.625
+        )
+    }
+
+    func testReaderScrollFadeTracksContentAboveTheViewport() {
+        XCTAssertEqual(ElectronicMailReaderScrollFade.progress(forContentOffset: -8), 0)
+        XCTAssertEqual(ElectronicMailReaderScrollFade.progress(forContentOffset: 0), 0)
+        XCTAssertEqual(ElectronicMailReaderScrollFade.progress(forContentOffset: 8), 0.5)
+        XCTAssertEqual(ElectronicMailReaderScrollFade.progress(forContentOffset: 16), 1)
+        XCTAssertEqual(ElectronicMailReaderScrollFade.progress(forContentOffset: 80), 1)
+        XCTAssertEqual(
+            ElectronicMailReaderScrollFade.progress(forContentOffset: 0, minimumProgress: 0.78),
+            0.78
+        )
+        XCTAssertEqual(
+            ElectronicMailReaderScrollFade.progress(forContentOffset: 16, minimumProgress: 0.78),
+            1
+        )
+    }
+
+    func testReaderHeaderKeepsItsFirstLineFixedAndGrowsDownForWrapping() {
+        XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderTitleOpticalCorrection, 10)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerHeaderTitleTop, 22)
+        XCTAssertEqual(
+            ElectronicMailControlMetrics.readerHeaderTitleTop,
+            ElectronicMailControlMetrics.headerCenterY
+                - ElectronicMailControlMetrics.readerHeaderTitleOpticalCorrection
+        )
+        let singleLineHeight = ElectronicMailControlMetrics.readerHeaderHeight(
+            subject: "Inbox subject",
+            availableWidth: 600
+        )
+        let wrappedHeight = ElectronicMailControlMetrics.readerHeaderHeight(
+            subject: String(repeating: "A long wrapped subject ", count: 8),
+            availableWidth: 260
+        )
+        XCTAssertEqual(
+            wrappedHeight - singleLineHeight,
+            ElectronicMailControlMetrics.readerHeaderAdditionalLineHeight
         )
     }
 
@@ -2380,13 +2458,33 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertFalse(destinations.map(\.title).contains("Calendar"))
     }
 
-    func testAIReaderChromeProgressKeepsSummaryFullWhileLiftingIt() {
-        XCTAssertEqual(AIReaderChromeScrollPolicy.progress(scrollDistance: -8), 0)
-        XCTAssertEqual(AIReaderChromeScrollPolicy.progress(scrollDistance: 0), 0)
-        XCTAssertEqual(AIReaderChromeScrollPolicy.progress(scrollDistance: 24), 0.5)
-        XCTAssertEqual(AIReaderChromeScrollPolicy.progress(scrollDistance: 48), 1)
-        XCTAssertEqual(AIReaderChromeScrollPolicy.progress(scrollDistance: 200), 1)
-        XCTAssertEqual(AIReaderChromeScrollPolicy.summaryLift, 24)
+    func testAIReaderChromeSummaryUsesCollapseAndExpansionHysteresis() {
+        XCTAssertEqual(AIReaderChromeScrollPolicy.collapseThreshold, 32)
+        XCTAssertEqual(AIReaderChromeScrollPolicy.expandThreshold, 8)
+        XCTAssertFalse(
+            AIReaderChromeScrollPolicy.isSummaryCollapsed(
+                currentlyCollapsed: false,
+                scrollDistance: 31
+            )
+        )
+        XCTAssertTrue(
+            AIReaderChromeScrollPolicy.isSummaryCollapsed(
+                currentlyCollapsed: false,
+                scrollDistance: 32
+            )
+        )
+        XCTAssertTrue(
+            AIReaderChromeScrollPolicy.isSummaryCollapsed(
+                currentlyCollapsed: true,
+                scrollDistance: 9
+            )
+        )
+        XCTAssertFalse(
+            AIReaderChromeScrollPolicy.isSummaryCollapsed(
+                currentlyCollapsed: true,
+                scrollDistance: 8
+            )
+        )
     }
 
     func testReplyAllPrefillKeepsSenderInToAndCopiesOtherRecipients() {
