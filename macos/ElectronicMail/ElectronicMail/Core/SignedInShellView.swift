@@ -12,7 +12,6 @@ enum ElectronicMailShellMetrics {
     static let navTitleGap = ElectronicMailControlMetrics.headerTitleGap
     static let navHeaderTitleGap = ElectronicMailControlMetrics.headerTitleGap
     static let navTextLeading = ElectronicMailControlMetrics.headerTitleLeading
-    static let contentTop: CGFloat = 8
     static let contentMaxWidth: CGFloat = 900
 
     static func utilityCenter(for width: CGFloat) -> CGFloat {
@@ -1291,10 +1290,11 @@ private struct ShellInboxModeSwitch: View {
 
                         Text(destination.title)
                             .font(ElectronicMailType.mailboxHeader(weight: isSelected ? .semibold : .medium))
+                            .lineLimit(1)
                     }
                     .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
                     .opacity(isSelected ? 1 : 0.5)
-                    .frame(width: 112)
+                    .frame(height: ElectronicMailControlMetrics.headerControlSize)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -1381,6 +1381,7 @@ private struct ShellComposeButton: View {
             symbol: "square.and.pencil",
             accessibilityLabel: "New message",
             symbolOpacity: ElectronicMailControlMetrics.mailboxHeaderIconOpacity,
+            symbolOffset: ElectronicMailControlMetrics.composeSymbolOpticalOffset,
             action: action
         )
     }
@@ -1409,6 +1410,7 @@ private struct ShellSearchButton: View {
             symbol: ElectronicMailSymbols.search,
             accessibilityLabel: "Search Mail",
             symbolOpacity: ElectronicMailControlMetrics.mailboxHeaderIconOpacity,
+            symbolOffset: ElectronicMailControlMetrics.searchSymbolOpticalOffset,
             action: action
         )
         .accessibilityHint("Expands the mailbox search field")

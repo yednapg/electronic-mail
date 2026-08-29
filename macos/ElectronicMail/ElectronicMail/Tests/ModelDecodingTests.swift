@@ -171,10 +171,19 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(ElectronicMailControlMetrics.headerControlSize, 36)
         XCTAssertEqual(ElectronicMailControlMetrics.headerSearchHeight, 42)
         XCTAssertEqual(ElectronicMailControlMetrics.headerSymbolSize, 18)
+        XCTAssertEqual(ElectronicMailControlMetrics.composeSymbolOpticalOffset.width, -0.5)
+        XCTAssertEqual(ElectronicMailControlMetrics.composeSymbolOpticalOffset.height, -1)
+        XCTAssertEqual(ElectronicMailControlMetrics.searchSymbolOpticalOffset.width, 0)
+        XCTAssertEqual(ElectronicMailControlMetrics.searchSymbolOpticalOffset.height, -0.5)
         XCTAssertEqual(ElectronicMailControlMetrics.mailboxHeaderIconOpacity, 0.50)
         XCTAssertEqual(ElectronicMailControlMetrics.headerControlGap, 32)
         XCTAssertEqual(ElectronicMailControlMetrics.mailboxHeaderControlGap, 16)
         XCTAssertEqual(ElectronicMailControlMetrics.mailboxHeaderTrailingInset, 100)
+        XCTAssertEqual(ElectronicMailControlMetrics.mailboxFirstSectionTopSpacing, 0)
+        XCTAssertEqual(ElectronicMailControlMetrics.mailboxSectionTopSpacing, 24)
+        XCTAssertEqual(ElectronicMailControlMetrics.mailboxScrollFadeHeight, 64)
+        XCTAssertEqual(ElectronicMailControlMetrics.mailboxScrollFadeActivationDistance, 16)
+        XCTAssertEqual(ElectronicMailControlMetrics.mailboxScrollFadeTopContentOpacity, 0)
         XCTAssertEqual(ElectronicMailControlMetrics.readerActionGap, 16)
         XCTAssertEqual(ElectronicMailControlMetrics.readerTwoLineGap, 6)
         XCTAssertEqual(ElectronicMailControlMetrics.readerSubjectLineLimit, 2)
@@ -191,9 +200,9 @@ final class ModelDecodingTests: XCTestCase {
             5.0 / 7.0,
             accuracy: 0.0001
         )
-        XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeHeight, 72)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeHeight, 64)
         XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeActivationDistance, 16)
-        XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeTopContentOpacity, 0.55)
+        XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeTopContentOpacity, 0)
         XCTAssertEqual(ElectronicMailControlMetrics.readerScrollFadeTopInset, 0)
         XCTAssertEqual(ElectronicMailControlMetrics.readerPreviousMessagePeekFadeProgress, 0.78)
         XCTAssertEqual(ElectronicMailControlMetrics.composerHeaderContentOffsetY, 14)
@@ -265,6 +274,37 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(
             ElectronicMailReaderScrollFade.progress(forContentOffset: 16, minimumProgress: 0.78),
             1
+        )
+        XCTAssertEqual(
+            ElectronicMailReaderScrollFade.progress(
+                forContentOffset: 8,
+                activationDistance: ElectronicMailControlMetrics.mailboxScrollFadeActivationDistance
+            ),
+            0.5
+        )
+    }
+
+    func testReaderActionClearanceOnlyExtendsContentThatReachesFloatingControls() {
+        XCTAssertFalse(
+            ElectronicMailReaderActionClearance.isRequired(
+                contentHeight: 500,
+                viewportHeight: 800,
+                actionsVisible: true
+            )
+        )
+        XCTAssertTrue(
+            ElectronicMailReaderActionClearance.isRequired(
+                contentHeight: 700,
+                viewportHeight: 800,
+                actionsVisible: true
+            )
+        )
+        XCTAssertFalse(
+            ElectronicMailReaderActionClearance.isRequired(
+                contentHeight: 700,
+                viewportHeight: 800,
+                actionsVisible: false
+            )
         )
     }
 

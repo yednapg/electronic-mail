@@ -72,13 +72,17 @@ public struct InboxView: View {
                     }
                 } else {
                     let snapshot = InboxRenderSnapshot(store: store)
-                    inboxList(snapshot: snapshot, metrics: metrics)
-                }
+                    ZStack {
+                        inboxList(snapshot: snapshot, metrics: metrics)
 
-                if let offlineStorageWarningMessage {
-                    ElectronicMailRefreshFailureToast(message: offlineStorageWarningMessage)
-                } else if store.refreshFailed && store.mailboxPresentationReady {
-                    ElectronicMailRefreshFailureToast(message: "Inbox could not refresh. Showing last saved state.")
+                        if let offlineStorageWarningMessage {
+                            ElectronicMailRefreshFailureToast(message: offlineStorageWarningMessage)
+                        } else if store.refreshFailed && store.mailboxPresentationReady {
+                            ElectronicMailRefreshFailureToast(
+                                message: "Inbox could not refresh. Showing last saved state."
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -412,12 +416,11 @@ private struct InboxMailboxList: View, Equatable {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Color.clear
-                .frame(height: ElectronicMailShellMetrics.contentTop)
-                .accessibilityHidden(true)
-
             ScrollViewReader { scrollProxy in
-                ScrollView(.vertical) {
+                ElectronicMailMailboxScrollView(
+                    colorScheme: colorScheme,
+                    showsIndicators: true
+                ) {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         if !snapshot.hasRows {
                             InboxEmptyState(
@@ -1387,7 +1390,9 @@ private struct InboxLayoutMetrics: Equatable {
     }
 
     func sectionTopSpacing(isFirst: Bool) -> CGFloat {
-        isFirst ? 12 : 24
+        isFirst
+            ? ElectronicMailControlMetrics.mailboxFirstSectionTopSpacing
+            : ElectronicMailControlMetrics.mailboxSectionTopSpacing
     }
 }
 
