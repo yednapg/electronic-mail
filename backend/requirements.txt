@@ -1,6 +1,6 @@
 fastapi>=0.115.0,<1.0.0
 alembic>=1.13.0,<2.0.0
-cryptography>=48.0.1,<50.0.0
+cryptography>=50.0.1,<51.0.0
 google-api-python-client>=2.169.0,<3.0.0
 google-auth-oauthlib>=1.2.0,<2.0.0
 google-cloud-pubsub>=2.25.0,<3.0.0
