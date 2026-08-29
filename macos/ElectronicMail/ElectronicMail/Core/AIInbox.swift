@@ -682,6 +682,7 @@ public struct AIInboxView: View {
                     systemImage: "sparkles.rectangle.stack",
                     description: Text(store.errorMessage ?? "Use Inbox while AI Inbox is unavailable.")
                 )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .task(id: searchText.trimmingCharacters(in: .whitespacesAndNewlines)) {
@@ -763,26 +764,11 @@ public struct AIInboxView: View {
             }
 
             VStack(alignment: .leading, spacing: 0) {
-                if store.stale || store.errorMessage != nil {
-                    HStack(spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                        Text(store.errorMessage ?? "Showing the last stable AI Inbox. Use Inbox if needed.")
-                            .lineLimit(1)
-                        Spacer(minLength: 12)
-                    }
-                    .font(ElectronicMailType.small())
-                    .padding(.horizontal, metrics.senderLeading)
-                    .frame(width: metrics.windowWidth, height: 34)
-                    .foregroundStyle(Color.orange)
-                    .background(Color.orange.opacity(0.10))
-                }
-
-                Color.clear
-                    .frame(height: ElectronicMailShellMetrics.contentTop)
-                    .accessibilityHidden(true)
-
                 ScrollViewReader { scrollProxy in
-                    ScrollView(.vertical) {
+                    ElectronicMailMailboxScrollView(
+                        colorScheme: colorScheme,
+                        showsIndicators: true
+                    ) {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             if sections.isEmpty {
                                 VStack(spacing: 12) {
@@ -870,6 +856,14 @@ public struct AIInboxView: View {
                         transaction.disablesAnimations = true
                     }
                 }
+            }
+        }
+        .overlay {
+            if store.stale || store.errorMessage != nil {
+                ElectronicMailRefreshFailureToast(
+                    message: store.errorMessage
+                        ?? "AI Inbox could not refresh. Showing its last stable state."
+                )
             }
         }
     }
@@ -987,6 +981,7 @@ private struct AIMatterConversationView: View {
     @State private var initialScrollOriginCaptureReady = false
     @State private var initialScrollMeasurementRequest = 0
     @State private var initialTopPeekRequest: Int?
+    @State private var conversationContentHeight: CGFloat = 0
 
     var body: some View {
         GeometryReader { proxy in
@@ -1000,6 +995,13 @@ private struct AIMatterConversationView: View {
                 AIMatterMessageRenderIdentity(id: $0.id, renderRevision: $0.message.renderRevision)
             }
             let pinnedSummaryHeight = pinnedSummaryCardHeight
+            let readerActionsVisible = activeMessage.flatMap(replyThreadID(for:)) != nil
+            let scrollViewportHeight = max(0, proxy.size.height - pinnedSummaryHeight)
+            let needsReaderActionClearance = ElectronicMailReaderActionClearance.isRequired(
+                contentHeight: conversationContentHeight,
+                viewportHeight: scrollViewportHeight,
+                actionsVisible: readerActionsVisible
+            )
 
             ZStack(alignment: .bottom) {
                 VStack(alignment: .leading, spacing: 0) {
@@ -1023,57 +1025,66 @@ private struct AIMatterConversationView: View {
                         onScrollOffsetChange: handleScrollOffset
                     ) {
                         VStack(alignment: .leading, spacing: 0) {
-
-                            if !(matter.reviewProposals ?? []).isEmpty {
-                                AIMatterReviewSection(
-                                    proposals: matter.reviewProposals ?? [],
-                                    colorScheme: colorScheme,
-                                    disabled: decisionsDisabled,
-                                    onKeepSeparate: { onReviewDecision("separate", $0) },
-                                    onAdd: { onReviewDecision("confirm", $0) },
-                                    onOpenEmail: { proposal in
-                                        openMessage(
-                                            proposal.messageID,
-                                            in: presentation,
-                                            scrollProxy: scrollProxy
-                                        )
-                                    }
-                                )
-                                .padding(.bottom, 22)
-                            }
-
-                            ForEach(Array(presentation.items.enumerated()), id: \.element.id) { index, item in
-                                if index > 0 {
-                                    Rectangle()
-                                        .fill(ElectronicMailDesign.readerHairline(for: colorScheme))
-                                        .frame(height: 1)
+                            VStack(alignment: .leading, spacing: 0) {
+                                if !(matter.reviewProposals ?? []).isEmpty {
+                                    AIMatterReviewSection(
+                                        proposals: matter.reviewProposals ?? [],
+                                        colorScheme: colorScheme,
+                                        disabled: decisionsDisabled,
+                                        onKeepSeparate: { onReviewDecision("separate", $0) },
+                                        onAdd: { onReviewDecision("confirm", $0) },
+                                        onOpenEmail: { proposal in
+                                            openMessage(
+                                                proposal.messageID,
+                                                in: presentation,
+                                                scrollProxy: scrollProxy
+                                            )
+                                        }
+                                    )
+                                    .padding(.bottom, 22)
                                 }
 
-                                EmailMessageCard(
-                                    threadID: item.message.threadID ?? matter.id,
-                                    message: item.message,
-                                    expanded: presentation.items.count == 1 || expandedMessageKeys.contains(item.id),
-                                    allowsCollapse: presentation.items.count > 1,
-                                    currentUserDisplayName: currentUserDisplayName,
-                                    currentUserEmail: currentUserEmail,
-                                    colorScheme: colorScheme,
-                                    mailboxLabel: .inbox,
-                                    onRespond: { mode, messageID in
-                                        respond(to: item.message, mode: mode, messageID: messageID)
-                                    },
-                                    onThreadAction: { action, _ in onThreadAction(action) },
-                                    onOpenAttachment: onOpenAttachment,
-                                    isAttachmentDownloading: isAttachmentDownloading,
-                                    groupingDetails: groupingDetails(for: item.message.id),
-                                    onOpenDetails: groupingEventMessageIDs.contains(item.message.id)
-                                        ? { loadGroupingExplanation(for: item.message.id) }
-                                        : nil,
-                                    onToggle: { toggle(item.id, in: presentation) }
-                                )
-                                .id(item.id)
+                                ForEach(Array(presentation.items.enumerated()), id: \.element.id) { index, item in
+                                    if index > 0 {
+                                        Rectangle()
+                                            .fill(ElectronicMailDesign.readerHairline(for: colorScheme))
+                                            .frame(height: 1)
+                                    }
+
+                                    EmailMessageCard(
+                                        threadID: item.message.threadID ?? matter.id,
+                                        message: item.message,
+                                        expanded: presentation.items.count == 1 || expandedMessageKeys.contains(item.id),
+                                        allowsCollapse: presentation.items.count > 1,
+                                        currentUserDisplayName: currentUserDisplayName,
+                                        currentUserEmail: currentUserEmail,
+                                        colorScheme: colorScheme,
+                                        mailboxLabel: .inbox,
+                                        onRespond: { mode, messageID in
+                                            respond(to: item.message, mode: mode, messageID: messageID)
+                                        },
+                                        onThreadAction: { action, _ in onThreadAction(action) },
+                                        onOpenAttachment: onOpenAttachment,
+                                        isAttachmentDownloading: isAttachmentDownloading,
+                                        groupingDetails: groupingDetails(for: item.message.id),
+                                        onOpenDetails: groupingEventMessageIDs.contains(item.message.id)
+                                            ? { loadGroupingExplanation(for: item.message.id) }
+                                            : nil,
+                                        onToggle: { toggle(item.id, in: presentation) }
+                                    )
+                                    .id(item.id)
+                                }
+                            }
+                            .background {
+                                GeometryReader { contentProxy in
+                                    Color.clear.preference(
+                                        key: ElectronicMailReaderContentHeightPreferenceKey.self,
+                                        value: contentProxy.size.height
+                                    )
+                                }
                             }
 
-                            if activeMessage.flatMap(replyThreadID(for:)) != nil {
+                            if needsReaderActionClearance {
                                 Color.clear
                                     .frame(
                                         height: ElectronicMailControlMetrics.readerFixedActionsReservedHeight
@@ -1128,6 +1139,10 @@ private struct AIMatterConversationView: View {
             .onPreferenceChange(AIMatterPinnedSummaryHeightPreferenceKey.self) { nextHeight in
                 guard abs(nextHeight - pinnedSummaryCardHeight) > 0.25 else { return }
                 pinnedSummaryCardHeight = nextHeight
+            }
+            .onPreferenceChange(ElectronicMailReaderContentHeightPreferenceKey.self) { nextHeight in
+                guard abs(nextHeight - conversationContentHeight) > 0.25 else { return }
+                conversationContentHeight = nextHeight
             }
             .onDisappear {
                 readerChromeState.reset()
@@ -1744,7 +1759,9 @@ private struct AIInboxListMetrics: Equatable {
     }
 
     func sectionTopSpacing(isFirst: Bool) -> CGFloat {
-        isFirst ? 12 : 24
+        isFirst
+            ? ElectronicMailControlMetrics.mailboxFirstSectionTopSpacing
+            : ElectronicMailControlMetrics.mailboxSectionTopSpacing
     }
 }
 

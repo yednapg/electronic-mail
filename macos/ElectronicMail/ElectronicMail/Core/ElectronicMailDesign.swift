@@ -24,6 +24,9 @@ public enum ElectronicMailDesign {
     public static let featureInbox = Color(red: 0.96, green: 0.50, blue: 0.08)
     public static let featureStarred = Color(red: 0.97, green: 0.69, blue: 0.02)
     public static let featureReply = Color(red: 0.48, green: 0.27, blue: 0.88)
+    /// Apple's semantic system red adapts to appearance and increased-contrast
+    /// settings, so failures stay legible without freezing a custom RGB value.
+    public static let errorAccent = Color(nsColor: .systemRed)
     public static let sidebarBackground = Color.black
     public static let sidebarText = Color.white.opacity(0.90)
     public static let sidebarSecondaryText = Color.white.opacity(0.58)
@@ -159,6 +162,11 @@ public enum ElectronicMailControlMetrics {
     /// its visible bubble is optically the same height as a 36-point icon button.
     public static let headerSearchHeight: CGFloat = 42
     public static let headerSymbolSize: CGFloat = 18
+    /// SF Symbols use typographic bounds rather than optical bounds. Keep the
+    /// uneven compose and search glyphs visually centered in their circular
+    /// mailbox controls without moving the control or its hit target.
+    public static let composeSymbolOpticalOffset = CGSize(width: -0.5, height: -1)
+    public static let searchSymbolOpticalOffset = CGSize(width: 0, height: -0.5)
     /// Mailbox navigation, compose, and search stay available without
     /// competing with the current mailbox title and message content.
     public static let mailboxHeaderIconOpacity: CGFloat = 0.50
@@ -170,6 +178,16 @@ public enum ElectronicMailControlMetrics {
     public static let mailboxHeaderControlGap: CGFloat = headerControlGap / 2
     /// Mailbox trailing controls align with the inbox date column.
     public static let mailboxHeaderTrailingInset: CGFloat = headerTitleLeading
+    /// The first mailbox section begins at the scroll viewport's clipping
+    /// boundary. Later sections retain separation from the rows above them.
+    public static let mailboxFirstSectionTopSpacing: CGFloat = 0
+    public static let mailboxSectionTopSpacing: CGFloat = 24
+    /// macOS 26 uses the native soft scroll-edge effect. These values drive the
+    /// opacity-gradient fallback on earlier systems so mailbox rows still fade
+    /// naturally beneath the fixed navigation header.
+    public static let mailboxScrollFadeHeight: CGFloat = 64
+    public static let mailboxScrollFadeActivationDistance: CGFloat = 16
+    public static let mailboxScrollFadeTopContentOpacity: CGFloat = 0
     /// Reader actions form a denser, content-scoped tool group. This is
     /// intentionally reader-only; shell and search spacing remain unchanged.
     public static let readerActionGap: CGFloat = headerControlGap / 2
@@ -200,15 +218,12 @@ public enum ElectronicMailControlMetrics {
     /// The Details disclosure belongs to sender metadata, so it is quieter
     /// than the adjacent date instead of reading as an accent-colored action.
     public static let readerDetailsLabelOpacity: CGFloat = 5.0 / 7.0
-    /// Once conversation content starts moving beneath the fixed reader
-    /// header, soften the clipped edge instead of letting rows disappear on a
-    /// hard horizontal line.
-    public static let readerScrollFadeHeight: CGFloat = 72
-    public static let readerScrollFadeActivationDistance: CGFloat = 16
-    /// Keep a faint trace of content at the clipped edge. This makes the
-    /// preceding collapsed message discoverable without reading like a second
-    /// active message.
-    public static let readerScrollFadeTopContentOpacity: CGFloat = 0.55
+    /// Readers use the exact same fade profile as both mailbox home screens.
+    /// Keeping these aliases shared also gives WebKit-backed email bodies the
+    /// same fully transparent clipped edge as native mailbox rows.
+    public static let readerScrollFadeHeight = mailboxScrollFadeHeight
+    public static let readerScrollFadeActivationDistance = mailboxScrollFadeActivationDistance
+    public static let readerScrollFadeTopContentOpacity = mailboxScrollFadeTopContentOpacity
     /// Reader scroll views already begin below all fixed chrome. The WebKit
     /// fade overlay therefore belongs at the viewport's own top edge.
     public static let readerScrollFadeTopInset: CGFloat = 0
@@ -387,12 +402,14 @@ struct ElectronicMailIconLabel: View {
     var role: ElectronicMailGlassRole = .standard
     var controlSize: CGFloat = ElectronicMailControlMetrics.headerControlSize
     var symbolSize: CGFloat = ElectronicMailControlMetrics.headerSymbolSize
+    var symbolOffset: CGSize = .zero
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         Image(systemName: symbol)
             .font(.system(size: symbolSize, weight: .medium))
             .foregroundStyle(foregroundColor)
+            .offset(x: symbolOffset.width, y: symbolOffset.height)
             .frame(
                 width: controlSize,
                 height: controlSize
@@ -419,6 +436,7 @@ struct ElectronicMailIconControl: View {
     var controlSize: CGFloat = ElectronicMailControlMetrics.headerControlSize
     var symbolSize: CGFloat = ElectronicMailControlMetrics.headerSymbolSize
     var symbolOpacity: CGFloat = 1
+    var symbolOffset: CGSize = .zero
     let action: () -> Void
 
     var body: some View {
@@ -427,7 +445,8 @@ struct ElectronicMailIconControl: View {
                 symbol: symbol,
                 role: role,
                 controlSize: controlSize,
-                symbolSize: symbolSize
+                symbolSize: symbolSize,
+                symbolOffset: symbolOffset
             )
             .opacity(symbolOpacity)
         }
@@ -1159,6 +1178,10 @@ public struct ElectronicMailHamburgerIcon: View {
 
 public struct ElectronicMailRefreshFailureToast: View {
     private let message: String
+    @Environment(\.electronicMailGlassRenderingMode) private var renderingMode
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var contrast
 
     public init(message: String) {
         self.message = message
@@ -1168,16 +1191,63 @@ public struct ElectronicMailRefreshFailureToast: View {
         VStack {
             Spacer()
 
-            Text(message)
-                .font(ElectronicMailType.status())
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(.regularMaterial, in: Capsule())
+            failureSurface
                 .padding(.bottom, 22)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .allowsHitTesting(false)
+    }
+
+    private var failureLabel: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: ElectronicMailType.statusSize, weight: .semibold))
+                .accessibilityHidden(true)
+
+            Text(message)
+                .font(ElectronicMailType.status(weight: .semibold))
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .foregroundStyle(ElectronicMailDesign.errorAccent)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Error: \(message)")
+    }
+
+    @ViewBuilder
+    private var failureSurface: some View {
+        if #available(macOS 26.0, *), usesNativeGlass {
+            failureLabel
+                .glassEffect(.regular, in: Capsule())
+                .overlay(errorBorder)
+        } else {
+            failureLabel
+                .background {
+                    if reduceTransparency {
+                        Capsule().fill(ElectronicMailDesign.panelFill(for: colorScheme))
+                    } else {
+                        Capsule().fill(.regularMaterial)
+                    }
+                }
+                .overlay(errorBorder)
+        }
+    }
+
+    private var errorBorder: some View {
+        Capsule()
+            .strokeBorder(
+                ElectronicMailDesign.errorAccent.opacity(contrast == .increased ? 1 : 0.90),
+                lineWidth: contrast == .increased ? 2 : 1.25
+            )
+    }
+
+    private var usesNativeGlass: Bool {
+        renderingMode.usesNativeGlass(
+            osMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
+            reduceTransparency: reduceTransparency
+        )
     }
 }
 

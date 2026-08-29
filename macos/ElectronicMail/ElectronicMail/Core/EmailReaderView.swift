@@ -25,6 +25,7 @@ struct EmailReaderView: View {
     @State private var activeMessageKey: EmailThreadPresentationItem.ID?
     @State private var expansionInitializedThreadID: String?
     @State private var initialTopPeekRequest: Int?
+    @State private var readerContentHeight: CGFloat = 0
 
     var body: some View {
         GeometryReader { proxy in
@@ -34,6 +35,12 @@ struct EmailReaderView: View {
             let selectedKey = resolvedActiveMessageKey(in: presentation)
             let activeMessage = presentation.items.first(where: { $0.id == selectedKey })?.message
                 ?? messages.first
+            let readerActionsVisible = activeMessage != nil && errorMessage == nil
+            let needsReaderActionClearance = ElectronicMailReaderActionClearance.isRequired(
+                contentHeight: readerContentHeight,
+                viewportHeight: proxy.size.height,
+                actionsVisible: readerActionsVisible
+            )
 
             ZStack(alignment: .bottom) {
                 ScrollViewReader { scrollProxy in
@@ -97,8 +104,16 @@ struct EmailReaderView: View {
                             }
                             .padding(.top, EmailReaderMetrics.contentTop)
                             .frame(maxWidth: .infinity)
+                            .background {
+                                GeometryReader { contentProxy in
+                                    Color.clear.preference(
+                                        key: ElectronicMailReaderContentHeightPreferenceKey.self,
+                                        value: contentProxy.size.height
+                                    )
+                                }
+                            }
 
-                            if activeMessage != nil, errorMessage == nil {
+                            if needsReaderActionClearance {
                                 Color.clear
                                     .frame(height: ElectronicMailControlMetrics.readerFixedActionsReservedHeight)
                                     .accessibilityHidden(true)
@@ -124,6 +139,10 @@ struct EmailReaderView: View {
                     .padding(.bottom, ElectronicMailControlMetrics.readerFloatingActionsBottomInset)
                     .zIndex(2)
                 }
+            }
+            .onPreferenceChange(ElectronicMailReaderContentHeightPreferenceKey.self) { nextHeight in
+                guard abs(nextHeight - readerContentHeight) > 0.25 else { return }
+                readerContentHeight = nextHeight
             }
         }
     }
@@ -171,6 +190,9 @@ struct ElectronicMailReaderFadingScrollView<Content: View>: View {
     let topPeekRequest: AnyHashable?
     let topPeekDistance: CGFloat
     let fadeTopInset: CGFloat
+    let fadeHeight: CGFloat
+    let fadeActivationDistance: CGFloat
+    let fadeTopContentOpacity: CGFloat
     let onScrollOffsetChange: (CGFloat) -> Void
     let content: Content
 
@@ -184,6 +206,9 @@ struct ElectronicMailReaderFadingScrollView<Content: View>: View {
         topPeekRequest: AnyHashable? = nil,
         topPeekDistance: CGFloat = ElectronicMailControlMetrics.readerPreviousMessagePeek,
         fadeTopInset: CGFloat = ElectronicMailControlMetrics.readerScrollFadeTopInset,
+        fadeHeight: CGFloat = ElectronicMailControlMetrics.readerScrollFadeHeight,
+        fadeActivationDistance: CGFloat = ElectronicMailControlMetrics.readerScrollFadeActivationDistance,
+        fadeTopContentOpacity: CGFloat = ElectronicMailControlMetrics.readerScrollFadeTopContentOpacity,
         onScrollOffsetChange: @escaping (CGFloat) -> Void = { _ in },
         @ViewBuilder content: () -> Content
     ) {
@@ -194,6 +219,9 @@ struct ElectronicMailReaderFadingScrollView<Content: View>: View {
         self.topPeekRequest = topPeekRequest
         self.topPeekDistance = topPeekDistance
         self.fadeTopInset = fadeTopInset
+        self.fadeHeight = fadeHeight
+        self.fadeActivationDistance = fadeActivationDistance
+        self.fadeTopContentOpacity = fadeTopContentOpacity
         self.onScrollOffsetChange = onScrollOffsetChange
         self.content = content()
     }
@@ -211,13 +239,16 @@ struct ElectronicMailReaderFadingScrollView<Content: View>: View {
                     )
                 }
         }
+        .scrollBounceBehavior(.basedOnSize, axes: .vertical)
         .onChange(of: scrollIdentity) { _, _ in
             fadeProgress = 0
         }
         .environment(\.electronicMailReaderFadeTopInset, fadeTopInset)
         .mask {
             ElectronicMailReaderFadeMask(
-                progress: fadeProgress
+                progress: fadeProgress,
+                height: fadeHeight,
+                topContentOpacity: fadeTopContentOpacity
             )
         }
     }
@@ -225,6 +256,7 @@ struct ElectronicMailReaderFadingScrollView<Content: View>: View {
     private func recordScrollOffset(_ nextOffset: CGFloat) {
         let nextProgress = ElectronicMailReaderScrollFade.progress(
             forContentOffset: nextOffset,
+            activationDistance: fadeActivationDistance,
             minimumProgress: topPeekRequest == nil
                 ? 0
                 : ElectronicMailControlMetrics.readerPreviousMessagePeekFadeProgress
@@ -238,11 +270,66 @@ struct ElectronicMailReaderFadingScrollView<Content: View>: View {
     }
 }
 
+enum ElectronicMailReaderActionClearance {
+    static func isRequired(
+        contentHeight: CGFloat,
+        viewportHeight: CGFloat,
+        actionsVisible: Bool,
+        reservedHeight: CGFloat = ElectronicMailControlMetrics.readerFixedActionsReservedHeight
+    ) -> Bool {
+        guard actionsVisible else { return false }
+        let unobscuredHeight = max(0, viewportHeight - reservedHeight)
+        return contentHeight > unobscuredHeight + 0.5
+    }
+}
+
+struct ElectronicMailReaderContentHeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// The shell header and mailbox viewport are separate stacked regions, so the
+/// native scroll-edge effect has no overlapping toolbar surface to blend with.
+/// Drive a fixed gradient mask from the measured scroll offset instead; this
+/// gives Inbox and AI Inbox the same visible fade on every supported macOS.
+struct ElectronicMailMailboxScrollView<Content: View>: View {
+    let colorScheme: ColorScheme
+    let showsIndicators: Bool
+    let content: Content
+
+    init(
+        colorScheme: ColorScheme,
+        showsIndicators: Bool,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.colorScheme = colorScheme
+        self.showsIndicators = showsIndicators
+        self.content = content()
+    }
+
+    var body: some View {
+        ElectronicMailReaderFadingScrollView(
+            colorScheme: colorScheme,
+            showsIndicators: showsIndicators,
+            fadeHeight: ElectronicMailControlMetrics.mailboxScrollFadeHeight,
+            fadeActivationDistance: ElectronicMailControlMetrics.mailboxScrollFadeActivationDistance,
+            fadeTopContentOpacity: ElectronicMailControlMetrics.mailboxScrollFadeTopContentOpacity
+        ) {
+            content
+        }
+    }
+}
+
 /// Mask the complete scroll surface rather than painting above it. That makes
 /// rich WKWebView bodies and native SwiftUI message rows fade through the same
 /// top edge even when AppKit composites the web view in a separate layer.
 private struct ElectronicMailReaderFadeMask: View {
     let progress: CGFloat
+    let height: CGFloat
+    let topContentOpacity: CGFloat
 
     var body: some View {
         let clampedProgress = min(1, max(0, progress))
@@ -251,14 +338,14 @@ private struct ElectronicMailReaderFadeMask: View {
                 colors: [
                     Color.black.opacity(
                         1 - clampedProgress
-                            * (1 - ElectronicMailControlMetrics.readerScrollFadeTopContentOpacity)
+                            * (1 - min(1, max(0, topContentOpacity)))
                     ),
                     Color.black,
                 ],
                 startPoint: .top,
                 endPoint: .bottom
             )
-            .frame(height: ElectronicMailControlMetrics.readerScrollFadeHeight)
+            .frame(height: max(0, height))
 
             Color.black
         }
@@ -269,11 +356,12 @@ private struct ElectronicMailReaderFadeMask: View {
 enum ElectronicMailReaderScrollFade {
     static func progress(
         forContentOffset contentOffset: CGFloat,
+        activationDistance: CGFloat = ElectronicMailControlMetrics.readerScrollFadeActivationDistance,
         minimumProgress: CGFloat = 0
     ) -> CGFloat {
         let scrollProgress = min(
             1,
-            max(0, contentOffset) / ElectronicMailControlMetrics.readerScrollFadeActivationDistance
+            max(0, contentOffset) / max(1, activationDistance)
         )
         return max(min(1, max(0, minimumProgress)), scrollProgress)
     }
