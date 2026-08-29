@@ -24,6 +24,7 @@ struct EmailReaderView: View {
     @State private var expandedMessageKeys: Set<EmailThreadPresentationItem.ID> = []
     @State private var activeMessageKey: EmailThreadPresentationItem.ID?
     @State private var expansionInitializedThreadID: String?
+    @State private var initialTopPeekRequest: Int?
 
     var body: some View {
         GeometryReader { proxy in
@@ -39,7 +40,8 @@ struct EmailReaderView: View {
                     ElectronicMailReaderFadingScrollView(
                         colorScheme: colorScheme,
                         showsIndicators: true,
-                        scrollIdentity: threadID
+                        scrollIdentity: threadID,
+                        topPeekRequest: initialTopPeekRequest
                     ) {
                         VStack(alignment: .center, spacing: 0) {
                             EmailReaderChrome(contentWidth: contentWidth) {
@@ -84,6 +86,10 @@ struct EmailReaderView: View {
                                                     messageKey,
                                                     anchor: explicitlyFocused ? .center : .top
                                                 )
+                                                guard !explicitlyFocused else { return }
+                                                DispatchQueue.main.async {
+                                                    initialTopPeekRequest = (initialTopPeekRequest ?? 0) + 1
+                                                }
                                             }
                                         }
                                     )
@@ -162,18 +168,21 @@ struct ElectronicMailReaderFadingScrollView<Content: View>: View {
     let showsIndicators: Bool
     let scrollIdentity: AnyHashable?
     let offsetReadRequest: AnyHashable?
+    let topPeekRequest: AnyHashable?
+    let topPeekDistance: CGFloat
     let fadeTopInset: CGFloat
     let onScrollOffsetChange: (CGFloat) -> Void
     let content: Content
 
-    @State private var scrollOffset: CGFloat = 0
-    @State private var initialScrollOffset: CGFloat?
+    @State private var fadeProgress: CGFloat = 0
 
     init(
         colorScheme: ColorScheme,
         showsIndicators: Bool,
         scrollIdentity: AnyHashable? = nil,
         offsetReadRequest: AnyHashable? = nil,
+        topPeekRequest: AnyHashable? = nil,
+        topPeekDistance: CGFloat = ElectronicMailControlMetrics.readerPreviousMessagePeek,
         fadeTopInset: CGFloat = ElectronicMailControlMetrics.readerScrollFadeTopInset,
         onScrollOffsetChange: @escaping (CGFloat) -> Void = { _ in },
         @ViewBuilder content: () -> Content
@@ -182,6 +191,8 @@ struct ElectronicMailReaderFadingScrollView<Content: View>: View {
         self.showsIndicators = showsIndicators
         self.scrollIdentity = scrollIdentity
         self.offsetReadRequest = offsetReadRequest
+        self.topPeekRequest = topPeekRequest
+        self.topPeekDistance = topPeekDistance
         self.fadeTopInset = fadeTopInset
         self.onScrollOffsetChange = onScrollOffsetChange
         self.content = content()
@@ -194,36 +205,35 @@ struct ElectronicMailReaderFadingScrollView<Content: View>: View {
                     ElectronicMailReaderScrollObserver(
                         identity: scrollIdentity,
                         offsetReadRequest: offsetReadRequest,
+                        topPeekRequest: topPeekRequest,
+                        topPeekDistance: topPeekDistance,
                         onOffsetChange: recordScrollOffset
                     )
                 }
         }
         .onChange(of: scrollIdentity) { _, _ in
-            initialScrollOffset = nil
-            scrollOffset = 0
+            fadeProgress = 0
         }
         .environment(\.electronicMailReaderFadeTopInset, fadeTopInset)
         .mask {
             ElectronicMailReaderFadeMask(
-                progress: ElectronicMailReaderScrollFade.progress(
-                    forContentTop: scrollOffset,
-                    initialContentTop: initialScrollOffset ?? scrollOffset
-                )
+                progress: fadeProgress
             )
         }
     }
 
     private func recordScrollOffset(_ nextOffset: CGFloat) {
-        if initialScrollOffset == nil {
-            initialScrollOffset = nextOffset
-            scrollOffset = nextOffset
-            onScrollOffsetChange(nextOffset)
-            return
+        let nextProgress = ElectronicMailReaderScrollFade.progress(
+            forContentOffset: nextOffset,
+            minimumProgress: topPeekRequest == nil
+                ? 0
+                : ElectronicMailControlMetrics.readerPreviousMessagePeekFadeProgress
+        )
+        let reachedEndpoint = nextProgress == 0 || nextProgress == 1
+        if abs(nextProgress - fadeProgress) >= (1.0 / 24.0)
+            || (reachedEndpoint && nextProgress != fadeProgress) {
+            fadeProgress = nextProgress
         }
-        guard abs(nextOffset - scrollOffset) > 0.25 else {
-            return
-        }
-        scrollOffset = nextOffset
         onScrollOffsetChange(nextOffset)
     }
 }
@@ -239,7 +249,10 @@ private struct ElectronicMailReaderFadeMask: View {
         VStack(spacing: 0) {
             LinearGradient(
                 colors: [
-                    Color.black.opacity(1 - clampedProgress),
+                    Color.black.opacity(
+                        1 - clampedProgress
+                            * (1 - ElectronicMailControlMetrics.readerScrollFadeTopContentOpacity)
+                    ),
                     Color.black,
                 ],
                 startPoint: .top,
@@ -254,6 +267,17 @@ private struct ElectronicMailReaderFadeMask: View {
 }
 
 enum ElectronicMailReaderScrollFade {
+    static func progress(
+        forContentOffset contentOffset: CGFloat,
+        minimumProgress: CGFloat = 0
+    ) -> CGFloat {
+        let scrollProgress = min(
+            1,
+            max(0, contentOffset) / ElectronicMailControlMetrics.readerScrollFadeActivationDistance
+        )
+        return max(min(1, max(0, minimumProgress)), scrollProgress)
+    }
+
     static func progress(
         forContentTop contentTop: CGFloat,
         initialContentTop: CGFloat = 0
@@ -272,12 +296,16 @@ enum ElectronicMailReaderScrollFade {
 private struct ElectronicMailReaderScrollObserver: NSViewRepresentable {
     let identity: AnyHashable?
     let offsetReadRequest: AnyHashable?
+    let topPeekRequest: AnyHashable?
+    let topPeekDistance: CGFloat
     let onOffsetChange: (CGFloat) -> Void
 
     func makeNSView(context _: Context) -> ObserverView {
         let view = ObserverView()
         view.identity = identity
         view.offsetReadRequest = offsetReadRequest
+        view.topPeekDistance = topPeekDistance
+        view.topPeekRequest = topPeekRequest
         view.onOffsetChange = onOffsetChange
         return view
     }
@@ -286,6 +314,8 @@ private struct ElectronicMailReaderScrollObserver: NSViewRepresentable {
         nsView.onOffsetChange = onOffsetChange
         nsView.identity = identity
         nsView.offsetReadRequest = offsetReadRequest
+        nsView.topPeekDistance = topPeekDistance
+        nsView.topPeekRequest = topPeekRequest
         nsView.installObservationIfPossible()
     }
 
@@ -293,8 +323,12 @@ private struct ElectronicMailReaderScrollObserver: NSViewRepresentable {
         var identity: AnyHashable? {
             didSet {
                 guard identity != oldValue else { return }
+                lastPublishedOffset = nil
+                appliedTopPeekRequest = nil
                 DispatchQueue.main.async { [weak self] in
-                    self?.publishCurrentOffset()
+                    self?.installObservationIfPossible()
+                    self?.applyPendingTopPeekIfNeeded()
+                    self?.publishCurrentOffset(force: true)
                 }
             }
         }
@@ -303,13 +337,32 @@ private struct ElectronicMailReaderScrollObserver: NSViewRepresentable {
                 guard offsetReadRequest != oldValue else { return }
                 DispatchQueue.main.async { [weak self] in
                     self?.installObservationIfPossible()
-                    self?.publishCurrentOffset()
+                    self?.publishCurrentOffset(force: true)
                 }
             }
         }
+        var topPeekRequest: AnyHashable? {
+            didSet {
+                guard topPeekRequest != oldValue else { return }
+                guard topPeekRequest != nil else {
+                    appliedTopPeekRequest = nil
+                    topPeekNotBefore = nil
+                    return
+                }
+                topPeekNotBefore = ProcessInfo.processInfo.systemUptime + 0.05
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                    self?.installObservationIfPossible()
+                    self?.applyPendingTopPeekIfNeeded()
+                }
+            }
+        }
+        var topPeekDistance: CGFloat = 0
         var onOffsetChange: (CGFloat) -> Void = { _ in }
         private weak var observedScrollView: NSScrollView?
         private var boundsObserver: NSObjectProtocol?
+        private var lastPublishedOffset: CGFloat?
+        private var appliedTopPeekRequest: AnyHashable?
+        private var topPeekNotBefore: TimeInterval?
 
         override func viewDidMoveToSuperview() {
             super.viewDidMoveToSuperview()
@@ -328,6 +381,7 @@ private struct ElectronicMailReaderScrollObserver: NSViewRepresentable {
         func installObservationIfPossible() {
             guard window != nil, let scrollView = enclosingScrollView() else { return }
             if observedScrollView === scrollView {
+                applyPendingTopPeekIfNeeded()
                 publishCurrentOffset()
                 return
             }
@@ -343,6 +397,7 @@ private struct ElectronicMailReaderScrollObserver: NSViewRepresentable {
             ) { [weak self] _ in
                 self?.publishCurrentOffset()
             }
+            applyPendingTopPeekIfNeeded()
             publishCurrentOffset()
         }
 
@@ -357,9 +412,39 @@ private struct ElectronicMailReaderScrollObserver: NSViewRepresentable {
             return nil
         }
 
-        private func publishCurrentOffset() {
+        private func publishCurrentOffset(force: Bool = false) {
             guard let observedScrollView else { return }
-            onOffsetChange(observedScrollView.contentView.bounds.origin.y)
+            let offset = observedScrollView.contentView.bounds.origin.y
+            if !force,
+               let lastPublishedOffset,
+               abs(offset - lastPublishedOffset) < 1 {
+                return
+            }
+            lastPublishedOffset = offset
+            onOffsetChange(offset)
+        }
+
+        private func applyPendingTopPeekIfNeeded() {
+            guard let topPeekRequest,
+                  topPeekRequest != appliedTopPeekRequest,
+                  ProcessInfo.processInfo.systemUptime >= (topPeekNotBefore ?? 0),
+                  topPeekDistance > 0,
+                  let observedScrollView else {
+                return
+            }
+            appliedTopPeekRequest = topPeekRequest
+            let clipView = observedScrollView.contentView
+            var targetBounds = clipView.bounds
+            let upwardDirection: CGFloat = clipView.documentView?.isFlipped == true ? -1 : 1
+            targetBounds.origin.y += upwardDirection * topPeekDistance
+            let constrainedBounds = clipView.constrainBoundsRect(targetBounds)
+            guard abs(constrainedBounds.origin.y - clipView.bounds.origin.y) > 0.25 else {
+                publishCurrentOffset(force: true)
+                return
+            }
+            clipView.scroll(to: constrainedBounds.origin)
+            observedScrollView.reflectScrolledClipView(clipView)
+            publishCurrentOffset(force: true)
         }
 
         private func removeObservation() {
@@ -368,6 +453,7 @@ private struct ElectronicMailReaderScrollObserver: NSViewRepresentable {
             }
             boundsObserver = nil
             observedScrollView = nil
+            lastPublishedOffset = nil
         }
     }
 }
@@ -1869,7 +1955,8 @@ private struct EmailOriginalBodyView: View {
         )
         .id("\(renderRevision)-\(colorScheme == .dark ? "dark" : "light")-\(presentationMode)")
         .background(ElectronicMailDesign.background(for: colorScheme))
-        .padding(16)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 16)
     }
 }
 
@@ -2505,7 +2592,10 @@ private final class EmailReaderFadeOverlayView: NSView {
         CATransaction.setDisableActions(true)
         gradientLayer.frame = bounds
         gradientLayer.colors = [
-            background.withAlphaComponent(clampedProgress).cgColor,
+            background.withAlphaComponent(
+                clampedProgress
+                    * (1 - ElectronicMailControlMetrics.readerScrollFadeTopContentOpacity)
+            ).cgColor,
             background.withAlphaComponent(0).cgColor,
         ]
         CATransaction.commit()
@@ -3156,7 +3246,7 @@ struct EmailMessageCard: View {
                 colorScheme: colorScheme
             )
             .equatable()
-            .padding(.top, 18)
+            .padding(.top, 8)
 
             if !message.attachments.isEmpty {
                 EmailAttachmentsView(
@@ -3867,8 +3957,8 @@ private enum EmailReaderMetrics {
     static let threadTitleActionGap: CGFloat = 20
     static let headerToConversation = ElectronicMailControlMetrics.readerHeaderToConversation
     static let collapsedRowHeight: CGFloat = 82
-    static let messageHeaderHeight: CGFloat = 66
-    static let messageHeaderVerticalPadding: CGFloat = 8
+    static let messageHeaderHeight: CGFloat = 58
+    static let messageHeaderVerticalPadding: CGFloat = 4
     static let messageHeaderToDetails: CGFloat = 12
     static let detailRowSpacing: CGFloat = 17
     static let detailPanelVerticalPadding: CGFloat = 15

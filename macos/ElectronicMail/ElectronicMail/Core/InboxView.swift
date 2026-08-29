@@ -496,10 +496,16 @@ private struct InboxMailboxList: View, Equatable {
                 }
                 .onDeleteCommand(perform: onMoveToTrash)
                 .background {
-                    InboxKeyboardNavigationCapture { delta in
-                        moveSelection(by: delta, scrollProxy: scrollProxy)
-                    }
+                    InboxKeyboardNavigationCapture(
+                        onMove: { delta in
+                            moveSelection(by: delta, scrollProxy: scrollProxy)
+                        },
+                        onOpenSelection: onOpenSelection
+                    )
                     .frame(width: 0, height: 0)
+                }
+                .onAppear {
+                    restoreSelectedRowPosition(scrollProxy: scrollProxy)
                 }
                 .transaction { transaction in
                     transaction.disablesAnimations = true
@@ -525,14 +531,29 @@ private struct InboxMailboxList: View, Equatable {
         onSelect(nextRow)
         scrollProxy.scrollTo(nextRow.id, anchor: .center)
     }
+
+    private func restoreSelectedRowPosition(scrollProxy: ScrollViewProxy) {
+        guard let selectedRowID = snapshot.selectedRowID,
+              snapshot.flatRows.contains(where: { $0.id == selectedRowID }) else {
+            return
+        }
+        DispatchQueue.main.async {
+            scrollProxy.scrollTo(selectedRowID, anchor: .center)
+        }
+    }
+}
+
+enum InboxKeyboardNavigationAction: Equatable {
+    case move(Int)
+    case openSelection
 }
 
 enum InboxKeyboardNavigationPolicy {
-    static func selectionDelta(
+    static func action(
         keyCode: UInt16,
         modifiers: NSEvent.ModifierFlags,
         isTextEditing: Bool
-    ) -> Int? {
+    ) -> InboxKeyboardNavigationAction? {
         guard !isTextEditing else {
             return nil
         }
@@ -544,26 +565,44 @@ enum InboxKeyboardNavigationPolicy {
 
         switch keyCode {
         case 126:
-            return -1
+            return .move(-1)
         case 125:
-            return 1
+            return .move(1)
+        case 36, 76:
+            return .openSelection
         default:
             return nil
         }
     }
+
+    static func selectionDelta(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags,
+        isTextEditing: Bool
+    ) -> Int? {
+        guard case .move(let delta) = action(
+            keyCode: keyCode,
+            modifiers: modifiers,
+            isTextEditing: isTextEditing
+        ) else { return nil }
+        return delta
+    }
 }
 
-private struct InboxKeyboardNavigationCapture: NSViewRepresentable {
+struct InboxKeyboardNavigationCapture: NSViewRepresentable {
     let onMove: (Int) -> Void
+    let onOpenSelection: () -> Void
 
     func makeNSView(context: Context) -> NavigationView {
         let view = NavigationView()
         view.onMove = onMove
+        view.onOpenSelection = onOpenSelection
         return view
     }
 
     func updateNSView(_ nsView: NavigationView, context: Context) {
         nsView.onMove = onMove
+        nsView.onOpenSelection = onOpenSelection
         nsView.installMonitorIfNeeded()
     }
 
@@ -573,6 +612,7 @@ private struct InboxKeyboardNavigationCapture: NSViewRepresentable {
 
     final class NavigationView: NSView {
         var onMove: ((Int) -> Void)?
+        var onOpenSelection: (() -> Void)?
         private var monitor: Any?
 
         override func viewDidMoveToWindow() {
@@ -616,7 +656,7 @@ private struct InboxKeyboardNavigationCapture: NSViewRepresentable {
 
             let responder = window.firstResponder
             let isTextEditing = responder is NSTextView || responder is NSTextField
-            guard let delta = InboxKeyboardNavigationPolicy.selectionDelta(
+            guard let action = InboxKeyboardNavigationPolicy.action(
                 keyCode: event.keyCode,
                 modifiers: event.modifierFlags,
                 isTextEditing: isTextEditing
@@ -624,7 +664,12 @@ private struct InboxKeyboardNavigationCapture: NSViewRepresentable {
                 return event
             }
 
-            onMove?(delta)
+            switch action {
+            case .move(let delta):
+                onMove?(delta)
+            case .openSelection:
+                onOpenSelection?()
+            }
             return nil
         }
     }
