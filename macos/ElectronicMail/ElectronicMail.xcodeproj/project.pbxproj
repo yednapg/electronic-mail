@@ -214,7 +214,7 @@
 		E3E23CEC3BF04A0C374FE7AF /* DashboardViewModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardViewModels.swift; sourceTree = "<group>"; };
 		E978EC1605F65D46914F4B58 /* APIClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClientTests.swift; sourceTree = "<group>"; };
 		E9F5EA6CD49C28E817A839FF /* ElectronicMailShared-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMailShared-Info.plist"; sourceTree = "<group>"; };
-		EEA81CF16E7AA4459285DF8C /* ElectronicMail.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ElectronicMail.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		EEA81CF16E7AA4459285DF8C /* Electronic Mail.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Electronic Mail.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		F7EE5BEA17BC2ECC7B4F475B /* IOSGoogleOAuthService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSGoogleOAuthService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -324,7 +324,7 @@
 		95EAB96B33F91D42E9B6B295 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				EEA81CF16E7AA4459285DF8C /* ElectronicMail.app */,
+				EEA81CF16E7AA4459285DF8C /* Electronic Mail.app */,
 				15E3C181BB57958668D88D57 /* ElectronicMailCore.framework */,
 				9840DAA09904CBD17DD1AB9C /* ElectronicMailiOS.app */,
 				12A865E23955430580FFD02C /* ElectronicMailShared.framework */,
@@ -547,8 +547,8 @@
 			name = ElectronicMail;
 			packageProductDependencies = (
 			);
-			productName = ElectronicMail;
-			productReference = EEA81CF16E7AA4459285DF8C /* ElectronicMail.app */;
+			productName = "Electronic Mail";
+			productReference = EEA81CF16E7AA4459285DF8C /* Electronic Mail.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -808,6 +808,7 @@
 				ELECTRONIC_MAIL_SOURCE_COMMIT = local;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = NO;
+				EXECUTABLE_NAME = "Electronic Mail";
 				INFOPLIST_FILE = "Config/InfoPlists/ElectronicMail-Release-Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -820,7 +821,8 @@
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.mac;
-				PRODUCT_NAME = ElectronicMail;
+				PRODUCT_MODULE_NAME = ElectronicMail;
+				PRODUCT_NAME = "Electronic Mail";
 				SDKROOT = macosx;
 				ONLY_ACTIVE_ARCH = NO;
 				SWIFT_COMPILATION_MODE = wholemodule;
@@ -842,6 +844,7 @@
 				ELECTRONIC_MAIL_SOURCE_COMMIT = local;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
+				EXECUTABLE_NAME = "Electronic Mail";
 				INFOPLIST_FILE = "Config/InfoPlists/ElectronicMail-Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -854,7 +857,8 @@
 					"-L$(DT_TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = app.electronicmail.mac;
-				PRODUCT_NAME = ElectronicMail;
+				PRODUCT_MODULE_NAME = ElectronicMail;
+				PRODUCT_NAME = "Electronic Mail";
 				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = (
 					"$(inherited)",

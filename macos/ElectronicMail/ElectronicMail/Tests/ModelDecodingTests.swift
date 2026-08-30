@@ -6,23 +6,21 @@ import Security
 @testable import ElectronicMailCore
 
 final class ModelDecodingTests: XCTestCase {
-    func testReaderRecipientLabelUsesAccountNameForSingleAddressAlias() {
+    func testReaderRecipientLabelUsesHeaderNameOrEmail() {
         XCTAssertEqual(
-            EmailReaderText.recipientLabel(
-                "owner@example.test",
-                currentUserDisplayName: "TestUser",
-                currentUserEmail: "demo@example.test"
-            ),
-            "to TestUser"
+            EmailReaderText.recipientLabel("mailbox-test@example.test"),
+            "to mailbox-test@example.test"
         )
         XCTAssertEqual(
-            EmailReaderText.recipientLabel(
-                "teammate@example.com, owner@example.test",
-                currentUserDisplayName: "TestUser",
-                currentUserEmail: "demo@example.test"
-            ),
+            EmailReaderText.recipientLabel("State Bank of India <bank-alerts@example.com>"),
+            "to State Bank of India"
+        )
+        XCTAssertEqual(
+            EmailReaderText.recipientLabel("teammate@example.com, owner@example.test"),
             "to teammate@example.com +1"
         )
+        XCTAssertEqual(EmailReaderText.recipientLabel(nil), "")
+        XCTAssertEqual(EmailReaderText.recipientLabel("   "), "")
     }
 
     func testInboxKeyboardNavigationRoutesOnlyPlainArrowKeysOutsideTextEditing() {

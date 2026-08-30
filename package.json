@@ -39,7 +39,7 @@
     "macos:typecheck": "bash scripts/xcode.sh build-for-testing -project macos/ElectronicMail/ElectronicMail.xcodeproj -scheme ElectronicMail -destination 'platform=macOS' COMPILER_INDEX_STORE_ENABLE=NO -jobs 2 -derivedDataPath /tmp/ElectronicMailDerivedData CODE_SIGNING_ALLOWED=NO",
     "macos:build": "bash scripts/xcode.sh build -project macos/ElectronicMail/ElectronicMail.xcodeproj -scheme ElectronicMail -destination 'platform=macOS' COMPILER_INDEX_STORE_ENABLE=NO -jobs 2 -derivedDataPath /tmp/ElectronicMailDerivedData CODE_SIGNING_ALLOWED=NO",
     "macos:test": "bash scripts/xcode.sh test -project macos/ElectronicMail/ElectronicMail.xcodeproj -scheme ElectronicMail -destination 'platform=macOS' COMPILER_INDEX_STORE_ENABLE=NO -jobs 2 -derivedDataPath /tmp/ElectronicMailDerivedData CODE_SIGNING_ALLOWED=NO",
-    "macos:open": "open /tmp/ElectronicMailDerivedData/Build/Products/Debug/ElectronicMail.app",
+    "macos:open": "open '/tmp/ElectronicMailDerivedData/Build/Products/Debug/Electronic Mail.app'",
     "macos:run": "npm run macos:build && npm run macos:open",
     "ios:generate": "cd macos/ElectronicMail && tuist generate",
     "ios:build": "xcodebuild build -workspace macos/ElectronicMail/ElectronicMail.xcworkspace -scheme ElectronicMailiOS -destination 'generic/platform=iOS' COMPILER_INDEX_STORE_ENABLE=NO -jobs 2 -derivedDataPath /tmp/ElectronicMailIOSDerivedData CODE_SIGNING_ALLOWED=NO",
