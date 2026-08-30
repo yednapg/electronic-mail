@@ -657,9 +657,9 @@ if [ "$SKIP_ARTIFACT_VERIFY" = "0" ]; then
   DMG_IS_MOUNTED=1
   python3 "$ROOT_DIR/scripts/verify_macos_dmg_layout.py" \
     --mount "$DMG_MOUNT_POINT" \
-    --app-name ElectronicMail.app
-  DMG_APP_PATH="$DMG_MOUNT_POINT/ElectronicMail.app"
-  verify_app_bundle "$DMG_APP_PATH" "ElectronicMail.app mounted from DMG_PATH"
+    --app-name "Electronic Mail.app"
+  DMG_APP_PATH="$DMG_MOUNT_POINT/Electronic Mail.app"
+  verify_app_bundle "$DMG_APP_PATH" "Electronic Mail.app mounted from DMG_PATH"
   hdiutil detach "$DMG_MOUNT_POINT" >/dev/null || fail "could not detach the verified DMG"
   DMG_IS_MOUNTED=0
 else

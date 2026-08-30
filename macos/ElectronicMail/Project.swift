@@ -66,7 +66,10 @@ let project = Project(
                     "CURRENT_PROJECT_VERSION": "1",
                     "ELECTRONIC_MAIL_SOURCE_COMMIT": "local",
                     "ENABLE_HARDENED_RUNTIME": "YES",
-                    "MARKETING_VERSION": "1.0.0"
+                    "EXECUTABLE_NAME": "Electronic Mail",
+                    "MARKETING_VERSION": "1.0.0",
+                    "PRODUCT_MODULE_NAME": "ElectronicMail",
+                    "PRODUCT_NAME": "Electronic Mail"
                 ],
                 configurations: [
                     .debug(name: "Debug", settings: [
