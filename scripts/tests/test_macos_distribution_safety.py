@@ -91,14 +91,14 @@ class MacOSDistributionSafetyTests(unittest.TestCase):
         self.assertIn('"bundle_identifier": "app.electronicmail.mac.beta"', beta_script)
         self.assertIn('"coinstallation_supported_during_sign_in": False', beta_script)
         self.assertIn("OAUTH COINSTALLATION LIMITATION", beta_script)
-        self.assertIn("remove every production ElectronicMail.app", beta_script)
+        self.assertIn("remove every production Electronic Mail.app", beta_script)
         self.assertIn("**OAuth co-installation limitation:**", beta_script)
-        self.assertIn("Remove every production `ElectronicMail.app` copy", beta_script)
-        self.assertNotIn('DMG_APP_PATH="$DMG_ROOT/ElectronicMail.app"', beta_script)
+        self.assertIn("Remove every production `Electronic Mail.app` copy", beta_script)
+        self.assertNotIn('DMG_APP_PATH="$DMG_ROOT/Electronic Mail.app"', beta_script)
 
         beta_guide = self.text("docs/MACOS_BETA.md")
         self.assertIn("does not isolate OAuth scheme routing", beta_guide)
-        self.assertIn("remove every production `ElectronicMail.app` copy", beta_guide)
+        self.assertIn("remove every production `Electronic Mail.app` copy", beta_guide)
 
         verifier = self.text("scripts/verify-macos-release.sh")
         self.assertIn("EXPECTED_BUNDLE_ID=app.electronicmail.mac", verifier)

@@ -28,7 +28,7 @@ fail() {
   exit 1
 }
 
-[ -d "$APP_PATH" ] || fail "APP_PATH must point to ElectronicMail.app"
+[ -d "$APP_PATH" ] || fail "APP_PATH must point to Electronic Mail.app"
 [ -n "$EXPECTED_BACKEND_URL" ] || fail "EXPECTED_BACKEND_URL is required"
 [ -n "$EXPECTED_VERSION" ] || fail "EXPECTED_VERSION is required"
 [ -n "$EXPECTED_BUILD_NUMBER" ] || fail "EXPECTED_BUILD_NUMBER is required"
@@ -76,7 +76,7 @@ for command in codesign grep lipo plutil python3 xcrun; do
 done
 
 INFO_PLIST="$APP_PATH/Contents/Info.plist"
-EXECUTABLE="$APP_PATH/Contents/MacOS/ElectronicMail"
+EXECUTABLE="$APP_PATH/Contents/MacOS/Electronic Mail"
 PRIVACY_MANIFEST="$APP_PATH/Contents/Resources/PrivacyInfo.xcprivacy"
 APP_ICON="$APP_PATH/Contents/Resources/AppIcon.icns"
 FRAMEWORK="$APP_PATH/Contents/Frameworks/ElectronicMailCore.framework"
@@ -139,11 +139,11 @@ case " $FRAMEWORK_ARCHITECTURES " in *" x86_64 "*) ;; *) fail "ElectronicMailCor
 
 if [ -n "$DSYM_PATH" ]; then
   command -v dwarfdump >/dev/null 2>&1 || fail "required command not found: dwarfdump"
-  DSYM_EXECUTABLE="$DSYM_PATH/Contents/Resources/DWARF/ElectronicMail"
-  [ -s "$DSYM_EXECUTABLE" ] || fail "ElectronicMail dSYM executable is missing"
+  DSYM_EXECUTABLE="$DSYM_PATH/Contents/Resources/DWARF/Electronic Mail"
+  [ -s "$DSYM_EXECUTABLE" ] || fail "Electronic Mail dSYM executable is missing"
   DSYM_ARCHITECTURES="$(lipo -archs "$DSYM_EXECUTABLE")"
-  case " $DSYM_ARCHITECTURES " in *" arm64 "*) ;; *) fail "ElectronicMail dSYM is missing arm64" ;; esac
-  case " $DSYM_ARCHITECTURES " in *" x86_64 "*) ;; *) fail "ElectronicMail dSYM is missing x86_64" ;; esac
+  case " $DSYM_ARCHITECTURES " in *" arm64 "*) ;; *) fail "Electronic Mail dSYM is missing arm64" ;; esac
+  case " $DSYM_ARCHITECTURES " in *" x86_64 "*) ;; *) fail "Electronic Mail dSYM is missing x86_64" ;; esac
   EXECUTABLE_UUIDS="$(dwarfdump --uuid "$EXECUTABLE" | awk '{print $2, $3}' | sort)"
   DSYM_UUIDS="$(dwarfdump --uuid "$DSYM_PATH" | awk '{print $2, $3}' | sort)"
   [ -n "$EXECUTABLE_UUIDS" ] || fail "main executable UUIDs could not be read"

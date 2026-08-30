@@ -3665,11 +3665,13 @@ private struct EmailMessageHeader: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
 
-            Text(recipientSummary)
-                .font(EmailReaderTypography.metadata())
-                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                .lineLimit(1)
-                .layoutPriority(1)
+            if !recipientSummary.isEmpty {
+                Text(recipientSummary)
+                    .font(EmailReaderTypography.metadata())
+                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                    .lineLimit(1)
+                    .layoutPriority(1)
+            }
         }
         .contentShape(Rectangle())
     }
@@ -3683,11 +3685,7 @@ private struct EmailMessageHeader: View {
     }
 
     private var recipientSummary: String {
-        EmailReaderText.recipientLabel(
-            message.to,
-            currentUserDisplayName: currentUserDisplayName,
-            currentUserEmail: currentUserEmail
-        )
+        EmailReaderText.recipientLabel(message.to)
     }
 }
 
@@ -3743,11 +3741,7 @@ private struct EmailMessageDetailsStrip: View {
     var body: some View {
         VStack(alignment: .leading, spacing: EmailReaderMetrics.detailRowSpacing) {
             addressRow("From", value: message.fromAddress)
-            addressRow(
-                "To",
-                value: message.to,
-                preferredDisplayName: recipientDisplayName(for: message.to)
-            )
+            addressRow("To", value: message.to)
             detailRow("Cc", value: message.cc)
             detailRow("Bcc", value: message.bcc)
             detailRow("Reply-To", value: message.replyTo)
@@ -3875,16 +3869,6 @@ private struct EmailMessageDetailsStrip: View {
         }
         return Text(email ?? rawValue)
             .foregroundColor(ElectronicMailDesign.secondaryText(for: colorScheme))
-    }
-
-    private func recipientDisplayName(for rawValue: String?) -> String? {
-        guard let recipientEmail = EmailReaderText.emailAddress(rawValue)?.lowercased(),
-              let userEmail = clean(currentUserEmail)?.lowercased(),
-              recipientEmail == userEmail
-        else {
-            return nil
-        }
-        return clean(currentUserDisplayName)
     }
 
     private func clean(_ value: String?) -> String? {
@@ -4138,68 +4122,25 @@ enum EmailReaderText {
         return trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
     }
 
-    static func recipientSummary(
-        _ rawValue: String,
-        currentUserDisplayName: String? = nil,
-        currentUserEmail: String? = nil
-    ) -> String {
+    static func recipientSummary(_ rawValue: String) -> String {
         let addresses = splitAddressList(rawValue)
         guard let first = addresses.first else {
             return ""
         }
-        let display = recipientDisplayName(
-            first,
-            currentUserDisplayName: currentUserDisplayName,
-            currentUserEmail: currentUserEmail,
-            allowsCurrentUserAlias: addresses.count == 1
-        ) ?? emailAddress(first) ?? first
+        let display = parsedDisplayName(first) ?? emailAddress(first) ?? first
         if addresses.count > 1 {
             return "\(display) +\(addresses.count - 1)"
         }
         return display
     }
 
-    static func recipientLabel(
-        _ rawValue: String?,
-        currentUserDisplayName: String? = nil,
-        currentUserEmail: String? = nil
-    ) -> String {
+    static func recipientLabel(_ rawValue: String?) -> String {
         let value = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let value, !value.isEmpty else {
-            return "to me"
+            return ""
         }
-        let display = recipientSummary(
-            value,
-            currentUserDisplayName: currentUserDisplayName,
-            currentUserEmail: currentUserEmail
-        )
-        return display.isEmpty ? "to me" : "to \(display)"
-    }
-
-    private static func recipientDisplayName(
-        _ rawValue: String,
-        currentUserDisplayName: String?,
-        currentUserEmail: String?,
-        allowsCurrentUserAlias: Bool
-    ) -> String? {
-        let rawEmail = emailAddress(rawValue)?.lowercased()
-        let userEmail = currentUserEmail?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        let parsedName = parsedDisplayName(rawValue)
-        if let rawEmail,
-           let userEmail,
-           rawEmail == userEmail,
-           let name = cleanDisplayName(currentUserDisplayName) {
-            return name
-        }
-        if allowsCurrentUserAlias,
-           rawEmail != nil,
-           parsedName == nil,
-           let name = cleanDisplayName(currentUserDisplayName) {
-            return name
-        }
-        return parsedName
+        let display = recipientSummary(value)
+        return display.isEmpty ? "" : "to \(display)"
     }
 
     private static func parsedDisplayName(_ rawValue: String) -> String? {

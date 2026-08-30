@@ -192,7 +192,7 @@ case "$command_name" in
         done
         [ -n "$mount_point" ] || stub_fail "attach did not provide a mount point"
         [ -d "${LAUNCH_TEST_DMG_APP_PATH:?}" ] || stub_fail "DMG source app is missing"
-        cp -R "$LAUNCH_TEST_DMG_APP_PATH" "$mount_point/ElectronicMail.app"
+        cp -R "$LAUNCH_TEST_DMG_APP_PATH" "$mount_point/Electronic Mail.app"
         ln -s /Applications "$mount_point/Applications"
         if [ "${LAUNCH_TEST_DMG_EXTRA_FILE:-0}" = "1" ]; then
           printf '%s\n' 'unexpected payload' > "$mount_point/Install.command"

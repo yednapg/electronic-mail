@@ -57,11 +57,11 @@ EOF
   <key>CFBundleIdentifier</key><string>app.electronicmail.core</string>
 </dict></plist>
 EOF
-  printf '%s\n' 'test universal executable' > "$app_path/Contents/MacOS/ElectronicMail"
+  printf '%s\n' 'test universal executable' > "$app_path/Contents/MacOS/Electronic Mail"
   printf '%s\n' 'test universal framework' > "$app_path/Contents/Frameworks/ElectronicMailCore.framework/ElectronicMailCore"
   printf '%s\n' 'test app icon' > "$app_path/Contents/Resources/AppIcon.icns"
   chmod +x \
-    "$app_path/Contents/MacOS/ElectronicMail" \
+    "$app_path/Contents/MacOS/Electronic Mail" \
     "$app_path/Contents/Frameworks/ElectronicMailCore.framework/ElectronicMailCore"
   cp \
     "$ROOT_DIR/macos/ElectronicMail/ElectronicMail/Mac/PrivacyInfo.xcprivacy" \
@@ -264,10 +264,10 @@ expect_failure() {
 ORIGINAL_PATH="$PATH"
 FAKE_BIN="$TEST_DIR/bin"
 ARTIFACT_DIR="$TEST_DIR/artifacts"
-SUPPLIED_APP_PATH="$TEST_DIR/supplied/ElectronicMail.app"
-DMG_APP_PATH="$TEST_DIR/dmg-source/ElectronicMail.app"
-MISMATCHED_DMG_APP_PATH="$TEST_DIR/mismatched-dmg-source/ElectronicMail.app"
-MISMATCHED_COMMIT_APP_PATH="$TEST_DIR/mismatched-commit/ElectronicMail.app"
+SUPPLIED_APP_PATH="$TEST_DIR/supplied/Electronic Mail.app"
+DMG_APP_PATH="$TEST_DIR/dmg-source/Electronic Mail.app"
+MISMATCHED_DMG_APP_PATH="$TEST_DIR/mismatched-dmg-source/Electronic Mail.app"
+MISMATCHED_COMMIT_APP_PATH="$TEST_DIR/mismatched-commit/Electronic Mail.app"
 DMG_PATH="$ARTIFACT_DIR/ElectronicMail-$VERSION-$BUILD_NUMBER.dmg"
 APP_ZIP_PATH="$ARTIFACT_DIR/ElectronicMail-$VERSION-$BUILD_NUMBER.zip"
 DSYM_ZIP_PATH="$ARTIFACT_DIR/ElectronicMail-$VERSION-$BUILD_NUMBER-dSYMs.zip"

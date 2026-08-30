@@ -178,8 +178,8 @@ rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
 
 ARCHIVE_PATH="$WORK_DIR/ElectronicMail.xcarchive"
-APP_PATH="$ARCHIVE_PATH/Products/Applications/ElectronicMail.app"
-DSYM_PATH="$ARCHIVE_PATH/dSYMs/ElectronicMail.app.dSYM"
+APP_PATH="$ARCHIVE_PATH/Products/Applications/Electronic Mail.app"
+DSYM_PATH="$ARCHIVE_PATH/dSYMs/Electronic Mail.app.dSYM"
 APP_ZIP="$OUTPUT_DIR/ElectronicMail-$VERSION-$BUILD_NUMBER.zip"
 DMG_PATH="$OUTPUT_DIR/ElectronicMail-$VERSION-$BUILD_NUMBER.dmg"
 DSYM_ZIP="$OUTPUT_DIR/ElectronicMail-$VERSION-$BUILD_NUMBER-dSYMs.zip"
@@ -231,8 +231,8 @@ bash "$ROOT_DIR/scripts/xcode.sh" archive \
   "ELECTRONIC_MAIL_SOURCE_COMMIT=$SOURCE_COMMIT" \
   "OTHER_CODE_SIGN_FLAGS=--timestamp"
 
-[ -d "$APP_PATH" ] || fail "archive did not contain ElectronicMail.app"
-[ -d "$DSYM_PATH" ] || fail "archive is missing ElectronicMail.app.dSYM"
+[ -d "$APP_PATH" ] || fail "archive did not contain Electronic Mail.app"
+[ -d "$DSYM_PATH" ] || fail "archive is missing Electronic Mail.app.dSYM"
 
 APP_PATH="$APP_PATH" \
 EXPECTED_BACKEND_URL="$BACKEND_URL" \
@@ -320,7 +320,7 @@ ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$APP_ZIP"
 
 DMG_STAGE="$WORK_DIR/dmg"
 mkdir -p "$DMG_STAGE"
-ditto "$APP_PATH" "$DMG_STAGE/ElectronicMail.app"
+ditto "$APP_PATH" "$DMG_STAGE/Electronic Mail.app"
 ln -s /Applications "$DMG_STAGE/Applications"
 hdiutil create -volname "Electronic Mail" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_PATH"
 hdiutil verify "$DMG_PATH"
@@ -351,8 +351,8 @@ ZIP_VERIFY_DIR="$WORK_DIR/zip-verification"
 rm -rf "$ZIP_VERIFY_DIR"
 mkdir -p "$ZIP_VERIFY_DIR"
 ditto -x -k "$APP_ZIP" "$ZIP_VERIFY_DIR"
-ZIP_APP_PATH="$ZIP_VERIFY_DIR/ElectronicMail.app"
-[ -d "$ZIP_APP_PATH" ] || fail "public ZIP does not contain ElectronicMail.app at its root"
+ZIP_APP_PATH="$ZIP_VERIFY_DIR/Electronic Mail.app"
+[ -d "$ZIP_APP_PATH" ] || fail "public ZIP does not contain Electronic Mail.app at its root"
 ZIP_REQUIRE_NOTARIZATION=0
 if [ "$SKIP_NOTARIZATION" != "1" ]; then
   ZIP_REQUIRE_NOTARIZATION=1
@@ -376,8 +376,8 @@ hdiutil attach -readonly -nobrowse -mountpoint "$DMG_MOUNT_POINT" "$DMG_PATH" >/
 DMG_IS_MOUNTED=1
 python3 "$ROOT_DIR/scripts/verify_macos_dmg_layout.py" \
   --mount "$DMG_MOUNT_POINT" \
-  --app-name ElectronicMail.app
-DMG_APP_PATH="$DMG_MOUNT_POINT/ElectronicMail.app"
+  --app-name "Electronic Mail.app"
+DMG_APP_PATH="$DMG_MOUNT_POINT/Electronic Mail.app"
 APP_PATH="$DMG_APP_PATH" \
 EXPECTED_BACKEND_URL="$BACKEND_URL" \
 EXPECTED_VERSION="$VERSION" \

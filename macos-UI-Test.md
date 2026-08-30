@@ -29,14 +29,14 @@ From repo root:
 ```sh
 npm run macos:build
 npm run macos:test
-open /tmp/ElectronicMailDerivedData/Build/Products/Debug/ElectronicMail.app
+open "/tmp/ElectronicMailDerivedData/Build/Products/Debug/Electronic Mail.app"
 ```
 
 If the app is already running and the change is visual, relaunch it:
 
 ```sh
 pkill -x ElectronicMail || true
-open /tmp/ElectronicMailDerivedData/Build/Products/Debug/ElectronicMail.app
+open "/tmp/ElectronicMailDerivedData/Build/Products/Debug/Electronic Mail.app"
 ```
 
 ## Known Visual Mistakes To Guard Against

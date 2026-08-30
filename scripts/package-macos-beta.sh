@@ -147,8 +147,8 @@ mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
 SOURCE_SNAPSHOT_ROOT="$WORK_DIR/source-snapshot"
 SOURCE_COPY="$SOURCE_SNAPSHOT_ROOT/macos/ElectronicMail"
 DERIVED_DATA_PATH="$WORK_DIR/DerivedData"
-APP_PATH="$DERIVED_DATA_PATH/Build/Products/Release/ElectronicMail.app"
-DSYM_PATH="$DERIVED_DATA_PATH/Build/Products/Release/ElectronicMail.app.dSYM"
+APP_PATH="$DERIVED_DATA_PATH/Build/Products/Release/Electronic Mail.app"
+DSYM_PATH="$DERIVED_DATA_PATH/Build/Products/Release/Electronic Mail.app.dSYM"
 FRAMEWORK_PATH="$APP_PATH/Contents/Frameworks/ElectronicMailCore.framework"
 BETA_ENTITLEMENTS_PATH="$SOURCE_COPY/Config/Entitlements/ElectronicMail-Beta.entitlements"
 DMG_ROOT="$WORK_DIR/dmg-root"
@@ -220,8 +220,8 @@ echo "==> Building Electronic Mail local beta $VERSION ($BUILD_NUMBER) from $SOU
   "CURRENT_YEAR=$CURRENT_YEAR" \
   "ELECTRONIC_MAIL_SOURCE_COMMIT=$SOURCE_COMMIT"
 
-[ -d "$APP_PATH" ] || fail "Release build did not produce ElectronicMail.app"
-[ -d "$DSYM_PATH" ] || fail "Release build did not produce ElectronicMail.app.dSYM"
+[ -d "$APP_PATH" ] || fail "Release build did not produce Electronic Mail.app"
+[ -d "$DSYM_PATH" ] || fail "Release build did not produce Electronic Mail.app.dSYM"
 [ -d "$FRAMEWORK_PATH" ] || fail "Release build did not embed ElectronicMailCore.framework"
 
 echo "==> Applying explicit identity-free ad-hoc signatures"
@@ -241,7 +241,7 @@ REQUIRE_NOTARIZATION=0 \
 bash "$ROOT_DIR/scripts/verify-macos-release.sh"
 
 echo "==> Smoke-testing the signed app's dynamic-library launch policy"
-if ! "$APP_PATH/Contents/MacOS/ElectronicMail" --electronic-mail-beta-launch-smoke; then
+if ! "$APP_PATH/Contents/MacOS/Electronic Mail" --electronic-mail-beta-launch-smoke; then
   fail "signed beta app failed its headless launch smoke"
 fi
 
@@ -281,7 +281,7 @@ notarized, macOS may refuse to open it without an explicit tester override.
 OAUTH COINSTALLATION LIMITATION: the beta and production apps intentionally use
 the same electronicmail:// callback scheme. macOS does not guarantee which
 installed app receives a shared custom-scheme callback. Before signing in or
-reconnecting an account in this beta, remove every production ElectronicMail.app
+reconnecting an account in this beta, remove every production Electronic Mail.app
 copy from the Mac. Reinstall production only after beta authentication finishes.
 
 For local-backend builds, start the backend on http://localhost:3001 before
@@ -316,7 +316,7 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     text = handle.read()
-for marker in ("UNNOTARIZED TEST SOFTWARE", "NOT A PRODUCTION RELEASE", "LIBRARY VALIDATION IS DISABLED", "Gatekeeper-acceptance claim", "OAUTH COINSTALLATION LIMITATION", "remove every production ElectronicMail.app"):
+for marker in ("UNNOTARIZED TEST SOFTWARE", "NOT A PRODUCTION RELEASE", "LIBRARY VALIDATION IS DISABLED", "Gatekeeper-acceptance claim", "OAUTH COINSTALLATION LIMITATION", "remove every production Electronic Mail.app"):
     if marker not in text:
         raise SystemExit(f"mounted beta README is missing warning: {marker}")
 PY
@@ -333,7 +333,7 @@ REQUIRE_NOTARIZATION=0 \
 bash "$ROOT_DIR/scripts/verify-macos-release.sh"
 
 echo "==> Smoke-testing the mounted DMG app's dynamic-library launch policy"
-if ! "$DMG_MOUNT_POINT/Electronic Mail Beta.app/Contents/MacOS/ElectronicMail" --electronic-mail-beta-launch-smoke; then
+if ! "$DMG_MOUNT_POINT/Electronic Mail Beta.app/Contents/MacOS/Electronic Mail" --electronic-mail-beta-launch-smoke; then
   fail "mounted beta DMG app failed its headless launch smoke"
 fi
 
@@ -440,7 +440,7 @@ override because this beta has not been notarized.
 
 **OAuth co-installation limitation:** beta and production both register the
 `electronicmail://` callback scheme, and macOS does not guarantee which installed
-app receives it. Remove every production `ElectronicMail.app` copy before signing
+app receives it. Remove every production `Electronic Mail.app` copy before signing
 in or reconnecting an account in the beta. Reinstall production only after beta
 authentication finishes.
 

@@ -74,8 +74,8 @@ rm -rf "$PREFLIGHT_WORK_DIR"
 mkdir -p "$PREFLIGHT_WORK_DIR"
 
 DERIVED_DATA_PATH="$PREFLIGHT_WORK_DIR/DerivedData"
-APP_PATH="$DERIVED_DATA_PATH/Build/Products/Release/ElectronicMail.app"
-DSYM_PATH="$DERIVED_DATA_PATH/Build/Products/Release/ElectronicMail.app.dSYM"
+APP_PATH="$DERIVED_DATA_PATH/Build/Products/Release/Electronic Mail.app"
+DSYM_PATH="$DERIVED_DATA_PATH/Build/Products/Release/Electronic Mail.app.dSYM"
 
 echo "==> Building an identity-free, universal Release app (credential-free preflight)"
 bash "$ROOT_DIR/scripts/xcode.sh" \
@@ -98,7 +98,7 @@ bash "$ROOT_DIR/scripts/xcode.sh" \
   "CURRENT_YEAR=$CURRENT_YEAR" \
   "ELECTRONIC_MAIL_SOURCE_COMMIT=$SOURCE_COMMIT"
 
-[ -d "$APP_PATH" ] || fail "Release build did not produce ElectronicMail.app"
+[ -d "$APP_PATH" ] || fail "Release build did not produce Electronic Mail.app"
 
 APP_PATH="$APP_PATH" \
 EXPECTED_BACKEND_URL="$BACKEND_URL" \
