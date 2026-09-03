@@ -9,7 +9,33 @@ public enum AIGroupingStyle: String, Codable, CaseIterable, Identifiable {
     var title: String { self == .focused ? "Focused matters" : "Broader projects" }
 }
 
+public enum AIReaderSummaryVisibility: String, CaseIterable, Identifiable {
+    case always
+    case off
+
+    public static let storageKey = "ElectronicMail.AIReaderSummaryVisibility"
+
+    public var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .always: return "Always Show"
+        case .off: return "Off"
+        }
+    }
+
+    var explanation: String {
+        switch self {
+        case .always:
+            return "Shows the AI summary control in the email reader."
+        case .off:
+            return "Hides AI summaries from the email reader."
+        }
+    }
+}
+
 public struct AIOrganizationProfile: Codable, Equatable {
+    var gmailAccountID: String? = nil
     let consented: Bool
     let enabled: Bool
     let available: Bool
@@ -23,6 +49,7 @@ public struct AIOrganizationProfile: Codable, Equatable {
         case groupingStyle = "grouping_style"
         case rolloutMode = "rollout_mode"
         case activeGenerationID = "active_generation_id"
+        case gmailAccountID = "gmail_account_id"
     }
 }
 
@@ -82,6 +109,8 @@ public enum AIMatterConfidenceState: String, Codable {
 }
 
 public struct AIMatterRow: Codable, Equatable, Identifiable {
+    var gmailAccountID: String? = nil
+    var sourceAccountEmail: String? = nil
     public let id: String
     let title: String
     let summary: String
@@ -110,6 +139,7 @@ public struct AIMatterRow: Codable, Equatable, Identifiable {
         case reviewCount = "review_count"
         case evidenceMessageIDs = "evidence_message_ids"
         case matchingMessageIDs = "matching_message_ids"
+        case gmailAccountID = "gmail_account_id"
     }
 }
 
@@ -159,6 +189,8 @@ public struct AIReviewProposal: Codable, Equatable, Identifiable {
 }
 
 public struct AIOrganizingRow: Codable, Equatable, Identifiable {
+    var gmailAccountID: String? = nil
+    var sourceAccountEmail: String? = nil
     public let id: String
     let gmailThreadID: String
     let title: String
@@ -178,17 +210,19 @@ public struct AIOrganizingRow: Codable, Equatable, Identifiable {
         case latestMessageAt = "latest_message_at"
         case messageCount = "message_count"
         case matchingMessageIDs = "matching_message_ids"
+        case gmailAccountID = "gmail_account_id"
     }
 }
 
 public struct AIInboxResponse: Codable, Equatable {
-    let profile: AIOrganizationProfile
+    var gmailAccountID: String? = nil
+    var profile: AIOrganizationProfile
     let generationID: String?
     let revision: String
     let stale: Bool
     let staleReason: String?
-    let matters: [AIMatterRow]
-    let organizing: [AIOrganizingRow]
+    var matters: [AIMatterRow]
+    var organizing: [AIOrganizingRow]
     let generatedAt: String
 
     enum CodingKeys: String, CodingKey {
@@ -196,10 +230,12 @@ public struct AIInboxResponse: Codable, Equatable {
         case generationID = "generation_id"
         case staleReason = "stale_reason"
         case generatedAt = "generated_at"
+        case gmailAccountID = "gmail_account_id"
     }
 }
 
 public struct AIMatterDetail: Codable, Equatable, Identifiable {
+    var gmailAccountID: String? = nil
     public let id: String
     let title: String
     let stableGoal: String
@@ -224,6 +260,7 @@ public struct AIMatterDetail: Codable, Equatable, Identifiable {
         case totalMessages = "total_messages"
         case matterMessageIDs = "matter_message_ids"
         case reviewProposals = "review_proposals"
+        case gmailAccountID = "gmail_account_id"
     }
 }
 
@@ -246,6 +283,7 @@ public struct MatterDecisionRequest: Codable, Equatable {
 }
 
 public struct MatterDecisionResponse: Codable, Equatable {
+    var gmailAccountID: String? = nil
     let clientDecisionID: String
     let decisionID: String
     let matterIDs: [String]
@@ -254,6 +292,7 @@ public struct MatterDecisionResponse: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case revision, state
+        case gmailAccountID = "gmail_account_id"
         case clientDecisionID = "client_decision_id"
         case decisionID = "decision_id"
         case matterIDs = "matter_ids"
@@ -277,6 +316,7 @@ public struct MatterEntityActionRequest: Codable, Equatable {
 }
 
 public struct MatterEntityActionResponse: Codable, Equatable {
+    var gmailAccountID: String? = nil
     let clientActionID: String
     let matterID: String
     let action: GmailThreadAction
@@ -286,6 +326,7 @@ public struct MatterEntityActionResponse: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case action, state
+        case gmailAccountID = "gmail_account_id"
         case clientActionID = "client_action_id"
         case matterID = "matter_id"
         case targetMessageIDs = "target_message_ids"
@@ -348,6 +389,8 @@ public final class AIInboxStore: ObservableObject {
     private let decisionQueue: MatterDecisionQueue
     private var query: String?
     private var requestID = UUID()
+    private var detailRequestID = UUID()
+    private var detailCache: [String: AIMatterDetail] = [:]
 
     init(client: AppClient) {
         self.client = client
@@ -366,6 +409,9 @@ public final class AIInboxStore: ObservableObject {
         do {
             let loaded = try await client.aiInbox(query: self.query)
             guard requestID == id else { return }
+            if response?.revision != loaded.revision {
+                detailCache.removeAll()
+            }
             response = loaded
             stale = loaded.stale
             errorMessage = loaded.staleReason
@@ -397,19 +443,32 @@ public final class AIInboxStore: ObservableObject {
     }
 
     func select(_ matterID: String) async {
+        let id = UUID()
+        detailRequestID = id
         detailLoading = true
         groupingExplanations = [:]
         explanationMessageIDsLoading = []
+        if let cached = detailCache[matterID] {
+            detail = cached
+            detailLoading = false
+            return
+        }
         do {
-            detail = try await client.aiMatter(matterID)
+            let loaded = try await client.aiMatter(matterID)
+            guard detailRequestID == id else { return }
+            detailCache[matterID] = loaded
+            detail = loaded
             detailLoading = false
         } catch {
+            guard detailRequestID == id else { return }
             detailLoading = false
             errorMessage = error.localizedDescription
         }
     }
 
     func closeDetail() {
+        detailRequestID = UUID()
+        detailLoading = false
         detail = nil
         groupingExplanations = [:]
         explanationMessageIDsLoading = []
@@ -602,7 +661,7 @@ public final class AIInboxStore: ObservableObject {
 
 @MainActor
 public final class AIReaderChromeState: ObservableObject {
-    @Published public private(set) var isSummaryCollapsed = false
+    @Published public private(set) var isSummaryCollapsed = true
 
     public init() {}
 
@@ -615,9 +674,13 @@ public final class AIReaderChromeState: ObservableObject {
         isSummaryCollapsed = nextValue
     }
 
-    func reset() {
-        guard isSummaryCollapsed else { return }
-        isSummaryCollapsed = false
+    func toggleSummary() {
+        isSummaryCollapsed.toggle()
+    }
+
+    func reset(collapsed: Bool = true) {
+        guard isSummaryCollapsed != collapsed else { return }
+        isSummaryCollapsed = collapsed
     }
 }
 
@@ -637,6 +700,7 @@ public struct AIInboxView: View {
 
     @State private var setupStyle: AIGroupingStyle = .focused
     @State private var selectedMatterID: String?
+    @State private var openingMatterID: String?
     @FocusState private var isListFocused: Bool
 
     public init(
@@ -669,6 +733,13 @@ public struct AIInboxView: View {
         Group {
             if let detail = store.detail {
                 matterDetail(detail)
+            } else if store.detailLoading {
+                ProgressView("Opening email…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .onExitCommand {
+                        openingMatterID = nil
+                        store.closeDetail()
+                    }
             } else if let profile = store.profile, !profile.consented || !profile.enabled {
                 consentView(profile)
             } else if store.loading && store.response == nil {
@@ -826,18 +897,6 @@ public struct AIInboxView: View {
                     .focusEffectDisabled()
                     .focused($isListFocused)
                     .defaultFocus($isListFocused, true)
-                    .onKeyPress(.upArrow) {
-                        moveSelection(in: matters, by: -1, scrollProxy: scrollProxy)
-                        return .handled
-                    }
-                    .onKeyPress(.downArrow) {
-                        moveSelection(in: matters, by: 1, scrollProxy: scrollProxy)
-                        return .handled
-                    }
-                    .onKeyPress(.return) {
-                        openSelectedMatter(in: matters)
-                        return .handled
-                    }
                     .background {
                         InboxKeyboardNavigationCapture(
                             onMove: { delta in
@@ -847,7 +906,8 @@ public struct AIInboxView: View {
                                 openSelectedMatter(in: matters)
                             }
                         )
-                        .frame(width: 0, height: 0)
+                        .frame(width: 1, height: 1)
+                        .accessibilityHidden(true)
                     }
                     .onAppear {
                         restoreSelectedMatterPosition(in: matters, scrollProxy: scrollProxy)
@@ -869,9 +929,15 @@ public struct AIInboxView: View {
     }
 
     private func open(_ matter: AIMatterRow) {
-        guard !store.mutationInProgress else { return }
+        guard !store.mutationInProgress, openingMatterID == nil else { return }
         selectedMatterID = matter.id
-        Task { await store.select(matter.id) }
+        openingMatterID = matter.id
+        Task {
+            await store.select(matter.id)
+            if openingMatterID == matter.id {
+                openingMatterID = nil
+            }
+        }
     }
 
     private func moveSelection(
@@ -972,6 +1038,9 @@ private struct AIMatterConversationView: View {
     let isAttachmentDownloading: (ThreadAttachment, String) -> Bool
     let readerChromeState: AIReaderChromeState
 
+    @AppStorage(AIReaderSummaryVisibility.storageKey)
+    private var summaryVisibilityRawValue = AIReaderSummaryVisibility.always.rawValue
+
     @State private var expandedMessageKeys: Set<EmailThreadPresentationItem.ID> = []
     @State private var activeMessageKey: EmailThreadPresentationItem.ID?
     @State private var initializedMatterID: String?
@@ -994,7 +1063,13 @@ private struct AIMatterConversationView: View {
             let renderIdentities = presentation.items.map {
                 AIMatterMessageRenderIdentity(id: $0.id, renderRevision: $0.message.renderRevision)
             }
-            let pinnedSummaryHeight = pinnedSummaryCardHeight
+            let summaryVisibility = AIReaderSummaryVisibility(rawValue: summaryVisibilityRawValue)
+                ?? .always
+            let showsSummary = AIReaderSummaryPresentationPolicy.shouldPresent(
+                mode: summaryVisibility,
+                summary: matter.summary
+            )
+            let pinnedSummaryHeight = showsSummary ? pinnedSummaryCardHeight : 0
             let readerActionsVisible = activeMessage.flatMap(replyThreadID(for:)) != nil
             let scrollViewportHeight = max(0, proxy.size.height - pinnedSummaryHeight)
             let needsReaderActionClearance = ElectronicMailReaderActionClearance.isRequired(
@@ -1005,14 +1080,17 @@ private struct AIMatterConversationView: View {
 
             ZStack(alignment: .bottom) {
                 VStack(alignment: .leading, spacing: 0) {
-                    AIMatterPinnedSummary(
-                        summary: matter.summary,
-                        colorScheme: colorScheme,
-                        gradientSeed: matter.id,
-                        contentWidth: contentWidth,
-                        chromeState: readerChromeState
-                    )
-                    .zIndex(1)
+                    if showsSummary {
+                        AIMatterPinnedSummary(
+                            summary: matter.summary,
+                            colorScheme: colorScheme,
+                            gradientSeed: matter.id,
+                            contentWidth: contentWidth,
+                            chromeState: readerChromeState,
+                            onToggle: toggleSummary
+                        )
+                        .zIndex(1)
+                    }
 
                 ScrollViewReader { scrollProxy in
                     ElectronicMailReaderFadingScrollView(
@@ -1144,6 +1222,9 @@ private struct AIMatterConversationView: View {
                 guard abs(nextHeight - conversationContentHeight) > 0.25 else { return }
                 conversationContentHeight = nextHeight
             }
+            .onChange(of: summaryVisibilityRawValue) { _, _ in
+                resetSummaryPresentation()
+            }
             .onDisappear {
                 readerChromeState.reset()
             }
@@ -1221,7 +1302,7 @@ private struct AIMatterConversationView: View {
             activeMessageKey = latestMessageKey
             initializedMatterID = matter.id
             summaryScrollOrigin = nil
-            readerChromeState.reset()
+            resetSummaryPresentation()
             establishingInitialScrollPosition = true
             initialScrollOriginCaptureReady = false
             DispatchQueue.main.async {
@@ -1258,6 +1339,19 @@ private struct AIMatterConversationView: View {
             return
         }
         readerChromeState.updateScrollDistance(abs(offset - summaryScrollOrigin))
+    }
+
+    private func resetSummaryPresentation() {
+        readerChromeState.reset(collapsed: true)
+        summaryScrollOrigin = nil
+    }
+
+    private func toggleSummary() {
+        let wasCollapsed = readerChromeState.isSummaryCollapsed
+        readerChromeState.toggleSummary()
+        if wasCollapsed {
+            summaryScrollOrigin = nil
+        }
     }
 
     private func resetConversationPosition() {
@@ -1308,28 +1402,18 @@ private struct AIMatterPinnedSummary: View {
     let gradientSeed: String
     let contentWidth: CGFloat
     @ObservedObject var chromeState: AIReaderChromeState
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let onToggle: () -> Void
 
     var body: some View {
-        Group {
-            if chromeState.isSummaryCollapsed {
-                AIMatterCompactSummaryCard(
-                    summary: summary,
-                    colorScheme: colorScheme,
-                    gradientSeed: gradientSeed
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
-            } else {
-                AIMatterSummaryCard(
-                    summary: summary,
-                    colorScheme: colorScheme,
-                    gradientSeed: gradientSeed
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
-            }
-        }
+        AIMatterSummaryDisclosure(
+            summary: summary,
+            colorScheme: colorScheme,
+            gradientSeed: gradientSeed,
+            isExpanded: !chromeState.isSummaryCollapsed,
+            onToggle: onToggle
+        )
         .frame(width: contentWidth, alignment: .leading)
-        .padding(.top, chromeState.isSummaryCollapsed ? 4 : ElectronicMailControlMetrics.readerContentTop)
+        .padding(.top, 4)
         .padding(.bottom, ElectronicMailControlMetrics.readerPinnedSummaryBottomSpacing)
         .frame(maxWidth: .infinity)
         .background {
@@ -1340,10 +1424,6 @@ private struct AIMatterPinnedSummary: View {
                 )
             }
         }
-        .animation(
-            reduceMotion ? nil : .easeOut(duration: 0.18),
-            value: chromeState.isSummaryCollapsed
-        )
     }
 }
 
@@ -1356,57 +1436,40 @@ private struct AIMatterPinnedSummaryHeightPreferenceKey: PreferenceKey {
 }
 
 enum AIReaderChromeScrollPolicy {
-    static let collapseThreshold: CGFloat = 32
-    static let expandThreshold: CGFloat = 8
+    static let collapseDistance: CGFloat = 96
 
     static func isSummaryCollapsed(
         currentlyCollapsed: Bool,
         scrollDistance: CGFloat
     ) -> Bool {
-        let distance = max(0, scrollDistance)
-        if currentlyCollapsed {
-            return distance > expandThreshold
-        }
-        return distance >= collapseThreshold
+        currentlyCollapsed || scrollDistance >= collapseDistance
     }
 }
 
-private struct AIMatterCompactSummaryCard: View {
-    let summary: String
-    let colorScheme: ColorScheme
-    let gradientSeed: String
-
-    private var textGradient: LinearGradient {
-        AISummaryGradientVariant.stableVariant(for: gradientSeed).gradient
-    }
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Label("AI summary", systemImage: "sparkles")
-                .font(ElectronicMailReaderType.metadata(weight: .semibold))
-                .foregroundStyle(textGradient)
-                .fixedSize()
-
-            Text(summary)
-                .font(ElectronicMailReaderType.metadata())
-                .foregroundStyle(textGradient)
-                .lineLimit(1)
-                .truncationMode(.tail)
-
-            Spacer(minLength: 0)
+enum AIReaderSummaryPresentationPolicy {
+    static func shouldPresent(
+        mode: AIReaderSummaryVisibility,
+        summary: String
+    ) -> Bool {
+        guard !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
         }
-        .padding(.horizontal, 16)
-        .frame(maxWidth: .infinity, minHeight: 52, maxHeight: 52, alignment: .leading)
-        .aiSummaryGlassSurface()
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("AI summary: \(summary)")
+
+        switch mode {
+        case .always:
+            return true
+        case .off:
+            return false
+        }
     }
 }
 
-private struct AIMatterSummaryCard: View {
+private struct AIMatterSummaryDisclosure: View {
     let summary: String
     let colorScheme: ColorScheme
     let gradientSeed: String
+    let isExpanded: Bool
+    let onToggle: () -> Void
 
     private var textGradient: LinearGradient {
         AISummaryGradientVariant.stableVariant(for: gradientSeed).gradient
@@ -1414,22 +1477,35 @@ private struct AIMatterSummaryCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
-            Label("AI summary", systemImage: "sparkles")
-                .font(ElectronicMailReaderType.metadata(weight: .semibold))
-                .foregroundStyle(textGradient)
+            Button(action: onToggle) {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
 
-            Text(summary)
-                .font(ElectronicMailReaderType.body())
+                    Label("AI summary", systemImage: "sparkles")
+                        .font(ElectronicMailReaderType.metadata(weight: .semibold))
+
+                    Spacer(minLength: 0)
+                }
                 .foregroundStyle(textGradient)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "Collapse AI summary" : "Expand AI summary")
+
+            if isExpanded {
+                Text(summary)
+                    .font(ElectronicMailReaderType.body())
+                    .foregroundStyle(textGradient)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .aiSummaryGlassSurface()
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("AI summary: \(summary)")
     }
 }
 

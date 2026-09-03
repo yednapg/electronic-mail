@@ -8,12 +8,41 @@ import SwiftUI
 struct ElectronicMailApp: App {
     @NSApplicationDelegateAdaptor(ElectronicMailApplicationDelegate.self) private var appDelegate
     @StateObject private var store: InboxStore
+    @StateObject private var accountSettingsStore: GmailAccountSettingsStore
+    @AppStorage(ElectronicMailAppearance.storageKey)
+    private var appearanceRawValue = ElectronicMailAppearance.system.rawValue
     private let visualQAMode: Bool
     private let signInVisualQAMode: Bool
     private let visualQAColorScheme: ColorScheme?
 
     init() {
 #if ELECTRONIC_MAIL_LOCAL_BETA
+        if CommandLine.arguments.count == 2,
+           CommandLine.arguments[1] == "--electronic-mail-recover-local-session" {
+            let tokenStore = KeychainSessionTokenStore()
+            let repaired = tokenStore.repairLatestLocalSession()
+            if !repaired, let message = tokenStore.lastLoadFailureMessage {
+                FileHandle.standardError.write(Data("\(message)\n".utf8))
+            }
+            Darwin.exit(repaired ? EXIT_SUCCESS : EXIT_FAILURE)
+        }
+        if CommandLine.arguments.count == 2,
+           CommandLine.arguments[1] == "--electronic-mail-save-local-session-stdin" {
+            let data = FileHandle.standardInput.readDataToEndOfFile()
+            let token = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let tokenStore = KeychainSessionTokenStore()
+            guard !token.isEmpty else {
+                Darwin.exit(EXIT_FAILURE)
+            }
+            do {
+                try tokenStore.save(token)
+                Darwin.exit(tokenStore.load() == token ? EXIT_SUCCESS : EXIT_FAILURE)
+            } catch {
+                FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
+                Darwin.exit(EXIT_FAILURE)
+            }
+        }
         if CommandLine.arguments.count == 2,
            CommandLine.arguments[1] == "--electronic-mail-beta-launch-smoke" {
             Darwin.exit(EXIT_SUCCESS)
@@ -22,7 +51,8 @@ struct ElectronicMailApp: App {
 #if DEBUG
         let arguments = CommandLine.arguments
         signInVisualQAMode = arguments.contains("--electronic-mail-sign-in-visual-qa")
-        visualQAMode = arguments.contains("--electronic-mail-visual-qa") || signInVisualQAMode
+        visualQAMode = arguments.contains("--electronic-mail-visual-qa")
+            || signInVisualQAMode
         if arguments.contains("--electronic-mail-visual-qa-dark") {
             visualQAColorScheme = .dark
         } else if arguments.contains("--electronic-mail-visual-qa-light") {
@@ -35,23 +65,34 @@ struct ElectronicMailApp: App {
         signInVisualQAMode = false
         visualQAColorScheme = nil
 #endif
+#if DEBUG
         if visualQAMode {
-            _store = StateObject(wrappedValue: InboxStore(client: DemoAppClient()))
-        } else {
-            let localMailStore = AppClientFactory.makeLocalMailStore()
-            _store = StateObject(
-                wrappedValue: InboxStore(
-                    client: AppClientFactory.makeDefaultClient(localMailStore: localMailStore),
-                    localMailStore: localMailStore
-                )
+            let client = DemoAppClient()
+            _store = StateObject(wrappedValue: InboxStore(client: client))
+            _accountSettingsStore = StateObject(
+                wrappedValue: GmailAccountSettingsStore(client: client)
             )
+            return
         }
+#endif
+        let localMailStore = AppClientFactory.makeLocalMailStore()
+        let client = AppClientFactory.makeDefaultClient(localMailStore: localMailStore)
+        _store = StateObject(
+            wrappedValue: InboxStore(
+                client: client,
+                localMailStore: localMailStore
+            )
+        )
+        _accountSettingsStore = StateObject(
+            wrappedValue: GmailAccountSettingsStore(client: client)
+        )
     }
 
     var body: some Scene {
         Window("", id: "main") {
             ElectronicMailRootView(
                 store: store,
+                accountSettingsStore: accountSettingsStore,
                 visualQAMode: visualQAMode,
                 startsAtSignIn: signInVisualQAMode
             )
@@ -62,9 +103,8 @@ struct ElectronicMailApp: App {
                 .tint(ElectronicMailDesign.appleBlue)
                 .electronicMailSymbolAppearance()
                 .background(ElectronicMailTrafficLightOverlayInstaller())
-                .preferredColorScheme(visualQAColorScheme)
+                .preferredColorScheme(preferredColorScheme)
         }
-        .windowStyle(.hiddenTitleBar)
         .defaultSize(
             width: ElectronicMailControlMetrics.onboardingWindowWidth,
             height: ElectronicMailControlMetrics.onboardingWindowHeight
@@ -124,6 +164,20 @@ struct ElectronicMailApp: App {
                 .disabled(!store.hasSessionToken)
             }
         }
+
+        Settings {
+            ElectronicMailSettingsView(
+                inboxStore: store,
+                accountSettingsStore: accountSettingsStore
+            )
+            .tint(ElectronicMailDesign.appleBlue)
+            .preferredColorScheme(preferredColorScheme)
+        }
+    }
+
+    private var preferredColorScheme: ColorScheme? {
+        visualQAColorScheme
+            ?? ElectronicMailAppearance(rawValue: appearanceRawValue)?.colorScheme
     }
 }
 
@@ -186,6 +240,10 @@ private final class WindowResolvingView: NSView {
 
 @MainActor
 private final class TrafficLightOverlayController {
+    private static let toolbarIdentifier = NSToolbar.Identifier(
+        "dev.demo-user.electronic-mail.window-toolbar"
+    )
+
     private(set) weak var window: NSWindow?
     private weak var containerView: NSView?
     private var overlayView: TrafficLightMaskView?
@@ -197,6 +255,7 @@ private final class TrafficLightOverlayController {
     }
 
     func install() {
+        configureNativeWindowChrome()
         updateGeometry()
         guard let window else { return }
         let notifications: [Notification.Name] = [
@@ -214,6 +273,40 @@ private final class TrafficLightOverlayController {
             ) { [weak self] _ in
                 Task { @MainActor in self?.updateGeometry() }
             }
+        }
+    }
+
+    private func configureNativeWindowChrome() {
+        guard let window else { return }
+
+        // Keep the app's single continuous surface while asking AppKit for
+        // the same traffic-light geometry it uses in modern unified-toolbar
+        // windows. AppKit remains the sole owner of button size, spacing,
+        // position, and hit targets; the overlay below only changes color.
+        window.styleMask.insert(.fullSizeContentView)
+        window.toolbarStyle = .unified
+
+        if window.toolbar == nil {
+            let toolbar = NSToolbar(identifier: Self.toolbarIdentifier)
+            toolbar.allowsUserCustomization = false
+            toolbar.autosavesConfiguration = false
+            toolbar.displayMode = .iconOnly
+            window.toolbar = toolbar
+        }
+
+        // Installing a toolbar can refresh title-bar appearance, so apply the
+        // seamless surface settings after the toolbar is attached.
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.backgroundColor = NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                ? .black
+                : .white
+        }
+        DispatchQueue.main.async { [weak window] in
+            window?.titlebarAppearsTransparent = true
+            window?.titlebarSeparatorStyle = .none
         }
     }
 
@@ -404,6 +497,7 @@ private struct ElectronicMailRootView: View {
     private static let asyncTokenStore = AsyncSessionTokenStore(store: tokenStore)
 
     @ObservedObject var store: InboxStore
+    @ObservedObject var accountSettingsStore: GmailAccountSettingsStore
     private let visualQAMode: Bool
     @State private var stage: AppLaunchStage
     @State private var setupStartedAt = Date()
@@ -412,8 +506,14 @@ private struct ElectronicMailRootView: View {
     @State private var signInInProgress = false
     @State private var signInError: String?
 
-    init(store: InboxStore, visualQAMode: Bool = false, startsAtSignIn: Bool = false) {
+    init(
+        store: InboxStore,
+        accountSettingsStore: GmailAccountSettingsStore,
+        visualQAMode: Bool = false,
+        startsAtSignIn: Bool = false
+    ) {
         self.store = store
+        self.accountSettingsStore = accountSettingsStore
         self.visualQAMode = visualQAMode
         _stage = State(initialValue: startsAtSignIn ? .signIn : (visualQAMode ? .app : .resolvingSession))
     }
@@ -450,6 +550,7 @@ private struct ElectronicMailRootView: View {
             case .app:
                 SignedInShellView(
                     store: store,
+                    accountSettingsStore: accountSettingsStore,
                     onReauthorizeGoogle: { try await performGoogleReauthorization() },
                     onSignOut: { try await performSignOut() },
                     onDisconnectGoogle: { try await performGoogleDisconnect() },
@@ -483,7 +584,6 @@ private struct ElectronicMailRootView: View {
             return
         }
 
-        clearSavedSessionTokenInBackground()
         signInInProgress = false
         setupError = nil
         resolvingError = nil
@@ -511,6 +611,10 @@ private struct ElectronicMailRootView: View {
             return
         }
         guard let token = savedToken, !token.isEmpty else {
+            if let loadFailureMessage = Self.tokenStore.lastLoadFailureMessage {
+                resolvingError = loadFailureMessage
+                return
+            }
             stage = .signIn
             return
         }
@@ -529,7 +633,6 @@ private struct ElectronicMailRootView: View {
             if store.hasSessionToken {
                 resolvingError = message
             } else {
-                clearSavedSessionTokenInBackground()
                 signInError = message
                 stage = .signIn
             }
@@ -680,7 +783,7 @@ private struct ElectronicMailRootView: View {
 
         guard ready else {
             setupError = store.currentReadiness?.errorMessage
-                ?? "Electronic Mail could not verify a saved batch within 30 seconds. Check your connection and retry."
+                ?? "Electronic Mail couldn’t load your saved inbox. Your email is safe. Check your connection and try again."
             return
         }
 
@@ -875,6 +978,10 @@ private final class MacSessionTokenStore: SessionTokenStoring, @unchecked Sendab
         store.load()
     }
 
+    var lastLoadFailureMessage: String? {
+        store.lastLoadFailureMessage
+    }
+
     func save(_ token: String) throws {
         try store.save(token)
     }
@@ -967,17 +1074,18 @@ private struct GoogleSignInView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            ZStack(alignment: .bottomTrailing) {
+            ZStack {
                 ElectronicMailDesign.background(for: colorScheme)
                     .ignoresSafeArea()
 
                 welcomeContent
                     .frame(maxWidth: 480)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-
-                signInArea
-                    .padding(.trailing, 24)
-                    .padding(.bottom, 24)
+                    // A hidden-title-bar window still reserves its top safe
+                    // area for the traffic lights. Offset by half that chrome
+                    // so the complete welcome group is centered against the
+                    // visible window border, not only the content safe area.
+                    .offset(y: -20)
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
@@ -1003,18 +1111,21 @@ private struct GoogleSignInView: View {
                 .multilineTextAlignment(.center)
                 .lineSpacing(3)
                 .fixedSize(horizontal: false, vertical: true)
+
+            signInArea
+                .padding(.top, 24)
         }
         .accessibilityElement(children: .contain)
     }
 
     private var signInArea: some View {
-        VStack(alignment: .trailing, spacing: 14) {
+        VStack(alignment: .center, spacing: 14) {
             if let errorMessage {
                 Text(errorMessage)
                     .font(ElectronicMailType.body())
                     .foregroundStyle(Color.red.opacity(colorScheme == .dark ? 0.92 : 0.82))
-                    .multilineTextAlignment(.trailing)
-                    .frame(maxWidth: 440, alignment: .trailing)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 440, alignment: .center)
                     .transition(.opacity)
             }
 
@@ -1048,11 +1159,11 @@ private struct ElectronicMailWelcomeAppIcon: View {
 
     var body: some View {
         iconArtwork
-        .frame(width: 68, height: 68)
+        .frame(width: 84, height: 84)
         .shadow(
             color: Color.black.opacity(colorScheme == .dark ? 0.34 : 0.16),
-            radius: 6,
-            y: 3
+            radius: 8,
+            y: 4
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Electronic Mail")
@@ -1109,11 +1220,9 @@ private struct GoogleSignInFeatureRow: View {
     ]
 
     var body: some View {
-        ElectronicMailGlassGroup(spacing: 14) {
-            HStack(spacing: 14) {
-                ForEach(features) { feature in
-                    GoogleSignInFeatureIcon(feature: feature)
-                }
+        HStack(spacing: 24) {
+            ForEach(features) { feature in
+                GoogleSignInFeatureIcon(feature: feature)
             }
         }
         .accessibilityElement(children: .contain)
@@ -1130,42 +1239,14 @@ private struct GoogleSignInFeature: Identifiable {
 }
 
 private struct GoogleSignInFeatureIcon: View {
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.colorScheme) private var colorScheme
     let feature: GoogleSignInFeature
 
-    @ViewBuilder
     var body: some View {
-        if #available(macOS 26.0, *), !reduceTransparency {
-            icon
-                .glassEffect(
-                    .regular.tint(feature.tint.opacity(colorScheme == .dark ? 0.28 : 0.18)),
-                    in: Circle()
-                )
-        } else {
-            icon
-                .background {
-                    Circle()
-                        .fill(reduceTransparency ? feature.tint.opacity(0.14) : .clear)
-                        .background(.regularMaterial, in: Circle())
-                }
-                .overlay {
-                    Circle()
-                        .strokeBorder(
-                            feature.tint.opacity(colorScheme == .dark ? 0.30 : 0.20),
-                            lineWidth: 1
-                        )
-                }
-        }
-    }
-
-    private var icon: some View {
         Image(systemName: feature.symbol)
             .symbolRenderingMode(.monochrome)
-            .font(.system(size: 19, weight: .medium))
+            .font(.system(size: 25, weight: .semibold))
             .foregroundStyle(feature.tint)
-            .frame(width: 42, height: 42)
-            .contentShape(Circle())
+            .frame(width: 36, height: 36)
             .accessibilityLabel(feature.label)
     }
 }
@@ -1181,39 +1262,60 @@ private struct SetupAnimationView: View {
     let onRetry: () -> Void
 
     var body: some View {
-        ZStack {
-            ElectronicMailDesign.background(for: colorScheme)
-                .ignoresSafeArea()
+        GeometryReader { proxy in
+            ZStack {
+                ElectronicMailDesign.background(for: colorScheme)
+                    .ignoresSafeArea()
 
-            VStack(spacing: 20) {
-                WavyStatusText(text: statusText)
-                    .id(statusText)
-                    .transition(reduceMotion ? .identity : .opacity.combined(with: .scale(scale: 0.985)))
-                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: statusText)
+                ZStack {
+                    VStack(spacing: 16) {
+                        WavyStatusText(text: statusText)
+                            .id(statusText)
+                            .transition(reduceMotion ? .identity : .opacity.combined(with: .scale(scale: 0.985)))
+                            .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: statusText)
 
-                ProgressView(value: progress.progressFraction)
-                    .progressViewStyle(.linear)
-                    .frame(width: 360)
-                    .accessibilityLabel("Mailbox setup progress")
-                    .accessibilityValue("\(Int(progress.progressFraction * 100)) percent")
+                        ProgressView(value: progress.progressFraction)
+                            .progressViewStyle(.linear)
+                            .frame(maxWidth: 360)
+                            .accessibilityLabel("Mailbox setup progress")
+                            .accessibilityValue("\(Int(progress.progressFraction * 100)) percent")
+                    }
+                    .frame(maxWidth: 420)
+                    .padding(.horizontal, 28)
+                    // Keep status and progress stationary when an error appears.
+                    .offset(y: -36)
 
-                if let errorMessage {
-                    VStack(spacing: 12) {
-                        Text(errorMessage)
-                            .font(ElectronicMailType.body())
-                            .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                        Button(action: onRetry) {
-                            Text("Retry")
-                                .padding(.horizontal, 18)
-                                .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
-                                .contentShape(Capsule())
+                    if let errorMessage {
+                        VStack(spacing: 10) {
+                            Text(errorMessage)
+                                .font(ElectronicMailType.small())
+                                .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                                .multilineTextAlignment(.center)
+                                .lineSpacing(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: ElectronicMailControlMetrics.setupErrorTextMaxWidth)
+
+                            Button("Retry", action: onRetry)
+                                .font(ElectronicMailType.small(weight: .medium))
+                                .buttonStyle(.bordered)
+                                .buttonBorderShape(.roundedRectangle(radius: 7))
+                                .controlSize(.small)
+                                // Preserve a comfortable pointer target without
+                                // inflating the visible system button chrome.
+                                .frame(minHeight: ElectronicMailControlMetrics.setupRetryHeight)
+                                .fixedSize()
                         }
-                        .font(ElectronicMailType.body(weight: .semibold))
-                        .electronicMailGlassButton(role: .standard, shape: .capsule)
+                        .padding(.horizontal, 28)
+                        .offset(y: 48)
+                        .transition(reduceMotion ? .identity : .opacity)
                     }
                 }
+                // Hidden-title-bar content is inset beneath the traffic lights.
+                // Correct by half that chrome to center against the window border.
+                .offset(y: -20)
             }
             .id(startedAt)
+            .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .environment(\.font, .body)
     }

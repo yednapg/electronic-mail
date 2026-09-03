@@ -34,7 +34,11 @@ let project = Project(
             bundleId: "app.electronicmail.core",
             deploymentTargets: .macOS("14.0"),
             infoPlist: .file(path: "Config/InfoPlists/ElectronicMailCore-Info.plist"),
-            sources: ["ElectronicMail/Core/**"],
+            sources: [
+                "ElectronicMail/Core/**",
+                "ElectronicMail/Shared/GmailAccountSettings.swift",
+                "ElectronicMail/Shared/MobileAuthFlow.swift",
+            ],
             resources: [
                 "ElectronicMail/Mac/PrivacyInfo.xcprivacy"
             ],

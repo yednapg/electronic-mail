@@ -77,6 +77,10 @@ public struct InboxView: View {
 
                         if let offlineStorageWarningMessage {
                             ElectronicMailRefreshFailureToast(message: offlineStorageWarningMessage)
+                        } else if !store.accountWarnings.isEmpty {
+                            ElectronicMailRefreshFailureToast(
+                                message: store.accountWarnings.joined(separator: " ")
+                            )
                         } else if store.refreshFailed && store.mailboxPresentationReady {
                             ElectronicMailRefreshFailureToast(
                                 message: "Inbox could not refresh. Showing last saved state."
@@ -478,18 +482,6 @@ private struct InboxMailboxList: View, Equatable {
                 .focusEffectDisabled()
                 .focused($isFocused)
                 .defaultFocus($isFocused, true)
-                .onKeyPress(.upArrow) {
-                    moveSelection(by: -1, scrollProxy: scrollProxy)
-                    return .handled
-                }
-                .onKeyPress(.downArrow) {
-                    moveSelection(by: 1, scrollProxy: scrollProxy)
-                    return .handled
-                }
-                .onKeyPress(.return) {
-                    onOpenSelection()
-                    return .handled
-                }
                 .onKeyPress(.delete, phases: .down) { keyPress in
                     guard keyPress.modifiers.contains(.command) else {
                         return .ignored
@@ -505,7 +497,8 @@ private struct InboxMailboxList: View, Equatable {
                         },
                         onOpenSelection: onOpenSelection
                     )
-                    .frame(width: 0, height: 0)
+                    .frame(width: 1, height: 1)
+                    .accessibilityHidden(true)
                 }
                 .onAppear {
                     restoreSelectedRowPosition(scrollProxy: scrollProxy)
@@ -600,6 +593,7 @@ struct InboxKeyboardNavigationCapture: NSViewRepresentable {
         let view = NavigationView()
         view.onMove = onMove
         view.onOpenSelection = onOpenSelection
+        view.installMonitorIfNeeded()
         return view
     }
 
@@ -632,7 +626,7 @@ struct InboxKeyboardNavigationCapture: NSViewRepresentable {
         }
 
         func installMonitorIfNeeded() {
-            guard monitor == nil, window != nil else {
+            guard monitor == nil else {
                 return
             }
 

@@ -41,6 +41,7 @@ struct ElectronicMailiOSRootView: View {
             case .dashboard:
                 DashboardScreen(
                     store: store,
+                    authService: authService,
                     onSignOut: {
                         Task { await signOut() }
                     }

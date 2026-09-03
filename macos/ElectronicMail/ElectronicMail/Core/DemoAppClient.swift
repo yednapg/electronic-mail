@@ -28,6 +28,25 @@ public final class DemoAppClient: AppClient {
         sessionState
     }
 
+    public func gmailAccounts() async throws -> GmailAccountsResponse {
+        GmailAccountsResponse(
+            multiAccountEnabled: true,
+            migrationVerified: true,
+            maxAccounts: 5,
+            primaryGmailAccountID: DemoAppFixtures.userID,
+            accounts: [
+                GmailAccount(
+                    id: DemoAppFixtures.userID,
+                    email: "demo@example.com",
+                    displayName: "TestUser",
+                    state: .ready,
+                    isPrimary: true,
+                    initialReadyAt: "2026-05-01T00:00:00+00:00"
+                )
+            ]
+        )
+    }
+
     public func mailbox(label: MailboxLabel = .inbox, limit: Int = 100, cursor: String? = nil) async throws -> MailboxResponse {
         sessionState.mailbox
     }
@@ -758,4 +777,5 @@ enum DemoAppFixtures {
         )
     }
 }
+
 #endif

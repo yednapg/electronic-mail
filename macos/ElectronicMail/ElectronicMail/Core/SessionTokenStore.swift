@@ -1,5 +1,4 @@
 import Foundation
-import LocalAuthentication
 import Security
 
 public protocol SessionTokenStoring: AnyObject {
@@ -315,6 +314,17 @@ private enum SessionTokenLedgerSnapshot: Sendable {
     case available(SessionTokenLedgerState)
 }
 
+struct SessionTokenGenerationRecord: Equatable, Sendable {
+    let mutation: SessionTokenMutation
+    let data: Data
+}
+
+private enum LocalGenerationRecoveryResult {
+    case token(String)
+    case tombstone
+    case retry
+}
+
 private final class SessionTokenGenerationLedger: @unchecked Sendable {
     private static let lock = NSLock()
     private static let storageKey = "ElectronicMail.session-token.v2.generation-ledger"
@@ -388,6 +398,34 @@ private final class SessionTokenGenerationLedger: @unchecked Sendable {
                 try persistLocked(state)
                 return mutation
             }
+        }
+    }
+
+    func recoverCommittedIfUnclaimed(_ mutation: SessionTokenMutation) throws -> Bool {
+        try Self.withLock {
+            guard case .absent = snapshotLocked() else {
+                return false
+            }
+            let state = SessionTokenLedgerState(
+                nextOrdinal: mutation.ordinal,
+                desired: mutation,
+                committedGenerationID: mutation.generationID,
+                entries: [SessionTokenLedgerEntry(mutation: mutation, recordPersisted: true)]
+            )
+            try persistLocked(state)
+            return true
+        }
+    }
+
+    func replaceWithCommittedForExplicitLocalRepair(_ mutation: SessionTokenMutation) throws {
+        try Self.withLock {
+            let state = SessionTokenLedgerState(
+                nextOrdinal: mutation.ordinal,
+                desired: mutation,
+                committedGenerationID: mutation.generationID,
+                entries: [SessionTokenLedgerEntry(mutation: mutation, recordPersisted: true)]
+            )
+            try persistLocked(state)
         }
     }
 
@@ -523,8 +561,38 @@ protocol SessionTokenSecureRecordStoring: AnyObject, Sendable {
     func readGenerationRecord(account: String) -> Data?
     func addGenerationRecord(_ data: Data, account: String) throws
     func deleteGenerationRecord(account: String) -> Bool
+    func readMigratableGenerationRecord(account: String) throws -> Data?
+    func deleteMigratableGenerationRecord(account: String) -> Bool
+    func latestLocalRecoveryRecord() -> SessionTokenGenerationRecord?
+    func latestLocalTokenRecoveryRecord() -> SessionTokenGenerationRecord?
+    var lastLocalRecoveryStatus: OSStatus? { get }
     func readLegacyRecord() -> Data?
     func deleteLegacyRecords()
+}
+
+extension SessionTokenSecureRecordStoring {
+    var lastLocalRecoveryStatus: OSStatus? { nil }
+
+    func latestLocalRecoveryRecord() -> SessionTokenGenerationRecord? {
+        nil
+    }
+
+    func latestLocalTokenRecoveryRecord() -> SessionTokenGenerationRecord? {
+        guard let record = latestLocalRecoveryRecord(), record.mutation.kind == .token else {
+            return nil
+        }
+        return record
+    }
+}
+
+extension SessionTokenSecureRecordStoring {
+    func readMigratableGenerationRecord(account _: String) throws -> Data? {
+        nil
+    }
+
+    func deleteMigratableGenerationRecord(account _: String) -> Bool {
+        false
+    }
 }
 
 public final class KeychainSessionTokenStore: SessionTokenStoring, @unchecked Sendable {
@@ -545,9 +613,7 @@ public final class KeychainSessionTokenStore: SessionTokenStoring, @unchecked Se
 
     #if os(macOS)
     static var classicMacLocalTestingPolicyAttributes: [String: Any] {
-        [
-            kSecAttrSynchronizable as String: false,
-        ]
+        [:]
     }
     #endif
 
@@ -567,9 +633,32 @@ public final class KeychainSessionTokenStore: SessionTokenStoring, @unchecked Se
         #endif
     }
 
+    static func shouldRetryClassicMacReadInteractively(
+        for status: OSStatus,
+        localBuild: Bool
+    ) -> Bool {
+        #if os(macOS)
+        return localBuild && (
+            status == errSecInteractionNotAllowed ||
+            status == errSecAuthFailed ||
+            status == errSecItemNotFound
+        )
+        #else
+        return false
+        #endif
+    }
+
     private let ledger: SessionTokenGenerationLedger
     private let records: SessionTokenSecureRecordStoring
     private let cleanupQueue: DispatchQueue
+    private let loadFailureLock = NSLock()
+    private var storedLoadFailureMessage: String?
+
+    public var lastLoadFailureMessage: String? {
+        loadFailureLock.lock()
+        defer { loadFailureLock.unlock() }
+        return storedLoadFailureMessage
+    }
 
     public convenience init(defaults: UserDefaults = .standard) {
         self.init(
@@ -594,18 +683,28 @@ public final class KeychainSessionTokenStore: SessionTokenStoring, @unchecked Se
     }
 
     public func load() -> String? {
+        setLoadFailureMessage(nil)
         for _ in 0..<4 {
             switch ledger.snapshot() {
             case .corrupt:
                 return nil
             case .absent:
-                guard let result = loadAndMigrateLegacyIfUnclaimed() else {
-                    if case .available = ledger.snapshot() {
-                        continue
-                    }
+                if let result = loadAndMigrateLegacyIfUnclaimed() {
+                    return result
+                }
+                if case .available = ledger.snapshot() {
+                    continue
+                }
+                switch recoverLatestLocalGenerationIfUnclaimed() {
+                case .token(let token):
+                    return token
+                case .tombstone:
+                    return nil
+                case .retry:
+                    continue
+                case nil:
                     return nil
                 }
-                return result
             case .available(let state):
                 guard let desired = state.desired else {
                     guard let result = loadAndMigrateLegacyIfUnclaimed() else {
@@ -623,11 +722,20 @@ public final class KeychainSessionTokenStore: SessionTokenStoring, @unchecked Se
                     scheduleCleanup()
                     return nil
                 }
-                guard let data = records.readGenerationRecord(account: Self.account(for: desired)) else {
+                let account = Self.account(for: desired)
+                guard let data = records.readGenerationRecord(account: account) else {
                     // A desired token with no exact record is intentionally
-                    // fail-closed. Never fall back to an older committed token.
+                    // fail-closed. The only permitted recovery is copying this
+                    // exact generation from the classic macOS Keychain into the
+                    // Team-bound Data Protection Keychain.
                     guard ledger.isDesired(desired) else {
                         continue
+                    }
+                    if let migrated = migrateExactClassicGeneration(
+                        desired,
+                        account: account
+                    ) {
+                        return migrated
                     }
                     return nil
                 }
@@ -640,6 +748,47 @@ public final class KeychainSessionTokenStore: SessionTokenStoring, @unchecked Se
             }
         }
         return nil
+    }
+
+    private func migrateExactClassicGeneration(
+        _ mutation: SessionTokenMutation,
+        account: String
+    ) -> String? {
+        do {
+            guard let classicData = try records.readMigratableGenerationRecord(account: account) else {
+                return nil
+            }
+            guard ledger.isDesired(mutation),
+                  let token = String(data: classicData, encoding: .utf8),
+                  !token.isEmpty else {
+                return nil
+            }
+
+            try records.addGenerationRecord(classicData, account: account)
+            guard records.readGenerationRecord(account: account) == classicData else {
+                throw KeychainError.migrationVerificationFailed
+            }
+            guard ledger.isDesired(mutation) else {
+                scheduleCleanup()
+                return nil
+            }
+
+            _ = try ledger.markRecordPersisted(mutation)
+            _ = records.deleteMigratableGenerationRecord(account: account)
+            scheduleCleanup()
+            return token
+        } catch {
+            setLoadFailureMessage(
+                "Electronic Mail found your saved sign-in but could not move it into the stable app Keychain. Unlock your Mac and try again, or sign in again. Your mailbox data and existing saved sign-in were not removed. \(error.localizedDescription)"
+            )
+            return nil
+        }
+    }
+
+    private func setLoadFailureMessage(_ message: String?) {
+        loadFailureLock.lock()
+        storedLoadFailureMessage = message
+        loadFailureLock.unlock()
     }
 
     public func save(_ token: String) throws {
@@ -681,9 +830,79 @@ public final class KeychainSessionTokenStore: SessionTokenStoring, @unchecked Se
         }
     }
 
+    /// Repairs a known accidental local tombstone after an ad-hoc-to-stable
+    /// signing transition. This is deliberately opt-in and is only invoked by
+    /// the local repair command; ordinary launch and explicit sign-out remain
+    /// fail-closed.
+    public func repairLatestLocalSession() -> Bool {
+        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
+        guard let record = records.latestLocalTokenRecoveryRecord() else {
+            if let status = records.lastLocalRecoveryStatus {
+                setLoadFailureMessage(KeychainError.status(status).localizedDescription)
+            } else {
+                setLoadFailureMessage("Electronic Mail did not find a readable saved local session.")
+            }
+            return false
+        }
+        guard let token = String(data: record.data, encoding: .utf8),
+              !token.isEmpty else {
+            setLoadFailureMessage("Electronic Mail found an invalid saved local session.")
+            return false
+        }
+        do {
+            try ledger.replaceWithCommittedForExplicitLocalRepair(record.mutation)
+            return load() == token
+        } catch {
+            setLoadFailureMessage(error.localizedDescription)
+            return false
+        }
+        #else
+        return false
+        #endif
+    }
+
     static func account(for mutation: SessionTokenMutation) -> String {
         let paddedOrdinal = String(format: "%020llu", mutation.ordinal)
         return "session.v2.\(paddedOrdinal).\(mutation.generationID).\(mutation.kind.rawValue)"
+    }
+
+    static func mutation(fromAccount account: String) -> SessionTokenMutation? {
+        let prefix = "session.v2."
+        guard account.hasPrefix(prefix) else {
+            return nil
+        }
+        let components = account.dropFirst(prefix.count).split(separator: ".", omittingEmptySubsequences: false)
+        guard components.count == 3,
+              let ordinal = UInt64(components[0]),
+              !components[1].isEmpty,
+              let kind = SessionTokenMutationKind(rawValue: String(components[2])) else {
+            return nil
+        }
+        let mutation = SessionTokenMutation(
+            generationID: String(components[1]),
+            ordinal: ordinal,
+            kind: kind
+        )
+        guard account == Self.account(for: mutation) else {
+            return nil
+        }
+        return mutation
+    }
+
+    private func recoverLatestLocalGenerationIfUnclaimed() -> LocalGenerationRecoveryResult? {
+        guard let record = records.latestLocalRecoveryRecord() else {
+            return nil
+        }
+        guard (try? ledger.recoverCommittedIfUnclaimed(record.mutation)) == true else {
+            return .retry
+        }
+        scheduleCleanup()
+        guard record.mutation.kind == .token,
+              let token = String(data: record.data, encoding: .utf8),
+              !token.isEmpty else {
+            return .tombstone
+        }
+        return .token(token)
     }
 
     private func loadAndMigrateLegacyIfUnclaimed() -> String? {
@@ -738,6 +957,14 @@ private extension SessionTokenGenerationLedger {
 private final class KeychainSessionTokenSecureRecordStore: SessionTokenSecureRecordStoring, @unchecked Sendable {
     private static let legacyService = "ElectronicMail"
     private static let legacyAccount = "email_session"
+    private let localRecoveryStatusLock = NSLock()
+    private var storedLocalRecoveryStatus: OSStatus?
+
+    var lastLocalRecoveryStatus: OSStatus? {
+        localRecoveryStatusLock.lock()
+        defer { localRecoveryStatusLock.unlock() }
+        return storedLocalRecoveryStatus
+    }
 
     func readGenerationRecord(account: String) -> Data? {
         #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
@@ -746,9 +973,25 @@ private final class KeychainSessionTokenSecureRecordStore: SessionTokenSecureRec
         // make securityd wait for authorization before returning
         // errSecMissingEntitlement, so local builds use their explicitly
         // non-synchronizing classic record directly.
-        let context = LAContext()
-        context.interactionNotAllowed = true
-        return readData(query: generationClassicQuery(account: account), authenticationContext: context)
+        // production Release builds never compile this fallback.
+        let query = generationClassicQuery(account: account)
+        var noninteractiveQuery = query
+        noninteractiveQuery[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+        let noninteractiveResult = readDataResult(query: noninteractiveQuery)
+        if let data = noninteractiveResult.data {
+            return data
+        }
+        guard KeychainSessionTokenStore.shouldRetryClassicMacReadInteractively(
+            for: noninteractiveResult.status,
+            localBuild: true
+        ) else {
+            return nil
+        }
+        // A session written by an older ad-hoc build can still be present but
+        // protected by that build's Keychain ACL. Let macOS offer its standard
+        // one-time Allow / Always Allow prompt for this exact generation. Once
+        // approved, the stable certificate can read it across future rebuilds.
+        return readData(query: query)
         #else
         return readData(query: generationSecureQuery(account: account))
         #endif
@@ -780,11 +1023,110 @@ private final class KeychainSessionTokenSecureRecordStore: SessionTokenSecureRec
         #endif
     }
 
+    func readMigratableGenerationRecord(account: String) throws -> Data? {
+        #if os(macOS) && !DEBUG && !ELECTRONIC_MAIL_LOCAL_BETA
+        try readDataReportingStatus(query: generationClassicQuery(account: account))
+        #else
+        nil
+        #endif
+    }
+
+    func deleteMigratableGenerationRecord(account: String) -> Bool {
+        #if os(macOS) && !DEBUG && !ELECTRONIC_MAIL_LOCAL_BETA
+        let status = SecItemDelete(generationClassicQuery(account: account) as CFDictionary)
+        return Self.isSuccessfulDeletion(status)
+        #else
+        false
+        #endif
+    }
+
+    func latestLocalRecoveryRecord() -> SessionTokenGenerationRecord? {
+        latestLocalRecoveryRecord(kind: nil, allowsInteraction: true)
+    }
+
+    func latestLocalTokenRecoveryRecord() -> SessionTokenGenerationRecord? {
+        // The explicit repair command must never trigger another password or
+        // Keychain authorization prompt. If the stable signing identity cannot
+        // read the record silently, repair stops without changing the ledger.
+        latestLocalRecoveryRecord(kind: .token, allowsInteraction: false)
+    }
+
+    private func latestLocalRecoveryRecord(
+        kind requiredKind: SessionTokenMutationKind?,
+        allowsInteraction: Bool
+    ) -> SessionTokenGenerationRecord? {
+        #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: KeychainSessionTokenStore.generationService,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        var item: CFTypeRef?
+        let attributeStatus = SecItemCopyMatching(query as CFDictionary, &item)
+        guard attributeStatus == errSecSuccess else {
+            setLocalRecoveryStatus(attributeStatus)
+            return nil
+        }
+        let dictionaries: [[String: Any]]
+        if let values = item as? [[String: Any]] {
+            dictionaries = values
+        } else if let value = item as? [String: Any] {
+            dictionaries = [value]
+        } else {
+            return nil
+        }
+        let matchingMutations = dictionaries.compactMap { value -> SessionTokenMutation? in
+            guard let account = value[kSecAttrAccount as String] as? String,
+                  let mutation = KeychainSessionTokenStore.mutation(fromAccount: account),
+                  (requiredKind.map { $0 == mutation.kind } ?? true) else {
+                return nil
+            }
+            return mutation
+        }
+        guard let selectedMutation = matchingMutations.max(by: {
+            lhs, rhs in lhs.ordinal < rhs.ordinal
+        }) else {
+            setLocalRecoveryStatus(errSecItemNotFound)
+            return nil
+        }
+
+        let account = KeychainSessionTokenStore.account(for: selectedMutation)
+        let baseQuery = generationClassicQuery(account: account)
+        var noninteractiveQuery = baseQuery
+        noninteractiveQuery[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+        var dataResult = readDataResult(query: noninteractiveQuery)
+        if allowsInteraction, KeychainSessionTokenStore.shouldRetryClassicMacReadInteractively(
+            for: dataResult.status,
+            localBuild: true
+        ) {
+            dataResult = readDataResult(query: baseQuery)
+        }
+        setLocalRecoveryStatus(dataResult.status)
+        guard let data = dataResult.data else {
+            return nil
+        }
+        if selectedMutation.kind == .tombstone,
+           String(data: data, encoding: .utf8) != "tombstone-v2" {
+            return nil
+        }
+        return SessionTokenGenerationRecord(mutation: selectedMutation, data: data)
+        #else
+        return nil
+        #endif
+    }
+
+    private func setLocalRecoveryStatus(_ status: OSStatus) {
+        localRecoveryStatusLock.lock()
+        storedLocalRecoveryStatus = status
+        localRecoveryStatusLock.unlock()
+    }
+
     func readLegacyRecord() -> Data? {
         #if os(macOS) && (DEBUG || ELECTRONIC_MAIL_LOCAL_BETA)
-        let context = LAContext()
-        context.interactionNotAllowed = true
-        return readData(query: legacyClassicQuery(), authenticationContext: context)
+        var query = legacyClassicQuery()
+        query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+        return readData(query: query)
         #else
         if let data = readData(query: legacySecureQuery(synchronizable: false)) {
             return data
@@ -826,17 +1168,35 @@ private final class KeychainSessionTokenSecureRecordStore: SessionTokenSecureRec
         }
     }
 
-    private func readData(query base: [String: Any], authenticationContext: LAContext? = nil) -> Data? {
+    private func readData(query base: [String: Any]) -> Data? {
+        readDataResult(query: base).data
+    }
+
+    private func readDataResult(
+        query base: [String: Any]
+    ) -> (data: Data?, status: OSStatus) {
         var query = base
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
-        if let authenticationContext {
-            query[kSecUseAuthenticationContext as String] = authenticationContext
-        }
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         guard status == errSecSuccess, let data = item as? Data else {
+            return (nil, status)
+        }
+        return (data, status)
+    }
+
+    private func readDataReportingStatus(query base: [String: Any]) throws -> Data? {
+        var query = base
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound {
             return nil
+        }
+        guard status == errSecSuccess, let data = item as? Data else {
+            throw KeychainError.status(status)
         }
         return data
     }
@@ -850,9 +1210,7 @@ private final class KeychainSessionTokenSecureRecordStore: SessionTokenSecureRec
 
     #if os(macOS)
     private func generationClassicQuery(account: String) -> [String: Any] {
-        var query = generationBaseQuery(account: account)
-        query[kSecAttrSynchronizable as String] = false
-        return query
+        generationBaseQuery(account: account)
     }
     #endif
 
@@ -873,9 +1231,7 @@ private final class KeychainSessionTokenSecureRecordStore: SessionTokenSecureRec
 
     #if os(macOS)
     private func legacyClassicQuery() -> [String: Any] {
-        var query = legacyBaseQuery()
-        query[kSecAttrSynchronizable as String] = false
-        return query
+        legacyBaseQuery()
     }
     #endif
 
@@ -894,6 +1250,7 @@ private final class KeychainSessionTokenSecureRecordStore: SessionTokenSecureRec
 
 public enum KeychainError: Error, Equatable, LocalizedError {
     case status(OSStatus)
+    case migrationVerificationFailed
 
     public var errorDescription: String? {
         switch self {
@@ -904,6 +1261,8 @@ public enum KeychainError: Error, Equatable, LocalizedError {
                 return "Electronic Mail could not securely save your sign-in because this build is missing a required Keychain signing entitlement. \(detail)"
             }
             return "Electronic Mail could not securely save your sign-in in the system Keychain. \(detail)"
+        case .migrationVerificationFailed:
+            return "Electronic Mail could not verify the copied Keychain record."
         }
     }
 }
