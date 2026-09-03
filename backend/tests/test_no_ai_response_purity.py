@@ -123,6 +123,7 @@ class NoAIResponsePurityTests(unittest.TestCase):
         get_import_state.return_value = SimpleNamespace(first_batch_imported_at="2026-05-15T12:00:00+00:00")
         get_snapshot.return_value = AppSessionSnapshotRecord(
             user_id="user-1",
+            gmail_account_id="account-1",
             dashboard={
                 "auth": {"available": True, "connected": True},
                 "profile": {"email": "me@example.com", "display_name": "Gaurav"},

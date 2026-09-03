@@ -9,6 +9,8 @@ from app.api.routes.auth_google import router as auth_google_router
 from app.api.routes.app_session import router as app_session_router
 from app.api.routes.entities import router as entities_router
 from app.api.routes.gmail import router as gmail_router
+from app.api.routes.gmail_accounts import router as gmail_accounts_router
+from app.api.routes.gmail_account_ai import router as gmail_account_ai_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.first_run import router as first_run_router
 from app.api.routes.jobs import router as jobs_router
@@ -57,6 +59,8 @@ def create_app(runtime_settings: Settings) -> FastAPI:
     application.include_router(mailbox_router)
     application.include_router(jobs_router)
     application.include_router(ai_inbox_router)
+    application.include_router(gmail_accounts_router)
+    application.include_router(gmail_account_ai_router)
 
     if not production_like:
         application.include_router(first_run_router)

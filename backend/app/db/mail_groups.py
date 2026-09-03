@@ -3,7 +3,7 @@ from __future__ import annotations
 """Postgres repositories for Gmail messages, mail groups, import state, and deletion guards."""
 
 import base64
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from sqlalchemy import text
 
+from app.db.account_scope import gmail_account_scope
 from app.db.repository import get_engine
 from app.db.user_mail_guard import (
     advisory_session_locks,
@@ -90,6 +91,7 @@ class GmailMessageRecord:
     mailbox_body_ready: bool | None = None
     mailbox_content_revision: str | None = None
     mailbox_attachment_count: int | None = None
+    gmail_account_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -331,6 +333,7 @@ class MailboxEventRecord:
     mailbox_label: str | None
     payload: dict[str, Any]
     created_at: str
+    gmail_account_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -428,6 +431,7 @@ def gmail_history_cursor_is_authoritative(state: Any) -> bool:
 @dataclass(frozen=True)
 class AppSessionSnapshotRecord:
     user_id: str
+    gmail_account_id: str
     dashboard: dict[str, Any]
     mailbox: dict[str, Any]
     sync: dict[str, Any]
@@ -448,6 +452,7 @@ class PendingThreadActionRecord:
     applied_at: str | None
     error: str | None
     updated_at: str
+    gmail_account_id: str = ""
     previous_labels: dict[str, list[str]] = field(default_factory=dict)
 
 
@@ -473,6 +478,7 @@ class PendingSendRecord:
     gmail_message_id: str | None
     error: str | None
     updated_at: str
+    gmail_account_id: str = ""
     attachments: list[dict[str, str]] = field(default_factory=list)
     request_hash: str = ""
 
@@ -496,6 +502,7 @@ class ClientDraftRecord:
     created_at: str
     saved_at: str | None
     updated_at: str
+    gmail_account_id: str = ""
 
 
 def user_can_write_gmail(database_url: str, *, user_id: str) -> bool:
@@ -641,7 +648,7 @@ def mark_import_started(database_url: str, *, user_id: str) -> None:
                 """
                 INSERT INTO gmail_import_state (user_id, last_import_started_at, updated_at)
                 VALUES (:user_id, now(), now())
-                ON CONFLICT (user_id) DO UPDATE SET
+                ON CONFLICT (gmail_account_id) DO UPDATE SET
                   last_import_started_at = now(),
                   phase = CASE
                     WHEN gmail_import_state.sync_generation IS NOT NULL
@@ -690,7 +697,7 @@ def mark_import_completed(
                   CASE WHEN :dashboard_ready THEN now() ELSE NULL END,
                   now(), now()
                 )
-                ON CONFLICT (user_id) DO UPDATE SET
+                ON CONFLICT (gmail_account_id) DO UPDATE SET
                   full_backfill_cursor = CASE
                     WHEN :clear_full_backfill_cursor THEN NULL
                     ELSE COALESCE(excluded.full_backfill_cursor, gmail_import_state.full_backfill_cursor)
@@ -742,7 +749,7 @@ def mark_history_delta_completed(
                 ) VALUES (
                   :user_id, :last_history_id, now(), now(), TRUE, now()
                 )
-                ON CONFLICT (user_id) DO UPDATE SET
+                ON CONFLICT (gmail_account_id) DO UPDATE SET
                   last_history_id = CASE
                     WHEN gmail_import_state.history_cursor_authoritative IS NOT TRUE
                       THEN excluded.last_history_id
@@ -780,7 +787,7 @@ def mark_import_error(database_url: str, *, user_id: str, error: str) -> None:
                 """
                 INSERT INTO gmail_import_state (user_id, last_sync_error, updated_at)
                 VALUES (:user_id, :error, now())
-                ON CONFLICT (user_id) DO UPDATE SET
+                ON CONFLICT (gmail_account_id) DO UPDATE SET
                   last_sync_error = excluded.last_sync_error,
                   phase = CASE
                     WHEN gmail_import_state.sync_generation IS NOT NULL THEN 'failed'
@@ -813,7 +820,7 @@ def mark_gmail_watch_started(
                   gmail_watch_started_at, gmail_watch_error, updated_at
                 )
                 VALUES (:user_id, :history_id, :expiration_at, now(), NULL, now())
-                ON CONFLICT (user_id) DO UPDATE SET
+                ON CONFLICT (gmail_account_id) DO UPDATE SET
                   gmail_watch_history_id = excluded.gmail_watch_history_id,
                   gmail_watch_expiration_at = excluded.gmail_watch_expiration_at,
                   gmail_watch_started_at = now(),
@@ -832,7 +839,7 @@ def mark_gmail_watch_error(database_url: str, *, user_id: str, error: str) -> No
                 """
                 INSERT INTO gmail_import_state (user_id, gmail_watch_error, updated_at)
                 VALUES (:user_id, :error, now())
-                ON CONFLICT (user_id) DO UPDATE SET
+                ON CONFLICT (gmail_account_id) DO UPDATE SET
                   gmail_watch_error = excluded.gmail_watch_error,
                   updated_at = now()
                 """
@@ -956,7 +963,7 @@ def activate_existing_gmail_progressive_sync(
                   now(), now()
                 FROM ranked_threads AS ranked
                 WHERE ranked.position < 100
-                ON CONFLICT (user_id, generation_id, gmail_thread_id) DO NOTHING
+                ON CONFLICT (gmail_account_id, generation_id, gmail_thread_id) DO NOTHING
                 """
             ),
             {"user_id": user_id, "generation_id": generation_id},
@@ -1173,7 +1180,7 @@ def initialize_gmail_initial_window(
                           :user_id, :generation_id, :gmail_thread_id, :position,
                           now(), now()
                         )
-                        ON CONFLICT (user_id, generation_id, gmail_thread_id) DO NOTHING
+                        ON CONFLICT (gmail_account_id, generation_id, gmail_thread_id) DO NOTHING
                         """
                     ),
                     {
@@ -1490,7 +1497,7 @@ def start_gmail_reconciliation(
                 """
                 INSERT INTO gmail_import_state (user_id, updated_at)
                 VALUES (:user_id, now())
-                ON CONFLICT (user_id) DO NOTHING
+                ON CONFLICT (gmail_account_id) DO NOTHING
                 """
             ),
             {"user_id": user_id},
@@ -1580,7 +1587,7 @@ def record_gmail_reconciliation_page(
                     INSERT INTO gmail_reconcile_seen (user_id, generation_id, message_id, seen_at)
                     SELECT :user_id, :generation_id, listed.message_id, now()
                     FROM unnest(CAST(:message_ids AS TEXT[])) AS listed(message_id)
-                    ON CONFLICT (user_id, generation_id, message_id) DO NOTHING
+                    ON CONFLICT (gmail_account_id, generation_id, message_id) DO NOTHING
                     """
                 ),
                 {
@@ -1654,7 +1661,7 @@ def commit_gmail_reconciliation_metadata_page(
                     INSERT INTO gmail_reconcile_seen (user_id, generation_id, message_id, seen_at)
                     SELECT :user_id, :generation_id, listed.message_id, now()
                     FROM unnest(CAST(:message_ids AS TEXT[])) AS listed(message_id)
-                    ON CONFLICT (user_id, generation_id, message_id) DO NOTHING
+                    ON CONFLICT (gmail_account_id, generation_id, message_id) DO NOTHING
                     """
                 ),
                 {
@@ -1730,7 +1737,7 @@ def record_gmail_reconciliation_seen(
                 INSERT INTO gmail_reconcile_seen (user_id, generation_id, message_id, seen_at)
                 SELECT :user_id, :generation_id, listed.message_id, now()
                 FROM unnest(CAST(:message_ids AS TEXT[])) AS listed(message_id)
-                ON CONFLICT (user_id, generation_id, message_id) DO NOTHING
+                ON CONFLICT (gmail_account_id, generation_id, message_id) DO NOTHING
                 """
             ),
             {
@@ -2055,7 +2062,7 @@ def replace_gmail_thread_orders(
                     ) VALUES (
                       :user_id, :label, :active_generation_id, :previous_generation_id, now()
                     )
-                    ON CONFLICT (user_id, label) DO UPDATE SET
+                    ON CONFLICT (gmail_account_id, label) DO UPDATE SET
                       active_generation_id = excluded.active_generation_id,
                       previous_generation_id = gmail_thread_order_state.active_generation_id,
                       refreshed_at = now()
@@ -2179,7 +2186,7 @@ def _upsert_gmail_messages_on_connection(connection, rows: list[GmailMessageReco
                       :attachment_descriptors_ready,
                       now(), now()
                     )
-                    ON CONFLICT (user_id, message_id) DO UPDATE SET
+                    ON CONFLICT (gmail_account_id, message_id) DO UPDATE SET
                       gmail_thread_id = excluded.gmail_thread_id,
                       history_id = CASE
                         WHEN excluded.history_id IS NULL
@@ -2879,7 +2886,7 @@ def upsert_pending_thread_action(
                   :server_action_id, :client_action_id, :user_id, :mailbox_thread_id, :target_message_id, :action,
                   'queued', :created_at, now(), CAST(:previous_labels_json AS JSONB), now()
                 )
-                ON CONFLICT (user_id, client_action_id) DO NOTHING
+                ON CONFLICT (gmail_account_id, client_action_id) DO NOTHING
                 RETURNING *
                 """
             ),
@@ -2948,24 +2955,36 @@ def insert_mailbox_event(
     database_url: str,
     *,
     user_id: str,
+    gmail_account_id: str | None = None,
     event_type: str,
     mailbox_label: str | None = None,
     payload: dict[str, Any] | None = None,
 ) -> MailboxEventRecord:
-    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
+    with user_mail_write_transaction(
+        get_engine(database_url),
+        user_id=user_id,
+        gmail_account_id=gmail_account_id,
+    ) as connection:
         row = connection.execute(
             text(
                 """
                 INSERT INTO mailbox_events (
-                  user_id, event_type, mailbox_label, payload_json, created_at
+                  user_id, gmail_account_id, event_type, mailbox_label, payload_json, created_at
                 ) VALUES (
-                  :user_id, :event_type, :mailbox_label, CAST(:payload_json AS JSONB), now()
+                  :user_id,
+                  COALESCE(
+                    :gmail_account_id,
+                    NULLIF(current_setting('electronic_mail.gmail_account_id', TRUE), ''),
+                    (SELECT primary_gmail_account_id FROM users WHERE id=:user_id)
+                  ),
+                  :event_type, :mailbox_label, CAST(:payload_json AS JSONB), now()
                 )
                 RETURNING *
                 """
             ),
             {
                 "user_id": user_id,
+                "gmail_account_id": gmail_account_id,
                 "event_type": event_type,
                 "mailbox_label": mailbox_label,
                 "payload_json": json.dumps(payload or {}, ensure_ascii=True),
@@ -2980,23 +2999,38 @@ def list_mailbox_events_after(
     database_url: str,
     *,
     user_id: str,
+    gmail_account_id: str | None = None,
     after_id: int | None = None,
     limit: int = 100,
 ) -> list[MailboxEventRecord]:
-    with get_engine(database_url).connect() as connection:
-        rows = connection.execute(
-            text(
-                """
-                SELECT *
-                FROM mailbox_events
-                WHERE user_id = :user_id
-                  AND id > :after_id
-                ORDER BY id ASC
-                LIMIT :limit
-                """
-            ),
-            {"user_id": user_id, "after_id": int(after_id or 0), "limit": max(1, min(limit, 500))},
-        ).mappings().all()
+    clauses = ["user_id = :user_id", "id > :after_id"]
+    params: dict[str, Any] = {
+        "user_id": user_id,
+        "after_id": int(after_id or 0),
+        "limit": max(1, min(limit, 500)),
+    }
+    if gmail_account_id is not None:
+        clauses.append("gmail_account_id = :gmail_account_id")
+        params["gmail_account_id"] = gmail_account_id
+    account_scope = (
+        gmail_account_scope(gmail_account_id)
+        if gmail_account_id is not None
+        else nullcontext()
+    )
+    with account_scope:
+        with get_engine(database_url).connect() as connection:
+            rows = connection.execute(
+                text(
+                    f"""
+                    SELECT *
+                    FROM mailbox_events
+                    WHERE {" AND ".join(clauses)}
+                    ORDER BY id ASC
+                    LIMIT :limit
+                    """
+                ),
+                params,
+            ).mappings().all()
     return [_mailbox_event_from_row(row) for row in rows]
 
 
@@ -3004,26 +3038,36 @@ def latest_mailbox_event(
     database_url: str,
     *,
     user_id: str,
+    gmail_account_id: str | None = None,
     event_type: str | None = None,
 ) -> MailboxEventRecord | None:
     clauses = ["user_id = :user_id"]
     params: dict[str, Any] = {"user_id": user_id}
+    if gmail_account_id is not None:
+        clauses.append("gmail_account_id = :gmail_account_id")
+        params["gmail_account_id"] = gmail_account_id
     if event_type:
         clauses.append("event_type = :event_type")
         params["event_type"] = event_type
-    with get_engine(database_url).connect() as connection:
-        row = connection.execute(
-            text(
-                f"""
-                SELECT *
-                FROM mailbox_events
-                WHERE {" AND ".join(clauses)}
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            ),
-            params,
-        ).mappings().first()
+    account_scope = (
+        gmail_account_scope(gmail_account_id)
+        if gmail_account_id is not None
+        else nullcontext()
+    )
+    with account_scope:
+        with get_engine(database_url).connect() as connection:
+            row = connection.execute(
+                text(
+                    f"""
+                    SELECT *
+                    FROM mailbox_events
+                    WHERE {" AND ".join(clauses)}
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """
+                ),
+                params,
+            ).mappings().first()
     return _mailbox_event_from_row(row) if row is not None else None
 
 
@@ -3075,7 +3119,7 @@ def upsert_pending_send(
                   :body_html, :headers_json, CAST(:attachments_json AS JSONB), :request_hash,
                   'queued', :created_at, now(), now()
                 )
-                ON CONFLICT (user_id, client_send_id) DO UPDATE SET
+                ON CONFLICT (gmail_account_id, client_send_id) DO UPDATE SET
                   request_hash = CASE
                     WHEN gmail_pending_sends.request_hash = '' THEN excluded.request_hash
                     ELSE gmail_pending_sends.request_hash
@@ -3205,7 +3249,7 @@ def upsert_client_draft(
                   :content_hash, :state, :error, :created_at,
                   CASE WHEN :state = 'saved' THEN now() ELSE NULL END, now()
                 )
-                ON CONFLICT (user_id, client_draft_id) DO UPDATE SET
+                ON CONFLICT (gmail_account_id, client_draft_id) DO UPDATE SET
                   gmail_draft_id = COALESCE(EXCLUDED.gmail_draft_id, gmail_client_drafts.gmail_draft_id),
                   gmail_message_id = COALESCE(EXCLUDED.gmail_message_id, gmail_client_drafts.gmail_message_id),
                   gmail_thread_id = COALESCE(EXCLUDED.gmail_thread_id, gmail_client_drafts.gmail_thread_id),
@@ -4903,7 +4947,7 @@ def upsert_mail_group(
                   :ranking_reason, :suppression_reason, :classified_at,
                   now(), now()
                 )
-                ON CONFLICT (user_id, group_key) DO UPDATE SET
+                ON CONFLICT (gmail_account_id, group_key) DO UPDATE SET
                   group_type = excluded.group_type,
                   enrichment_status = excluded.enrichment_status,
                   membership_source = excluded.membership_source,
@@ -4980,7 +5024,7 @@ def replace_group_members(
                     """
                     INSERT INTO mail_group_members (id, user_id, group_id, gmail_message_id, gmail_thread_id, reason, confidence, created_at)
                     VALUES (:id, :user_id, :group_id, :gmail_message_id, :gmail_thread_id, :reason, :confidence, now())
-                    ON CONFLICT (user_id, group_id, gmail_message_id) DO NOTHING
+                    ON CONFLICT (gmail_account_id, group_id, gmail_message_id) DO NOTHING
                     """
                 ),
                 {
@@ -5011,7 +5055,7 @@ def append_group_members(
                     """
                     INSERT INTO mail_group_members (id, user_id, group_id, gmail_message_id, gmail_thread_id, reason, confidence, created_at)
                     VALUES (:id, :user_id, :group_id, :gmail_message_id, :gmail_thread_id, :reason, :confidence, now())
-                    ON CONFLICT (user_id, group_id, gmail_message_id) DO NOTHING
+                    ON CONFLICT (gmail_account_id, group_id, gmail_message_id) DO NOTHING
                     """
                 ),
                 {
@@ -5440,16 +5484,45 @@ def oldest_imported_message_at(database_url: str, *, user_id: str) -> str | None
     return _iso(value) if value is not None else None
 
 
-def get_app_session_snapshot(database_url: str, *, user_id: str) -> AppSessionSnapshotRecord | None:
+def _primary_gmail_account_id(database_url: str, *, user_id: str) -> str | None:
     with get_engine(database_url).connect() as connection:
-        row = connection.execute(
-            text("SELECT * FROM app_session_snapshots WHERE user_id = :user_id"),
+        value = connection.execute(
+            text("SELECT primary_gmail_account_id FROM users WHERE id = :user_id"),
             {"user_id": user_id},
-        ).mappings().first()
+        ).scalar_one_or_none()
+    return str(value) if value else None
+
+
+def get_app_session_snapshot(
+    database_url: str,
+    *,
+    user_id: str,
+    gmail_account_id: str | None = None,
+) -> AppSessionSnapshotRecord | None:
+    resolved_account_id = gmail_account_id or _primary_gmail_account_id(
+        database_url,
+        user_id=user_id,
+    )
+    if resolved_account_id is None:
+        return None
+    with gmail_account_scope(resolved_account_id):
+        with get_engine(database_url).connect() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT *
+                    FROM app_session_snapshots
+                    WHERE user_id = :user_id
+                      AND gmail_account_id = :gmail_account_id
+                    """
+                ),
+                {"user_id": user_id, "gmail_account_id": resolved_account_id},
+            ).mappings().first()
     if row is None:
         return None
     return AppSessionSnapshotRecord(
         user_id=str(row["user_id"]),
+        gmail_account_id=str(row.get("gmail_account_id") or row["user_id"]),
         dashboard=json.loads(row["dashboard_json"] or "{}"),
         mailbox=json.loads(row["mailbox_json"] or "{}"),
         sync=json.loads(row["sync_json"] or "{}"),
@@ -5461,30 +5534,46 @@ def upsert_app_session_snapshot(
     database_url: str,
     *,
     user_id: str,
+    gmail_account_id: str | None = None,
     dashboard: dict[str, Any],
     mailbox: dict[str, Any],
     sync: dict[str, Any],
 ) -> None:
-    with user_mail_write_transaction(get_engine(database_url), user_id=user_id) as connection:
-        connection.execute(
-            text(
-                """
-                INSERT INTO app_session_snapshots (user_id, dashboard_json, mailbox_json, sync_json, updated_at)
-                VALUES (:user_id, :dashboard_json, :mailbox_json, :sync_json, now())
-                ON CONFLICT (user_id) DO UPDATE SET
-                  dashboard_json = excluded.dashboard_json,
-                  mailbox_json = excluded.mailbox_json,
-                  sync_json = excluded.sync_json,
-                  updated_at = now()
-                """
-            ),
-            {
-                "user_id": user_id,
-                "dashboard_json": json.dumps(dashboard, ensure_ascii=True),
-                "mailbox_json": json.dumps(mailbox, ensure_ascii=True),
-                "sync_json": json.dumps(sync, ensure_ascii=True),
-            },
-        )
+    resolved_account_id = gmail_account_id or _primary_gmail_account_id(
+        database_url,
+        user_id=user_id,
+    )
+    if resolved_account_id is None:
+        raise RuntimeError("Primary Gmail account is not configured")
+    with gmail_account_scope(resolved_account_id):
+        with user_mail_write_transaction(
+            get_engine(database_url),
+            user_id=user_id,
+            gmail_account_id=resolved_account_id,
+        ) as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO app_session_snapshots (
+                      user_id, gmail_account_id, dashboard_json, mailbox_json, sync_json, updated_at
+                    ) VALUES (
+                      :user_id, :gmail_account_id, :dashboard_json, :mailbox_json, :sync_json, now()
+                    )
+                    ON CONFLICT (gmail_account_id) DO UPDATE SET
+                      dashboard_json = excluded.dashboard_json,
+                      mailbox_json = excluded.mailbox_json,
+                      sync_json = excluded.sync_json,
+                      updated_at = now()
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "gmail_account_id": resolved_account_id,
+                    "dashboard_json": json.dumps(dashboard, ensure_ascii=True),
+                    "mailbox_json": json.dumps(mailbox, ensure_ascii=True),
+                    "sync_json": json.dumps(sync, ensure_ascii=True),
+                },
+            )
 
 
 def _normalized_mailbox_label(label: str) -> str:
@@ -5619,6 +5708,7 @@ def _message_params(message: GmailMessageRecord) -> dict[str, Any]:
 def _message_from_row(row) -> GmailMessageRecord:
     return GmailMessageRecord(
         user_id=str(row["user_id"]),
+        gmail_account_id=str(row.get("gmail_account_id") or row["user_id"]),
         message_id=str(row["message_id"]),
         gmail_thread_id=str(row["gmail_thread_id"]) if row["gmail_thread_id"] is not None else None,
         history_id=str(row["history_id"]) if row["history_id"] is not None else None,
@@ -5665,6 +5755,7 @@ def _mailbox_message_from_row(row) -> GmailMessageRecord:
 
     return GmailMessageRecord(
         user_id=str(row["user_id"]),
+        gmail_account_id=str(row.get("gmail_account_id") or row["user_id"]),
         message_id=str(row["message_id"]),
         gmail_thread_id=str(row["gmail_thread_id"]) if row["gmail_thread_id"] is not None else None,
         history_id=str(row["history_id"]) if row["history_id"] is not None else None,
@@ -5977,6 +6068,11 @@ def _mailbox_event_from_row(row) -> MailboxEventRecord:
         mailbox_label=str(row["mailbox_label"]) if row["mailbox_label"] is not None else None,
         payload=payload_value,
         created_at=_iso(row["created_at"]),
+        gmail_account_id=(
+            str(row["gmail_account_id"])
+            if "gmail_account_id" in row and row["gmail_account_id"] is not None
+            else None
+        ),
     )
 
 

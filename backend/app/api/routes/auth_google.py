@@ -33,12 +33,17 @@ from app.services.auth import (
     revoke_request_session,
 )
 from app.db.repository import (
+    GmailAccountLimitError,
+    GmailAccountOwnershipConflictError,
     create_mobile_oauth_handoff,
     delete_google_oauth_token,
     delete_oauth_login_session,
     delete_user_account_with_google_subject_tombstone,
     get_mobile_oauth_handoff,
     get_oauth_login_session,
+    get_gmail_account_by_google_subject,
+    link_gmail_account,
+    multi_account_migration_verified,
     get_user,
     get_user_by_google_subject,
     oauth_session_is_after_google_subject_deletion,
@@ -460,6 +465,13 @@ def auth_google_callback(
             delete_oauth_login_session(str(settings.database_path), state=state)
         handoff_status = "cancelled" if error == "access_denied" else "failed"
         safe_error = "Google sign-in was cancelled." if handoff_status == "cancelled" else "Google sign-in failed. Please try again."
+        link_response = _native_link_completion_redirect(
+            oauth_session,
+            status=handoff_status,
+            error=safe_error,
+        )
+        if link_response is not None:
+            return link_response
         terminal_response = _persist_terminal_mobile_handoff(
             redirect_to,
             status=handoff_status,
@@ -472,6 +484,13 @@ def auth_google_callback(
     if code is None:
         if state:
             delete_oauth_login_session(str(settings.database_path), state=state)
+        link_response = _native_link_completion_redirect(
+            oauth_session,
+            status="failed",
+            error="Google sign-in failed. Please try again.",
+        )
+        if link_response is not None:
+            return link_response
         terminal_response = _persist_terminal_mobile_handoff(
             redirect_to,
             status="failed",
@@ -494,7 +513,107 @@ def auth_google_callback(
         subject_hash = google_subject_tombstone_hash(result.google_sub)
         unpersisted_google_subject_hash = subject_hash
         with exclusive_google_subject_lock(database_url, subject_hash=subject_hash):
+            if oauth_session is not None and getattr(oauth_session, "intent", "login") == "link":
+                initiating_user_id = getattr(oauth_session, "initiating_user_id", None)
+                if initiating_user_id is None:
+                    raise RuntimeError("Gmail link session has no app user")
+                if not (
+                    settings.multi_gmail_enabled
+                    and settings.multi_gmail_verified_backup_id
+                    and multi_account_migration_verified(
+                        database_url,
+                        user_id=initiating_user_id,
+                    )
+                ):
+                    raise RuntimeError("Adding Gmail accounts is not enabled for this inbox")
+                if state:
+                    oauth_login_session_delete_attempted = True
+                    delete_oauth_login_session(database_url, state=state)
+                if not oauth_session_is_after_google_subject_deletion(
+                    database_url,
+                    subject_hash=subject_hash,
+                    oauth_started_epoch=result.oauth_started_epoch,
+                ):
+                    raise RuntimeError("OAuth session predates account deletion")
+                if has_active_google_token_revocation(
+                    database_url,
+                    subject_hash=subject_hash,
+                ):
+                    raise RuntimeError("Previous Google authorization cleanup is still pending")
+                collision_account = get_gmail_account_by_google_subject(
+                    database_url,
+                    google_sub=result.google_sub,
+                )
+                if (
+                    collision_account is not None
+                    and collision_account.user_id != initiating_user_id
+                ):
+                    # Do not revoke this newly-issued grant: Google revocation
+                    # can invalidate the same subject's already-stored grant.
+                    # Refresh it in place for its current owner, but never move
+                    # ownership without the separate proof/merge workflow.
+                    link_gmail_account(
+                        database_url,
+                        user_id=collision_account.user_id,
+                        email=result.profile.email or collision_account.email,
+                        display_name=result.profile.display_name,
+                        google_sub=result.google_sub,
+                        token_json_encrypted=encrypt_json(settings, result.tokens),
+                        oauth_started_epoch=result.oauth_started_epoch,
+                        max_accounts=settings.multi_gmail_max_accounts,
+                    )
+                    unpersisted_google_tokens = None
+                    link_response = _native_link_completion_redirect(
+                        oauth_session,
+                        status="failed",
+                        error=(
+                            "This Gmail is already linked to another Electronic Mail "
+                            "account. Account merge is required."
+                        ),
+                    )
+                    if link_response is None:
+                        raise RuntimeError("Gmail link redirect is invalid")
+                    return link_response
+                linked_account = link_gmail_account(
+                    database_url,
+                    user_id=initiating_user_id,
+                    email=result.profile.email or "",
+                    display_name=result.profile.display_name,
+                    google_sub=result.google_sub,
+                    token_json_encrypted=encrypt_json(settings, result.tokens),
+                    oauth_started_epoch=result.oauth_started_epoch,
+                    max_accounts=settings.multi_gmail_max_accounts,
+                )
+                unpersisted_google_tokens = None
+                logger.info(
+                    "gmail.account_linked",
+                    extra={
+                        "event_fields": {
+                            "event": "gmail.account_linked",
+                            "user_id": initiating_user_id,
+                            "gmail_account_id": linked_account.id,
+                        }
+                    },
+                )
+                link_response = _native_link_completion_redirect(
+                    oauth_session,
+                    status="linked",
+                    gmail_account_id=linked_account.id,
+                )
+                if link_response is None:
+                    raise RuntimeError("Gmail link redirect is invalid")
+                return link_response
+
             existing_user = get_user_by_google_subject(database_url, result.google_sub)
+            existing_account = (
+                get_gmail_account_by_google_subject(
+                    database_url,
+                    google_sub=result.google_sub,
+                )
+                if existing_user is not None
+                and getattr(existing_user, "google_sub", result.google_sub) != result.google_sub
+                else None
+            )
             callback_user_id = existing_user.id if existing_user is not None else None
             try:
                 if state:
@@ -511,31 +630,55 @@ def auth_google_callback(
                     subject_hash=subject_hash,
                 ):
                     raise RuntimeError("Previous Google authorization cleanup is still pending. Please try again later.")
-                user = create_or_update_user(
-                    settings,
-                    profile=result.profile,
-                    google_sub=result.google_sub,
-                    oauth_started_epoch=result.oauth_started_epoch,
-                )
-                callback_user_id = user.id
-                with exclusive_user_mail_lock(database_url, user_id=user.id):
-                    # Google revocation is project/user-wide, so replacing an
-                    # ordinary active grant must be an atomic overwrite only.
-                    reconnect_google_oauth_token(
+                if (
+                    existing_account is not None
+                    and existing_user is not None
+                    and existing_account.id != existing_user.primary_gmail_account_id
+                ):
+                    # Signing in through a linked secondary Gmail authenticates
+                    # the owning app user. It must not rewrite the primary
+                    # profile, token, sync state, or inbox.
+                    user = existing_user
+                    link_gmail_account(
                         database_url,
                         user_id=user.id,
+                        email=result.profile.email or existing_account.email,
+                        display_name=result.profile.display_name,
+                        google_sub=result.google_sub,
                         token_json_encrypted=encrypt_json(settings, result.tokens),
                         oauth_started_epoch=result.oauth_started_epoch,
+                        max_accounts=settings.multi_gmail_max_accounts,
                     )
-                    # Ownership transfers only after the atomic guard-clear and
-                    # token transaction commits. Later callback work must not
-                    # revoke that durable credential.
                     unpersisted_google_tokens = None
-                ensure_gmail_watch(settings, user_id=user.id)
-                try:
-                    enqueue_first_run(settings, user_id=user.id)
-                except Exception:
-                    pass
+                else:
+                    user = create_or_update_user(
+                        settings,
+                        profile=result.profile,
+                        google_sub=result.google_sub,
+                        oauth_started_epoch=result.oauth_started_epoch,
+                    )
+                callback_user_id = user.id
+                primary_gmail_account_id = getattr(
+                    user,
+                    "primary_gmail_account_id",
+                    user.id,
+                ) or user.id
+                if existing_account is None or existing_account.id == primary_gmail_account_id:
+                    with exclusive_user_mail_lock(database_url, user_id=user.id):
+                        # Replacing the primary grant remains an atomic overwrite.
+                        reconnect_google_oauth_token(
+                            database_url,
+                            user_id=user.id,
+                            token_json_encrypted=encrypt_json(settings, result.tokens),
+                            oauth_started_epoch=result.oauth_started_epoch,
+                        )
+                        # Ownership transfers only after the token transaction commits.
+                        unpersisted_google_tokens = None
+                    ensure_gmail_watch(settings, user_id=user.id)
+                    try:
+                        enqueue_first_run(settings, user_id=user.id)
+                    except Exception:
+                        pass
                 logger.info(
                     "gmail.oauth_completed",
                     extra={
@@ -587,6 +730,17 @@ def auth_google_callback(
         if terminal_response is not None:
             return terminal_response
         raise
+    except (GmailAccountLimitError, GmailAccountOwnershipConflictError) as exc:
+        if state and not oauth_login_session_delete_attempted:
+            delete_oauth_login_session(str(settings.database_path), state=state)
+        link_response = _native_link_completion_redirect(
+            oauth_session,
+            status="failed",
+            error=str(exc),
+        )
+        if link_response is not None:
+            return link_response
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     except RuntimeError as exc:
         if state and not oauth_login_session_delete_attempted:
             delete_oauth_login_session(str(settings.database_path), state=state)
@@ -597,6 +751,13 @@ def auth_google_callback(
         )
         if terminal_response is not None:
             return terminal_response
+        link_response = _native_link_completion_redirect(
+            oauth_session,
+            status="failed",
+            error="Gmail account could not be added. Please try again.",
+        )
+        if link_response is not None:
+            return link_response
         if "Start again from /auth/google" in str(exc):
             return _no_store_redirect("/auth/google")
         raise HTTPException(status_code=400, detail="Google sign-in failed. Please try again.") from None
@@ -610,6 +771,13 @@ def auth_google_callback(
         )
         if terminal_response is not None:
             return terminal_response
+        link_response = _native_link_completion_redirect(
+            oauth_session,
+            status="failed",
+            error="Gmail account could not be added. Please try again.",
+        )
+        if link_response is not None:
+            return link_response
         raise HTTPException(status_code=400, detail="Google sign-in failed. Please try again.") from None
     finally:
         # A database failure can prevent durable tracking itself. The normal
@@ -680,6 +848,30 @@ def auth_google_callback(
 
 def _is_mobile_handoff_redirect(redirect_to: str) -> bool:
     return _mobile_handoff_context(redirect_to) is not None
+
+
+def _native_link_completion_redirect(
+    oauth_session,
+    *,
+    status: str,
+    gmail_account_id: str | None = None,
+    error: str | None = None,
+) -> RedirectResponse | None:
+    """Return only to the configured native callback for a link-intent session."""
+    if (
+        oauth_session is None
+        or getattr(oauth_session, "intent", "login") != "link"
+        or oauth_session.redirect_to != settings.mobile_redirect_uri
+    ):
+        return None
+    params = {"status": status}
+    if gmail_account_id:
+        params["gmail_account_id"] = gmail_account_id
+    if error:
+        params["error"] = error
+    return _no_store_redirect(
+        f"{settings.mobile_redirect_uri}?{urlencode(params)}"
+    )
 
 
 def _mobile_handoff_context(redirect_to: str) -> tuple[str, str] | None:

@@ -68,6 +68,44 @@ Digest pins intentionally prevent automatic base-image updates. Review vulnerabi
 3. Restore the latest production backup into an isolated target, apply `alembic upgrade head`, run `python -m app.schema_check`, compare row counts and constraints, and prove that the backup can be restored before changing `DATABASE_URL`. Keep the old database read-only during the rollback window.
 4. Apply migrations once from the API pre-deploy hook (`alembic upgrade head`). Do not run schema migrations concurrently from every worker. Readiness now verifies both the vector extension and every AI Inbox table/column.
 5. Start the four queue-worker services and Gmail poller, then the API. Keep `AI_INBOX_ENABLED=false` until the shadow projection is ready.
+
+## Multi-Gmail preservation rollout
+
+Multi-Gmail is a staged rollout. Never enable it in the same deployment that
+applies migrations `20260830_0035` and `20260830_0036`.
+
+1. Pause releases and take a provider-managed database backup/snapshot. Verify
+   the snapshot is complete and perform the normal restore drill. Record its
+   immutable provider id.
+2. Deploy the schema and clients with `MULTI_GMAIL_ENABLED=false`,
+   `MULTI_GMAIL_WRITES_ENABLED=false`, `MULTI_GMAIL_AI_ENABLED=false`, and
+   `MULTI_GMAIL_VERIFIED_BACKUP_ID` empty. Migration 0035 creates one primary
+   Gmail account per current user, reusing the current user id, and only adds a
+   `gmail_account_id` to existing rows. Migration 0036 changes only the OAuth
+   credential key from the app user to that already-backfilled Gmail account;
+   it does not rewrite the encrypted primary token.
+   The API, worker, and poller database role must be `NOSUPERUSER
+   NOBYPASSRLS`. Production readiness intentionally fails when either
+   multi-account gate is enabled with a role that can bypass Gmail-account row
+   isolation.
+3. Run `python -m app.multi_account_check`. It must return JSON with `"ok":
+   true`; any unassigned message, thread, draft, action, sync, or AI row blocks
+   the rollout.
+4. Open the existing inbox on macOS and iOS and exercise inbox, thread reader,
+   draft, send, pending action, sync, and AI matter reads. Compare operational
+   counts to the pre-migration snapshot.
+5. Set `MULTI_GMAIL_VERIFIED_BACKUP_ID` to the verified provider snapshot id.
+   In an isolated staging environment, a later deployment may set
+   `MULTI_GMAIL_ENABLED=true` to test authenticated account linking. Keep the
+   write and AI gates disabled until the account importer reports `ready`. The linked
+   Gmail appears in Settings as `Linked — inbox setup pending`; it must not
+   enter the Inbox or AI Inbox picker until the account-scoped sync cutover is
+   complete. Keep the flag false in production during this intermediate stage.
+
+If any check differs, leave multi-Gmail disabled. The migration transaction
+rolls back automatically on an assignment or identifier mismatch. After a
+second Gmail is ever linked, do not deploy an older backend or downgrade the
+schema; use a forward fix or restore the verified database backup.
 6. Configure GitHub repository secrets `PRODUCTION_BACKEND_URL` and `PRODUCTION_OPS_BEARER_TOKEN`; the bearer must be an app session for an `OPS_ADMIN_EMAILS` account and must be rotated like any other privileged credential.
 7. Require `.github/workflows/verify-production-backend.yml` before release promotion. Railway's production `deployment_status=success` event starts the verifier, which waits for three consecutive exact-release snapshots across `/health`, `/ready`, and authenticated `/v1/ops/health`. It proves Postgres/schema readiness, zero dead/stale jobs, bounded queues, fresh heartbeats, all worker releases matching the API, and one or more instances of each exact fast, reader, slow, AI, and poller role. The ops endpoint remains authenticated; no public worker-readiness endpoint is added.
 8. Process the allowlisted user's latest 30 days into a shadow generation. Promote only after the AI Inbox precision, evidence, cost, latency, and zero-false-merge gates pass. Model, prompt, embedding, or threshold changes require a new shadow generation; never mutate an active projection in place.
