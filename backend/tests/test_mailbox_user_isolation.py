@@ -132,12 +132,18 @@ class MailboxUserIsolationTests(unittest.TestCase):
         self.assertEqual(response.json()["job_id"], "job-user-b")
         enqueue_sync.assert_called_once_with(mailbox_routes.settings, user_id="user-b")
 
-    def test_schema_keeps_gmail_messages_owned_by_user_and_message(self) -> None:
+    def test_schema_keeps_gmail_messages_owned_by_gmail_account_and_message(self) -> None:
         baseline = Path("backend/migrations/versions/20260514_0001_mail_groups_baseline.py").read_text()
+        account_migration = Path(
+            "backend/migrations/versions/20260830_0038_account_scoped_mail_ai.py"
+        ).read_text()
         repository = Path("backend/app/db/mail_groups.py").read_text()
 
         self.assertIn("PRIMARY KEY(user_id, message_id)", baseline)
-        self.assertIn("ON CONFLICT (user_id, message_id)", repository)
+        self.assertIn(
+            "PRIMARY KEY (gmail_account_id, message_id)", account_migration
+        )
+        self.assertIn("ON CONFLICT (gmail_account_id, message_id)", repository)
 
 
 if __name__ == "__main__":

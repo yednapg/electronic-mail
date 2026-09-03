@@ -39,6 +39,7 @@ from app.db.jobs import (
 from app.db.user_mail_guard import (
     UserMailWorkBlocked,
     exclusive_google_subject_lock,
+    shared_gmail_account_mail_lock,
     shared_user_mail_lock,
     update_connected_google_oauth_token,
 )
@@ -179,7 +180,13 @@ def build_google_service(
     return build(api, version, http=guarded_http, cache_discovery=False)
 
 
-def get_google_auth_url(settings: Settings, redirect_to: str | None = None) -> str:
+def get_google_auth_url(
+    settings: Settings,
+    redirect_to: str | None = None,
+    *,
+    intent: str = "login",
+    initiating_user_id: str | None = None,
+) -> str:
     """Build and persist a PKCE Google authorization URL."""
     flow = create_flow(settings)
     # Always show Google's account chooser before consent. Desktop browsers
@@ -191,13 +198,21 @@ def get_google_auth_url(settings: Settings, redirect_to: str | None = None) -> s
         prompt="select_account consent",
         include_granted_scopes="true",
     )
-    save_db_oauth_login_session(
-        str(settings.database_path),
-        state=state,
-        code_verifier=flow.code_verifier,
-        redirect_to=redirect_to,
-        expires_at=(datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
-    )
+    session_kwargs = {
+        "state": state,
+        "code_verifier": flow.code_verifier,
+        "redirect_to": redirect_to,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
+    }
+    if intent == "login" and initiating_user_id is None:
+        save_db_oauth_login_session(str(settings.database_path), **session_kwargs)
+    else:
+        save_db_oauth_login_session(
+            str(settings.database_path),
+            **session_kwargs,
+            intent=intent,
+            initiating_user_id=initiating_user_id,
+        )
     return authorization_url
 
 
@@ -268,6 +283,7 @@ def create_authorized_credentials(
     settings: Settings,
     *,
     user_id: str | None = None,
+    gmail_account_id: str | None = None,
     refresh_expired: bool = True,
     persist_updates: bool = True,
 ) -> Credentials | None:
@@ -279,13 +295,26 @@ def create_authorized_credentials(
             refresh_expired=refresh_expired,
             persist_updates=persist_updates,
         ).credentials
-    with shared_user_mail_lock(str(settings.database_path), user_id=user_id):
-        credentials = _load_authorized_credentials(
-            settings,
-            user_id=user_id,
-            refresh_expired=refresh_expired,
-            persist_updates=persist_updates,
-        ).credentials
+    if gmail_account_id is None:
+        from app.db.account_scope import active_gmail_account_id
+        gmail_account_id = active_gmail_account_id()
+    lock = (
+        shared_gmail_account_mail_lock(
+            str(settings.database_path), user_id=user_id,
+            gmail_account_id=gmail_account_id,
+        )
+        if gmail_account_id is not None
+        else shared_user_mail_lock(str(settings.database_path), user_id=user_id)
+    )
+    with lock:
+        kwargs = {
+            "user_id": user_id,
+            "refresh_expired": refresh_expired,
+            "persist_updates": persist_updates,
+        }
+        if gmail_account_id is not None:
+            kwargs["gmail_account_id"] = gmail_account_id
+        credentials = _load_authorized_credentials(settings, **kwargs).credentials
         if credentials is not None:
             setattr(
                 credentials,
@@ -310,6 +339,7 @@ def _load_authorized_credentials(
     settings: Settings,
     *,
     user_id: str | None,
+    gmail_account_id: str | None = None,
     refresh_expired: bool,
     persist_updates: bool,
 ) -> _CredentialLoadResult:
@@ -318,7 +348,11 @@ def _load_authorized_credentials(
 
     tokens: dict[str, object]
     if user_id is not None:
-        token_row = get_google_oauth_token(str(settings.database_path), user_id=user_id)
+        token_row = get_google_oauth_token(
+            str(settings.database_path),
+            user_id=user_id,
+            gmail_account_id=gmail_account_id,
+        )
         if token_row is None:
             return _credential_result(False, False)
         try:
@@ -390,7 +424,12 @@ def _load_authorized_credentials(
             refreshed_tokens = token_payload_from_credentials(credentials)
             if persist_updates:
                 try:
-                    persist_token_payload(settings, refreshed_tokens, user_id=user_id)
+                    persist_token_payload(
+                        settings,
+                        refreshed_tokens,
+                        user_id=user_id,
+                        gmail_account_id=gmail_account_id,
+                    )
                 except UserMailWorkBlocked:
                     revoke_google_token_payload(refreshed_tokens)
                     return _credential_result(False, False)
@@ -413,7 +452,12 @@ def _load_authorized_credentials(
 
     if persist_updates and normalized_tokens != tokens and refreshed_tokens is None:
         try:
-            persist_token_payload(settings, normalized_tokens, user_id=user_id)
+            persist_token_payload(
+                settings,
+                normalized_tokens,
+                user_id=user_id,
+                gmail_account_id=gmail_account_id,
+            )
         except UserMailWorkBlocked:
             return _credential_result(False, False)
 
@@ -445,15 +489,18 @@ def create_gmail_service(
     settings: Settings,
     *,
     user_id: str | None = None,
+    gmail_account_id: str | None = None,
     refresh_expired: bool = True,
     persist_updates: bool = True,
 ):
-    credentials = create_authorized_credentials(
-        settings,
-        user_id=user_id,
-        refresh_expired=refresh_expired,
-        persist_updates=persist_updates,
-    )
+    kwargs = {
+        "user_id": user_id,
+        "refresh_expired": refresh_expired,
+        "persist_updates": persist_updates,
+    }
+    if gmail_account_id is not None:
+        kwargs["gmail_account_id"] = gmail_account_id
+    credentials = create_authorized_credentials(settings, **kwargs)
     if credentials is None:
         raise GoogleCredentialsUnavailable("Google credentials are not connected")
     return build_google_service(
@@ -478,10 +525,20 @@ def _create_gmail_service_for_exclusive_cleanup(settings: Settings, *, user_id: 
     return build_google_service("gmail", "v1", credentials)
 
 
-def missing_google_scopes(settings: Settings, *, user_id: str, required_scopes: list[str] | None = None) -> list[str]:
+def missing_google_scopes(
+    settings: Settings,
+    *,
+    user_id: str,
+    gmail_account_id: str | None = None,
+    required_scopes: list[str] | None = None,
+) -> list[str]:
     """Return OAuth scopes absent from the persisted token payload."""
     required = required_scopes or [GMAIL_FULL_SCOPE]
-    token_row = get_google_oauth_token(str(settings.database_path), user_id=user_id)
+    token_row = get_google_oauth_token(
+        str(settings.database_path),
+        user_id=user_id,
+        gmail_account_id=gmail_account_id,
+    )
     if token_row is None:
         return required
     try:
@@ -1093,7 +1150,13 @@ def token_payload_from_credentials(credentials: Credentials) -> dict[str, object
     return payload
 
 
-def persist_token_payload(settings: Settings, tokens: dict[str, object], *, user_id: str | None) -> None:
+def persist_token_payload(
+    settings: Settings,
+    tokens: dict[str, object],
+    *,
+    user_id: str | None,
+    gmail_account_id: str | None = None,
+) -> None:
     if user_id is None:
         TOKEN_FILE_PATH.write_text(json.dumps(tokens, indent=2))
         return
@@ -1103,6 +1166,7 @@ def persist_token_payload(settings: Settings, tokens: dict[str, object], *, user
     update_connected_google_oauth_token(
         str(settings.database_path),
         user_id=user_id,
+        gmail_account_id=gmail_account_id,
         token_json_encrypted=encrypt_json(settings, tokens),
     )
 

@@ -315,19 +315,24 @@ def _google_auth_state(settings: Settings, *, user_id: str) -> GoogleAuthState:
 
 
 def enqueue_first_run(settings: Settings, *, user_id: str) -> str:
+    from app.db.account_scope import active_gmail_account_id
+    account_id = active_gmail_account_id() or user_id
     job = enqueue_job(
         str(settings.database_path),
         kind="gmail_import_batch",
         queue="critical",
         user_id=user_id,
-        dedupe_key=f"first-run:{user_id}",
+        gmail_account_id=account_id,
+        dedupe_key=f"first-run:{user_id}:{account_id}",
         priority=100,
-        payload={"user_id": user_id, "batch_size": FIRST_BATCH_SIZE, "first_run": True},
+        payload={"user_id": user_id, "gmail_account_id": account_id, "batch_size": FIRST_BATCH_SIZE, "first_run": True},
     )
     return job.id
 
 
 def enqueue_mailbox_sync(settings: Settings, *, user_id: str) -> str:
+    from app.db.account_scope import active_gmail_account_id
+    account_id = active_gmail_account_id() or user_id
     state = get_import_state(str(settings.database_path), user_id=user_id)
     if gmail_history_cursor_is_authoritative(state):
         job = enqueue_job(
@@ -335,9 +340,10 @@ def enqueue_mailbox_sync(settings: Settings, *, user_id: str) -> str:
             kind="gmail_delta_sync",
             queue="critical",
             user_id=user_id,
-            dedupe_key=f"gmail-delta-sync:{user_id}",
+            gmail_account_id=account_id,
+            dedupe_key=f"gmail-delta-sync:{user_id}:{account_id}",
             priority=85,
-            payload={"user_id": user_id, "batch_size": 100, "source": "manual"},
+            payload={"user_id": user_id, "gmail_account_id": account_id, "batch_size": 100, "source": "manual"},
         )
         ensure_background_import_work(settings, user_id=user_id)
         return job.id
@@ -347,9 +353,10 @@ def enqueue_mailbox_sync(settings: Settings, *, user_id: str) -> str:
         kind="gmail_import_batch",
         queue="default",
         user_id=user_id,
-        dedupe_key=f"mailbox-sync:{user_id}",
+        gmail_account_id=account_id,
+        dedupe_key=f"mailbox-sync:{user_id}:{account_id}",
         priority=20,
-        payload={"user_id": user_id, "batch_size": BACKFILL_BATCH_SIZE, "first_run": False},
+        payload={"user_id": user_id, "gmail_account_id": account_id, "batch_size": BACKFILL_BATCH_SIZE, "first_run": False},
     )
     ensure_background_import_work(settings, user_id=user_id)
     return job.id

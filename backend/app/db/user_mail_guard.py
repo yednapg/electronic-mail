@@ -89,7 +89,12 @@ def google_subject_lock_key(subject_hash: str) -> int:
     return _advisory_lock_key("google-subject", subject_hash)
 
 
-def guard_user_mail_write(connection: Connection, *, user_id: str) -> None:
+def guard_user_mail_write(
+    connection: Connection,
+    *,
+    user_id: str,
+    gmail_account_id: str | None = None,
+) -> None:
     """Serialize one transaction with destructive work, then re-check its durable guard."""
     _configure_advisory_lock_timeout(connection)
     try:
@@ -102,6 +107,16 @@ def guard_user_mail_write(connection: Connection, *, user_id: str) -> None:
             raise AdvisoryLockUnavailable(_LOCK_UNAVAILABLE_MESSAGE) from exc
         raise
     _require_user_mail_work_allowed(connection, user_id=user_id)
+    if gmail_account_id is not None:
+        _require_gmail_account_work_allowed(
+            connection,
+            user_id=user_id,
+            gmail_account_id=gmail_account_id,
+        )
+        connection.execute(
+            text("SELECT set_config('electronic_mail.gmail_account_id', :account_id, TRUE)"),
+            {"account_id": gmail_account_id},
+        )
     # The token-write trigger uses this transaction-local proof to distinguish
     # current guarded refreshes from writes issued by a drained older replica.
     connection.execute(
@@ -132,11 +147,50 @@ def _require_user_mail_work_allowed(connection: Connection, *, user_id: str) -> 
         raise UserMailWorkBlocked("Gmail-derived work is no longer allowed for this user")
 
 
+def _require_gmail_account_work_allowed(
+    connection: Connection,
+    *,
+    user_id: str,
+    gmail_account_id: str,
+) -> None:
+    allowed = connection.execute(
+        text(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM gmail_accounts AS account
+              JOIN google_oauth_tokens AS token
+                ON token.gmail_account_id = account.id
+               AND token.user_id = account.user_id
+              WHERE account.id = :gmail_account_id
+                AND account.user_id = :user_id
+                AND account.state IN ('importing', 'ready')
+                AND account.google_disconnected_at IS NULL
+                AND account.google_data_delete_requested_at IS NULL
+                AND account.google_data_deleted_at IS NULL
+            )
+            """
+        ),
+        {"user_id": user_id, "gmail_account_id": gmail_account_id},
+    ).scalar_one()
+    if not bool(allowed):
+        raise UserMailWorkBlocked("Gmail-derived work is no longer allowed for this account")
+
+
 @contextmanager
-def user_mail_write_transaction(engine: Engine, *, user_id: str) -> Iterator[Connection]:
+def user_mail_write_transaction(
+    engine: Engine,
+    *,
+    user_id: str,
+    gmail_account_id: str | None = None,
+) -> Iterator[Connection]:
     """Open a transaction that cannot commit across a disconnect or destructive purge."""
     with engine.begin() as connection:
-        guard_user_mail_write(connection, user_id=user_id)
+        guard_user_mail_write(
+            connection,
+            user_id=user_id,
+            gmail_account_id=gmail_account_id,
+        )
         yield connection
 
 
@@ -144,6 +198,7 @@ def update_connected_google_oauth_token(
     database_url: str,
     *,
     user_id: str,
+    gmail_account_id: str | None = None,
     token_json_encrypted: str,
 ) -> None:
     """Update an existing connected token without allowing refresh to recreate it."""
@@ -156,11 +211,16 @@ def update_connected_google_oauth_token(
                 SET token_json_encrypted = :token_json_encrypted,
                     updated_at = now()
                 WHERE user_id = :user_id
+                  AND gmail_account_id = COALESCE(
+                    :gmail_account_id,
+                    (SELECT primary_gmail_account_id FROM users WHERE id = :user_id)
+                  )
                 RETURNING user_id
                 """
             ),
             {
                 "user_id": user_id,
+                "gmail_account_id": gmail_account_id,
                 "token_json_encrypted": token_json_encrypted,
             },
         ).scalar_one_or_none()
@@ -333,6 +393,31 @@ def shared_user_mail_lock(database_url: str, *, user_id: str) -> Iterator[None]:
     ) as connection:
         _require_user_mail_work_allowed(connection, user_id=user_id)
         # End the guard-check transaction while retaining the session lock.
+        connection.commit()
+        yield
+
+
+@contextmanager
+def shared_gmail_account_mail_lock(
+    database_url: str,
+    *,
+    user_id: str,
+    gmail_account_id: str,
+) -> Iterator[None]:
+    """Drain-safe provider lock for exactly one Gmail account."""
+    with _advisory_lock_scope(
+        database_url,
+        locks=[
+            ("shared", user_mail_provider_lock_key(user_id)),
+            ("shared", user_mail_provider_lock_key(gmail_account_id)),
+        ],
+    ) as connection:
+        _require_user_mail_work_allowed(connection, user_id=user_id)
+        _require_gmail_account_work_allowed(
+            connection,
+            user_id=user_id,
+            gmail_account_id=gmail_account_id,
+        )
         connection.commit()
         yield
 

@@ -11,21 +11,23 @@ from threading import Lock
 from typing import Any, Iterable, Iterator
 from uuid import uuid4
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import NullPool
 
 from app.db.models import (
     StoredAppSession,
     StoredGoogleOAuthToken,
+    StoredGmailAccount,
     StoredMobileLoginCode,
     StoredMobileOAuthHandoff,
     StoredOAuthLoginSession,
     StoredUser,
 )
+from app.db.account_scope import gmail_account_scope
 
 DEFAULT_USER_ID = os.getenv("APP_USER_ID", "local-user").strip() or "local-user"
-ALEMBIC_HEAD_REVISION = "20260828_0034"
+ALEMBIC_HEAD_REVISION = "20260830_0041"
 ALEMBIC_BASELINE_REVISION = ALEMBIC_HEAD_REVISION
 POSTGRES_URL_PREFIXES = ("postgres://", "postgresql://")
 ADVISORY_LOCK_POOL_SIZE = 10
@@ -38,8 +40,31 @@ _ENGINES_LOCK = Lock()
 logger = logging.getLogger(__name__)
 
 
+def _install_account_scope_hook(engine: Engine) -> None:
+    """Copy the request/worker account scope into each new DB transaction."""
+    if not isinstance(engine, Engine):
+        return
+    from app.db.account_scope import active_gmail_account_id
+
+    @event.listens_for(engine, "begin")
+    def _set_account_scope(connection) -> None:
+        account_id = active_gmail_account_id() or ""
+        connection.exec_driver_sql(
+            "SELECT set_config('electronic_mail.gmail_account_id', %s, true)",
+            (account_id,),
+        )
+
+
 class IdentityConflictError(RuntimeError):
     """A verified Google principal conflicts with another stored account."""
+
+
+class GmailAccountLimitError(RuntimeError):
+    """The app user already owns the configured maximum Gmail accounts."""
+
+
+class GmailAccountOwnershipConflictError(RuntimeError):
+    """The verified Gmail identity belongs to another app user."""
 
 
 class RowAdapter:
@@ -149,6 +174,7 @@ def get_engine(database_path: str) -> Engine:
                 max_overflow=10,
                 pool_recycle=1800,
             )
+            _install_account_scope_hook(engine)
             _ENGINES[url] = engine
         return engine
 
@@ -297,18 +323,55 @@ def upsert_user(
         user_id = str(existing["id"]) if existing is not None else str(uuid4())
         created_at = str(existing["created_at"]) if existing is not None else now
         enabled = bool(existing["access_enabled"]) if existing is not None else access_enabled
+        is_new_user = existing is None
         connection.execute(
             """
-            INSERT INTO users (id, email, display_name, google_sub, access_enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            WITH upserted_user AS (
+            INSERT INTO users (
+              id, email, display_name, google_sub, access_enabled,
+              created_at, updated_at, primary_gmail_account_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               email = excluded.email,
               display_name = excluded.display_name,
               google_sub = excluded.google_sub,
               access_enabled = excluded.access_enabled,
               updated_at = excluded.updated_at
+            RETURNING *
+            ), upserted_gmail AS (
+            INSERT INTO gmail_accounts (
+              id, user_id, email, display_name, google_sub, state,
+              initial_ready_at, created_at, updated_at
+            )
+            SELECT id, id, email, display_name, google_sub, ?, ?, created_at, updated_at
+            FROM upserted_user
+            ON CONFLICT(id) DO UPDATE SET
+              email = excluded.email,
+              display_name = excluded.display_name,
+              google_sub = excluded.google_sub,
+              updated_at = excluded.updated_at
+            RETURNING id, user_id
+            )
+            INSERT INTO multi_account_migration_audits (
+              user_id, gmail_account_id, row_counts, identifier_checksums
+            )
+            SELECT user_id, id, '{}'::jsonb, '{}'::jsonb
+            FROM upserted_gmail
+            ON CONFLICT(user_id) DO NOTHING
             """,
-            (user_id, normalized_email, display_name, google_sub, enabled, created_at, now),
+            (
+                user_id,
+                normalized_email,
+                display_name,
+                google_sub,
+                enabled,
+                created_at,
+                now,
+                user_id,
+                "importing" if is_new_user else "ready",
+                None if is_new_user else created_at,
+            ),
         )
         row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     return _to_user(row)
@@ -322,10 +385,16 @@ def get_user(database_path: str, user_id: str) -> StoredUser | None:
 
 
 def get_user_by_google_subject(database_path: str, google_sub: str) -> StoredUser | None:
-    """Load an existing app user by Google's immutable subject identifier."""
+    """Load the app user that owns Google's immutable Gmail identity."""
     with connect(database_path) as connection:
         row = connection.execute(
-            "SELECT * FROM users WHERE google_sub = ? LIMIT 1",
+            """
+            SELECT owner.*
+            FROM gmail_accounts account
+            JOIN users owner ON owner.id = account.user_id
+            WHERE account.google_sub = ?
+            LIMIT 1
+            """,
             (google_sub.strip(),),
         ).fetchone()
     return _to_user(row) if row is not None else None
@@ -336,6 +405,323 @@ def get_user_by_email(database_path: str, email: str) -> StoredUser | None:
     with connect(database_path) as connection:
         row = connection.execute("SELECT * FROM users WHERE email = ? LIMIT 1", (email.strip().lower(),)).fetchone()
     return _to_user(row) if row is not None else None
+
+
+def list_gmail_accounts(database_path: str, *, user_id: str) -> list[StoredGmailAccount]:
+    """List visible Gmail accounts without ever combining mailbox data."""
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM gmail_accounts
+            WHERE user_id = ?
+              AND state <> 'deleting'
+            ORDER BY created_at ASC, id ASC
+            """,
+            (user_id,),
+        ).fetchall()
+    return [_to_gmail_account(row) for row in rows]
+
+
+def get_gmail_account_by_google_subject(
+    database_path: str,
+    *,
+    google_sub: str,
+) -> StoredGmailAccount | None:
+    """Resolve Google's immutable subject to its Gmail-account owner."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM gmail_accounts WHERE google_sub = ? LIMIT 1",
+            (google_sub.strip(),),
+        ).fetchone()
+    return _to_gmail_account(row) if row is not None else None
+
+
+def link_gmail_account(
+    database_path: str,
+    *,
+    user_id: str,
+    email: str,
+    google_sub: str,
+    display_name: str | None,
+    token_json_encrypted: str,
+    oauth_started_epoch: int,
+    max_accounts: int,
+) -> StoredGmailAccount:
+    """Atomically attach one verified Gmail identity and its credential.
+
+    The primary token row is never selected or updated here. A same-owner
+    identity is treated as an idempotent reauthorization of that exact Gmail
+    account; a different owner is a merge collision and is rejected.
+    """
+    normalized_email = email.strip().lower()
+    verified_sub = google_sub.strip()
+    if not normalized_email or not verified_sub:
+        raise ValueError("Verified Gmail email and Google subject are required")
+    now = utc_now_iso()
+    with connect(database_path) as connection:
+        connection.execute(
+            "SELECT set_config('electronic_mail.oauth_started_epoch', ?, TRUE)",
+            (str(oauth_started_epoch),),
+        )
+        owner = connection.execute(
+            "SELECT id FROM users WHERE id = ? FOR UPDATE",
+            (user_id,),
+        ).fetchone()
+        if owner is None:
+            raise ValueError("App user does not exist")
+
+        existing = connection.execute(
+            "SELECT * FROM gmail_accounts WHERE google_sub = ? FOR UPDATE",
+            (verified_sub,),
+        ).fetchone()
+        if existing is not None and str(existing["user_id"]) != user_id:
+            raise GmailAccountOwnershipConflictError(
+                "This Gmail account belongs to another Electronic Mail account"
+            )
+
+        if existing is None:
+            count_row = connection.execute(
+                """
+                SELECT COUNT(*) AS account_count
+                FROM gmail_accounts
+                WHERE user_id = ? AND state <> 'deleting'
+                """,
+                (user_id,),
+            ).fetchone()
+            if count_row is not None and int(count_row["account_count"]) >= max_accounts:
+                raise GmailAccountLimitError("Maximum Gmail account count reached")
+            gmail_account_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO gmail_accounts (
+                  id, user_id, email, display_name, google_sub, state,
+                  initial_ready_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'connecting', NULL, ?, ?)
+                """,
+                (
+                    gmail_account_id,
+                    user_id,
+                    normalized_email,
+                    display_name,
+                    verified_sub,
+                    now,
+                    now,
+                ),
+            )
+        else:
+            gmail_account_id = str(existing["id"])
+            connection.execute(
+                """
+                UPDATE gmail_accounts
+                SET email = ?,
+                    display_name = ?,
+                    state = CASE
+                      WHEN state = 'ready' THEN 'ready'
+                      WHEN state = 'importing' THEN 'importing'
+                      ELSE 'connecting'
+                    END,
+                    google_disconnected_at = NULL,
+                    google_data_delete_requested_at = NULL,
+                    google_data_deleted_at = NULL,
+                    updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (normalized_email, display_name, now, gmail_account_id, user_id),
+            )
+
+        connection.execute(
+            """
+            INSERT INTO google_oauth_tokens (
+              user_id, gmail_account_id, token_json_encrypted, updated_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(gmail_account_id) DO UPDATE SET
+              user_id = excluded.user_id,
+              token_json_encrypted = excluded.token_json_encrypted,
+              updated_at = excluded.updated_at
+            """,
+            (user_id, gmail_account_id, token_json_encrypted, now),
+        )
+        row = connection.execute(
+            "SELECT * FROM gmail_accounts WHERE id = ? AND user_id = ?",
+            (gmail_account_id, user_id),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("Failed to link Gmail account")
+    return _to_gmail_account(row)
+
+
+def get_gmail_account(
+    database_path: str,
+    *,
+    user_id: str,
+    gmail_account_id: str,
+) -> StoredGmailAccount | None:
+    """Load one Gmail account only when it belongs to the app user."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM gmail_accounts
+            WHERE id = ? AND user_id = ?
+            LIMIT 1
+            """,
+            (gmail_account_id, user_id),
+        ).fetchone()
+    return _to_gmail_account(row) if row is not None else None
+
+
+def mark_gmail_account_ready(
+    database_path: str,
+    *,
+    user_id: str,
+    gmail_account_id: str,
+) -> StoredGmailAccount:
+    """Publish an owned Gmail account after its isolated credential is verified."""
+    now = utc_now_iso()
+    with connect(database_path) as connection:
+        row = connection.execute(
+            """
+            UPDATE gmail_accounts
+            SET state = 'ready',
+                initial_ready_at = COALESCE(initial_ready_at, ?),
+                updated_at = ?
+            WHERE id = ? AND user_id = ?
+              AND state IN ('connecting', 'importing', 'ready')
+            RETURNING *
+            """,
+            (now, now, gmail_account_id, user_id),
+        ).fetchone()
+    if row is None:
+        raise ValueError("Gmail account is not available for setup")
+    return _to_gmail_account(row)
+
+
+def mark_gmail_account_ready_if_imported(
+    database_path: str,
+    *,
+    user_id: str,
+    gmail_account_id: str,
+) -> StoredGmailAccount | None:
+    """Publish an account only after its account-scoped import is durable."""
+    now = utc_now_iso()
+    with gmail_account_scope(gmail_account_id):
+        with connect(database_path) as connection:
+            row = connection.execute(
+                """
+                UPDATE gmail_accounts AS account
+                SET state = 'ready',
+                    initial_ready_at = COALESCE(account.initial_ready_at, ?),
+                    updated_at = ?
+                FROM gmail_import_state AS import_state
+                WHERE account.id = ?
+                  AND account.user_id = ?
+                  AND account.state IN ('importing', 'ready')
+                  AND import_state.gmail_account_id = account.id
+                  AND import_state.user_id = account.user_id
+                  AND import_state.first_batch_imported_at IS NOT NULL
+                  AND import_state.initial_window_complete
+                  AND NULLIF(import_state.last_history_id, '') IS NOT NULL
+                RETURNING account.*
+                """,
+                (now, now, gmail_account_id, user_id),
+            ).fetchone()
+    return _to_gmail_account(row) if row is not None else None
+
+
+def mark_gmail_account_importing(
+    database_path: str,
+    *,
+    user_id: str,
+    gmail_account_id: str,
+) -> StoredGmailAccount:
+    """Keep a linked account out of write/AI presentation until import is durable."""
+    now = utc_now_iso()
+    with connect(database_path) as connection:
+        row = connection.execute(
+            """
+            UPDATE gmail_accounts
+            SET state='importing', initial_ready_at=NULL, updated_at=?
+            WHERE id=? AND user_id=? AND state IN ('connecting','importing','ready')
+            RETURNING *
+            """,
+            (now, gmail_account_id, user_id),
+        ).fetchone()
+    if row is None:
+        raise ValueError("Gmail account cannot begin importing")
+    return _to_gmail_account(row)
+
+
+def gmail_account_import_ready(
+    database_path: str,
+    *,
+    user_id: str,
+    gmail_account_id: str,
+) -> bool:
+    """Return whether this account has a durable initial window and sync cursor."""
+    with gmail_account_scope(gmail_account_id):
+        with connect(database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1
+                  FROM gmail_import_state
+                  WHERE user_id = ?
+                    AND gmail_account_id = ?
+                    AND first_batch_imported_at IS NOT NULL
+                    AND initial_window_complete
+                    AND NULLIF(last_history_id, '') IS NOT NULL
+                )
+                """,
+                (user_id, gmail_account_id),
+            ).fetchone()
+    return bool(row[0]) if row is not None else False
+
+
+def mark_gmail_account_reauth_required(
+    database_path: str,
+    *,
+    user_id: str,
+    gmail_account_id: str,
+) -> StoredGmailAccount:
+    """Pause only the credential that failed; never disconnect sibling Gmail accounts."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            """
+            UPDATE gmail_accounts
+            SET state = 'reauth_required', updated_at = ?
+            WHERE id = ? AND user_id = ?
+            RETURNING *
+            """,
+            (utc_now_iso(), gmail_account_id, user_id),
+        ).fetchone()
+    if row is None:
+        raise LookupError("Gmail account not found")
+    return _to_gmail_account(row)
+
+
+def multi_account_migration_verified(database_path: str, *, user_id: str) -> bool:
+    """Return whether preservation checks passed for the user's old inbox."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM multi_account_migration_audits audit
+              JOIN users u
+                ON u.id = audit.user_id
+               AND u.primary_gmail_account_id = audit.gmail_account_id
+              JOIN gmail_accounts ga
+                ON ga.id = audit.gmail_account_id
+               AND ga.user_id = audit.user_id
+              WHERE audit.user_id = ?
+            ) AS verified
+            """,
+            (user_id,),
+        ).fetchone()
+    return bool(row["verified"]) if row is not None else False
 
 
 def is_allowed_email(database_path: str, email: str) -> bool | None:
@@ -426,25 +812,38 @@ def save_oauth_login_session(
     code_verifier: str,
     redirect_to: str | None,
     expires_at: str,
+    intent: str = "login",
+    initiating_user_id: str | None = None,
 ) -> None:
     """Persist an OAuth PKCE login session keyed by state."""
     with connect(database_path) as connection:
         connection.execute(
             """
             INSERT INTO oauth_login_sessions (
-              state, code_verifier, redirect_to, expires_at, created_at, started_epoch
+              state, code_verifier, redirect_to, expires_at, created_at,
+              started_epoch, intent, initiating_user_id
             )
             VALUES (
-              ?, ?, ?, ?, clock_timestamp(), nextval('google_identity_event_epoch_seq')
+              ?, ?, ?, ?, clock_timestamp(),
+              nextval('google_identity_event_epoch_seq'), ?, ?
             )
             ON CONFLICT(state) DO UPDATE SET
               code_verifier = excluded.code_verifier,
               redirect_to = excluded.redirect_to,
               expires_at = excluded.expires_at,
               created_at = excluded.created_at,
-              started_epoch = excluded.started_epoch
+              started_epoch = excluded.started_epoch,
+              intent = excluded.intent,
+              initiating_user_id = excluded.initiating_user_id
             """,
-            (state, code_verifier, redirect_to, expires_at),
+            (
+                state,
+                code_verifier,
+                redirect_to,
+                expires_at,
+                intent,
+                initiating_user_id,
+            ),
         )
 
 
@@ -680,9 +1079,11 @@ def upsert_google_oauth_token(
     user_id: str,
     token_json_encrypted: str,
     oauth_started_epoch: int | None = None,
+    gmail_account_id: str | None = None,
 ) -> StoredGoogleOAuthToken:
-    """Persist encrypted Google OAuth credentials for a user."""
+    """Persist encrypted Google OAuth credentials for one Gmail account."""
     now = utc_now_iso()
+    account_id = gmail_account_id or user_id
     with connect(database_path) as connection:
         if oauth_started_epoch is not None:
             connection.execute(
@@ -691,15 +1092,21 @@ def upsert_google_oauth_token(
             )
         connection.execute(
             """
-            INSERT INTO google_oauth_tokens (user_id, token_json_encrypted, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
+            INSERT INTO google_oauth_tokens (
+              user_id, gmail_account_id, token_json_encrypted, updated_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(gmail_account_id) DO UPDATE SET
+              user_id = excluded.user_id,
               token_json_encrypted = excluded.token_json_encrypted,
               updated_at = excluded.updated_at
             """,
-            (user_id, token_json_encrypted, now),
+            (user_id, account_id, token_json_encrypted, now),
         )
-        row = connection.execute("SELECT * FROM google_oauth_tokens WHERE user_id = ?", (user_id,)).fetchone()
+        row = connection.execute(
+            "SELECT * FROM google_oauth_tokens WHERE gmail_account_id = ?",
+            (account_id,),
+        ).fetchone()
     return _to_google_oauth_token(row)
 
 
@@ -709,9 +1116,11 @@ def reconnect_google_oauth_token(
     user_id: str,
     token_json_encrypted: str,
     oauth_started_epoch: int,
+    gmail_account_id: str | None = None,
 ) -> StoredGoogleOAuthToken:
-    """Atomically clear deletion guards and persist a newer OAuth grant."""
+    """Atomically clear primary-account guards and persist a newer OAuth grant."""
     now = utc_now_iso()
+    account_id = gmail_account_id or user_id
     with connect(database_path) as connection:
         connection.execute(
             "SELECT set_config('electronic_mail.oauth_started_epoch', ?, TRUE)",
@@ -730,34 +1139,84 @@ def reconnect_google_oauth_token(
         )
         connection.execute(
             """
-            INSERT INTO google_oauth_tokens (user_id, token_json_encrypted, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
+            INSERT INTO google_oauth_tokens (
+              user_id, gmail_account_id, token_json_encrypted, updated_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(gmail_account_id) DO UPDATE SET
+              user_id = excluded.user_id,
               token_json_encrypted = excluded.token_json_encrypted,
               updated_at = excluded.updated_at
             """,
-            (user_id, token_json_encrypted, now),
+            (user_id, account_id, token_json_encrypted, now),
         )
         row = connection.execute(
-            "SELECT * FROM google_oauth_tokens WHERE user_id = ?",
-            (user_id,),
+            "SELECT * FROM google_oauth_tokens WHERE gmail_account_id = ?",
+            (account_id,),
         ).fetchone()
     if row is None:
         raise RuntimeError("Failed to persist Google OAuth credentials")
     return _to_google_oauth_token(row)
 
 
-def get_google_oauth_token(database_path: str, *, user_id: str) -> StoredGoogleOAuthToken | None:
-    """Load encrypted Google OAuth credentials for a user."""
+def get_google_oauth_token(
+    database_path: str,
+    *,
+    user_id: str,
+    gmail_account_id: str | None = None,
+) -> StoredGoogleOAuthToken | None:
+    """Load credentials for an owned Gmail account, defaulting to primary."""
     with connect(database_path) as connection:
-        row = connection.execute("SELECT * FROM google_oauth_tokens WHERE user_id = ?", (user_id,)).fetchone()
+        if gmail_account_id is None:
+            row = connection.execute(
+                """
+                SELECT token.*
+                FROM users owner
+                JOIN google_oauth_tokens token
+                  ON token.gmail_account_id = owner.primary_gmail_account_id
+                 AND token.user_id = owner.id
+                WHERE owner.id = ?
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM google_oauth_tokens
+                WHERE user_id = ? AND gmail_account_id = ?
+                LIMIT 1
+                """,
+                (user_id, gmail_account_id),
+            ).fetchone()
     return _to_google_oauth_token(row) if row is not None else None
 
 
-def delete_google_oauth_token(database_path: str, *, user_id: str) -> None:
-    """Remove stored Google OAuth credentials for one user."""
+def delete_google_oauth_token(
+    database_path: str,
+    *,
+    user_id: str,
+    gmail_account_id: str | None = None,
+) -> None:
+    """Remove one owned Gmail credential, defaulting to the primary account."""
     with connect(database_path) as connection:
-        connection.execute("DELETE FROM google_oauth_tokens WHERE user_id = ?", (user_id,))
+        if gmail_account_id is None:
+            connection.execute(
+                """
+                DELETE FROM google_oauth_tokens token
+                USING users owner
+                WHERE owner.id = ?
+                  AND token.user_id = owner.id
+                  AND token.gmail_account_id = owner.primary_gmail_account_id
+                """,
+                (user_id,),
+            )
+        else:
+            connection.execute(
+                "DELETE FROM google_oauth_tokens WHERE user_id = ? AND gmail_account_id = ?",
+                (user_id, gmail_account_id),
+            )
 
 
 def record_google_subject_revocation(
@@ -813,6 +1272,29 @@ def _to_user(row: RowAdapter) -> StoredUser:
         access_enabled=bool(row["access_enabled"]),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+        primary_gmail_account_id=(
+            str(row["primary_gmail_account_id"])
+            if "primary_gmail_account_id" in row.keys()
+            else str(row["id"])
+        ),
+    )
+
+
+def _to_gmail_account(row: RowAdapter) -> StoredGmailAccount:
+    return StoredGmailAccount(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        email=str(row["email"]),
+        display_name=str(row["display_name"]) if row["display_name"] is not None else None,
+        google_sub=str(row["google_sub"]),
+        state=str(row["state"]),
+        initial_ready_at=(
+            str(row["initial_ready_at"])
+            if row["initial_ready_at"] is not None
+            else None
+        ),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
     )
 
 
@@ -837,6 +1319,12 @@ def _to_oauth_login_session(row: RowAdapter) -> StoredOAuthLoginSession:
         expires_at=str(row["expires_at"]),
         created_at=str(row["created_at"]),
         started_epoch=int(row["started_epoch"]),
+        intent=str(row["intent"]),
+        initiating_user_id=(
+            str(row["initiating_user_id"])
+            if row["initiating_user_id"] is not None
+            else None
+        ),
     )
 
 
@@ -869,6 +1357,7 @@ def _to_mobile_oauth_handoff(row: RowAdapter) -> StoredMobileOAuthHandoff:
 def _to_google_oauth_token(row: RowAdapter) -> StoredGoogleOAuthToken:
     return StoredGoogleOAuthToken(
         user_id=str(row["user_id"]),
+        gmail_account_id=str(row["gmail_account_id"]),
         token_json_encrypted=str(row["token_json_encrypted"]),
         updated_at=str(row["updated_at"]),
     )

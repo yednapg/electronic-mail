@@ -134,7 +134,7 @@ class ExistingAccountProgressiveUpgradeTests(unittest.TestCase):
         self.assertIs(state, projected)
         sql = "\n".join(statement for statement, _params in connection.calls)
         self.assertIn("ROW_NUMBER() OVER", sql)
-        self.assertIn("ON CONFLICT (user_id, generation_id, gmail_thread_id) DO NOTHING", sql)
+        self.assertIn("ON CONFLICT (gmail_account_id, generation_id, gmail_thread_id) DO NOTHING", sql)
         self.assertIn("initial_window_complete = TRUE", sql)
         mutating_sql = "\n".join(
             statement

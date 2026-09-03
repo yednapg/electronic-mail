@@ -16,6 +16,24 @@ class StoredUser:
     access_enabled: bool
     created_at: str
     updated_at: str
+    # Legacy fixtures predate the additive ownership column. Runtime rows
+    # always provide it after migration 0035.
+    primary_gmail_account_id: str = ""
+
+
+@dataclass
+class StoredGmailAccount:
+    """One independently-scoped Gmail mailbox owned by an app user."""
+
+    id: str
+    user_id: str
+    email: str
+    display_name: str | None
+    google_sub: str
+    state: str
+    initial_ready_at: str | None
+    created_at: str
+    updated_at: str
 
 
 @dataclass
@@ -42,6 +60,8 @@ class StoredOAuthLoginSession:
     expires_at: str
     created_at: str
     started_epoch: int
+    intent: str = "login"
+    initiating_user_id: str | None = None
 
 
 @dataclass
@@ -72,8 +92,9 @@ class StoredMobileOAuthHandoff:
 
 @dataclass
 class StoredGoogleOAuthToken:
-    """Encrypted Google OAuth credentials for one app user."""
+    """Encrypted Google OAuth credentials for one Gmail account."""
 
     user_id: str
+    gmail_account_id: str
     token_json_encrypted: str
     updated_at: str

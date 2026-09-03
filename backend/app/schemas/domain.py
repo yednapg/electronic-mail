@@ -32,6 +32,14 @@ QueuedThreadActionState = Literal["queued", "applying", "applied", "failed"]
 MailSendState = Literal["queued", "sending", "sent", "failed", "reauth_required"]
 MailboxLabel = Literal["inbox", "sent", "drafts", "spam", "trash", "archive", "starred", "all"]
 JobStatus = Literal["queued", "running", "succeeded", "failed"]
+GmailAccountState = Literal[
+    "connecting",
+    "importing",
+    "ready",
+    "reauth_required",
+    "disconnected",
+    "deleting",
+]
 ThreadMessageReaderMarkerKind = Literal["external_warning", "classification"]
 
 class SourceRecord(BaseModel):
@@ -142,6 +150,39 @@ class AuthMeResponse(BaseModel):
 
     authenticated: bool
     user: AuthUserResponse | None = None
+
+
+class GmailAccountResponse(BaseModel):
+    """Safe account metadata; mailbox content is fetched separately per id."""
+
+    id: str
+    email: str
+    display_name: str | None = None
+    state: GmailAccountState
+    is_primary: bool
+    initial_ready_at: str | None = None
+
+
+class GmailAccountsResponse(BaseModel):
+    """Account picker/settings state for the authenticated app account."""
+
+    multi_account_enabled: bool
+    migration_verified: bool
+    max_accounts: int
+    primary_gmail_account_id: str
+    accounts: list[GmailAccountResponse] = Field(default_factory=list)
+
+
+class GmailAccountLinkStartRequest(BaseModel):
+    """Native callback used after an authenticated Gmail-link OAuth flow."""
+
+    redirect_to: str = Field(min_length=1, max_length=2048)
+
+
+class GmailAccountLinkStartResponse(BaseModel):
+    """Google authorization URL bound to the current app user."""
+
+    authorization_url: str
 
 
 class MobileSessionExchangeRequest(BaseModel):
@@ -286,6 +327,7 @@ class QueuedThreadActionRequest(BaseModel):
 class QueuedThreadActionResponse(BaseModel):
     """Queued/applied state for an offline-capable mailbox action."""
 
+    gmail_account_id: str | None = None
     client_action_id: str
     server_action_id: str
     mailbox_thread_id: str
@@ -366,6 +408,7 @@ class MailDraftSaveRequest(BaseModel):
 class MailDraftResponse(BaseModel):
     """Current durable identity and save state for a Gmail draft."""
 
+    gmail_account_id: str | None = None
     client_draft_id: str
     gmail_draft_id: str | None = None
     gmail_message_id: str | None = None
@@ -403,6 +446,7 @@ class MailDraftAttachment(BaseModel):
 class MailSendResponse(BaseModel):
     """Durable send status returned to native compose/reply UI."""
 
+    gmail_account_id: str | None = None
     client_send_id: str
     server_send_id: str | None = None
     mailbox_thread_id: str | None = None
@@ -576,11 +620,13 @@ class MailboxResponse(BaseModel):
     history_metadata_complete: bool | None = None
     history_body_complete: bool | None = None
     last_progress_at: str | None = None
+    account_warnings: list[str] = Field(default_factory=list)
 
 
 class MailboxSyncStateResponse(BaseModel):
     """Current local Gmail sync/watch status for UI cache reconciliation."""
 
+    gmail_account_id: str | None = None
     connected: bool
     last_history_id: str | None = None
     last_full_sync_at: str | None = None

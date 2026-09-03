@@ -40,6 +40,7 @@ class BackgroundJob:
     started_at: str | None
     completed_at: str | None
     updated_at: str
+    gmail_account_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ def enqueue_job(
     kind: str,
     payload: dict[str, Any] | None = None,
     user_id: str | None = None,
+    gmail_account_id: str | None = None,
     dedupe_key: str | None = None,
     queue: str = "default",
     priority: int = 0,
@@ -72,8 +74,16 @@ def enqueue_job(
     job_id = str(uuid4())
     payload_json = json.dumps(payload or {}, ensure_ascii=True)
     run_after_seconds = max(0, int(run_after_seconds))
+    if gmail_account_id is None:
+        from app.db.account_scope import active_gmail_account_id
+        gmail_account_id = active_gmail_account_id()
+    resolved_gmail_account_id = gmail_account_id or user_id
     transaction = (
-        user_mail_write_transaction(engine, user_id=user_id)
+        user_mail_write_transaction(
+            engine,
+            user_id=user_id,
+            gmail_account_id=resolved_gmail_account_id,
+        )
         if user_id is not None
         else engine.begin()
     )
@@ -83,12 +93,14 @@ def enqueue_job(
                 text(
                     """
                     SELECT * FROM background_jobs
-                    WHERE kind = :kind AND dedupe_key = :dedupe_key AND status IN ('queued', 'running')
+                    WHERE gmail_account_id IS NOT DISTINCT FROM :gmail_account_id
+                      AND kind = :kind AND dedupe_key = :dedupe_key
+                      AND status IN ('queued', 'running')
                     ORDER BY created_at DESC
                     LIMIT 1
                     """
                 ),
-                {"kind": kind, "dedupe_key": dedupe_key},
+                {"gmail_account_id": resolved_gmail_account_id, "kind": kind, "dedupe_key": dedupe_key},
             ).mappings().first()
             if existing is not None:
                 if str(existing["status"]) == "queued":
@@ -127,11 +139,13 @@ def enqueue_job(
             text(
                 """
                 INSERT INTO background_jobs (
-                  id, kind, queue, status, user_id, dedupe_key, priority, payload_version,
-                  payload_json, max_attempts, run_after, created_at, updated_at
+                  id, kind, queue, status, user_id, gmail_account_id,
+                  dedupe_key, priority, payload_version, payload_json,
+                  max_attempts, run_after, created_at, updated_at
                 ) VALUES (
-                  :id, :kind, :queue, 'queued', :user_id, :dedupe_key, :priority, :payload_version,
-                  :payload_json, :max_attempts, now() + (:run_after_seconds * interval '1 second'), now(), now()
+                  :id, :kind, :queue, 'queued', :user_id, :gmail_account_id,
+                  :dedupe_key, :priority, :payload_version, :payload_json,
+                  :max_attempts, now() + (:run_after_seconds * interval '1 second'), now(), now()
                 )
                 ON CONFLICT DO NOTHING
                 RETURNING *
@@ -142,6 +156,7 @@ def enqueue_job(
                 "kind": kind,
                 "queue": queue,
                 "user_id": user_id,
+                "gmail_account_id": resolved_gmail_account_id,
                 "dedupe_key": dedupe_key,
                 "priority": priority,
                 "payload_version": payload_version,
@@ -155,12 +170,14 @@ def enqueue_job(
                 text(
                     """
                     SELECT * FROM background_jobs
-                    WHERE kind = :kind AND dedupe_key = :dedupe_key AND status IN ('queued', 'running')
+                    WHERE gmail_account_id IS NOT DISTINCT FROM :gmail_account_id
+                      AND kind = :kind AND dedupe_key = :dedupe_key
+                      AND status IN ('queued', 'running')
                     ORDER BY created_at DESC
                     LIMIT 1
                     """
                 ),
-                {"kind": kind, "dedupe_key": dedupe_key},
+                {"gmail_account_id": resolved_gmail_account_id, "kind": kind, "dedupe_key": dedupe_key},
             ).mappings().first()
         if row is None:
             raise RuntimeError("Job enqueue failed")
@@ -653,6 +670,11 @@ def _job_from_row(row) -> BackgroundJob:
         queue=str(row["queue"]),
         status=str(row["status"]),
         user_id=str(row["user_id"]) if row["user_id"] is not None else None,
+        gmail_account_id=(
+            str(row["gmail_account_id"])
+            if "gmail_account_id" in row.keys() and row["gmail_account_id"] is not None
+            else None
+        ),
         dedupe_key=str(row["dedupe_key"]) if row["dedupe_key"] is not None else None,
         priority=int(row["priority"]),
         payload_version=int(row["payload_version"]),

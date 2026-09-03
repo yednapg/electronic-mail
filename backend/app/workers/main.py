@@ -25,13 +25,18 @@ from app.db.jobs import (
     renew_heartbeat,
     retry_backoff_seconds,
 )
-from app.db.repository import get_user_by_email
+from app.db.repository import (
+    get_user_by_email,
+    mark_gmail_account_ready_if_imported,
+    mark_gmail_account_reauth_required,
+)
 from app.db.mail_groups import (
     gmail_history_cursor_is_authoritative,
     mark_google_disconnected,
     mark_import_error,
 )
 from app.db.user_mail_guard import UserMailWorkBlocked
+from app.db.account_scope import gmail_account_scope
 from app.services.gmail_importer import (
     GMAIL_SEARCH_MAX_PAGES,
     refresh_gmail_thread_order,
@@ -46,6 +51,10 @@ from app.services.integrations.google import retry_encrypted_google_token_revoca
 from app.services.mailbox_events import DASHBOARD_CHANGED, MAILBOX_CHANGED, MAILBOX_SYNC_PROGRESS, emit_mailbox_event
 from app.services.mailbox_actions import rollback_failed_thread_action, run_pending_thread_action
 from app.services.mailbox_sends import run_pending_send
+from app.services.account_mailbox_writes import (
+    deliver_pending_action as deliver_account_pending_action,
+    deliver_pending_send as deliver_account_pending_send,
+)
 from app.services.mailbox_search import run_mailbox_search_hydration
 from app.services.mail_groups import (
     MAILBOX_REBUILD_LIMIT,
@@ -163,7 +172,22 @@ def _run_worker_cycle(settings, *, worker_id: str, queues: list[str], heartbeat_
     )
     heartbeat_thread.start()
     try:
-        _run_job(settings, job)
+        account_id = getattr(job, "gmail_account_id", None) or job.payload.get("gmail_account_id") or job.user_id
+        if isinstance(account_id, str) and account_id:
+            with gmail_account_scope(account_id):
+                _run_job(settings, job)
+                job_user_id = job.payload.get("user_id") or job.user_id
+                if (
+                    job.kind in _PROGRESSIVE_GMAIL_JOB_KINDS
+                    and isinstance(job_user_id, str)
+                ):
+                    mark_gmail_account_ready_if_imported(
+                        database_url,
+                        user_id=job_user_id,
+                        gmail_account_id=account_id,
+                    )
+        else:
+            _run_job(settings, job)
         complete_job(database_url, job.id, worker_id=worker_id)
     except UserMailWorkBlocked:
         cancel_claimed_job(database_url, job.id, worker_id=worker_id)
@@ -268,18 +292,35 @@ def _mark_gmail_reauthorization_required(settings, *, job, exc: BaseException) -
     database_url = str(settings.database_path)
     error = safe_google_error(exc, operation="mail sync")
     try:
-        mark_google_disconnected(database_url, user_id=user_id)
-        mark_import_error(database_url, user_id=user_id, error=error)
-        emit_mailbox_event(
-            settings,
-            user_id=user_id,
-            event_type=MAILBOX_SYNC_PROGRESS,
-            payload={
-                "source": "gmail_authorization",
-                "phase": "failed",
-                "reauthorization_required": True,
-            },
-        )
+        account_id = getattr(job, "gmail_account_id", None) or job.payload.get("gmail_account_id")
+        is_secondary = isinstance(account_id, str) and account_id and account_id != user_id
+        if is_secondary:
+            mark_gmail_account_reauth_required(
+                database_url, user_id=user_id, gmail_account_id=account_id,
+            )
+            with gmail_account_scope(account_id):
+                mark_import_error(database_url, user_id=user_id, error=error)
+                emit_mailbox_event(
+                    settings, user_id=user_id, event_type=MAILBOX_SYNC_PROGRESS,
+                    payload={
+                        "source": "gmail_authorization", "phase": "failed",
+                        "reauthorization_required": True,
+                        "gmail_account_id": account_id,
+                    },
+                )
+        else:
+            mark_google_disconnected(database_url, user_id=user_id)
+            mark_import_error(database_url, user_id=user_id, error=error)
+            emit_mailbox_event(
+                settings,
+                user_id=user_id,
+                event_type=MAILBOX_SYNC_PROGRESS,
+                payload={
+                    "source": "gmail_authorization",
+                    "phase": "failed",
+                    "reauthorization_required": True,
+                },
+            )
     except Exception as state_error:
         logger.warning(
             "gmail.authorization_state_failed",
@@ -459,6 +500,28 @@ def _run_job(settings, job) -> None:
         if not isinstance(user_id, str):
             raise RuntimeError("gmail_send_message missing user_id")
         run_pending_send(settings, user_id=user_id, server_send_id=str(payload.get("server_send_id") or ""))
+        return
+    if job.kind == "gmail_account_send_message":
+        gmail_account_id = getattr(job, "gmail_account_id", None)
+        if not isinstance(user_id, str) or not gmail_account_id:
+            raise RuntimeError("gmail_account_send_message missing account scope")
+        deliver_account_pending_send(
+            settings,
+            user_id=user_id,
+            gmail_account_id=gmail_account_id,
+            server_send_id=str(payload.get("server_send_id") or ""),
+        )
+        return
+    if job.kind == "gmail_account_thread_action":
+        gmail_account_id = getattr(job, "gmail_account_id", None)
+        if not isinstance(user_id, str) or not gmail_account_id:
+            raise RuntimeError("gmail_account_thread_action missing account scope")
+        deliver_account_pending_action(
+            settings,
+            user_id=user_id,
+            gmail_account_id=gmail_account_id,
+            server_action_id=str(payload.get("server_action_id") or ""),
+        )
         return
     if job.kind == "ai_message_organize":
         if not isinstance(user_id, str):

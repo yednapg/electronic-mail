@@ -129,6 +129,35 @@ class GmailWorkerRetryWiringTests(unittest.TestCase):
         )
         self.assertIsNone(worker._job_queue_wait_ms("invalid", None))
 
+    def test_successful_import_job_promotes_only_its_durable_account(self) -> None:
+        job = _job(kind="gmail_import_batch", attempt_count=1)
+        job.gmail_account_id = "gmail-2"
+        job.payload["gmail_account_id"] = "gmail-2"
+        settings = SimpleNamespace(
+            database_path="postgresql://example/db",
+            release_sha="release-1",
+        )
+        with (
+            patch.object(worker, "renew_heartbeat"),
+            patch.object(worker, "claim_job", return_value=job),
+            patch.object(worker, "_run_job"),
+            patch.object(worker, "complete_job", return_value=True),
+            patch.object(worker, "mark_gmail_account_ready_if_imported") as promote,
+        ):
+            worked = worker._run_worker_cycle(
+                settings,
+                worker_id="worker-1",
+                queues=["critical"],
+                heartbeat_interval=30,
+            )
+
+        self.assertTrue(worked)
+        promote.assert_called_once_with(
+            "postgresql://example/db",
+            user_id="user-1",
+            gmail_account_id="gmail-2",
+        )
+
     def test_worker_passes_gmail_retry_after_to_failure_transition(self) -> None:
         job = _job(kind="gmail_delta_sync", attempt_count=1)
         settings = SimpleNamespace(

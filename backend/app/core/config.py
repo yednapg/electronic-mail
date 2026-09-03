@@ -76,6 +76,11 @@ class Settings:
     gmail_pubsub_push_audience: str
     gmail_pubsub_push_service_account_email: str
     gmail_watch_renewal_hours: int
+    multi_gmail_enabled: bool
+    multi_gmail_writes_enabled: bool
+    multi_gmail_ai_enabled: bool
+    multi_gmail_max_accounts: int
+    multi_gmail_verified_backup_id: str
     google_client_id: str
     google_client_secret: str
     google_redirect_uri: str
@@ -178,6 +183,19 @@ class Settings:
 
         if self.gmail_watch_renewal_hours < 1:
             errors.append("GMAIL_WATCH_RENEWAL_HOURS must be greater than 0")
+
+        if not 1 <= self.multi_gmail_max_accounts <= 5:
+            errors.append("MULTI_GMAIL_MAX_ACCOUNTS must be between 1 and 5")
+
+        if self.multi_gmail_enabled and not self.multi_gmail_verified_backup_id:
+            errors.append(
+                "MULTI_GMAIL_VERIFIED_BACKUP_ID is required before multi-Gmail can be enabled"
+            )
+
+        if (self.multi_gmail_writes_enabled or self.multi_gmail_ai_enabled) and not self.multi_gmail_enabled:
+            errors.append(
+                "MULTI_GMAIL_ENABLED must be true before account writes or account AI can be enabled"
+            )
 
         if not self.database_url.startswith(("postgres://", "postgresql://")):
             errors.append("DATABASE_URL must be Postgres. SQLite is no longer supported.")
@@ -357,6 +375,16 @@ def load_settings() -> Settings:
         gmail_pubsub_push_audience=os.getenv("GMAIL_PUBSUB_PUSH_AUDIENCE", "").strip().strip("\"'"),
         gmail_pubsub_push_service_account_email=os.getenv("GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL", "").strip().strip("\"'").lower(),
         gmail_watch_renewal_hours=int(os.getenv("GMAIL_WATCH_RENEWAL_HOURS", "24")),
+        multi_gmail_enabled=_resolve_boolean("MULTI_GMAIL_ENABLED", default=False),
+        multi_gmail_writes_enabled=_resolve_boolean(
+            "MULTI_GMAIL_WRITES_ENABLED",
+            default=_resolve_boolean("MULTI_GMAIL_ENABLED", default=False),
+        ),
+        multi_gmail_ai_enabled=_resolve_boolean("MULTI_GMAIL_AI_ENABLED", default=False),
+        multi_gmail_max_accounts=int(os.getenv("MULTI_GMAIL_MAX_ACCOUNTS", "5")),
+        multi_gmail_verified_backup_id=os.getenv(
+            "MULTI_GMAIL_VERIFIED_BACKUP_ID", ""
+        ).strip().strip("\"'"),
         google_client_id=os.getenv("GOOGLE_CLIENT_ID", "").strip().strip("\"'"),
         google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET", "").strip().strip("\"'"),
         google_redirect_uri=os.getenv(
