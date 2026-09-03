@@ -72,9 +72,15 @@
     "release:macos:beta:github:publish": "python3 scripts/publish_macos_beta.py publish",
     "release:macos:validate": "bash scripts/release-macos.sh --validate-inputs",
     "release:macos": "bash scripts/release-macos.sh",
+    "macos:local-signed:validate": "bash scripts/install-macos-local-signed.sh --validate-inputs",
+    "macos:local-signed:install": "bash scripts/install-macos-local-signed.sh",
+    "macos:local-signed:test": "python3 -m unittest scripts/tests/test_macos_local_signed_policy.py",
+    "macos:local-self-signed:validate": "bash scripts/install-macos-local-self-signed.sh --validate-inputs",
+    "macos:local-self-signed:install": "bash scripts/install-macos-local-self-signed.sh",
+    "macos:local-self-signed:test": "python3 -m unittest scripts/tests/test_macos_local_self_signed_policy.py",
     "verify": "npm run verify:macos",
     "verify:macos": "npm run macos:typecheck && npm run macos:test",
-    "verify:all": "npm run reproducibility:verify && npm run reproducibility:verify:test && npm run release:macos:beta:test && npm run verify:macos && npm run backend:test && npm run backend:compile && npm run database:scripts:test && npm run web:typecheck && npm run web:test && npm run web:build && npm run web:verify:assets:test && npm run web:verify:assets && npm run launch:verify:test && npm run security:audit"
+    "verify:all": "npm run reproducibility:verify && npm run reproducibility:verify:test && npm run release:macos:beta:test && npm run macos:local-signed:test && npm run macos:local-self-signed:test && npm run verify:macos && npm run backend:test && npm run backend:compile && npm run database:scripts:test && npm run web:typecheck && npm run web:test && npm run web:build && npm run web:verify:assets:test && npm run web:verify:assets && npm run launch:verify:test && npm run security:audit"
   },
   "overrides": {
     "postcss": "8.5.23",

@@ -19,6 +19,7 @@ SOURCE_BETA_ENTITLEMENTS="$ROOT_DIR/macos/ElectronicMail/Config/Entitlements/Ele
 SOURCE_PRIVACY_MANIFEST="$ROOT_DIR/macos/ElectronicMail/ElectronicMail/Mac/PrivacyInfo.xcprivacy"
 SOURCE_RELEASE_INFO="$ROOT_DIR/macos/ElectronicMail/Config/InfoPlists/ElectronicMail-Release-Info.plist"
 SOURCE_BETA_INFO="$ROOT_DIR/macos/ElectronicMail/Config/InfoPlists/ElectronicMail-Beta-Info.plist"
+SOURCE_LOCAL_SIGNED_INFO="$ROOT_DIR/macos/ElectronicMail/Config/InfoPlists/ElectronicMail-LocalSigned-Info.plist"
 SOURCE_PROJECT_MANIFEST="$ROOT_DIR/macos/ElectronicMail/Project.swift"
 SOURCE_XCODE_PROJECT="$ROOT_DIR/macos/ElectronicMail/ElectronicMail.xcodeproj/project.pbxproj"
 SOURCE_DEMO_CLIENT="$ROOT_DIR/macos/ElectronicMail/ElectronicMail/Core/DemoAppClient.swift"
@@ -33,18 +34,18 @@ fail() {
 [ -n "$EXPECTED_VERSION" ] || fail "EXPECTED_VERSION is required"
 [ -n "$EXPECTED_BUILD_NUMBER" ] || fail "EXPECTED_BUILD_NUMBER is required"
 [ -n "$EXPECTED_SOURCE_COMMIT" ] || fail "EXPECTED_SOURCE_COMMIT is required"
-if [ "$EXPECTED_SOURCE_COMMIT" != "local" ] && [[ ! "$EXPECTED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
-  fail "EXPECTED_SOURCE_COMMIT must be 'local' or a full lowercase 40- or 64-character Git commit SHA"
+if [ "$EXPECTED_SOURCE_COMMIT" != "local" ] && [ "$EXPECTED_SOURCE_COMMIT" != "local-working-tree" ] && [[ ! "$EXPECTED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+  fail "EXPECTED_SOURCE_COMMIT must be a permitted local marker or a full lowercase 40- or 64-character Git commit SHA"
 fi
 case "$SIGNING_MODE" in
   identity-free | developer-id) ;;
   *) fail "SIGNING_MODE must be identity-free or developer-id" ;;
 esac
 case "$INFO_POLICY" in
-  production | local-beta) ;;
-  *) fail "INFO_POLICY must be production or local-beta" ;;
+  production | local-beta | local-signed) ;;
+  *) fail "INFO_POLICY must be production, local-beta, or local-signed" ;;
 esac
-if [ "$INFO_POLICY" = "production" ]; then
+if [ "$INFO_POLICY" = "production" ] || [ "$INFO_POLICY" = "local-signed" ]; then
   EXPECTED_BUNDLE_ID=app.electronicmail.mac
 else
   EXPECTED_BUNDLE_ID=app.electronicmail.mac.beta
@@ -60,6 +61,12 @@ esac
 if [ "$SIGNING_MODE" = "developer-id" ]; then
   [ -n "$EXPECTED_TEAM_ID" ] || fail "EXPECTED_TEAM_ID is required for Developer ID verification"
   [ "$EXPECTED_SOURCE_COMMIT" != "local" ] || fail "Developer ID artifacts must be bound to a Git commit, not the local development marker"
+  if [ "$INFO_POLICY" = "production" ] && [ "$EXPECTED_SOURCE_COMMIT" = "local-working-tree" ]; then
+    fail "production Developer ID artifacts must be bound to a Git commit"
+  fi
+  if [ "$INFO_POLICY" != "local-signed" ] && [ "$EXPECTED_SOURCE_COMMIT" = "local-working-tree" ]; then
+    fail "the local-working-tree marker is permitted only for the local-signed policy"
+  fi
 fi
 if [ "$REQUIRE_NOTARIZATION" = "1" ] && [ "$SIGNING_MODE" != "developer-id" ]; then
   fail "notarization cannot be required for an identity-free artifact"
@@ -69,6 +76,9 @@ if [ "$REQUIRE_ADHOC_SIGNATURE" = "1" ] && [ "$SIGNING_MODE" != "identity-free" 
 fi
 if [ "$REQUIRE_ADHOC_SIGNATURE" = "1" ] && [ "$INFO_POLICY" != "local-beta" ]; then
   fail "an ad-hoc signature can be required only for the local-beta policy"
+fi
+if [ "$INFO_POLICY" = "local-signed" ] && [ "$SIGNING_MODE" != "developer-id" ]; then
+  fail "the local-signed policy requires a Developer ID signature"
 fi
 
 for command in codesign grep lipo plutil python3 xcrun; do
@@ -106,6 +116,7 @@ plutil -lint "$SOURCE_BETA_ENTITLEMENTS" >/dev/null
 plutil -lint "$SOURCE_PRIVACY_MANIFEST" >/dev/null
 plutil -lint "$SOURCE_RELEASE_INFO" >/dev/null
 plutil -lint "$SOURCE_BETA_INFO" >/dev/null
+plutil -lint "$SOURCE_LOCAL_SIGNED_INFO" >/dev/null
 plutil -lint "$INFO_PLIST" >/dev/null
 plutil -lint "$PRIVACY_MANIFEST" >/dev/null
 plutil -lint "$FRAMEWORK_INFO_PLIST" >/dev/null
@@ -150,7 +161,7 @@ if [ -n "$DSYM_PATH" ]; then
   [ "$EXECUTABLE_UUIDS" = "$DSYM_UUIDS" ] || fail "dSYM UUIDs do not match the packaged executable"
 fi
 
-python3 - "$SOURCE_ENTITLEMENTS" "$SOURCE_BETA_ENTITLEMENTS" "$SOURCE_PRIVACY_MANIFEST" "$SOURCE_RELEASE_INFO" "$SOURCE_BETA_INFO" "$SOURCE_PROJECT_MANIFEST" "$SOURCE_XCODE_PROJECT" "$SOURCE_DEMO_CLIENT" "$PRIVACY_MANIFEST" "$FRAMEWORK_PRIVACY_MANIFEST" "$INFO_PLIST" "$INFO_POLICY" <<'PY'
+python3 - "$SOURCE_ENTITLEMENTS" "$SOURCE_BETA_ENTITLEMENTS" "$SOURCE_PRIVACY_MANIFEST" "$SOURCE_RELEASE_INFO" "$SOURCE_BETA_INFO" "$SOURCE_LOCAL_SIGNED_INFO" "$SOURCE_PROJECT_MANIFEST" "$SOURCE_XCODE_PROJECT" "$SOURCE_DEMO_CLIENT" "$PRIVACY_MANIFEST" "$FRAMEWORK_PRIVACY_MANIFEST" "$INFO_PLIST" "$INFO_POLICY" <<'PY'
 import plistlib
 import re
 import sys
@@ -161,6 +172,7 @@ import sys
     source_privacy_path,
     source_release_info_path,
     source_beta_info_path,
+    source_local_signed_info_path,
     source_project_manifest_path,
     source_xcode_project_path,
     source_demo_client_path,
@@ -270,8 +282,9 @@ require(
 
 source_release_info = load(source_release_info_path)
 source_beta_info = load(source_beta_info_path)
+source_local_signed_info = load(source_local_signed_info_path)
 packaged_info = load(packaged_info_path)
-for label, source_info in (("Release", source_release_info), ("Beta", source_beta_info)):
+for label, source_info in (("Release", source_release_info), ("Beta", source_beta_info), ("Local signed", source_local_signed_info)):
     require(source_info.get("BackendBaseURL") == "$(ELECTRONIC_MAIL_BACKEND_URL)", f"{label} Info.plist must use backend build-setting injection")
     require(source_info.get("ElectronicMailSourceCommit") == "$(ELECTRONIC_MAIL_SOURCE_COMMIT)", f"{label} Info.plist must use source-commit build-setting injection")
 
@@ -285,8 +298,12 @@ expected_beta_ats = {
     }
 }
 require(source_beta_info.get("NSAppTransportSecurity") == expected_beta_ats, "Beta Info.plist must contain only the exact localhost HTTP exception")
+require(source_local_signed_info.get("NSAppTransportSecurity") == expected_beta_ats, "Local-signed Info.plist must contain only the exact localhost HTTP exception")
 require(source_beta_info.get("ElectronicMailDistributionChannel") == "local-testing-beta", "Beta Info.plist must identify the local-testing distribution channel")
 require(source_beta_info.get("ElectronicMailNotarized") is False, "Beta Info.plist must explicitly mark the app as unnotarized")
+require(source_local_signed_info.get("ElectronicMailDistributionChannel") == "local-developer-id", "Local-signed Info.plist must identify the Developer ID channel")
+require(source_local_signed_info.get("ElectronicMailNotarized") is False, "Local-signed Info.plist must explicitly mark the app as unnotarized")
+require(source_local_signed_info.get("CFBundleDisplayName") == "Electronic Mail", "Local-signed Info.plist must preserve the production display name")
 beta_url_types = source_beta_info.get("CFBundleURLTypes")
 require(
     isinstance(beta_url_types, list)
@@ -309,6 +326,11 @@ elif info_policy == "local-beta":
     require(packaged_info.get("ElectronicMailDistributionChannel") == "local-testing-beta", "packaged beta app is missing its local-testing marker")
     require(packaged_info.get("ElectronicMailNotarized") is False, "packaged beta app must explicitly say it is unnotarized")
     require(packaged_info.get("CFBundleDisplayName") == "Electronic Mail Beta", "packaged beta app must have a conspicuous beta display name")
+elif info_policy == "local-signed":
+    require(packaged_info.get("NSAppTransportSecurity") == expected_beta_ats, "packaged local-signed app must contain only the exact localhost HTTP exception")
+    require(packaged_info.get("ElectronicMailDistributionChannel") == "local-developer-id", "packaged local-signed app is missing its Developer ID marker")
+    require(packaged_info.get("ElectronicMailNotarized") is False, "packaged local-signed app must explicitly say it is unnotarized")
+    require(packaged_info.get("CFBundleDisplayName") == "Electronic Mail", "packaged local-signed app must preserve the production display name")
 else:
     raise SystemExit(f"unsupported Info.plist policy: {info_policy}")
 require(any("electronicmail" in item.get("CFBundleURLSchemes", []) for item in packaged_info.get("CFBundleURLTypes", [])), "OAuth callback URL scheme is missing")

@@ -1,5 +1,7 @@
 # macOS direct-distribution release
 
+For a stable Developer-ID-signed replacement that connects only to the local backend, use [MACOS_LOCAL_SIGNED.md](MACOS_LOCAL_SIGNED.md). That lane preserves the production app identity but is not a notarized distribution artifact.
+
 Electronic Mail ships as a native macOS app. The web project remains a supporting surface for OAuth completion and the public privacy, terms, and support pages; it is not the product UI.
 
 In production, the web service returns `404` for `/gmail`, `/dashboard`, their nested routes, and the legacy web BFF under `/api`. The legacy UI remains reachable only in a non-production developer runtime for fixtures and regression tests. The public home page must direct users to the installed Mac app, and `/post-login` exists only to confirm a completed browser OAuth flow and send the user back to the app.
