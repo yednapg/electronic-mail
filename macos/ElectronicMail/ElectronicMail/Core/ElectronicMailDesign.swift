@@ -150,7 +150,13 @@ public enum ElectronicMailControlMetrics {
     /// Launch, sign-in, and mailbox preparation stay in a deliberately compact
     /// centered window before the ready inbox unfolds into the main workspace.
     public static let onboardingWindowWidth: CGFloat = 680
-    public static let onboardingWindowHeight: CGFloat = 520
+    public static let onboardingWindowHeight: CGFloat = 440
+    /// Setup failures wrap inside a readable measure instead of expanding the
+    /// onboarding stack beyond the compact launch window.
+    public static let setupErrorTextMaxWidth: CGFloat = 420
+    /// Retry is a compact macOS action, not a primary onboarding call to
+    /// action. Its label remains comfortably clickable without a large pill.
+    public static let setupRetryHeight: CGFloat = 28
     public static let mainWindowWidth: CGFloat = 1512
     public static let mainWindowHeight: CGFloat = 918
     public static let mainWindowBackdropInset: CGFloat = 24
@@ -176,8 +182,9 @@ public enum ElectronicMailControlMetrics {
     /// Mailbox compose and search controls form a tighter pair than the
     /// independent controls used on the other shell surfaces.
     public static let mailboxHeaderControlGap: CGFloat = headerControlGap / 2
-    /// Mailbox trailing controls align with the inbox date column.
-    public static let mailboxHeaderTrailingInset: CGFloat = headerTitleLeading
+    /// Mailbox trailing controls mirror the leading utility control's outer
+    /// inset instead of following the inset message-date column.
+    public static let mailboxHeaderTrailingInset: CGFloat = trailingInset
     /// The first mailbox section begins at the scroll viewport's clipping
     /// boundary. Later sections retain separation from the rows above them.
     public static let mailboxFirstSectionTopSpacing: CGFloat = 0

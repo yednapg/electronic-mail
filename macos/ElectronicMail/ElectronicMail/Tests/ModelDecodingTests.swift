@@ -155,7 +155,9 @@ final class ModelDecodingTests: XCTestCase {
 
     func testSharedMacControlRolesRemainConsistent() {
         XCTAssertEqual(ElectronicMailControlMetrics.onboardingWindowWidth, 680)
-        XCTAssertEqual(ElectronicMailControlMetrics.onboardingWindowHeight, 520)
+        XCTAssertEqual(ElectronicMailControlMetrics.onboardingWindowHeight, 440)
+        XCTAssertEqual(ElectronicMailControlMetrics.setupErrorTextMaxWidth, 420)
+        XCTAssertEqual(ElectronicMailControlMetrics.setupRetryHeight, 28)
         XCTAssertEqual(ElectronicMailControlMetrics.mainWindowWidth, 1512)
         XCTAssertEqual(ElectronicMailControlMetrics.mainWindowHeight, 918)
         XCTAssertEqual(ElectronicMailControlMetrics.mainWindowBackdropInset, 24)
@@ -176,7 +178,7 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(ElectronicMailControlMetrics.mailboxHeaderIconOpacity, 0.50)
         XCTAssertEqual(ElectronicMailControlMetrics.headerControlGap, 32)
         XCTAssertEqual(ElectronicMailControlMetrics.mailboxHeaderControlGap, 16)
-        XCTAssertEqual(ElectronicMailControlMetrics.mailboxHeaderTrailingInset, 100)
+        XCTAssertEqual(ElectronicMailControlMetrics.mailboxHeaderTrailingInset, 32)
         XCTAssertEqual(ElectronicMailControlMetrics.mailboxFirstSectionTopSpacing, 0)
         XCTAssertEqual(ElectronicMailControlMetrics.mailboxSectionTopSpacing, 24)
         XCTAssertEqual(ElectronicMailControlMetrics.mailboxScrollFadeHeight, 64)
@@ -434,7 +436,7 @@ final class ModelDecodingTests: XCTestCase {
         let policy = KeychainSessionTokenStore.classicMacLocalTestingPolicyAttributes
 
         XCTAssertNil(policy[kSecUseDataProtectionKeychain as String])
-        XCTAssertEqual(policy[kSecAttrSynchronizable as String] as? Bool, false)
+        XCTAssertNil(policy[kSecAttrSynchronizable as String])
         XCTAssertNil(policy[kSecAttrAccessible as String])
         XCTAssertTrue(KeychainSessionTokenStore.classicMacFallbackEnabled)
         XCTAssertTrue(
@@ -449,10 +451,137 @@ final class ModelDecodingTests: XCTestCase {
                 debugBuild: true
             )
         )
+        XCTAssertTrue(
+            KeychainSessionTokenStore.shouldRetryClassicMacReadInteractively(
+                for: errSecInteractionNotAllowed,
+                localBuild: true
+            )
+        )
+        XCTAssertTrue(
+            KeychainSessionTokenStore.shouldRetryClassicMacReadInteractively(
+                for: errSecAuthFailed,
+                localBuild: true
+            )
+        )
+        XCTAssertTrue(
+            KeychainSessionTokenStore.shouldRetryClassicMacReadInteractively(
+                for: errSecItemNotFound,
+                localBuild: true
+            )
+        )
+        XCTAssertFalse(
+            KeychainSessionTokenStore.shouldRetryClassicMacReadInteractively(
+                for: errSecInteractionNotAllowed,
+                localBuild: false
+            )
+        )
     }
 
     func testGenerationKeychainServiceIsStableAcrossBuilds() {
         XCTAssertEqual(KeychainSessionTokenStore.generationService, "ElectronicMail.session.v2")
+    }
+
+    func testGenerationAccountRoundTripsForLocalRecovery() {
+        let mutation = SessionTokenMutation(
+            generationID: "recoverable-generation",
+            ordinal: 42,
+            kind: .token
+        )
+
+        XCTAssertEqual(
+            KeychainSessionTokenStore.mutation(
+                fromAccount: KeychainSessionTokenStore.account(for: mutation)
+            ),
+            mutation
+        )
+        XCTAssertNil(KeychainSessionTokenStore.mutation(fromAccount: "session.v2.invalid"))
+    }
+
+    func testMissingLocalLedgerRecoversHighestCommittedKeychainToken() throws {
+        let originalDefaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let replacementDefaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore()
+        let cleanupQueue = DispatchQueue(label: "test.session-token.cleanup.local-ledger-recovery")
+        let originalStore = KeychainSessionTokenStore(
+            defaults: originalDefaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        try originalStore.save("preserved-session")
+        cleanupQueue.sync {}
+
+        let replacementStore = KeychainSessionTokenStore(
+            defaults: replacementDefaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+
+        XCTAssertEqual(replacementStore.load(), "preserved-session")
+        XCTAssertEqual(replacementStore.load(), "preserved-session")
+    }
+
+    func testMissingLocalLedgerHonorsHighestCommittedTombstone() throws {
+        let originalDefaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let replacementDefaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore()
+        let cleanupQueue = DispatchQueue(
+            label: "test.session-token.cleanup.local-tombstone-recovery",
+            attributes: .initiallyInactive
+        )
+        let originalStore = KeychainSessionTokenStore(
+            defaults: originalDefaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        try originalStore.save("signed-in-session")
+        originalStore.clear()
+
+        let replacementStore = KeychainSessionTokenStore(
+            defaults: replacementDefaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+
+        XCTAssertNil(replacementStore.load())
+        cleanupQueue.activate()
+    }
+
+    func testExplicitLocalRepairReplacesAccidentalUncommittedTombstone() throws {
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore()
+        let cleanupQueue = DispatchQueue(label: "test.session-token.cleanup.explicit-local-repair")
+        let store = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        try store.save("preserved-session")
+        _ = try store.prepareMutation(.tombstone)
+        XCTAssertNil(store.load())
+
+        XCTAssertTrue(store.repairLatestLocalSession())
+        XCTAssertEqual(store.load(), "preserved-session")
+    }
+
+    func testExplicitLocalRepairRestoresNewestTokenBeforeAccidentalPersistedTombstone() throws {
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore()
+        let cleanupQueue = DispatchQueue(
+            label: "test.session-token.cleanup.explicit-persisted-tombstone-repair",
+            attributes: .initiallyInactive
+        )
+        let store = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        try store.save("preserved-session")
+        store.clear()
+        XCTAssertNil(store.load())
+
+        XCTAssertTrue(store.repairLatestLocalSession())
+        XCTAssertEqual(store.load(), "preserved-session")
+        cleanupQueue.activate()
     }
 
     func testAsyncSessionTokenStoreReturnsImmediateTokenOffMainThread() async {
@@ -720,6 +849,47 @@ final class ModelDecodingTests: XCTestCase {
         )
         XCTAssertNil(relaunchedStore.load())
         XCTAssertTrue(records.containsGenerationValue("older-session"))
+    }
+
+    func testStableSigningMigrationCopiesExactDesiredGenerationBeforeDeletingClassicRecord() throws {
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore()
+        let cleanupQueue = DispatchQueue(label: "test.session-token.cleanup.stable-signing-migration")
+        let store = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        let mutation = try XCTUnwrap(store.prepareMutation(.token))
+        let account = KeychainSessionTokenStore.account(for: mutation)
+        records.seedMigratableGeneration(Data("preserved-session".utf8), account: account)
+
+        XCTAssertEqual(store.load(), "preserved-session")
+        cleanupQueue.sync {}
+        XCTAssertEqual(records.readGenerationRecord(account: account), Data("preserved-session".utf8))
+        XCTAssertFalse(records.containsMigratableGeneration(account: account))
+        XCTAssertEqual(records.migratableDeletionAccounts, [account])
+        XCTAssertNil(store.lastLoadFailureMessage)
+    }
+
+    func testStableSigningMigrationFailureKeepsClassicRecordAndSurfacesRecoveryMessage() throws {
+        let defaults = UserDefaults.ephemeralTokenStoreDefaults()
+        let records = GenerationSessionTokenRecordTestStore(generationWriteError: .status(errSecAuthFailed))
+        let cleanupQueue = DispatchQueue(label: "test.session-token.cleanup.failed-stable-signing-migration")
+        let store = KeychainSessionTokenStore(
+            defaults: defaults,
+            records: records,
+            cleanupQueue: cleanupQueue
+        )
+        let mutation = try XCTUnwrap(store.prepareMutation(.token))
+        let account = KeychainSessionTokenStore.account(for: mutation)
+        records.seedMigratableGeneration(Data("preserved-session".utf8), account: account)
+
+        XCTAssertNil(store.load())
+        XCTAssertTrue(records.containsMigratableGeneration(account: account))
+        XCTAssertTrue(records.migratableDeletionAccounts.isEmpty)
+        XCTAssertNil(records.readGenerationRecord(account: account))
+        XCTAssertTrue(store.lastLoadFailureMessage?.contains("were not removed") == true)
     }
 
     func testPendingSignOutTombstoneSurvivesRelaunch() throws {
@@ -2496,31 +2666,44 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertFalse(destinations.map(\.title).contains("Calendar"))
     }
 
-    func testAIReaderChromeSummaryUsesCollapseAndExpansionHysteresis() {
-        XCTAssertEqual(AIReaderChromeScrollPolicy.collapseThreshold, 32)
-        XCTAssertEqual(AIReaderChromeScrollPolicy.expandThreshold, 8)
+    func testAIReaderChromeSummaryCollapsesAfterReadingBegins() {
         XCTAssertFalse(
             AIReaderChromeScrollPolicy.isSummaryCollapsed(
                 currentlyCollapsed: false,
-                scrollDistance: 31
+                scrollDistance: 0
             )
         )
         XCTAssertTrue(
             AIReaderChromeScrollPolicy.isSummaryCollapsed(
                 currentlyCollapsed: false,
-                scrollDistance: 32
+                scrollDistance: AIReaderChromeScrollPolicy.collapseDistance
             )
         )
         XCTAssertTrue(
             AIReaderChromeScrollPolicy.isSummaryCollapsed(
                 currentlyCollapsed: true,
-                scrollDistance: 9
+                scrollDistance: 0
+            )
+        )
+    }
+
+    func testAIReaderSummaryVisibilitySupportsAlwaysShowAndOff() {
+        XCTAssertTrue(
+            AIReaderSummaryPresentationPolicy.shouldPresent(
+                mode: .always,
+                summary: "Always visible"
             )
         )
         XCTAssertFalse(
-            AIReaderChromeScrollPolicy.isSummaryCollapsed(
-                currentlyCollapsed: true,
-                scrollDistance: 8
+            AIReaderSummaryPresentationPolicy.shouldPresent(
+                mode: .off,
+                summary: "Hidden"
+            )
+        )
+        XCTAssertFalse(
+            AIReaderSummaryPresentationPolicy.shouldPresent(
+                mode: .always,
+                summary: "   "
             )
         )
     }
@@ -2966,6 +3149,85 @@ final class ModelDecodingTests: XCTestCase {
 
         XCTAssertEqual(try GoogleOAuthService.loginCode(from: url), "abc123")
         XCTAssertEqual(GoogleOAuthService.handoffID(from: url), "handoff-1")
+    }
+
+    func testGoogleOAuthServiceParsesLinkedGmailAccountWithoutLoginCode() throws {
+        let url = try XCTUnwrap(
+            URL(
+                string: "electronicmail://auth/callback?status=linked&gmail_account_id=gmail-2"
+            )
+        )
+
+        XCTAssertEqual(try GoogleOAuthService.linkedAccountID(from: url), "gmail-2")
+    }
+
+    func testGoogleOAuthServiceFiltersAccountLinkCallbacks() throws {
+        let loginCallback = try XCTUnwrap(
+            URL(string: "electronicmail://auth/callback?login_code=login-1")
+        )
+        let linkedCallback = try XCTUnwrap(
+            URL(
+                string: "electronicmail://auth/callback?status=linked&gmail_account_id=gmail-2"
+            )
+        )
+
+        XCTAssertNil(
+            try GoogleOAuthService.linkedAccountIDIfLinkCallback(from: loginCallback)
+        )
+        XCTAssertEqual(
+            try GoogleOAuthService.linkedAccountIDIfLinkCallback(from: linkedCallback),
+            "gmail-2"
+        )
+    }
+
+    func testGoogleOAuthServiceTreatsCancelledAccountLinkAsCancellation() throws {
+        let callback = try XCTUnwrap(
+            URL(string: "electronicmail://auth/callback?status=cancelled")
+        )
+
+        XCTAssertThrowsError(
+            try GoogleOAuthService.linkedAccountIDIfLinkCallback(from: callback)
+        ) { error in
+            XCTAssertEqual(error as? OAuthError, .authenticationCancelled)
+        }
+    }
+
+    @MainActor
+    func testCancellingAccountLinkClearsPendingURLWithoutChangingAccounts() async {
+        let authorizationURL = URL(string: "https://accounts.example.test/authorize")!
+        let authorizeStarted = expectation(description: "Authorization started")
+        let store = GmailAccountSettingsStore(
+            client: DemoAppClient(),
+            startAccountLink: { _ in
+                GmailAccountLinkStartResponse(authorizationURL: authorizationURL)
+            }
+        )
+        await store.load()
+        let accountsBeforeLink = store.response?.accounts
+
+        let linkTask = Task { @MainActor in
+            await store.addAccount { receivedURL in
+                XCTAssertEqual(receivedURL, authorizationURL)
+                authorizeStarted.fulfill()
+                try await Task.sleep(nanoseconds: 60_000_000_000)
+                return DemoAppFixtures.userID
+            }
+        }
+
+        await fulfillment(of: [authorizeStarted], timeout: 1)
+        XCTAssertTrue(store.isLinkingAccount)
+        XCTAssertEqual(store.pendingAuthorizationURL, authorizationURL)
+
+        linkTask.cancel()
+        await linkTask.value
+
+        XCTAssertFalse(store.isLinkingAccount)
+        XCTAssertNil(store.pendingAuthorizationURL)
+        XCTAssertEqual(store.response?.accounts, accountsBeforeLink)
+        XCTAssertEqual(
+            store.linkNotice,
+            "Adding Gmail account was cancelled. Your current inbox was not changed."
+        )
     }
 
     func testGoogleOAuthServiceBuildsVerifierBoundHandoffRedirect() throws {
@@ -4219,21 +4481,26 @@ private final class GenerationSessionTokenRecordTestStore: SessionTokenSecureRec
     private let lock = NSLock()
     private var didEnterBlockedOperation = false
     private var generationRecords: [String: Data] = [:]
+    private var migratableGenerationRecords: [String: Data] = [:]
     private var legacyRecord: Data?
     private var writeValues: [String] = []
     private var writeAccounts: [String] = []
     private var writeMainThreadFlags: [Bool] = []
+    private var deletedMigratableAccounts: [String] = []
+    private let generationWriteError: KeychainError?
 
     init(
         legacyToken: String? = nil,
         blockedOperation: BlockedOperation? = nil,
         started: XCTestExpectation? = nil,
-        finished: XCTestExpectation? = nil
+        finished: XCTestExpectation? = nil,
+        generationWriteError: KeychainError? = nil
     ) {
         legacyRecord = legacyToken.map { Data($0.utf8) }
         self.blockedOperation = blockedOperation
         self.started = started
         self.finished = finished
+        self.generationWriteError = generationWriteError
     }
 
     var generationWriteValues: [String] {
@@ -4252,6 +4519,24 @@ private final class GenerationSessionTokenRecordTestStore: SessionTokenSecureRec
         lock.lock()
         defer { lock.unlock() }
         return writeMainThreadFlags
+    }
+
+    var migratableDeletionAccounts: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return deletedMigratableAccounts
+    }
+
+    func seedMigratableGeneration(_ data: Data, account: String) {
+        lock.lock()
+        migratableGenerationRecords[account] = data
+        lock.unlock()
+    }
+
+    func containsMigratableGeneration(account: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return migratableGenerationRecords[account] != nil
     }
 
     func containsGenerationValue(_ value: String) -> Bool {
@@ -4275,6 +4560,9 @@ private final class GenerationSessionTokenRecordTestStore: SessionTokenSecureRec
             releaseSemaphore.wait()
             finished?.fulfill()
         }
+        if let generationWriteError {
+            throw generationWriteError
+        }
         lock.lock()
         if generationRecords[account] == nil {
             generationRecords[account] = data
@@ -4290,6 +4578,45 @@ private final class GenerationSessionTokenRecordTestStore: SessionTokenSecureRec
         generationRecords.removeValue(forKey: account)
         lock.unlock()
         return true
+    }
+
+    func readMigratableGenerationRecord(account: String) throws -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return migratableGenerationRecords[account]
+    }
+
+    func deleteMigratableGenerationRecord(account: String) -> Bool {
+        lock.lock()
+        migratableGenerationRecords.removeValue(forKey: account)
+        deletedMigratableAccounts.append(account)
+        lock.unlock()
+        return true
+    }
+
+    func latestLocalRecoveryRecord() -> SessionTokenGenerationRecord? {
+        lock.lock()
+        defer { lock.unlock() }
+        return generationRecords.compactMap { account, data in
+            guard let mutation = KeychainSessionTokenStore.mutation(fromAccount: account) else {
+                return nil
+            }
+            return SessionTokenGenerationRecord(mutation: mutation, data: data)
+        }
+        .max { lhs, rhs in lhs.mutation.ordinal < rhs.mutation.ordinal }
+    }
+
+    func latestLocalTokenRecoveryRecord() -> SessionTokenGenerationRecord? {
+        lock.lock()
+        defer { lock.unlock() }
+        return generationRecords.compactMap { account, data in
+            guard let mutation = KeychainSessionTokenStore.mutation(fromAccount: account),
+                  mutation.kind == .token else {
+                return nil
+            }
+            return SessionTokenGenerationRecord(mutation: mutation, data: data)
+        }
+        .max { lhs, rhs in lhs.mutation.ordinal < rhs.mutation.ordinal }
     }
 
     func readLegacyRecord() -> Data? {

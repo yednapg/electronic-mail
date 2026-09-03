@@ -87,6 +87,10 @@ public final class OfflineFirstAppClient: AppClient {
         backend.supportsFolderCountPrefetch
     }
 
+    public var canPersistCurrentMailboxCache: Bool {
+        backend.canPersistCurrentMailboxCache
+    }
+
     public func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
         try await backend.exchangeMobileSession(loginCode: loginCode)
     }
@@ -148,6 +152,22 @@ public final class OfflineFirstAppClient: AppClient {
         return response
     }
 
+    public func gmailAccounts() async throws -> GmailAccountsResponse {
+        try await backend.gmailAccounts()
+    }
+
+    public func startGmailAccountLink(redirectTo: String) async throws -> GmailAccountLinkStartResponse {
+        try await backend.startGmailAccountLink(redirectTo: redirectTo)
+    }
+
+    public func setupGmailAccount(accountID: String) async throws -> GmailAccount {
+        try await backend.setupGmailAccount(accountID: accountID)
+    }
+
+    public func configureMailboxScope(_ scope: MailboxViewScope, accounts: GmailAccountsResponse) {
+        backend.configureMailboxScope(scope, accounts: accounts)
+    }
+
     public func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
         let operationGeneration = try await beginAccountOperationAfterTransitions()
         let expectedSessionToken = backend.sessionToken
@@ -159,7 +179,7 @@ public final class OfflineFirstAppClient: AppClient {
             let response = try await backend.mailbox(label: label, limit: limit, cursor: cursor)
             try validateSessionToken(expectedSessionToken)
             try validateAccountOperation(operationGeneration)
-            if let userID {
+            if canPersistCurrentMailboxCache, let userID {
                 try await withAccountSideEffectFence(operationGeneration) {
                     await self.offlineContentSyncCoordinator.observe(
                         mailbox: response,
@@ -177,7 +197,8 @@ public final class OfflineFirstAppClient: AppClient {
             // Returning it for a cursor request would make the caller append a
             // whole snapshot as though it were that page. Only the initial
             // request may fall back to the last atomically persisted snapshot.
-            if cursor == nil,
+            if canPersistCurrentMailboxCache,
+               cursor == nil,
                let userID,
                let cached = localMailStore.readMailbox(userID: userID, label: label) {
                 try validateAccountOperation(operationGeneration)
@@ -239,7 +260,7 @@ public final class OfflineFirstAppClient: AppClient {
         let operationGeneration = try await beginAccountOperationAfterTransitions()
         let expectedSessionToken = backend.sessionToken
         let expectedUserID = currentBackendUserID ?? localMailStore.readSession()?.user.id
-        if let expectedUserID {
+        if canPersistCurrentMailboxCache, let expectedUserID {
             try await withAccountSideEffectFence(operationGeneration) {
                 await self.offlineContentSyncCoordinator.prioritize(
                     threadID: threadID,
@@ -272,18 +293,20 @@ public final class OfflineFirstAppClient: AppClient {
         if response.userID != expectedUserID {
             throw APIError.emptyResponse
         }
-        try performIfCurrent(operationGeneration) {
-            if response.offset == 0, !response.hasMore {
-                localMailStore.writeThread(response, userID: response.userID, threadID: threadID)
+        if canPersistCurrentMailboxCache {
+            try performIfCurrent(operationGeneration) {
+                if response.offset == 0, !response.hasMore {
+                    localMailStore.writeThread(response, userID: response.userID, threadID: threadID)
+                }
             }
-        }
-        try await withAccountSideEffectFence(operationGeneration) {
-            await self.attachmentPrefetchCoordinator.enqueue(
-                thread: response,
-                userID: response.userID,
-                selected: true,
-                accountEpoch: operationGeneration
-            )
+            try await withAccountSideEffectFence(operationGeneration) {
+                await self.attachmentPrefetchCoordinator.enqueue(
+                    thread: response,
+                    userID: response.userID,
+                    selected: true,
+                    accountEpoch: operationGeneration
+                )
+            }
         }
         try validateAccountOperation(operationGeneration)
         return response

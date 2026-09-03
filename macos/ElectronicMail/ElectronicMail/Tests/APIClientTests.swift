@@ -36,6 +36,35 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(session.mailbox.totalThreads, DemoAppFixtures.mailbox.totalThreads)
     }
 
+    func testStartGmailAccountLinkUsesAuthenticatedIntentEndpoint() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/gmail-accounts/link")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer live-session-token")
+            let body = self.requestBodyData(request)
+            let payload = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: body) as? [String: String]
+            )
+            XCTAssertEqual(payload["redirect_to"], "electronicmail://auth/callback")
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!,
+                Data(#"{"authorization_url":"https://accounts.google.com/oauth"}"#.utf8)
+            )
+        }
+        client.sessionToken = "live-session-token"
+
+        let response = try await client.startGmailAccountLink(
+            redirectTo: "electronicmail://auth/callback"
+        )
+
+        XCTAssertEqual(response.authorizationURL.absoluteString, "https://accounts.google.com/oauth")
+    }
+
     func testMobileSessionExchangeUsesBackendEndpoint() async throws {
         let client = makeClient { request in
             XCTAssertEqual(request.httpMethod, "POST")
@@ -211,7 +240,7 @@ final class APIClientTests: XCTestCase {
     func testDraftUpdateEncodesRetainedAttachments() async throws {
         let client = makeClient { request in
             XCTAssertEqual(request.httpMethod, "PUT")
-            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/drafts/draft%2Fone")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/gmail-accounts/gmail-account-1/mailbox/drafts/draft%2Fone")
             let payload = try JSONDecoder.backend.decode(MailDraftSaveRequest.self, from: self.requestBodyData(request))
             XCTAssertEqual(payload.retainedAttachmentIDs, ["attachment-1"])
             XCTAssertEqual(payload.attachments?.first?.filename, "new.txt")
@@ -232,7 +261,8 @@ final class APIClientTests: XCTestCase {
             bodyHTML: nil,
             attachments: [MailAttachmentUpload(filename: "new.txt", mimeType: "text/plain", dataBase64: "bmV3")],
             retainedAttachmentIDs: ["attachment-1"],
-            createdAt: "2026-07-13T00:00:00Z"
+            createdAt: "2026-07-13T00:00:00Z",
+            gmailAccountID: "gmail-account-1"
         )
 
         let response = try await client.updateDraft(gmailDraftID: "draft/one", request: request)
@@ -243,7 +273,7 @@ final class APIClientTests: XCTestCase {
     func testResponseDraftCreateEncodesThreadContextAndForwardOptions() async throws {
         let client = makeClient { request in
             XCTAssertEqual(request.httpMethod, "POST")
-            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/drafts")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/gmail-accounts/gmail-account-1/mailbox/drafts")
             let body = self.requestBodyData(request)
             let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
             XCTAssertEqual(payload["client_draft_id"] as? String, "stable-response-draft")
@@ -274,7 +304,8 @@ final class APIClientTests: XCTestCase {
             sourceMessageID: "message-9",
             includeQuotedOriginal: true,
             includeOriginalAttachments: false,
-            createdAt: "2026-07-23T00:00:00Z"
+            createdAt: "2026-07-23T00:00:00Z",
+            gmailAccountID: "gmail-account-1"
         )
 
         let response = try await client.createDraft(request)
@@ -351,7 +382,7 @@ final class APIClientTests: XCTestCase {
     func testQueuedThreadActionUsesMailboxEndpoint() async throws {
         let client = makeClient { request in
             XCTAssertEqual(request.httpMethod, "POST")
-            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/thread-actions")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/gmail-accounts/gmail-account-1/mailbox/thread-actions")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
             let payload = try JSONDecoder.backend.decode(QueuedThreadActionRequest.self, from: self.requestBodyData(request))
             XCTAssertEqual(payload.mailboxThreadID, "group-1")
@@ -371,15 +402,15 @@ final class APIClientTests: XCTestCase {
             return (HTTPURLResponse(url: request.url!, statusCode: 202, httpVersion: nil, headerFields: nil)!, data)
         }
 
-        let response = try await client.enqueueThreadAction(
-            QueuedThreadActionRequest(
+        var request = QueuedThreadActionRequest(
                 clientActionID: "client-1",
                 mailboxThreadID: "group-1",
                 targetMessageID: nil,
                 action: .archive,
                 createdAt: "2026-05-21T09:00:00Z"
             )
-        )
+        request.gmailAccountID = "gmail-account-1"
+        let response = try await client.enqueueThreadAction(request)
 
         XCTAssertEqual(response.serverActionID, "server-1")
         XCTAssertEqual(response.state, .queued)
@@ -388,7 +419,7 @@ final class APIClientTests: XCTestCase {
     func testComposeUsesMailboxSendEndpoint() async throws {
         let client = makeClient { request in
             XCTAssertEqual(request.httpMethod, "POST")
-            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/compose")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/gmail-accounts/gmail-account-1/mailbox/compose")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
             let payload = try JSONDecoder.backend.decode(MailComposeRequest.self, from: self.requestBodyData(request))
             XCTAssertEqual(payload.clientSendID, "client-send-1")
@@ -420,7 +451,8 @@ final class APIClientTests: XCTestCase {
                 subject: "Hello",
                 bodyText: "Body",
                 bodyHTML: nil,
-                createdAt: "2026-05-21T09:00:00Z"
+                createdAt: "2026-05-21T09:00:00Z",
+                gmailAccountID: "gmail-account-1"
             )
         )
 
@@ -431,7 +463,7 @@ final class APIClientTests: XCTestCase {
     func testReplyUsesMailboxThreadReplyEndpoint() async throws {
         let client = makeClient { request in
             XCTAssertEqual(request.httpMethod, "POST")
-            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/mailbox/threads/group%2Fwith%20space/reply")
+            XCTAssertEqual(request.url?.path(percentEncoded: true), "/v1/gmail-accounts/gmail-account-1/mailbox/threads/group%2Fwith%20space/reply")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
             let payload = try JSONDecoder.backend.decode(MailReplyRequest.self, from: self.requestBodyData(request))
             XCTAssertEqual(payload.clientSendID, "client-send-1")
@@ -463,7 +495,8 @@ final class APIClientTests: XCTestCase {
                 bcc: [],
                 bodyText: "Reply body",
                 bodyHTML: nil,
-                createdAt: "2026-05-21T09:00:00Z"
+                createdAt: "2026-05-21T09:00:00Z",
+                gmailAccountID: "gmail-account-1"
             )
         )
 

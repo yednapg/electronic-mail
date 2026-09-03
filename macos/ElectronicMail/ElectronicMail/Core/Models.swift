@@ -194,6 +194,139 @@ public struct AuthUserResponse: Codable, Equatable {
     }
 }
 
+public enum GmailAccountState: String, Codable, Equatable {
+    case connecting
+    case importing
+    case ready
+    case reauthRequired = "reauth_required"
+    case disconnected
+    case deleting
+
+    public var isMailboxReadable: Bool {
+        self == .ready || self == .importing
+    }
+}
+
+public struct GmailAccount: Codable, Equatable, Identifiable {
+    public let id: String
+    public let email: String
+    public let displayName: String?
+    public let state: GmailAccountState
+    public let isPrimary: Bool
+    public let initialReadyAt: String?
+
+    public init(
+        id: String,
+        email: String,
+        displayName: String?,
+        state: GmailAccountState,
+        isPrimary: Bool,
+        initialReadyAt: String?
+    ) {
+        self.id = id
+        self.email = email
+        self.displayName = displayName
+        self.state = state
+        self.isPrimary = isPrimary
+        self.initialReadyAt = initialReadyAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case email
+        case displayName = "display_name"
+        case state
+        case isPrimary = "is_primary"
+        case initialReadyAt = "initial_ready_at"
+    }
+}
+
+public struct GmailAccountsResponse: Codable, Equatable {
+    public let multiAccountEnabled: Bool
+    public let migrationVerified: Bool
+    public let maxAccounts: Int
+    public let primaryGmailAccountID: String
+    public let accounts: [GmailAccount]
+
+    public init(
+        multiAccountEnabled: Bool,
+        migrationVerified: Bool,
+        maxAccounts: Int,
+        primaryGmailAccountID: String,
+        accounts: [GmailAccount]
+    ) {
+        self.multiAccountEnabled = multiAccountEnabled
+        self.migrationVerified = migrationVerified
+        self.maxAccounts = maxAccounts
+        self.primaryGmailAccountID = primaryGmailAccountID
+        self.accounts = accounts
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case multiAccountEnabled = "multi_account_enabled"
+        case migrationVerified = "migration_verified"
+        case maxAccounts = "max_accounts"
+        case primaryGmailAccountID = "primary_gmail_account_id"
+        case accounts
+    }
+}
+
+public struct GmailAccountLinkStartRequest: Codable, Equatable {
+    public let redirectTo: String
+
+    public init(redirectTo: String) {
+        self.redirectTo = redirectTo
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case redirectTo = "redirect_to"
+    }
+}
+
+public struct GmailAccountLinkStartResponse: Codable, Equatable {
+    public let authorizationURL: URL
+
+    enum CodingKeys: String, CodingKey {
+        case authorizationURL = "authorization_url"
+    }
+}
+
+/// Combined is a presentation scope only. It can never be serialized as a
+/// Gmail account id or sent to an account-scoped backend operation.
+public enum MailboxViewScope: Hashable, Identifiable {
+    case combined
+    case gmail(accountID: String)
+
+    public var id: String {
+        switch self {
+        case .combined:
+            return "combined"
+        case .gmail(let accountID):
+            return "gmail:\(accountID)"
+        }
+    }
+
+    public var gmailAccountID: String? {
+        guard case .gmail(let accountID) = self else { return nil }
+        return accountID
+    }
+}
+
+public struct ScopedGmailThreadID: Equatable {
+    public let accountID: String
+    public let gmailThreadID: String
+
+    public init?(_ value: String) {
+        let parts = value.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count == 3, parts[0] == "gmail-account",
+              !parts[1].isEmpty, !parts[2].isEmpty else {
+            return nil
+        }
+        accountID = String(parts[1])
+        gmailThreadID = String(parts[2])
+    }
+}
+
 public struct MobileSessionExchangeRequest: Codable, Equatable {
     let loginCode: String
     let handoffID: String
@@ -878,7 +1011,7 @@ public struct MailboxResponse: Codable, Equatable {
     let label: MailboxLabel
     let totalThreads: Int
     var unreadThreads: Int? = nil
-    let nextCursor: String?
+    var nextCursor: String?
     let loadedThreads: Int?
     let windowDays: Int?
     let sections: [GmailThreadSection]
@@ -902,6 +1035,7 @@ public struct MailboxResponse: Codable, Equatable {
     var historyMetadataComplete: Bool? = nil
     var historyBodyComplete: Bool? = nil
     var lastProgressAt: String? = nil
+    var accountWarnings: [String]? = nil
 
     var isEmpty: Bool {
         totalThreads == 0 || sections.allSatisfy { $0.rows.isEmpty }
@@ -934,7 +1068,8 @@ public struct MailboxResponse: Codable, Equatable {
         initialWindowComplete: Bool? = nil,
         historyMetadataComplete: Bool? = nil,
         historyBodyComplete: Bool? = nil,
-        lastProgressAt: String? = nil
+        lastProgressAt: String? = nil,
+        accountWarnings: [String]? = nil
     ) {
         self.label = label
         self.totalThreads = totalThreads
@@ -963,6 +1098,7 @@ public struct MailboxResponse: Codable, Equatable {
         self.historyMetadataComplete = historyMetadataComplete
         self.historyBodyComplete = historyBodyComplete
         self.lastProgressAt = lastProgressAt
+        self.accountWarnings = accountWarnings
     }
 
     enum CodingKeys: String, CodingKey {
@@ -993,10 +1129,71 @@ public struct MailboxResponse: Codable, Equatable {
         case historyMetadataComplete = "history_metadata_complete"
         case historyBodyComplete = "history_body_complete"
         case lastProgressAt = "last_progress_at"
+        case accountWarnings = "account_warnings"
+    }
+}
+
+extension MailboxResponse {
+    static func combinedForPresentation(
+        _ responses: [MailboxResponse],
+        primaryNextCursor: String?,
+        accountWarnings: [String] = []
+    ) -> MailboxResponse {
+        guard let first = responses.first else {
+            return MailboxResponse(label: .inbox, totalThreads: 0)
+        }
+        var titleByThreadID: [String: String] = [:]
+        var rows: [GmailThreadRow] = []
+        for response in responses {
+            for section in response.sections {
+                for row in section.rows {
+                    titleByThreadID[row.threadID] = section.title
+                    rows.append(row)
+                }
+            }
+        }
+        rows.sort { lhs, rhs in
+            (lhs.latestMessageAt ?? lhs.latestReceivedAt) > (rhs.latestMessageAt ?? rhs.latestReceivedAt)
+        }
+        var sections: [GmailThreadSection] = []
+        for row in rows {
+            let title = titleByThreadID[row.threadID] ?? "Earlier"
+            if sections.last?.title == title {
+                var last = sections.removeLast()
+                last = GmailThreadSection(id: last.id, title: last.title, rows: last.rows + [row])
+                sections.append(last)
+            } else {
+                sections.append(
+                    GmailThreadSection(
+                        id: "combined:\(sections.count):\(row.threadID)",
+                        title: title,
+                        rows: [row]
+                    )
+                )
+            }
+        }
+        return MailboxResponse(
+            label: first.label,
+            totalThreads: responses.reduce(0) { $0 + $1.totalThreads },
+            unreadThreads: responses.reduce(0) { $0 + ($1.unreadThreads ?? 0) },
+            nextCursor: primaryNextCursor,
+            loadedThreads: rows.count,
+            sections: sections,
+            readyCount: rows.count,
+            pendingCount: 0,
+            mailboxRevision: responses.compactMap(\.mailboxRevision).joined(separator: "+"),
+            generatedAt: responses.compactMap(\.generatedAt).max(),
+            fullImportRunning: false,
+            fullImportCompleted: true,
+            phase: "ready",
+            initialWindowComplete: true,
+            accountWarnings: accountWarnings
+        )
     }
 }
 
 public struct MailboxSyncStateResponse: Codable, Equatable {
+    var gmailAccountID: String? = nil
     let connected: Bool
     let lastHistoryID: String?
     let lastFullSyncAt: String?
@@ -1032,6 +1229,7 @@ public struct MailboxSyncStateResponse: Codable, Equatable {
     var lastProgressAt: String? = nil
 
     enum CodingKeys: String, CodingKey {
+        case gmailAccountID = "gmail_account_id"
         case connected
         case lastHistoryID = "last_history_id"
         case lastFullSyncAt = "last_full_sync_at"
@@ -1173,6 +1371,7 @@ public struct GmailThreadMutationResponse: Codable, Equatable {
 }
 
 public struct QueuedThreadActionRequest: Codable, Equatable {
+    var gmailAccountID: String? = nil
     let clientActionID: String
     let mailboxThreadID: String
     let targetMessageID: String?
@@ -1185,6 +1384,7 @@ public struct QueuedThreadActionRequest: Codable, Equatable {
         case targetMessageID = "target_message_id"
         case action
         case createdAt = "created_at"
+        case gmailAccountID = "gmail_account_id"
     }
 }
 
@@ -1196,6 +1396,7 @@ public enum QueuedThreadActionState: String, Codable, Equatable {
 }
 
 public struct QueuedThreadActionResponse: Codable, Equatable {
+    var gmailAccountID: String? = nil
     let clientActionID: String
     let serverActionID: String
     let mailboxThreadID: String
@@ -1216,10 +1417,12 @@ public struct QueuedThreadActionResponse: Codable, Equatable {
         case queuedAt = "queued_at"
         case appliedAt = "applied_at"
         case error
+        case gmailAccountID = "gmail_account_id"
     }
 }
 
 public struct MailComposeRequest: Codable, Equatable {
+    var gmailAccountID: String?
     let clientSendID: String
     let to: [String]
     let cc: [String]
@@ -1239,7 +1442,8 @@ public struct MailComposeRequest: Codable, Equatable {
         bodyText: String,
         bodyHTML: String?,
         attachments: [MailAttachmentUpload] = [],
-        createdAt: String
+        createdAt: String,
+        gmailAccountID: String? = nil
     ) {
         self.clientSendID = clientSendID
         self.to = to
@@ -1250,6 +1454,7 @@ public struct MailComposeRequest: Codable, Equatable {
         self.bodyHTML = bodyHTML
         self.attachments = attachments
         self.createdAt = createdAt
+        self.gmailAccountID = gmailAccountID
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1262,6 +1467,7 @@ public struct MailComposeRequest: Codable, Equatable {
         case bodyHTML = "body_html"
         case attachments
         case createdAt = "created_at"
+        case gmailAccountID = "gmail_account_id"
     }
 }
 
@@ -1284,6 +1490,7 @@ public enum MailReplyMode: String, Codable, Equatable {
 }
 
 public struct MailReplyRequest: Codable, Equatable {
+    var gmailAccountID: String?
     let clientSendID: String
     let sourceMessageID: String?
     let mode: MailReplyMode
@@ -1311,7 +1518,8 @@ public struct MailReplyRequest: Codable, Equatable {
         attachments: [MailAttachmentUpload] = [],
         includeQuotedOriginal: Bool = true,
         includeOriginalAttachments: Bool = false,
-        createdAt: String
+        createdAt: String,
+        gmailAccountID: String? = nil
     ) {
         self.clientSendID = clientSendID
         self.sourceMessageID = sourceMessageID
@@ -1326,6 +1534,7 @@ public struct MailReplyRequest: Codable, Equatable {
         self.includeQuotedOriginal = includeQuotedOriginal
         self.includeOriginalAttachments = includeOriginalAttachments
         self.createdAt = createdAt
+        self.gmailAccountID = gmailAccountID
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1342,10 +1551,12 @@ public struct MailReplyRequest: Codable, Equatable {
         case includeQuotedOriginal = "include_quoted_original"
         case includeOriginalAttachments = "include_original_attachments"
         case createdAt = "created_at"
+        case gmailAccountID = "gmail_account_id"
     }
 }
 
 public struct MailSendResponse: Codable, Equatable {
+    var gmailAccountID: String? = nil
     let clientSendID: String
     let serverSendID: String?
     let mailboxThreadID: String?
@@ -1368,6 +1579,7 @@ public struct MailSendResponse: Codable, Equatable {
         case sentAt = "sent_at"
         case error
         case reauthURL = "reauth_url"
+        case gmailAccountID = "gmail_account_id"
     }
 }
 
@@ -1577,6 +1789,7 @@ public struct GmailDraftResponse: Codable, Equatable {
 }
 
 public struct MailDraftSaveRequest: Codable, Equatable {
+    var gmailAccountID: String?
     let clientDraftID: String
     let gmailDraftID: String?
     let gmailThreadID: String?
@@ -1612,7 +1825,8 @@ public struct MailDraftSaveRequest: Codable, Equatable {
         sourceMessageID: String? = nil,
         includeQuotedOriginal: Bool = true,
         includeOriginalAttachments: Bool = true,
-        createdAt: String
+        createdAt: String,
+        gmailAccountID: String? = nil
     ) {
         self.clientDraftID = clientDraftID
         self.gmailDraftID = gmailDraftID
@@ -1631,6 +1845,7 @@ public struct MailDraftSaveRequest: Codable, Equatable {
         self.includeQuotedOriginal = includeQuotedOriginal
         self.includeOriginalAttachments = includeOriginalAttachments
         self.createdAt = createdAt
+        self.gmailAccountID = gmailAccountID
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1651,6 +1866,7 @@ public struct MailDraftSaveRequest: Codable, Equatable {
         case includeQuotedOriginal = "include_quoted_original"
         case includeOriginalAttachments = "include_original_attachments"
         case createdAt = "created_at"
+        case gmailAccountID = "gmail_account_id"
     }
 
     public init(from decoder: Decoder) throws {
@@ -1672,6 +1888,7 @@ public struct MailDraftSaveRequest: Codable, Equatable {
         includeQuotedOriginal = try container.decodeIfPresent(Bool.self, forKey: .includeQuotedOriginal) ?? true
         includeOriginalAttachments = try container.decodeIfPresent(Bool.self, forKey: .includeOriginalAttachments) ?? true
         createdAt = try container.decode(String.self, forKey: .createdAt)
+        gmailAccountID = try container.decodeIfPresent(String.self, forKey: .gmailAccountID)
     }
 }
 
@@ -2141,6 +2358,7 @@ public enum MailDraftState: String, Codable, Equatable {
 }
 
 public struct MailDraftResponse: Codable, Equatable {
+    var gmailAccountID: String? = nil
     let clientDraftID: String
     let gmailDraftID: String?
     let gmailMessageID: String?
@@ -2173,6 +2391,7 @@ public struct MailDraftResponse: Codable, Equatable {
         case savedAt = "saved_at"
         case error
         case reauthURL = "reauth_url"
+        case gmailAccountID = "gmail_account_id"
     }
 }
 

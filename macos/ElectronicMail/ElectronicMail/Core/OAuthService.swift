@@ -1,5 +1,6 @@
 import AuthenticationServices
 import AppKit
+import Combine
 import CryptoKit
 import Foundation
 
@@ -15,6 +16,7 @@ public enum OAuthError: LocalizedError, Equatable {
     case handoffTimedOut
     case handoffFailed(Int)
     case handoffRejected(String)
+    case accountLinkFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -32,6 +34,8 @@ public enum OAuthError: LocalizedError, Equatable {
             return "Google sign-in failed with server response \(statusCode)."
         case .handoffRejected(let message):
             return message
+        case .accountLinkFailed(let message):
+            return message
         }
     }
 }
@@ -41,7 +45,7 @@ public extension Notification.Name {
 }
 
 @MainActor
-public final class GoogleOAuthService: NSObject, OAuthServicing, ASWebAuthenticationPresentationContextProviding {
+public final class GoogleOAuthService: NSObject, ObservableObject, OAuthServicing, ASWebAuthenticationPresentationContextProviding {
     private var authenticationSession: ASWebAuthenticationSession?
 
     public override init() {
@@ -86,6 +90,53 @@ public final class GoogleOAuthService: NSObject, OAuthServicing, ASWebAuthentica
         }
         NSApp.activate(ignoringOtherApps: true)
         return loginCode
+    }
+
+    public func startGoogleAccountLink(authorizationURL: URL) async throws -> String {
+        let accountID = try await withThrowingTaskGroup(of: String.self) { group in
+            group.addTask {
+                try await Self.waitForLinkedAccountCallback()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 300_000_000_000)
+                throw OAuthError.handoffTimedOut
+            }
+
+            // Give the notification listener an opportunity to subscribe before
+            // the external browser can return through the app URL scheme.
+            await Task.yield()
+            guard NSWorkspace.shared.open(authorizationURL) else {
+                group.cancelAll()
+                throw OAuthError.browserOpenFailed
+            }
+
+            guard let accountID = try await group.next() else {
+                throw OAuthError.accountLinkFailed(
+                    "Gmail account linking ended without a result. Please try again."
+                )
+            }
+            group.cancelAll()
+            return accountID
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        return accountID
+    }
+
+    public func openGoogleAccountLinkInSafari(_ authorizationURL: URL) {
+        guard let safariURL = NSWorkspace.shared.urlForApplication(
+            withBundleIdentifier: "com.apple.Safari"
+        ) else {
+            _ = NSWorkspace.shared.open(authorizationURL)
+            return
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.open(
+            [authorizationURL],
+            withApplicationAt: safariURL,
+            configuration: configuration
+        )
     }
 
     public func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
@@ -171,6 +222,61 @@ public final class GoogleOAuthService: NSObject, OAuthServicing, ASWebAuthentica
             .queryItems?
             .first(where: { $0.name == "handoff_id" })?
             .value
+    }
+
+    nonisolated static func linkedAccountID(from callbackURL: URL) throws -> String {
+        guard let components = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false) else {
+            throw OAuthError.accountLinkFailed("Gmail account could not be added. Please try again.")
+        }
+        let items = components.queryItems ?? []
+        if items.first(where: { $0.name == "status" })?.value?.lowercased() == "linked",
+           let accountID = items.first(where: { $0.name == "gmail_account_id" })?.value,
+           !accountID.isEmpty {
+            return accountID
+        }
+        let message = items.first(where: { $0.name == "error" })?.value
+        throw OAuthError.accountLinkFailed(
+            message ?? "Gmail account could not be added. Please try again."
+        )
+    }
+
+    nonisolated static func waitForLinkedAccountCallback() async throws -> String {
+        for await notification in NotificationCenter.default.notifications(
+            named: .electronicMailOAuthCallback
+        ) {
+            try Task.checkCancellation()
+            guard let url = notification.object as? URL else {
+                continue
+            }
+            if let accountID = try linkedAccountIDIfLinkCallback(from: url) {
+                return accountID
+            }
+        }
+        throw OAuthError.accountLinkFailed(
+            "Gmail account linking ended without a result. Please try again."
+        )
+    }
+
+    nonisolated static func linkedAccountIDIfLinkCallback(from url: URL) throws -> String? {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme == MobileAuthFlow.callbackScheme,
+              components.host == "auth",
+              components.path == "/callback" else {
+            return nil
+        }
+
+        let status = components.queryItems?
+            .first(where: { $0.name == "status" })?
+            .value?
+            .lowercased()
+        switch status {
+        case "linked", "failed":
+            return try linkedAccountID(from: url)
+        case "cancelled":
+            throw OAuthError.authenticationCancelled
+        default:
+            return nil
+        }
     }
 
     nonisolated static func mobileHandoffRedirectURL(
