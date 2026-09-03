@@ -68,6 +68,10 @@ public final class DashboardStore: ObservableObject {
         client.baseURL
     }
 
+    public var accountClient: AppClient {
+        client
+    }
+
     public var hasSessionToken: Bool {
         client.sessionToken?.isEmpty == false
     }

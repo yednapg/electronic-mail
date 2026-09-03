@@ -212,6 +212,50 @@ final class DashboardViewModelTests: XCTestCase {
         XCTAssertEqual(loginCode, "login-after-retry")
     }
 
+    @MainActor
+    func testDefaultSenderPreferenceSurvivesSettingsStoreRecreation() {
+        let suiteName = "GmailAccountSettingsStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let firstStore = GmailAccountSettingsStore(
+            client: DemoAppClient(),
+            defaults: defaults
+        )
+        firstStore.defaultSenderAccountID = DemoAppFixtures.userID
+
+        let restoredStore = GmailAccountSettingsStore(
+            client: DemoAppClient(),
+            defaults: defaults
+        )
+
+        XCTAssertEqual(restoredStore.defaultSenderAccountID, DemoAppFixtures.userID)
+    }
+
+    @MainActor
+    func testUnavailableDefaultSenderFallsBackToAskEveryTime() async {
+        let suiteName = "GmailAccountSettingsStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(
+            "missing-gmail-account",
+            forKey: GmailComposingPreferences.defaultSenderAccountIDStorageKey
+        )
+        let store = GmailAccountSettingsStore(
+            client: DemoAppClient(),
+            defaults: defaults
+        )
+
+        await store.load()
+
+        XCTAssertNil(store.defaultSenderAccountID)
+        XCTAssertNil(
+            defaults.string(
+                forKey: GmailComposingPreferences.defaultSenderAccountIDStorageKey
+            )
+        )
+    }
+
     private func contractFixtureData(_ name: String) throws -> Data {
         var directory = URL(fileURLWithPath: #filePath)
 

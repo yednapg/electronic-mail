@@ -33,6 +33,45 @@ final class IOSGoogleOAuthService: NSObject, ASWebAuthenticationPresentationCont
         }
     }
 
+    func startGoogleAccountLink(authorizationURL: URL) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            let session = ASWebAuthenticationSession(
+                url: authorizationURL,
+                callbackURLScheme: MobileAuthFlow.callbackScheme
+            ) { callbackURL, error in
+                self.webSession = nil
+                if let error = error as? ASWebAuthenticationSessionError,
+                   error.code == .canceledLogin {
+                    continuation.resume(throwing: IOSGoogleOAuthError.cancelled)
+                    return
+                }
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                guard let callbackURL else {
+                    continuation.resume(throwing: GmailAccountLinkError.missingAccountID)
+                    return
+                }
+                do {
+                    continuation.resume(
+                        returning: try GmailAccountLinkError.linkedAccountID(from: callbackURL)
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+            session.presentationContextProvider = self
+            session.prefersEphemeralWebBrowserSession = false
+            webSession = session
+            guard session.start() else {
+                webSession = nil
+                continuation.resume(throwing: IOSGoogleOAuthError.browserStartFailed)
+                return
+            }
+        }
+    }
+
     private func authenticateWithCallback(baseURL: URL) async throws -> String {
         let redirectURL = URL(string: MobileAuthFlow.callbackRedirectURI)!
         let url = try MobileAuthFlow.authenticationURL(baseURL: baseURL, redirectURL: redirectURL)

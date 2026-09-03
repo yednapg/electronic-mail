@@ -126,6 +126,7 @@ public protocol AppClient: AnyObject {
     var mode: AppRunMode { get }
     var supportsRealtimeMailboxUpdates: Bool { get }
     var supportsFolderCountPrefetch: Bool { get }
+    var canPersistCurrentMailboxCache: Bool { get }
 
     func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse
     func exchangeMobileSession(grant: MobileAuthenticationGrant) async throws -> MobileSessionExchangeResponse
@@ -134,6 +135,10 @@ public protocol AppClient: AnyObject {
     func deleteGoogleData() async throws
     func deleteAccount() async throws
     func appSession() async throws -> AppSessionResponse
+    func gmailAccounts() async throws -> GmailAccountsResponse
+    func startGmailAccountLink(redirectTo: String) async throws -> GmailAccountLinkStartResponse
+    func setupGmailAccount(accountID: String) async throws -> GmailAccount
+    func configureMailboxScope(_ scope: MailboxViewScope, accounts: GmailAccountsResponse)
     func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse
     func mailboxFolderCount(label: MailboxLabel) async throws -> MailboxResponse
     func searchMailbox(
@@ -180,9 +185,24 @@ public protocol AppClient: AnyObject {
 public extension AppClient {
     var supportsRealtimeMailboxUpdates: Bool { false }
     var supportsFolderCountPrefetch: Bool { false }
+    var canPersistCurrentMailboxCache: Bool { true }
+
+    func configureMailboxScope(_ scope: MailboxViewScope, accounts: GmailAccountsResponse) {}
+
+    func setupGmailAccount(accountID: String) async throws -> GmailAccount {
+        throw APIError.httpStatus(501)
+    }
 
     func mailboxFolderCount(label: MailboxLabel) async throws -> MailboxResponse {
         try await mailbox(label: label, limit: 1, cursor: nil)
+    }
+
+    func gmailAccounts() async throws -> GmailAccountsResponse {
+        throw APIError.httpStatus(501)
+    }
+
+    func startGmailAccountLink(redirectTo: String) async throws -> GmailAccountLinkStartResponse {
+        throw APIError.httpStatus(501)
     }
 
     func exchangeMobileSession(grant: MobileAuthenticationGrant) async throws -> MobileSessionExchangeResponse {
@@ -307,10 +327,22 @@ public final class LiveBackendAppClient: AppClient {
     public var sessionToken: String?
     public let mode: AppRunMode = .localBackend
     public let supportsRealtimeMailboxUpdates = true
-    public let supportsFolderCountPrefetch = true
+    public var supportsFolderCountPrefetch: Bool {
+        guard let accounts = configuredGmailAccounts else { return true }
+        return activeMailboxScope.gmailAccountID == accounts.primaryGmailAccountID
+    }
+    public var canPersistCurrentMailboxCache: Bool {
+        guard let accounts = configuredGmailAccounts else { return true }
+        return activeMailboxScope.gmailAccountID == accounts.primaryGmailAccountID
+    }
 
     private let session: URLSession
     private let decoder: JSONDecoder
+    private var activeMailboxScope: MailboxViewScope = .combined
+    private var configuredGmailAccounts: GmailAccountsResponse?
+    private var sendAccountIDs: [String: String] = [:]
+    private var draftAccountIDs: [String: String] = [:]
+    private var matterAccountIDs: [String: String] = [:]
 
     public init(baseURL: URL, session: URLSession? = nil, decoder: JSONDecoder = .backend) {
         self.baseURL = baseURL
@@ -330,6 +362,28 @@ public final class LiveBackendAppClient: AppClient {
 
     public func appSession() async throws -> AppSessionResponse {
         try await request(path: "/v1/app/session")
+    }
+
+    public func gmailAccounts() async throws -> GmailAccountsResponse {
+        try await request(path: "/v1/gmail-accounts")
+    }
+
+    public func startGmailAccountLink(redirectTo: String) async throws -> GmailAccountLinkStartResponse {
+        let payload = GmailAccountLinkStartRequest(redirectTo: redirectTo)
+        let body = try JSONEncoder.backend.encode(payload)
+        return try await request(path: "/v1/gmail-accounts/link", method: "POST", body: body)
+    }
+
+    public func setupGmailAccount(accountID: String) async throws -> GmailAccount {
+        try await request(
+            path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/setup",
+            method: "POST"
+        )
+    }
+
+    public func configureMailboxScope(_ scope: MailboxViewScope, accounts: GmailAccountsResponse) {
+        activeMailboxScope = scope
+        configuredGmailAccounts = accounts
     }
 
     public func exchangeMobileSession(loginCode: String) async throws -> MobileSessionExchangeResponse {
@@ -370,6 +424,104 @@ public final class LiveBackendAppClient: AppClient {
     }
 
     public func mailbox(label: MailboxLabel = .inbox, limit: Int = 100, cursor: String? = nil) async throws -> MailboxResponse {
+        if let accounts = configuredGmailAccounts {
+            switch activeMailboxScope {
+            case .gmail(let accountID):
+                if accountID != accounts.primaryGmailAccountID {
+                    let providerCursor = try mailboxCursor(
+                        cursor,
+                        expectedRoute: "account:\(accountID)"
+                    )
+                    var response = try await accountMailbox(
+                        accountID: accountID,
+                        label: label,
+                        limit: limit,
+                        cursor: providerCursor
+                    )
+                    response.nextCursor = wrappedMailboxCursor(
+                        response.nextCursor,
+                        route: "account:\(accountID)"
+                    )
+                    return response
+                }
+                let primaryCursor = try mailboxCursor(cursor, expectedRoute: "primary")
+                var response = try await unscopedMailbox(
+                    label: label,
+                    limit: limit,
+                    cursor: primaryCursor
+                )
+                response.nextCursor = wrappedMailboxCursor(response.nextCursor, route: "primary")
+                return response
+            case .combined:
+                // Only the primary cursor is continued. Secondary Gmail pages
+                // are independent and are never presented to the backend as a
+                // synthetic combined mailbox.
+                if cursor == nil {
+                    var responses: [MailboxResponse] = []
+                    var warnings: [String] = []
+                    var primaryNextCursor: String?
+                    do {
+                        let primary = try await unscopedMailbox(label: label, limit: limit, cursor: nil)
+                        responses.append(primary)
+                        primaryNextCursor = primary.nextCursor
+                    } catch {
+                        let email = accounts.accounts.first(where: { $0.isPrimary })?.email ?? "primary Gmail"
+                        warnings.append("Could not load \(email). Other accounts remain available.")
+                    }
+                    for account in accounts.accounts where account.state.isMailboxReadable && !account.isPrimary {
+                        do {
+                            responses.append(try await accountMailbox(
+                                accountID: account.id,
+                                label: label,
+                                limit: min(limit, 50),
+                                cursor: nil
+                            ))
+                        } catch {
+                            warnings.append("Could not load \(account.email). Other accounts remain available.")
+                        }
+                    }
+                    guard !responses.isEmpty else { throw APIError.httpStatus(503) }
+                    var combined = MailboxResponse.combinedForPresentation(
+                        responses,
+                        primaryNextCursor: primaryNextCursor,
+                        accountWarnings: warnings
+                    )
+                    combined.nextCursor = wrappedMailboxCursor(primaryNextCursor, route: "primary")
+                    return combined
+                }
+                let primaryCursor = try mailboxCursor(cursor, expectedRoute: "primary")
+                var response = try await unscopedMailbox(
+                    label: label,
+                    limit: limit,
+                    cursor: primaryCursor
+                )
+                response.nextCursor = wrappedMailboxCursor(response.nextCursor, route: "primary")
+                return response
+            }
+        }
+        return try await unscopedMailbox(label: label, limit: limit, cursor: cursor)
+    }
+
+    private func wrappedMailboxCursor(_ cursor: String?, route: String) -> String? {
+        guard let cursor, !cursor.isEmpty else { return nil }
+        return "scope|\(route)|\(cursor)"
+    }
+
+    private func mailboxCursor(_ cursor: String?, expectedRoute: String) throws -> String? {
+        guard let cursor, !cursor.isEmpty else { return nil }
+        guard cursor.hasPrefix("scope|") else {
+            // A cursor produced before a scope change must never be replayed
+            // against a different Gmail provider mailbox.
+            throw CancellationError()
+        }
+        let parts = cursor.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count == 3, parts[1] == Substring(expectedRoute) else {
+            throw CancellationError()
+        }
+        return String(parts[2])
+    }
+
+    private func unscopedMailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
         var queryItems = [
             URLQueryItem(name: "label", value: label.rawValue),
             URLQueryItem(name: "limit", value: String(limit)),
@@ -378,6 +530,25 @@ public final class LiveBackendAppClient: AppClient {
             queryItems.append(URLQueryItem(name: "cursor", value: cursor))
         }
         return try await request(path: "/v1/mailbox", queryItems: queryItems)
+    }
+
+    private func accountMailbox(
+        accountID: String,
+        label: MailboxLabel,
+        limit: Int,
+        cursor: String?
+    ) async throws -> MailboxResponse {
+        var queryItems = [
+            URLQueryItem(name: "label", value: label.rawValue),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+        if let cursor, !cursor.isEmpty {
+            queryItems.append(URLQueryItem(name: "cursor", value: cursor))
+        }
+        return try await request(
+            path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox",
+            queryItems: queryItems
+        )
     }
 
     public func searchMailbox(
@@ -400,11 +571,46 @@ public final class LiveBackendAppClient: AppClient {
         if !hydrateInBackground {
             queryItems.append(URLQueryItem(name: "hydrate", value: "false"))
         }
+        if let accounts = configuredGmailAccounts {
+            if let accountID = activeMailboxScope.gmailAccountID {
+                return try await request(
+                    path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/search",
+                    queryItems: queryItems
+                )
+            }
+            var responses: [MailboxResponse] = []
+            var warnings: [String] = []
+            for account in accounts.accounts where account.state.isMailboxReadable {
+                do {
+                    responses.append(try await request(
+                        path: "/v1/gmail-accounts/\(account.id.urlPathEncoded)/mailbox/search",
+                        queryItems: queryItems
+                    ))
+                } catch {
+                    warnings.append("Could not search \(account.email). Other accounts remain available.")
+                }
+            }
+            guard !responses.isEmpty else { throw APIError.httpStatus(503) }
+            return MailboxResponse.combinedForPresentation(
+                responses,
+                primaryNextCursor: nil,
+                accountWarnings: warnings
+            )
+        }
         return try await request(path: "/v1/mailbox/search", queryItems: queryItems)
     }
 
     public func thread(threadID: String, limit: Int = 50, offset: Int = 0) async throws -> ThreadReaderResponse {
-        try await request(
+        if let scoped = ScopedGmailThreadID(threadID) {
+            return try await request(
+                path: "/v1/gmail-accounts/\(scoped.accountID.urlPathEncoded)/threads/\(scoped.gmailThreadID.urlPathEncoded)",
+                queryItems: [
+                    URLQueryItem(name: "limit", value: String(limit)),
+                    URLQueryItem(name: "offset", value: String(offset)),
+                ]
+            )
+        }
+        return try await request(
             path: "/v1/mailbox/threads/\(threadID.urlPathEncoded)",
             queryItems: [
                 URLQueryItem(name: "limit", value: String(limit)),
@@ -424,11 +630,22 @@ public final class LiveBackendAppClient: AppClient {
     }
 
     public func mailboxSyncState() async throws -> MailboxSyncStateResponse {
-        try await request(path: "/v1/mailbox/sync-state")
+        if let accountID = activeMailboxScope.gmailAccountID {
+            return try await request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/sync-state"
+            )
+        }
+        return try await request(path: "/v1/mailbox/sync-state")
     }
 
     public func triggerMailboxSync() async throws -> MailboxSyncTriggerResponse {
-        try await request(path: "/v1/mailbox/sync", method: "POST")
+        if let accountID = activeMailboxScope.gmailAccountID {
+            return try await request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/sync",
+                method: "POST"
+            )
+        }
+        return try await request(path: "/v1/mailbox/sync", method: "POST")
     }
 
     public func syncMailboxNow() async throws -> MailboxSyncTriggerResponse {
@@ -449,59 +666,155 @@ public final class LiveBackendAppClient: AppClient {
 
     public func enqueueThreadAction(_ request: QueuedThreadActionRequest) async throws -> QueuedThreadActionResponse {
         let body = try JSONEncoder.backend.encode(request)
-        return try await self.request(path: "/v1/mailbox/thread-actions", method: "POST", body: body)
+        guard let accountID = writeAccountID(explicit: request.gmailAccountID, threadID: request.mailboxThreadID) else {
+            throw APIError.httpStatus(409)
+        }
+        return try await self.request(
+            path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/thread-actions",
+            method: "POST", body: body
+        )
     }
 
     public func sendCompose(_ request: MailComposeRequest) async throws -> MailSendResponse {
         let body = try JSONEncoder.backend.encode(request)
-        return try await self.request(path: "/v1/mailbox/compose", method: "POST", body: body)
+        guard let accountID = writeAccountID(explicit: request.gmailAccountID) else {
+            throw APIError.httpStatus(409)
+        }
+        let response: MailSendResponse = try await self.request(
+            path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/compose",
+            method: "POST", body: body
+        )
+        rememberSend(response, fallbackAccountID: accountID)
+        return response
     }
 
     public func sendReply(threadID: String, request: MailReplyRequest) async throws -> MailSendResponse {
         let body = try JSONEncoder.backend.encode(request)
-        return try await self.request(path: "/v1/mailbox/threads/\(threadID.urlPathEncoded)/reply", method: "POST", body: body)
+        guard let accountID = writeAccountID(explicit: request.gmailAccountID, threadID: threadID) else {
+            throw APIError.httpStatus(409)
+        }
+        let response: MailSendResponse = try await self.request(
+            path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/threads/\(threadID.urlPathEncoded)/reply",
+            method: "POST", body: body
+        )
+        rememberSend(response, fallbackAccountID: accountID)
+        return response
     }
 
     public func outbox(limit: Int = 100) async throws -> MailOutboxResponse {
-        try await request(
+        if let accountID = writeAccountID() {
+            return try await request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/outbox",
+                queryItems: [URLQueryItem(name: "limit", value: String(limit))]
+            )
+        }
+        return try await request(
             path: "/v1/mailbox/outbox",
             queryItems: [URLQueryItem(name: "limit", value: String(limit))]
         )
     }
 
     public func sendStatus(serverSendID: String) async throws -> MailSendResponse {
-        try await request(
+        if let accountID = sendAccountIDs[serverSendID] ?? writeAccountID() {
+            return try await request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/sends/\(serverSendID.urlPathEncoded)",
+                timeoutInterval: 3
+            )
+        }
+        return try await request(
             path: "/v1/mailbox/sends/\(serverSendID.urlPathEncoded)",
             timeoutInterval: 3
         )
     }
 
     public func retrySend(serverSendID: String) async throws -> MailSendResponse {
-        try await request(path: "/v1/mailbox/sends/\(serverSendID.urlPathEncoded)/retry", method: "POST")
+        if let accountID = sendAccountIDs[serverSendID] ?? writeAccountID() {
+            return try await request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/sends/\(serverSendID.urlPathEncoded)/retry",
+                method: "POST"
+            )
+        }
+        return try await request(path: "/v1/mailbox/sends/\(serverSendID.urlPathEncoded)/retry", method: "POST")
     }
 
 
     public func createDraft(_ request: MailDraftSaveRequest) async throws -> MailDraftResponse {
         let body = try JSONEncoder.backend.encode(request)
-        return try await self.request(path: "/v1/mailbox/drafts", method: "POST", body: body)
+        guard let accountID = writeAccountID(explicit: request.gmailAccountID, threadID: request.mailboxThreadID) else {
+            throw APIError.httpStatus(409)
+        }
+        let response: MailDraftResponse = try await self.request(
+            path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/drafts",
+            method: "POST", body: body
+        )
+        rememberDraft(response, fallbackAccountID: accountID)
+        return response
     }
 
     public func draft(mailboxThreadID: String) async throws -> MailDraftResponse {
-        try await self.request(path: "/v1/mailbox/drafts/\(mailboxThreadID.urlPathEncoded)")
+        if let accountID = draftAccountIDs[mailboxThreadID] ?? writeAccountID(threadID: mailboxThreadID) {
+            let rawID = ScopedGmailThreadID(mailboxThreadID)?.gmailThreadID ?? mailboxThreadID
+            let response: MailDraftResponse = try await self.request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/drafts/\(rawID.urlPathEncoded)"
+            )
+            rememberDraft(response, fallbackAccountID: accountID)
+            return response
+        }
+        return try await self.request(path: "/v1/mailbox/drafts/\(mailboxThreadID.urlPathEncoded)")
     }
 
     public func updateDraft(gmailDraftID: String, request: MailDraftSaveRequest) async throws -> MailDraftResponse {
         let body = try JSONEncoder.backend.encode(request)
-        return try await self.request(path: "/v1/mailbox/drafts/\(gmailDraftID.urlPathEncoded)", method: "PUT", body: body)
+        guard let accountID = request.gmailAccountID ?? draftAccountIDs[gmailDraftID] ?? writeAccountID(threadID: request.mailboxThreadID) else {
+            throw APIError.httpStatus(409)
+        }
+        let response: MailDraftResponse = try await self.request(
+            path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/drafts/\(gmailDraftID.urlPathEncoded)",
+            method: "PUT", body: body
+        )
+        rememberDraft(response, fallbackAccountID: accountID)
+        return response
     }
 
     public func deleteDraft(gmailDraftID: String) async throws {
+        if let accountID = draftAccountIDs[gmailDraftID] ?? writeAccountID() {
+            try await emptyRequest(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/drafts/\(gmailDraftID.urlPathEncoded)",
+                method: "DELETE"
+            )
+            return
+        }
         try await emptyRequest(path: "/v1/mailbox/drafts/\(gmailDraftID.urlPathEncoded)", method: "DELETE")
     }
 
     public func sendDraft(gmailDraftID: String, request: MailDraftSendRequest) async throws -> MailSendResponse {
         let body = try JSONEncoder.backend.encode(request)
-        return try await self.request(path: "/v1/mailbox/drafts/\(gmailDraftID.urlPathEncoded)/send", method: "POST", body: body)
+        guard let accountID = draftAccountIDs[gmailDraftID] ?? writeAccountID() else {
+            throw APIError.httpStatus(409)
+        }
+        let response: MailSendResponse = try await self.request(
+            path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/drafts/\(gmailDraftID.urlPathEncoded)/send",
+            method: "POST", body: body
+        )
+        rememberSend(response, fallbackAccountID: accountID)
+        return response
+    }
+
+    private func writeAccountID(explicit: String? = nil, threadID: String? = nil) -> String? {
+        if let explicit, !explicit.isEmpty { return explicit }
+        if let threadID, let scoped = ScopedGmailThreadID(threadID) { return scoped.accountID }
+        if let selected = activeMailboxScope.gmailAccountID { return selected }
+        return configuredGmailAccounts?.primaryGmailAccountID
+    }
+
+    private func rememberSend(_ response: MailSendResponse, fallbackAccountID: String) {
+        guard let serverSendID = response.serverSendID else { return }
+        sendAccountIDs[serverSendID] = response.gmailAccountID ?? fallbackAccountID
+    }
+
+    private func rememberDraft(_ response: MailDraftResponse, fallbackAccountID: String) {
+        guard let gmailDraftID = response.gmailDraftID else { return }
+        draftAccountIDs[gmailDraftID] = response.gmailAccountID ?? fallbackAccountID
     }
 
     public func downloadAttachment(messageID: String, attachment: ThreadAttachment) async throws -> DownloadedAttachment {
@@ -532,6 +845,40 @@ public final class LiveBackendAppClient: AppClient {
     }
 
     public func aiInbox(query: String? = nil) async throws -> AIInboxResponse {
+        if let accountID = activeMailboxScope.gmailAccountID {
+            return try await accountAIInbox(accountID: accountID, query: query)
+        }
+        if let accounts = configuredGmailAccounts?.accounts.filter({ $0.state == .ready }),
+           !accounts.isEmpty {
+            var loaded: [AIInboxResponse] = []
+            var failures: [String] = []
+            for account in accounts {
+                do {
+                    loaded.append(try await accountAIInbox(accountID: account.id, query: query))
+                } catch {
+                    failures.append(account.email)
+                }
+            }
+            guard let first = loaded.first else {
+                throw APIError.httpStatus(503)
+            }
+            var matters = loaded.flatMap(\.matters)
+            matters.sort { $0.latestMessageAt > $1.latestMessageAt }
+            var organizing = loaded.flatMap(\.organizing)
+            organizing.sort { $0.latestMessageAt > $1.latestMessageAt }
+            return AIInboxResponse(
+                profile: loaded.first(where: {
+                    $0.gmailAccountID == configuredGmailAccounts?.primaryGmailAccountID
+                })?.profile ?? first.profile,
+                generationID: nil,
+                revision: loaded.map(\.revision).joined(separator: ":"),
+                stale: loaded.contains(where: { $0.stale }) || !failures.isEmpty,
+                staleReason: failures.isEmpty ? nil : "Could not load AI Inbox for \(failures.joined(separator: ", ")).",
+                matters: matters,
+                organizing: organizing,
+                generatedAt: loaded.map(\.generatedAt).max() ?? first.generatedAt
+            )
+        }
         if let query, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return try await request(
                 path: "/v1/ai-inbox/search",
@@ -542,36 +889,101 @@ public final class LiveBackendAppClient: AppClient {
     }
 
     public func aiOrganizationProfile() async throws -> AIOrganizationProfile {
-        try await request(path: "/v1/ai-organization/profile")
+        if let accountID = writeAccountID() {
+            return try await request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/ai-organization/profile"
+            )
+        }
+        return try await request(path: "/v1/ai-organization/profile")
     }
 
     public func updateAIOrganizationProfile(_ patch: AIOrganizationProfilePatch) async throws -> AIOrganizationProfile {
         let body = try JSONEncoder.backend.encode(patch)
+        if let accountID = writeAccountID() {
+            return try await request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/ai-organization/profile",
+                method: "PATCH", body: body
+            )
+        }
         return try await request(path: "/v1/ai-organization/profile", method: "PATCH", body: body)
     }
 
     public func aiMatter(_ matterID: String) async throws -> AIMatterDetail {
-        try await request(path: "/v1/matters/\(matterID.urlPathEncoded)")
+        if let accountID = matterAccountIDs[matterID] ?? writeAccountID() {
+            return try await request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/matters/\(matterID.urlPathEncoded)"
+            )
+        }
+        return try await request(path: "/v1/matters/\(matterID.urlPathEncoded)")
     }
 
     public func aiGroupingExplanation(matterID: String, messageID: String) async throws -> AIGroupingExplanation {
-        try await request(
+        if let accountID = matterAccountIDs[matterID] ?? writeAccountID() {
+            return try await request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/matters/\(matterID.urlPathEncoded)/messages/\(messageID.urlPathEncoded)/grouping-reason"
+            )
+        }
+        return try await request(
             path: "/v1/matters/\(matterID.urlPathEncoded)/messages/\(messageID.urlPathEncoded)/grouping-reason"
         )
     }
 
     public func applyMatterDecision(_ request: MatterDecisionRequest) async throws -> MatterDecisionResponse {
         let body = try JSONEncoder.backend.encode(request)
+        if let accountID = matterAccountIDs[request.matterID] ?? writeAccountID() {
+            return try await self.request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/matter-decisions",
+                method: "POST", body: body
+            )
+        }
         return try await self.request(path: "/v1/matter-decisions", method: "POST", body: body)
     }
 
     public func applyMatterAction(_ request: MatterEntityActionRequest) async throws -> MatterEntityActionResponse {
         let body = try JSONEncoder.backend.encode(request)
+        if let accountID = matterAccountIDs[request.matterID] ?? writeAccountID() {
+            return try await self.request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/mailbox/entity-actions",
+                method: "POST", body: body
+            )
+        }
         return try await self.request(path: "/v1/mailbox/entity-actions", method: "POST", body: body)
     }
 
     public func deleteAIOrganizationData() async throws {
+        if let accountID = writeAccountID() {
+            try await emptyRequest(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/ai-organization/data",
+                method: "DELETE"
+            )
+            return
+        }
         try await emptyRequest(path: "/v1/ai-organization/data", method: "DELETE")
+    }
+
+    private func accountAIInbox(accountID: String, query: String?) async throws -> AIInboxResponse {
+        let path: String
+        var queryItems: [URLQueryItem] = []
+        if let query, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            path = "/v1/gmail-accounts/\(accountID.urlPathEncoded)/ai-inbox/search"
+            queryItems = [URLQueryItem(name: "q", value: query)]
+        } else {
+            path = "/v1/gmail-accounts/\(accountID.urlPathEncoded)/ai-inbox"
+        }
+        var response: AIInboxResponse = try await request(path: path, queryItems: queryItems)
+        let accountEmail = configuredGmailAccounts?.accounts.first(where: { $0.id == accountID })?.email
+        response.gmailAccountID = accountID
+        response.profile.gmailAccountID = accountID
+        for index in response.matters.indices {
+            response.matters[index].gmailAccountID = accountID
+            response.matters[index].sourceAccountEmail = accountEmail
+            matterAccountIDs[response.matters[index].id] = accountID
+        }
+        for index in response.organizing.indices {
+            response.organizing[index].gmailAccountID = accountID
+            response.organizing[index].sourceAccountEmail = accountEmail
+        }
+        return response
     }
 
     private func request<Response: Decodable>(
@@ -689,7 +1101,7 @@ public final class LiveBackendAppClient: AppClient {
     }
 }
 
-private extension String {
+extension String {
     var urlPathEncoded: String {
         var allowedCharacters = CharacterSet.urlPathAllowed
         allowedCharacters.remove(charactersIn: "/")

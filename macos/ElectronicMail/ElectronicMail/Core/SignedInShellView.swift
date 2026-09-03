@@ -100,7 +100,9 @@ public final class ElectronicMailComposerShutdownCoordinator {
 public struct SignedInShellView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.openSettings) private var openSettings
     @ObservedObject private var store: InboxStore
+    @ObservedObject private var accountSettingsStore: GmailAccountSettingsStore
     @StateObject private var aiInboxStore: AIInboxStore
     private let onReauthorizeGoogle: () async throws -> Void
     private let onSignOut: () async throws -> Void
@@ -111,7 +113,6 @@ public struct SignedInShellView: View {
     @State private var navigationOpen = false
     @State private var mailboxSearchOpen = false
     @State private var mailboxSearchFocusRequested = false
-    @State private var aiInboxSettingsOpen = false
     @State private var aiInboxOrganizeOpen = false
     @State private var commandPaletteOpen = false
     @State private var composer: MailComposerPresentation?
@@ -124,18 +125,30 @@ public struct SignedInShellView: View {
     @State private var confirmAIMatterTrash = false
     @State private var contactPhotoAuthorizationRunning = false
     @State private var aiReaderChromeState: AIReaderChromeState
+    @AppStorage(ElectronicMailSettingsDestination.selectionStorageKey)
+    private var selectedSettingsDestination = ElectronicMailSettingsDestination.accounts.rawValue
     @AppStorage("ElectronicMailContactPhotoPromptDismissed") private var contactPhotoPromptDismissed = false
 
     public init(
         store: InboxStore,
+        accountSettingsStore: GmailAccountSettingsStore,
         onReauthorizeGoogle: @escaping () async throws -> Void = {},
         onSignOut: @escaping () async throws -> Void = {},
         onDisconnectGoogle: @escaping () async throws -> Void = {},
         onDeleteAccount: @escaping () async throws -> Void = {}
     ) {
+        let startupScreen = ElectronicMailStartupScreen(
+            rawValue: UserDefaults.standard.string(
+                forKey: ElectronicMailStartupScreen.storageKey
+            ) ?? ""
+        ) ?? .inbox
         self.store = store
+        self.accountSettingsStore = accountSettingsStore
         _aiInboxStore = StateObject(wrappedValue: AIInboxStore(client: store.aiInboxClient))
         _aiReaderChromeState = State(initialValue: AIReaderChromeState())
+        _supplementalDestination = State(
+            initialValue: startupScreen.supplementalDestination
+        )
         self.onReauthorizeGoogle = onReauthorizeGoogle
         self.onSignOut = onSignOut
         self.onDisconnectGoogle = onDisconnectGoogle
@@ -201,6 +214,7 @@ public struct SignedInShellView: View {
                             presentation: composer,
                             recoverySnapshot: recoveredComposerSnapshot,
                             store: store,
+                            accountSettingsStore: accountSettingsStore,
                             colorScheme: colorScheme,
                             onReauthorizeGoogle: onReauthorizeGoogle,
                             onClose: closeComposer(preserving:)
@@ -232,6 +246,21 @@ public struct SignedInShellView: View {
         }
         .task(id: selection) {
             await applyMailboxSelection()
+        }
+        .task {
+            await accountSettingsStore.load()
+            if let accounts = accountSettingsStore.response {
+                await store.setMailboxViewScope(
+                    accountSettingsStore.selectedScope,
+                    accounts: accounts
+                )
+            }
+        }
+        .onChange(of: accountSettingsStore.selectedScope) { _, scope in
+            guard let accounts = accountSettingsStore.response else { return }
+            Task {
+                await store.setMailboxViewScope(scope, accounts: accounts)
+            }
         }
         .onChange(of: store.activeMailboxLabel) { _, label in
             guard supplementalDestination == nil else {
@@ -412,7 +441,7 @@ public struct SignedInShellView: View {
         )
         let showsReader = store.readerThreadID != nil || activeAIMatter != nil
         let showsMailboxControls = supplementalDestination == nil || supplementalDestination == .aiInbox
-        let fixedTrailingControlCount: CGFloat = supplementalDestination == .aiInbox ? 2 : 1
+        let fixedTrailingControlCount: CGFloat = showsMailboxControls ? 3 : 2
         let readerTitleLeading = ElectronicMailControlMetrics.centeredContentLeading(
             containerWidth: width,
             maxContentWidth: ElectronicMailControlMetrics.readerMaxWidth,
@@ -431,7 +460,9 @@ public struct SignedInShellView: View {
                 + (mailboxSearchOpen ? searchWidth : ElectronicMailControlMetrics.headerControlSize)
                 + ElectronicMailControlMetrics.mailboxHeaderTrailingInset
         } else {
-            ElectronicMailControlMetrics.headerControlSize + ElectronicMailControlMetrics.trailingInset
+            ElectronicMailControlMetrics.headerControlSize * fixedTrailingControlCount
+                + ElectronicMailControlMetrics.headerControlGap
+                + ElectronicMailControlMetrics.trailingInset
         }
         let readerTitleAvailableWidth = max(
             1,
@@ -519,10 +550,18 @@ public struct SignedInShellView: View {
                                 max(0, readerTitleLeading - ElectronicMailControlMetrics.trailingInset)
                             )
                     } else {
-                        if supplementalDestination == .aiInbox {
-                            ShellAIInboxSettingsButton(
+                        ShellAccountSettingsButton(
+                            colorScheme: colorScheme,
+                            action: openAccountSettings
+                        )
+
+                        if showsMailboxControls {
+                            ShellInboxSettingsButton(
                                 colorScheme: colorScheme,
-                                action: { aiInboxSettingsOpen = true }
+                                accessibilityLabel: supplementalDestination == .aiInbox
+                                    ? "AI Inbox Settings"
+                                    : "Inbox Settings",
+                                action: openInboxSettings
                             )
                         }
 
@@ -704,7 +743,7 @@ public struct SignedInShellView: View {
             AIInboxView(
                 store: aiInboxStore,
                 searchText: $mailboxSearchText,
-                showSettings: $aiInboxSettingsOpen,
+                showSettings: .constant(false),
                 showOrganize: $aiInboxOrganizeOpen,
                 currentUserDisplayName: store.session?.readiness.userDisplayName
                     ?? store.session?.dashboard.profile?.displayName
@@ -753,6 +792,18 @@ public struct SignedInShellView: View {
             return true
         }
         return supplementalDestination == nil && selection == .inbox
+    }
+
+    private func openAccountSettings() {
+        selectedSettingsDestination = ElectronicMailSettingsDestination.accounts.rawValue
+        openSettings()
+    }
+
+    private func openInboxSettings() {
+        selectedSettingsDestination = supplementalDestination == .aiInbox
+            ? ElectronicMailSettingsDestination.aiInbox.rawValue
+            : ElectronicMailSettingsDestination.general.rawValue
+        openSettings()
     }
 
     private var primaryNavigationSelection: ShellPrimaryNavigationDestination? {
@@ -1034,7 +1085,14 @@ public struct SignedInShellView: View {
             commandPaletteOpen = false
         }
         presentComposer(
-            MailComposerPresentation(mode: .compose, threadID: nil, sourceMessageID: nil, title: "New message")
+            MailComposerPresentation(
+                mode: .compose,
+                threadID: nil,
+                sourceMessageID: nil,
+                title: "New message",
+                gmailAccountID: accountSettingsStore.selectedScope.gmailAccountID
+                    ?? accountSettingsStore.defaultSenderAccountID
+            )
         )
     }
 
@@ -1074,14 +1132,21 @@ public struct SignedInShellView: View {
                 mode: mode,
                 threadID: threadID,
                 sourceMessageID: sourceMessageID,
-                title: activeAIMatter?.title ?? store.readerRow?.title ?? mode.title
+                title: activeAIMatter?.title ?? store.readerRow?.title ?? mode.title,
+                gmailAccountID: ScopedGmailThreadID(threadID)?.accountID
+                    ?? accountSettingsStore.response?.primaryGmailAccountID
             )
         )
     }
 
     private func openDraftComposer(threadID: String) {
         presentComposer(
-            MailComposerPresentation(mode: .draft, threadID: threadID, sourceMessageID: nil, title: "Edit Draft")
+            MailComposerPresentation(
+                mode: .draft, threadID: threadID, sourceMessageID: nil,
+                title: "Edit Draft",
+                gmailAccountID: ScopedGmailThreadID(threadID)?.accountID
+                    ?? accountSettingsStore.response?.primaryGmailAccountID
+            )
         )
     }
 
@@ -1168,6 +1233,19 @@ enum ShellSupplementalDestination: Equatable {
 
     var primaryNavigationDestination: ShellPrimaryNavigationDestination {
         switch self {
+        case .aiInbox:
+            return .aiInbox
+        case .todos:
+            return .todos
+        }
+    }
+}
+
+private extension ElectronicMailStartupScreen {
+    var supplementalDestination: ShellSupplementalDestination? {
+        switch self {
+        case .inbox:
+            return nil
         case .aiInbox:
             return .aiInbox
         case .todos:
@@ -1387,14 +1465,30 @@ private struct ShellComposeButton: View {
     }
 }
 
-private struct ShellAIInboxSettingsButton: View {
+private struct ShellAccountSettingsButton: View {
     let colorScheme: ColorScheme
     let action: () -> Void
 
     var body: some View {
         ElectronicMailIconControl(
+            symbol: "person.crop.circle",
+            accessibilityLabel: "Account Settings",
+            symbolOpacity: ElectronicMailControlMetrics.mailboxHeaderIconOpacity,
+            action: action
+        )
+        .accessibilityHint("Opens Gmail account settings")
+    }
+}
+
+private struct ShellInboxSettingsButton: View {
+    let colorScheme: ColorScheme
+    let accessibilityLabel: String
+    let action: () -> Void
+
+    var body: some View {
+        ElectronicMailIconControl(
             symbol: "gearshape",
-            accessibilityLabel: "AI Inbox Settings",
+            accessibilityLabel: accessibilityLabel,
             symbolOpacity: ElectronicMailControlMetrics.mailboxHeaderIconOpacity,
             action: action
         )
@@ -2274,6 +2368,7 @@ private struct MailComposerPresentation: Identifiable, Equatable {
     let threadID: String?
     let sourceMessageID: String?
     let title: String
+    var gmailAccountID: String? = nil
 
     var actionTitle: String {
         switch mode {
@@ -2293,6 +2388,7 @@ private struct MailComposerPresentation: Identifiable, Equatable {
 
 private struct ComposerRecoverySnapshot: Codable, Equatable, @unchecked Sendable {
     let accountUserID: String
+    let gmailAccountID: String?
     let mode: MailComposerMode
     let threadID: String?
     let sourceMessageID: String?
@@ -2333,7 +2429,8 @@ private struct ComposerRecoverySnapshot: Codable, Equatable, @unchecked Sendable
             mode: mode,
             threadID: threadID,
             sourceMessageID: sourceMessageID,
-            title: title
+            title: title,
+            gmailAccountID: gmailAccountID
         )
     }
 
@@ -2660,6 +2757,7 @@ private struct MailComposerOverlay: View {
     let presentation: MailComposerPresentation
     let recoverySnapshot: ComposerRecoverySnapshot?
     @ObservedObject var store: InboxStore
+    @ObservedObject var accountSettingsStore: GmailAccountSettingsStore
     let colorScheme: ColorScheme
     let onReauthorizeGoogle: () async throws -> Void
     let onClose: (ComposerRecoverySnapshot?) -> Void
@@ -2672,8 +2770,9 @@ private struct MailComposerOverlay: View {
 
                 MailComposerSheet(
                     presentation: presentation,
-                    recoverySnapshot: recoverySnapshot,
-                    store: store,
+                        recoverySnapshot: recoverySnapshot,
+                        store: store,
+                        accountSettingsStore: accountSettingsStore,
                     colorScheme: colorScheme,
                     onReauthorizeGoogle: onReauthorizeGoogle,
                     onClose: onClose
@@ -2737,11 +2836,13 @@ private struct MailComposerSheet: View {
     let presentation: MailComposerPresentation
     let recoverySnapshot: ComposerRecoverySnapshot?
     @ObservedObject var store: InboxStore
+    @ObservedObject var accountSettingsStore: GmailAccountSettingsStore
     let colorScheme: ColorScheme
     let onReauthorizeGoogle: () async throws -> Void
     let onClose: (ComposerRecoverySnapshot?) -> Void
 
     @State private var activeMode: MailComposerMode
+    @State private var gmailAccountID: String?
     @State private var toText = ""
     @State private var ccText = ""
     @State private var bccText = ""
@@ -2792,6 +2893,7 @@ private struct MailComposerSheet: View {
         presentation: MailComposerPresentation,
         recoverySnapshot: ComposerRecoverySnapshot?,
         store: InboxStore,
+        accountSettingsStore: GmailAccountSettingsStore,
         colorScheme: ColorScheme,
         onReauthorizeGoogle: @escaping () async throws -> Void,
         onClose: @escaping (ComposerRecoverySnapshot?) -> Void
@@ -2799,10 +2901,14 @@ private struct MailComposerSheet: View {
         self.presentation = presentation
         self.recoverySnapshot = recoverySnapshot
         self._store = ObservedObject(wrappedValue: store)
+        self._accountSettingsStore = ObservedObject(wrappedValue: accountSettingsStore)
         self.colorScheme = colorScheme
         self.onReauthorizeGoogle = onReauthorizeGoogle
         self.onClose = onClose
         self._activeMode = State(initialValue: presentation.mode)
+        self._gmailAccountID = State(
+            initialValue: recoverySnapshot?.gmailAccountID ?? presentation.gmailAccountID
+        )
     }
 
     var body: some View {
@@ -3039,16 +3145,33 @@ private struct MailComposerSheet: View {
                 .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
                 .frame(width: MailComposerLayout.fieldLabelWidth, alignment: .leading)
 
-            Text(currentSenderName)
-                .font(ElectronicMailComposerType.value())
-                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-
-            if let email = store.session?.user.email, !email.isEmpty {
-                Text(email)
+            if senderIsLocked {
+                Text(currentSenderName)
                     .font(ElectronicMailComposerType.value())
-                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+                if let email = currentSenderEmail, !email.isEmpty {
+                    Text(email)
+                        .font(ElectronicMailComposerType.value())
+                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            } else {
+                Picker("From Gmail account", selection: $gmailAccountID) {
+                    Text("Choose Gmail account").tag(nil as String?)
+                    ForEach(senderAccounts) { account in
+                        Text(account.email).tag(Optional(account.id))
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .disabled(composerControlsDisabled || gmailDraftID != nil)
+            }
+
+            if gmailAccountID == nil {
+                Text("Required")
+                    .font(ElectronicMailComposerType.status())
+                    .foregroundStyle(.orange)
             }
 
             Spacer(minLength: 0)
@@ -3060,7 +3183,7 @@ private struct MailComposerSheet: View {
                 .frame(height: 1)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("From \(currentSenderName), \(store.session?.user.email ?? "")")
+        .accessibilityLabel("From \(currentSenderName), \(currentSenderEmail ?? "")")
     }
 
     private var composerToField: some View {
@@ -3146,11 +3269,30 @@ private struct MailComposerSheet: View {
         }
     }
 
+    private var senderAccounts: [GmailAccount] {
+        accountSettingsStore.response?.accounts.filter { $0.state == .ready } ?? []
+    }
+
+    private var selectedSenderAccount: GmailAccount? {
+        guard let gmailAccountID else { return nil }
+        return senderAccounts.first { $0.id == gmailAccountID }
+    }
+
+    private var senderIsLocked: Bool {
+        isResponseComposer || presentation.mode == .draft || gmailDraftID != nil
+    }
+
+    private var currentSenderEmail: String? {
+        selectedSenderAccount?.email ?? store.session?.user.email
+    }
+
     private var currentSenderName: String {
-        store.session?.user.displayName
+        selectedSenderAccount?.displayName
+            ?? selectedSenderAccount?.email
+            ?? store.session?.user.displayName
             ?? store.session?.user.firstName
             ?? store.session?.user.email
-            ?? "You"
+            ?? "Choose an account"
     }
 
     private var attachmentSummary: String {
@@ -3758,6 +3900,7 @@ private struct MailComposerSheet: View {
                 clientDraftID = draft.clientDraftID
                 gmailDraftID = draft.gmailDraftID
                 gmailThreadID = draft.gmailThreadID
+                gmailAccountID = draft.gmailAccountID ?? gmailAccountID
                 toText = draft.to.joined(separator: ", ")
                 ccText = draft.cc.joined(separator: ", ")
                 bccText = draft.bcc.joined(separator: ", ")
@@ -3798,6 +3941,7 @@ private struct MailComposerSheet: View {
     @MainActor
     private func apply(_ recovery: ComposerRecoverySnapshot) {
         activeMode = recovery.mode
+        gmailAccountID = recovery.gmailAccountID ?? gmailAccountID
         toText = recovery.toText
         ccText = recovery.ccText
         bccText = recovery.bccText
@@ -3856,6 +4000,7 @@ private struct MailComposerSheet: View {
         }
         return ComposerRecoverySnapshot(
             accountUserID: accountUserID,
+            gmailAccountID: gmailAccountID,
             mode: effectiveMode,
             threadID: presentation.threadID,
             sourceMessageID: presentation.sourceMessageID,
@@ -3942,6 +4087,10 @@ private struct MailComposerSheet: View {
     @discardableResult
     private func saveDraftIfNeeded(force: Bool, expectedRevision: UInt64? = nil) async -> MailDraftResponse? {
         guard force || shouldPersistGmailDraft else { return nil }
+        guard gmailAccountID != nil else {
+            statusText = "Choose a Gmail account in From."
+            return nil
+        }
         savingDraft = true
         if !sending { statusText = "Saving draft..." }
         defer { savingDraft = false }
@@ -3966,7 +4115,8 @@ private struct MailComposerSheet: View {
                     sourceMessageID: responseMode == nil ? nil : presentation.sourceMessageID,
                     includeQuotedOriginal: true,
                     includeOriginalAttachments: responseMode == .forward && includeOriginalAttachments,
-                    createdAt: ISO8601DateFormatter().string(from: Date())
+                    createdAt: ISO8601DateFormatter().string(from: Date()),
+                    gmailAccountID: gmailAccountID
                 )
             )
             guard MailComposerPolicy.shouldApplyDraftSaveResponse(state: response.state) else {

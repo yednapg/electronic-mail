@@ -5648,6 +5648,59 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(client.mailboxCallCount, 1)
     }
 
+    func testReadinessPollingRecoversMailboxAfterEarlyBackendFailure() async {
+        let unavailableMailbox = makeProgressiveMailbox(
+            metadataCount: 0,
+            bodyReadyCount: 0,
+            estimatedTotalCount: 640,
+            visibleRowCount: 0
+        )
+        let recoveredMailbox = makeProgressiveMailbox(
+            metadataCount: 100,
+            bodyReadyCount: 25,
+            estimatedTotalCount: 640,
+            initialWindowComplete: true
+        )
+        let client = ManualSyncAppClient()
+        client.appSessionOverride = makeProgressiveSession(mailbox: unavailableMailbox)
+        client.mailboxResponseOverride = recoveredMailbox
+        client.mailboxFailuresRemaining = 1
+
+        var syncState = makeMailboxSyncStateResponse(
+            connected: true,
+            mailboxRevision: recoveredMailbox.mailboxRevision
+        )
+        syncState.syncGeneration = recoveredMailbox.syncGeneration
+        syncState.phase = recoveredMailbox.phase
+        syncState.initialTargetCount = recoveredMailbox.initialTargetCount
+        syncState.initialMetadataCount = recoveredMailbox.initialMetadataCount
+        syncState.initialBodyTargetCount = recoveredMailbox.initialBodyTargetCount
+        syncState.initialBodyReadyCount = recoveredMailbox.initialBodyReadyCount
+        syncState.estimatedTotalCount = recoveredMailbox.estimatedTotalCount
+        syncState.initialWindowComplete = recoveredMailbox.initialWindowComplete
+        syncState.lastProgressAt = "2026-07-25T12:00:01Z"
+        client.syncStateOverride = syncState
+
+        let store = InboxStore(
+            client: client,
+            sessionCache: AppSessionCache(defaults: .ephemeral()),
+            threadCache: ThreadCache(defaults: .ephemeral()),
+            automaticallyPrefetchThreads: false
+        )
+        store.setSessionToken("live-session-token")
+
+        await store.load()
+
+        XCTAssertEqual(client.mailboxCallCount, 1)
+        XCTAssertFalse(store.mailboxPresentationReady)
+
+        await store.refreshForReadiness()
+
+        XCTAssertEqual(client.mailboxCallCount, 2)
+        XCTAssertTrue(store.mailboxPresentationReady)
+        XCTAssertTrue(store.isReadyForMainInterface)
+    }
+
     func testHydrationEventDuringInFlightStaleReaderFetchStartsOneImmediateFollowUp() async {
         let mailbox = makeSingleRowMailbox(threadID: "racing-thread", title: "Racing hydration")
         let requestGate = ReaderActionRequestGate()
@@ -5939,7 +5992,9 @@ final class InboxStoreTests: XCTestCase {
                 data: #"{"mailbox_label":"inbox","payload":{"mailbox_revision":"import-revision-2"}}"#
             )
         )
-        try? await Task.sleep(nanoseconds: 1_250_000_000)
+        for _ in 0..<800 where client.searchCalls.count < 2 || store.flatRows.isEmpty {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
 
         XCTAssertEqual(store.searchQuery, "exact invoice")
         XCTAssertEqual(store.flatRows.map(\.threadID), ["import-search-result"])
@@ -9528,6 +9583,11 @@ private final class ManualSyncAppClient: AppClient {
     var baseURL = AppConfiguration.defaultBackendURL
     var sessionToken: String?
     let mode: AppRunMode = .localBackend
+    var appSessionOverride: AppSessionResponse?
+    var mailboxResponseOverride: MailboxResponse?
+    var mailboxFailuresRemaining = 0
+    var syncStateOverride: MailboxSyncStateResponse?
+    private(set) var mailboxCallCount = 0
     private(set) var syncNowCallCount = 0
     private(set) var logoutCallCount = 0
     private(set) var mailboxLabels: [MailboxLabel] = []
@@ -9546,11 +9606,19 @@ private final class ManualSyncAppClient: AppClient {
     }
 
     func appSession() async throws -> AppSessionResponse {
-        DemoAppFixtures.appSession
+        appSessionOverride ?? DemoAppFixtures.appSession
     }
 
     func mailbox(label: MailboxLabel, limit: Int, cursor: String?) async throws -> MailboxResponse {
+        mailboxCallCount += 1
         mailboxLabels.append(label)
+        if mailboxFailuresRemaining > 0 {
+            mailboxFailuresRemaining -= 1
+            throw APIError.httpStatus(503)
+        }
+        if let mailboxResponseOverride {
+            return mailboxResponseOverride
+        }
         let mailbox = DemoAppFixtures.mailbox
         return MailboxResponse(
             label: label,
@@ -9576,6 +9644,9 @@ private final class ManualSyncAppClient: AppClient {
     func mailboxSyncState() async throws -> MailboxSyncStateResponse {
         if let syncStateFailureStatus {
             throw APIError.httpStatus(syncStateFailureStatus)
+        }
+        if let syncStateOverride {
+            return syncStateOverride
         }
         return makeSyncState(connected: syncStateConnected)
     }

@@ -28,6 +28,11 @@
 		3709BB98DACBC3EA02588F53 /* APIClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E978EC1605F65D46914F4B58 /* APIClientTests.swift */; };
 		43C4E9360B2153C3AFED1FE0 /* DashboardStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1248366AFBD8E041955962EB /* DashboardStore.swift */; };
 		44F11154D52AC0E19A462409 /* DashboardViewModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3E23CEC3BF04A0C374FE7AF /* DashboardViewModels.swift */; };
+		B03500000000000000000001 /* GmailAccountSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = B03500000000000000000000 /* GmailAccountSettings.swift */; };
+		B03500000000000000000002 /* GmailAccountSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = B03500000000000000000000 /* GmailAccountSettings.swift */; };
+		B03500000000000000000003 /* MobileAuthFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70934CFC827A51900D954C83 /* MobileAuthFlow.swift */; };
+		B03600000000000000000011 /* ElectronicMailSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B03600000000000000000001 /* ElectronicMailSettingsView.swift */; };
+		B03600000000000000000012 /* AIOrganizationSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B03600000000000000000002 /* AIOrganizationSettingsView.swift */; };
 		450DF872F290F5105277BAFD /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4B0DA2215CE7CF473AE431B /* Models.swift */; };
 		4A90C425C83E253DE4697898 /* AppConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51A82E6E83CB2F01653310C9 /* AppConfiguration.swift */; };
 		54DFBE2A0077AFAAE24BA36C /* LocalMailStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 312841A2440897390E5606AE /* LocalMailStore.swift */; };
@@ -203,6 +208,9 @@
 		A89D2A08606ADBA921590EED /* ElectronicMailCore-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMailCore-Info.plist"; sourceTree = "<group>"; };
 		AFB79EFC32537484EE3D6FBE /* ModelDecodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDecodingTests.swift; sourceTree = "<group>"; };
 		B3E279E99C5A2401814A085C /* ElectronicMailiOSRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElectronicMailiOSRootView.swift; sourceTree = "<group>"; };
+		B03500000000000000000000 /* GmailAccountSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GmailAccountSettings.swift; sourceTree = "<group>"; };
+		B03600000000000000000001 /* ElectronicMailSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ElectronicMailSettingsView.swift; sourceTree = "<group>"; };
+		B03600000000000000000002 /* AIOrganizationSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIOrganizationSettingsView.swift; sourceTree = "<group>"; };
 		C4B0DA2215CE7CF473AE431B /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		C9A1D426A580DEF065947EE2 /* AppSessionCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSessionCache.swift; sourceTree = "<group>"; };
 		CB0697E28A5D995EE4729866 /* ElectronicMailSharedTests-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ElectronicMailSharedTests-Info.plist"; sourceTree = "<group>"; };
@@ -356,10 +364,20 @@
 			children = (
 				1248366AFBD8E041955962EB /* DashboardStore.swift */,
 				E3E23CEC3BF04A0C374FE7AF /* DashboardViewModels.swift */,
+				B03500000000000000000000 /* GmailAccountSettings.swift */,
 				942CBD31879339E0CDAE5995 /* InboxViewModels.swift */,
 				70934CFC827A51900D954C83 /* MobileAuthFlow.swift */,
 			);
 			path = Shared;
+			sourceTree = "<group>";
+		};
+		B03600000000000000000020 /* Settings */ = {
+			isa = PBXGroup;
+			children = (
+				B03600000000000000000002 /* AIOrganizationSettingsView.swift */,
+				B03600000000000000000001 /* ElectronicMailSettingsView.swift */,
+			);
+			path = Settings;
 			sourceTree = "<group>";
 		};
 		D24F83F759C2C34B06A17450 /* InfoPlists */ = {
@@ -398,6 +416,7 @@
 			isa = PBXGroup;
 			children = (
 				A1A1A1A1A1A1A1A1A1A1A100 /* AIInbox.swift */,
+				B03600000000000000000020 /* Settings */,
 				0C0A77C95EA34E90A5200001 /* AttachmentPrefetchCoordinator.swift */,
 				D1139801E4AE9E09FEFCADE0 /* AppClient.swift */,
 				51A82E6E83CB2F01653310C9 /* AppConfiguration.swift */,
@@ -649,6 +668,7 @@
 				B3CB9CB1DB57C9E21455E52E /* ThreadCache.swift in Sources */,
 				43C4E9360B2153C3AFED1FE0 /* DashboardStore.swift in Sources */,
 				44F11154D52AC0E19A462409 /* DashboardViewModels.swift in Sources */,
+				B03500000000000000000001 /* GmailAccountSettings.swift in Sources */,
 				623B2C8D6E927A9B2BF7C378 /* InboxViewModels.swift in Sources */,
 				85BE8CDEC5D21EBB44723AAB /* MobileAuthFlow.swift in Sources */,
 			);
@@ -677,6 +697,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				A1A1A1A1A1A1A1A1A1A1A101 /* AIInbox.swift in Sources */,
+				B03600000000000000000012 /* AIOrganizationSettingsView.swift in Sources */,
+				B03600000000000000000011 /* ElectronicMailSettingsView.swift in Sources */,
 				0C0A77C95EA34E90A5300001 /* AttachmentPrefetchCoordinator.swift in Sources */,
 				BE1F6B1BE413185277F42DA7 /* AppClient.swift in Sources */,
 				4A90C425C83E253DE4697898 /* AppConfiguration.swift in Sources */,
@@ -699,6 +721,8 @@
 				5B9CB4C7A88FF38FC9BA197A /* SignedInShellView.swift in Sources */,
 				8295184470A5D6D34BBD8F55 /* ThreadCache.swift in Sources */,
 				0A55E3A899E2ADD637B82617 /* TodoHomeView.swift in Sources */,
+				B03500000000000000000002 /* GmailAccountSettings.swift in Sources */,
+				B03500000000000000000003 /* MobileAuthFlow.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

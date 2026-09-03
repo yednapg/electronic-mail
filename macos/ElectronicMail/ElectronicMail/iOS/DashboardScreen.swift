@@ -3,8 +3,24 @@ import SwiftUI
 
 struct DashboardScreen: View {
     @ObservedObject var store: DashboardStore
+    @StateObject private var accountSettingsStore: GmailAccountSettingsStore
+    let authService: IOSGoogleOAuthService
     let onSignOut: () -> Void
     @State private var selectedMode: DashboardMode = .todo
+    @State private var settingsPresented = false
+
+    init(
+        store: DashboardStore,
+        authService: IOSGoogleOAuthService,
+        onSignOut: @escaping () -> Void
+    ) {
+        self.store = store
+        self.authService = authService
+        self.onSignOut = onSignOut
+        _accountSettingsStore = StateObject(
+            wrappedValue: GmailAccountSettingsStore(client: store.accountClient)
+        )
+    }
 
     var body: some View {
         NavigationStack {
@@ -12,6 +28,25 @@ struct DashboardScreen: View {
                 .toolbar(.hidden, for: .navigationBar)
                 .sheet(item: selectedThreadBinding) { thread in
                     ThreadDetailView(thread: thread)
+                }
+                .sheet(isPresented: $settingsPresented) {
+                    NavigationStack {
+                        GmailAccountSettingsView(
+                            store: accountSettingsStore,
+                            authorizeAccount: { authorizationURL in
+                                try await authService.startGoogleAccountLink(
+                                    authorizationURL: authorizationURL
+                                )
+                            }
+                        )
+                            .navigationTitle("Settings")
+                            .navigationBarTitleDisplayMode(.inline)
+                            .toolbar {
+                                ToolbarItem(placement: .confirmationAction) {
+                                    Button("Done") { settingsPresented = false }
+                                }
+                            }
+                    }
                 }
         }
     }
@@ -42,6 +77,8 @@ struct DashboardScreen: View {
                     snapshot: snapshot,
                     inboxSnapshot: store.inboxSnapshot,
                     store: store,
+                    accountSettingsStore: accountSettingsStore,
+                    onOpenSettings: { settingsPresented = true },
                     onSignOut: onSignOut
                 )
             } else {
@@ -92,6 +129,8 @@ private struct DashboardModeContainer: View {
     let snapshot: DashboardSnapshot
     let inboxSnapshot: MobileInboxSnapshot?
     @ObservedObject var store: DashboardStore
+    @ObservedObject var accountSettingsStore: GmailAccountSettingsStore
+    let onOpenSettings: () -> Void
     let onSignOut: () -> Void
 
     var body: some View {
@@ -99,10 +138,13 @@ private struct DashboardModeContainer: View {
             DashboardTopBar(
                 selectedMode: $selectedMode,
                 syncing: store.syncing,
+                accountResponse: accountSettingsStore.response,
+                selectedScope: $accountSettingsStore.selectedScope,
                 onRefresh: {
                     AppHaptics.lightImpact()
                     Task { await store.triggerSyncAndRefresh() }
                 },
+                onOpenSettings: onOpenSettings,
                 onSignOut: onSignOut
             )
 
@@ -115,6 +157,7 @@ private struct DashboardModeContainer: View {
         }
         .background(IOSDashboardPalette.background.ignoresSafeArea())
         .preferredColorScheme(.dark)
+        .task { await accountSettingsStore.load() }
     }
 }
 
@@ -132,7 +175,10 @@ private enum IOSDashboardPalette {
 private struct DashboardTopBar: View {
     @Binding var selectedMode: DashboardMode
     let syncing: Bool
+    let accountResponse: GmailAccountsResponse?
+    @Binding var selectedScope: MailboxViewScope
     let onRefresh: () -> Void
+    let onOpenSettings: () -> Void
     let onSignOut: () -> Void
 
     var body: some View {
@@ -151,6 +197,32 @@ private struct DashboardTopBar: View {
                 }
 
                 Divider()
+
+                if let accountResponse {
+                    Menu("Inbox account") {
+                        Button {
+                            selectedScope = .combined
+                        } label: {
+                            Label("Combined", systemImage: selectedScope == .combined ? "checkmark" : "tray.2")
+                        }
+                        ForEach(accountResponse.accounts) { account in
+                            Button {
+                                selectedScope = .gmail(accountID: account.id)
+                            } label: {
+                                Label(
+                                    account.email,
+                                    systemImage: selectedScope.gmailAccountID == account.id ? "checkmark" : "envelope"
+                                )
+                            }
+                        }
+                    }
+
+                    Divider()
+                }
+
+                Button(action: onOpenSettings) {
+                    Label("Settings", systemImage: "gearshape")
+                }
 
                 Button(action: onRefresh) {
                     Label("Refresh", systemImage: syncing ? "arrow.triangle.2.circlepath.circle.fill" : "arrow.clockwise")

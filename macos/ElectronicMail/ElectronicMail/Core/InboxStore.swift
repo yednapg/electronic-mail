@@ -745,6 +745,7 @@ private actor LocalMailStoreWorker {
 public final class InboxStore: ObservableObject {
     @Published public private(set) var phase: LoadPhase = .idle
     @Published private(set) var session: AppSessionResponse?
+    @Published public private(set) var mailboxViewScope: MailboxViewScope = .combined
     @Published private(set) var activeMailboxLabel: MailboxLabel = .inbox {
         didSet {
             invalidateInboxSections()
@@ -753,12 +754,14 @@ public final class InboxStore: ObservableObject {
     }
     @Published private(set) var activeMailbox: MailboxResponse? {
         didSet {
+            accountWarnings = activeMailbox?.accountWarnings ?? []
             if !isSearchActive {
                 reconcileConversationExpansionState(with: activeMailbox)
             }
             invalidateInboxSections()
         }
     }
+    @Published private(set) var accountWarnings: [String] = []
     @Published private(set) var refreshFailed = false
     @Published private(set) var manualSyncInProgress = false
     @Published private(set) var selectedThreadID: String?
@@ -1593,6 +1596,16 @@ public final class InboxStore: ObservableObject {
 
     public func refreshForReadiness() async {
         await refreshSetupSyncState()
+        guard (!mailboxPresentationReady || refreshFailed),
+              shouldRecoverMailboxDuringReadiness else {
+            return
+        }
+        // The first mailbox request can race a backend that is still starting.
+        // Sync-state polling alone can then report a durable batch without ever
+        // replacing the failed mailbox snapshot. Fetch once the backend proves
+        // that a presentable batch exists; normal snapshot verification still
+        // prevents partial or cross-generation rows from being published.
+        await refreshActiveMailbox(allowCachedFallback: true, force: true)
     }
 
     public func beginReadinessRefresh() {
@@ -1627,6 +1640,7 @@ public final class InboxStore: ObservableObject {
 
     public func sendCompose(
         clientSendID: String = UUID().uuidString,
+        gmailAccountID: String? = nil,
         to: [String],
         cc: [String] = [],
         bcc: [String] = [],
@@ -1648,7 +1662,8 @@ public final class InboxStore: ObservableObject {
                 bodyText: bodyText,
                 bodyHTML: nil,
                 attachments: attachments,
-                createdAt: ISO8601DateFormatter.backendActionTimestamp.string(from: Date())
+                createdAt: ISO8601DateFormatter.backendActionTimestamp.string(from: Date()),
+                gmailAccountID: gmailAccountID ?? mailboxViewScope.gmailAccountID
             )
         )
         scheduleRefreshAfterConfirmedSend(response)
@@ -1686,7 +1701,8 @@ public final class InboxStore: ObservableObject {
                 bodyHTML: nil,
                 attachments: attachments,
                 includeOriginalAttachments: includeOriginalAttachments,
-                createdAt: ISO8601DateFormatter.backendActionTimestamp.string(from: Date())
+                createdAt: ISO8601DateFormatter.backendActionTimestamp.string(from: Date()),
+                gmailAccountID: ScopedGmailThreadID(threadID)?.accountID ?? mailboxViewScope.gmailAccountID
             )
         )
         scheduleRefreshAfterConfirmedSend(response)
@@ -1769,11 +1785,16 @@ public final class InboxStore: ObservableObject {
     }
 
     public func saveDraft(_ request: MailDraftSaveRequest) async throws -> MailDraftResponse {
+        var scopedRequest = request
+        if scopedRequest.gmailAccountID == nil {
+            scopedRequest.gmailAccountID = ScopedGmailThreadID(request.mailboxThreadID ?? "")?.accountID
+                ?? mailboxViewScope.gmailAccountID
+        }
         let response: MailDraftResponse
-        if let gmailDraftID = request.gmailDraftID, !gmailDraftID.isEmpty {
-            response = try await client.updateDraft(gmailDraftID: gmailDraftID, request: request)
+        if let gmailDraftID = scopedRequest.gmailDraftID, !gmailDraftID.isEmpty {
+            response = try await client.updateDraft(gmailDraftID: gmailDraftID, request: scopedRequest)
         } else {
-            response = try await client.createDraft(request)
+            response = try await client.createDraft(scopedRequest)
         }
         if response.state == .saved {
             lastMailboxRefreshAt[.drafts] = nil
@@ -2942,7 +2963,8 @@ public final class InboxStore: ObservableObject {
         cancelActiveMailboxRefresh()
         lastMailboxRefreshAt[label] = nil
         await waitForPendingLocalMailStorePurge()
-        if let userID,
+        if client.canPersistCurrentMailboxCache,
+           let userID,
            let cached = await localMailStoreWorker.readMailbox(userID: userID, label: label) {
             guard operationGeneration == accountOperationGeneration,
                   session?.user.id == userID,
@@ -2969,6 +2991,43 @@ public final class InboxStore: ObservableObject {
         await refreshFolderCountsIfNeeded()
     }
 
+    public func setMailboxViewScope(
+        _ scope: MailboxViewScope,
+        accounts: GmailAccountsResponse
+    ) async {
+        guard mailboxViewScope != scope else {
+            client.configureMailboxScope(scope, accounts: accounts)
+            lastMailboxRefreshAt[activeMailboxLabel] = nil
+            await refreshActiveMailbox(allowCachedFallback: false, force: true)
+            return
+        }
+        accountOperationGeneration &+= 1
+        stopMailboxEventStream()
+        lastMailboxEventID = nil
+        client.configureMailboxScope(scope, accounts: accounts)
+        mailboxViewScope = scope
+        cancelFolderCountRefresh()
+        cancelActiveMailboxRefresh()
+        clearSearch()
+        closeReader()
+        selectedThreadID = nil
+        selectedMessageID = nil
+        activeThreadID = nil
+        activeMessageID = nil
+        readerThread = nil
+        readerRow = nil
+        readerError = nil
+        openedThreads = [:]
+        pendingConversationExpansions = [:]
+        authoritativeConversationContent = [:]
+        expandedThreadIDs = []
+        activeMailbox = nil
+        lastMailboxRefreshAt[activeMailboxLabel] = nil
+        phase = .loading
+        await refreshActiveMailbox(allowCachedFallback: false, force: true)
+        startMailboxEventStream()
+    }
+
     public func syncNow() async {
         guard !manualSyncInProgress else {
             return
@@ -2980,7 +3039,12 @@ public final class InboxStore: ObservableObject {
 
         do {
             if client.mode == .localBackend {
-                let response = try await client.syncMailboxNow()
+                let response: MailboxSyncTriggerResponse
+                if mailboxViewScope.gmailAccountID == nil {
+                    response = try await client.syncMailboxNow()
+                } else {
+                    response = try await client.triggerMailboxSync()
+                }
                 syncState = response.state
                 guard response.state.connected, response.status.lowercased() != "not_connected" else {
                     transitionToReauthentication()
@@ -3113,13 +3177,15 @@ public final class InboxStore: ObservableObject {
             targetMessageID: targetMessageID
         )
         do {
-            let request = QueuedThreadActionRequest(
+            var request = QueuedThreadActionRequest(
                 clientActionID: UUID().uuidString,
                 mailboxThreadID: threadID,
                 targetMessageID: targetMessageID,
                 action: action,
                 createdAt: ISO8601DateFormatter.backendActionTimestamp.string(from: Date())
             )
+            request.gmailAccountID = ScopedGmailThreadID(threadID)?.accountID
+                ?? mailboxViewScope.gmailAccountID
             _ = try await client.enqueueThreadAction(request)
             guard operationGeneration == accountOperationGeneration else {
                 return true
@@ -3847,6 +3913,36 @@ public final class InboxStore: ObservableObject {
         }
     }
 
+    private var shouldRecoverMailboxDuringReadiness: Bool {
+        let syncStateProgress = syncState?.mailboxSyncProgress
+        // This decision runs immediately after polling sync-state, so prefer
+        // that response over an older app-session snapshot. The mailbox
+        // response itself is still verified against the merged generation
+        // before any rows become visible.
+        let progress: MailboxSyncProgress
+        if let syncStateProgress, syncStateProgress.hasReportedProgress {
+            progress = syncStateProgress
+        } else {
+            progress = preferredMailboxSyncProgress
+        }
+        if !progress.hasReportedProgress {
+            return currentReadiness?.mailboxReady == true
+                || currentReadiness?.readyToEnter == true
+        }
+
+        let estimatedTotal = max(0, progress.estimatedTotalCount ?? syncState?.totalThreads ?? 0)
+        let initialTarget = max(
+            0,
+            progress.initialTargetCount ?? min(100, estimatedTotal)
+        )
+        if initialTarget == 0 {
+            return progress.initialWindowComplete == true && estimatedTotal == 0
+        }
+
+        let committedBatchTarget = min(25, initialTarget)
+        return max(0, progress.initialMetadataCount ?? 0) >= committedBatchTarget
+    }
+
     public func startLiveRefreshLoop() {
         guard client.supportsRealtimeMailboxUpdates else {
             return
@@ -3908,7 +4004,13 @@ public final class InboxStore: ObservableObject {
     }
 
     private func runMailboxEventStream(sessionToken: String) async throws {
-        guard let url = URL(string: "/v1/events/mailbox", relativeTo: client.baseURL)?.absoluteURL else {
+        let eventPath: String
+        if let accountID = mailboxViewScope.gmailAccountID {
+            eventPath = "/v1/gmail-accounts/\(accountID.urlPathEncoded)/events/mailbox"
+        } else {
+            eventPath = "/v1/events/mailbox"
+        }
+        guard let url = URL(string: eventPath, relativeTo: client.baseURL)?.absoluteURL else {
             throw APIError.invalidURL
         }
         var request = URLRequest(url: url)
@@ -4880,7 +4982,7 @@ public final class InboxStore: ObservableObject {
         operationGeneration: UInt
     ) async {
         await waitForPendingLocalMailStorePurge()
-        guard !localMailStoreWritesBlocked else {
+        guard !localMailStoreWritesBlocked, client.canPersistCurrentMailboxCache else {
             return
         }
         await localMailStoreWorker.writeMailbox(
@@ -4901,7 +5003,7 @@ public final class InboxStore: ObservableObject {
         operationGeneration: UInt
     ) async {
         await waitForPendingLocalMailStorePurge()
-        guard !localMailStoreWritesBlocked else {
+        guard !localMailStoreWritesBlocked, client.canPersistCurrentMailboxCache else {
             return
         }
         await localMailStoreWorker.writeMailbox(
@@ -4922,7 +5024,7 @@ public final class InboxStore: ObservableObject {
         operationGeneration: UInt
     ) async {
         await waitForPendingLocalMailStorePurge()
-        guard !localMailStoreWritesBlocked else {
+        guard !localMailStoreWritesBlocked, client.canPersistCurrentMailboxCache else {
             return
         }
         await localMailStoreWorker.writeThread(
