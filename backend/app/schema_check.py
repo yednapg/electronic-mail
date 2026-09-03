@@ -33,6 +33,7 @@ REQUIRED_SCHEMA_PROBES = (
     "SELECT 1 FROM gmail_client_drafts LIMIT 1",
     "SELECT login_code_hash, exchange_code_challenge FROM mobile_oauth_handoffs LIMIT 1",
     "SELECT started_epoch FROM oauth_login_sessions LIMIT 1",
+    "SELECT intent, initiating_user_id FROM oauth_login_sessions LIMIT 1",
     "SELECT subject_hash, deleted_epoch FROM google_subject_deletion_tombstones LIMIT 1",
     "SELECT active_generation_id, previous_generation_id FROM gmail_thread_order_state LIMIT 1",
     "SELECT generation_id, gmail_thread_id, position FROM gmail_thread_order_entries LIMIT 1",
@@ -74,6 +75,23 @@ REQUIRED_SCHEMA_PROBES = (
     ),
     "SELECT decision_type, constraints_json, idempotency_key FROM matter_decisions LIMIT 1",
     "SELECT model, latency_ms, estimated_cost_usd, error_code FROM ai_usage_events LIMIT 1",
+    (
+        "SELECT id, user_id, email, google_sub, state, initial_ready_at "
+        "FROM gmail_accounts LIMIT 1"
+    ),
+    "SELECT primary_gmail_account_id FROM users LIMIT 1",
+    (
+        "SELECT gmail_account_id, row_counts, identifier_checksums, verified_at "
+        "FROM multi_account_migration_audits LIMIT 1"
+    ),
+    "SELECT gmail_account_id FROM gmail_messages LIMIT 1",
+    "SELECT gmail_account_id FROM gmail_import_state LIMIT 1",
+    "SELECT gmail_account_id FROM gmail_pending_sends LIMIT 1",
+    "SELECT gmail_account_id FROM gmail_client_drafts LIMIT 1",
+    "SELECT gmail_account_id FROM matter_profiles LIMIT 1",
+    "SELECT gmail_account_id FROM matters LIMIT 1",
+    "SELECT gmail_account_id FROM ai_usage_events LIMIT 1",
+    "SELECT user_id, gmail_account_id FROM google_oauth_tokens LIMIT 1",
 )
 
 
@@ -112,6 +130,15 @@ def schema_is_current(settings: Settings) -> bool:
                 return False
             if connection.exec_driver_sql(VECTOR_EXTENSION_PROBE).scalar() != 1:
                 return False
+            if getattr(settings, "is_production_like", False) is True and (
+                getattr(settings, "multi_gmail_writes_enabled", False) is True
+                or getattr(settings, "multi_gmail_ai_enabled", False) is True
+            ):
+                role_bypasses_isolation = connection.exec_driver_sql(
+                    "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname=current_user"
+                ).scalar()
+                if bool(role_bypasses_isolation):
+                    return False
             for query in REQUIRED_SCHEMA_PROBES:
                 connection.exec_driver_sql(query)
     except Exception:

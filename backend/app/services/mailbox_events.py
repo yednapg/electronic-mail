@@ -26,6 +26,7 @@ def emit_mailbox_event(
     settings: Settings,
     *,
     user_id: str,
+    gmail_account_id: str | None = None,
     event_type: str,
     mailbox_label: str | None = None,
     payload: dict[str, Any] | None = None,
@@ -38,18 +39,27 @@ def emit_mailbox_event(
     return insert_mailbox_event(
         str(settings.database_path),
         user_id=user_id,
+        gmail_account_id=gmail_account_id,
         event_type=event_type,
         mailbox_label=mailbox_label,
         payload=event_payload,
     )
 
 
-def list_events_after(settings: Settings, *, user_id: str, after_id: int | None, limit: int = 100) -> list[MailboxEventRecord]:
-    return list_mailbox_events_after(str(settings.database_path), user_id=user_id, after_id=after_id, limit=limit)
+def list_events_after(settings: Settings, *, user_id: str, gmail_account_id: str | None = None,
+                      after_id: int | None, limit: int = 100) -> list[MailboxEventRecord]:
+    return list_mailbox_events_after(
+        str(settings.database_path), user_id=user_id,
+        gmail_account_id=gmail_account_id, after_id=after_id, limit=limit,
+    )
 
 
-def latest_event(settings: Settings, *, user_id: str, event_type: str | None = None) -> MailboxEventRecord | None:
-    return latest_mailbox_event(str(settings.database_path), user_id=user_id, event_type=event_type)
+def latest_event(settings: Settings, *, user_id: str, gmail_account_id: str | None = None,
+                 event_type: str | None = None) -> MailboxEventRecord | None:
+    return latest_mailbox_event(
+        str(settings.database_path), user_id=user_id,
+        gmail_account_id=gmail_account_id, event_type=event_type,
+    )
 
 
 def parse_last_event_id(value: str | None) -> int | None:
@@ -81,6 +91,7 @@ def event_payload(record: MailboxEventRecord) -> dict[str, Any]:
     return {
         "id": record.id,
         "event_type": record.event_type,
+        "gmail_account_id": getattr(record, "gmail_account_id", None),
         "mailbox_label": record.mailbox_label,
         "created_at": record.created_at,
         "payload": record.payload,

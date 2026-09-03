@@ -2152,6 +2152,7 @@ class SpeedPipelineTests(unittest.TestCase):
     ) -> None:
         mock_snapshot.return_value = AppSessionSnapshotRecord(
             user_id="user-1",
+            gmail_account_id="account-1",
             dashboard={"auth": {"available": True, "connected": True, "connect_url": None}, "feed": {}, "runtime_status": {}},
             mailbox={"label": "inbox", "total_threads": 0, "sections": []},
             sync={

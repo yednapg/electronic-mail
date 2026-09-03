@@ -25,6 +25,7 @@ RolloutMode = Literal["disabled", "shadow", "preview", "live"]
 
 
 class AIOrganizationProfileResponse(BaseModel):
+    gmail_account_id: str | None = None
     consented: bool
     enabled: bool
     available: bool
@@ -73,6 +74,7 @@ class AIShadowEvaluationResponse(BaseModel):
 
 
 class AIMatterRow(BaseModel):
+    gmail_account_id: str | None = None
     id: str
     kind: Literal["matter"] = "matter"
     title: str
@@ -94,6 +96,7 @@ class AIMatterRow(BaseModel):
 
 
 class AIOrganizingRow(BaseModel):
+    gmail_account_id: str | None = None
     id: str
     kind: Literal["organizing"] = "organizing"
     gmail_thread_id: str
@@ -109,6 +112,7 @@ class AIOrganizingRow(BaseModel):
 
 
 class AIInboxResponse(BaseModel):
+    gmail_account_id: str | None = None
     profile: AIOrganizationProfileResponse
     generation_id: str | None = None
     revision: str
@@ -142,6 +146,7 @@ class AIReviewProposal(AIGroupingExplanation):
 
 
 class AIMatterDetailResponse(BaseModel):
+    gmail_account_id: str | None = None
     id: str
     title: str
     stable_goal: str
@@ -168,6 +173,7 @@ class MatterDecisionRequest(BaseModel):
 
 
 class MatterDecisionResponse(BaseModel):
+    gmail_account_id: str | None = None
     client_decision_id: str
     decision_id: str
     matter_ids: list[str]
@@ -184,6 +190,7 @@ class MatterEntityActionRequest(BaseModel):
 
 
 class MatterEntityActionResponse(BaseModel):
+    gmail_account_id: str | None = None
     client_action_id: str
     matter_id: str
     action: GmailThreadAction
@@ -193,6 +200,7 @@ class MatterEntityActionResponse(BaseModel):
 
 
 class AIOrganizationProgressResponse(BaseModel):
+    gmail_account_id: str | None = None
     generation_id: str | None = None
     phase: Literal["disabled", "organizing_recent", "organizing_history", "ready", "failed"]
     recent_total: int = 0

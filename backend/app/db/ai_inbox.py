@@ -298,7 +298,7 @@ def update_profile(
                   :enabled, :grouping_style, :rollout_mode, :active_generation_id,
                   1, now(), now()
                 )
-                ON CONFLICT (user_id) DO UPDATE SET
+                ON CONFLICT (gmail_account_id) DO UPDATE SET
                   consented_at = CASE
                     WHEN :consented THEN COALESCE(matter_profiles.consented_at, now())
                     ELSE NULL
@@ -1144,7 +1144,7 @@ def begin_message_processing(
                   :user_id, :message_id, :generation_id, :content_revision,
                   :normalized_sha256, 'processing', :embedding_model, :prompt_version
                 )
-                ON CONFLICT (user_id, message_id, generation_id) DO UPDATE SET
+                ON CONFLICT (gmail_account_id, message_id, generation_id) DO UPDATE SET
                   content_revision = EXCLUDED.content_revision,
                   normalized_sha256 = EXCLUDED.normalized_sha256,
                   processing_state = CASE
@@ -1273,7 +1273,7 @@ def upsert_attachment_extraction(
                   :mime_type, :source_bytes, :extracted_text, :extracted_sha256,
                   :status, :truncated, :error_code
                 )
-                ON CONFLICT (user_id, message_id, attachment_id) DO UPDATE SET
+                ON CONFLICT (gmail_account_id, message_id, attachment_id) DO UPDATE SET
                   content_revision = EXCLUDED.content_revision,
                   filename = EXCLUDED.filename,
                   mime_type = EXCLUDED.mime_type,
@@ -2179,7 +2179,7 @@ def apply_matter_assignment(
                   :user_id, :generation_id, :matter_id, :message_id,
                   :membership_source, :confidence, :provisional
                 )
-                ON CONFLICT (user_id, generation_id, message_id) DO UPDATE SET
+                ON CONFLICT (gmail_account_id, generation_id, message_id) DO UPDATE SET
                   matter_id = CASE WHEN matter_members.membership_locked THEN matter_members.matter_id ELSE EXCLUDED.matter_id END,
                   membership_source = CASE WHEN matter_members.membership_locked THEN matter_members.membership_source ELSE EXCLUDED.membership_source END,
                   confidence = CASE WHEN matter_members.membership_locked THEN matter_members.confidence ELSE EXCLUDED.confidence END,
@@ -2446,13 +2446,14 @@ def record_usage(
 
 
 def monthly_usage(database_url: str, *, user_id: str | None = None) -> float:
-    sql = "SELECT COALESCE(SUM(estimated_cost_usd), 0) FROM ai_usage_events WHERE created_at >= date_trunc('month', now())"
-    params: dict[str, Any] = {}
-    if user_id is not None:
-        sql += " AND user_id = :user_id"
-        params["user_id"] = user_id
     with get_engine(database_url).connect() as connection:
-        return float(connection.execute(text(sql), params).scalar_one() or 0)
+        return float(
+            connection.execute(
+                text("SELECT electronic_mail_monthly_ai_usage(:user_id)"),
+                {"user_id": user_id},
+            ).scalar_one()
+            or 0
+        )
 
 
 def generation_progress(database_url: str, *, user_id: str) -> dict[str, Any]:
