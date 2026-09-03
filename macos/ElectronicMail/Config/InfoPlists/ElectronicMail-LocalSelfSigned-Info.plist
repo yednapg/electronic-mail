@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BackendBaseURL</key>
+	<string>$(ELECTRONIC_MAIL_BACKEND_URL)</string>
+	<key>ElectronicMailDistributionChannel</key>
+	<string>local-self-signed</string>
+	<key>ElectronicMailLocalSigningIdentitySHA1</key>
+	<string>$(ELECTRONIC_MAIL_LOCAL_SIGNING_IDENTITY_SHA1)</string>
+	<key>ElectronicMailNotarized</key>
+	<false/>
+	<key>ElectronicMailSourceCommit</key>
+	<string>$(ELECTRONIC_MAIL_SOURCE_COMMIT)</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Electronic Mail</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Electronic Mail</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>app.electronicmail.mac</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>electronicmail</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSFileQuarantineEnabled</key>
+	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>localhost</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+				<key>NSIncludesSubdomains</key>
+				<false/>
+			</dict>
+		</dict>
+	</dict>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © $(CURRENT_YEAR) Electronic Mail. All rights reserved.</string>
+	<key>NSRequiresAquaSystemAppearance</key>
+	<false/>
+</dict>
+</plist>
