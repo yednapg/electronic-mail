@@ -67,6 +67,7 @@ from app.services.mail_groups import (
 from app.workers.retry_policy import gmail_is_authorization_failure, gmail_retry_delay_seconds
 from app.services.ai_inbox import finalize_generation, organize_message, run_generation_bootstrap
 from app.services.ai_inbox_actions import run_matter_action
+from app.services.ai_todos import extract_todos_for_matter
 
 STOP = False
 logger = logging.getLogger(__name__)
@@ -373,6 +374,10 @@ def _run_job(settings, job) -> None:
     user_id = payload.get("user_id") or job.user_id
     if job.payload_version != 1:
         raise RuntimeError(f"Unsupported payload version {job.payload_version}")
+    if job.kind == "push_notification":
+        from app.services.push_notifications import deliver_push_notification
+        deliver_push_notification(settings, delivery_id=job.payload["delivery_id"], user_id=job.user_id)
+        return
     if job.kind == "google_token_revoke":
         retry_encrypted_google_token_revocation(
             settings,
@@ -554,6 +559,16 @@ def _run_job(settings, job) -> None:
             settings,
             user_id=user_id,
             generation_id=str(payload.get("generation_id") or ""),
+        )
+        return
+    if job.kind == "ai_todo_extract":
+        if not isinstance(user_id, str):
+            raise RuntimeError("ai_todo_extract missing user_id")
+        extract_todos_for_matter(
+            settings,
+            user_id=user_id,
+            generation_id=str(payload.get("generation_id") or ""),
+            matter_id=str(payload.get("matter_id") or ""),
         )
         return
     if job.kind == "ai_matter_action":

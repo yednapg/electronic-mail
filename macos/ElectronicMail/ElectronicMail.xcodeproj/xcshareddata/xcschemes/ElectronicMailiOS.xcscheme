@@ -20,6 +20,34 @@
                ReferencedContainer = "container:ElectronicMail.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "B03A00000000000000000051"
+               BuildableName = "ElectronicMailiOSTests.xctest"
+               BlueprintName = "ElectronicMailiOSTests"
+               ReferencedContainer = "container:ElectronicMail.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "B03B00000000000000000051"
+               BuildableName = "ElectronicMailiOSUITests.xctest"
+               BlueprintName = "ElectronicMailiOSUITests"
+               ReferencedContainer = "container:ElectronicMail.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction
@@ -29,6 +57,28 @@
       shouldUseLaunchSchemeArgsEnv = "YES"
       disableMainThreadChecker = "YES">
       <Testables>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "B03A00000000000000000051"
+               BuildableName = "ElectronicMailiOSTests.xctest"
+               BlueprintName = "ElectronicMailiOSTests"
+               ReferencedContainer = "container:ElectronicMail.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "B03B00000000000000000051"
+               BuildableName = "ElectronicMailiOSUITests.xctest"
+               BlueprintName = "ElectronicMailiOSUITests"
+               ReferencedContainer = "container:ElectronicMail.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction

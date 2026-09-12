@@ -1,5 +1,4 @@
 /** Public landing page for the native macOS product. */
-import Link from 'next/link';
 import React from 'react';
 
 import { AppMark } from '../components/AppMark';
@@ -37,20 +36,9 @@ export function HomePageContent({ downloadConfig }: { downloadConfig: DownloadCo
           <a className="login-primary-link" href={downloadConfig.url}>
             Download for macOS
           </a>
-        ) : downloadState === 'paused' ? (
-          <Link className="login-primary-link" href="/support">
-            Downloads paused — get support
-          </Link>
         ) : (
-          <Link className="login-primary-link" href="/support">
-            Download unavailable — get support
-          </Link>
+          <p className="login-native-description">Downloads are temporarily unavailable.</p>
         )}
-        <nav className="login-legal-links" aria-label="Legal and support">
-          <Link href="/product-info">Product information</Link>
-          <Link href="/product-info">Usage</Link>
-          <Link href="/support">Support</Link>
-        </nav>
       </div>
     </main>
   );

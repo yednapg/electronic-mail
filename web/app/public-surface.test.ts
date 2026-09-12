@@ -34,7 +34,7 @@ test('public landing page fails closed when downloads are paused', () => {
     },
   }));
 
-  assert.match(markup, /Downloads paused/);
+  assert.match(markup, /Downloads are temporarily unavailable/);
   assert.doesNotMatch(markup, /Download for macOS/);
   assert.doesNotMatch(markup, /href="https:\/\/downloads\.electronicmail\.app/);
 });
@@ -54,7 +54,7 @@ test('public landing page does not describe broken configuration as an intention
       downloadConfig,
     }));
 
-    assert.match(markup, /Download unavailable/);
+    assert.match(markup, /Downloads are temporarily unavailable/);
     assert.doesNotMatch(markup, /Downloads paused|Download for macOS/);
     assert.doesNotMatch(markup, /href="https:\/\/downloads\.electronicmail\.app/);
   }
@@ -80,9 +80,6 @@ test('OAuth completion resolves backend failure to a safe unavailable state', as
   const markup = renderToStaticMarkup(React.createElement(OAuthCompletionUnavailableView));
   assert.match(markup, /Connection status unavailable/);
   assert.match(markup, /Return to Electronic Mail on your Mac/);
-  assert.match(markup, /href="\/post-login"/);
-  assert.match(markup, /Try again/);
-  assert.match(markup, /href="\/support"/);
   assert.doesNotMatch(markup, /fetch failed|private backend detail|Google account connected/);
 });
 

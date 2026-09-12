@@ -336,13 +336,17 @@ actor EmailRemoteImageLoader {
     }
 }
 
-final class EmailRemoteImageSchemeHandler: NSObject, WKURLSchemeHandler {
-    static let scheme = "electronicmail-image"
+public final class EmailRemoteImageSchemeHandler: NSObject, WKURLSchemeHandler {
+    public static let scheme = "electronicmail-image"
 
     private let lock = NSLock()
     private var tasks: [ObjectIdentifier: Task<Void, Never>] = [:]
 
-    func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
+    public override init() {
+        super.init()
+    }
+
+    public func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
         let identifier = ObjectIdentifier(urlSchemeTask as AnyObject)
         let task = Task { [weak self, weak urlSchemeTask] in
             guard let self,
@@ -373,7 +377,7 @@ final class EmailRemoteImageSchemeHandler: NSObject, WKURLSchemeHandler {
         }
     }
 
-    func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
+    public func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
         let identifier = ObjectIdentifier(urlSchemeTask as AnyObject)
         let task = lock.withMediaCacheLock { tasks.removeValue(forKey: identifier) }
         task?.cancel()

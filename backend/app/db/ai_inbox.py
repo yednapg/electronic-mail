@@ -21,6 +21,7 @@ from app.core.counterpart_identity import (
     counterpart_aware_headline,
     mailbox_owner_identity,
 )
+from app.db.account_scope import active_gmail_account_id
 from app.db.repository import get_engine
 from app.db.user_mail_guard import user_mail_write_transaction
 
@@ -640,6 +641,7 @@ def list_ai_inbox(
     search_query: str | None = None,
     limit: int = 200,
     generation_id_override: str | None = None,
+    matter_status: str | None = None,
 ) -> dict[str, Any]:
     profile = get_profile(database_url, user_id=user_id)
     generation_id = generation_id_override or profile.get("active_generation_id")
@@ -662,6 +664,7 @@ def list_ai_inbox(
         "limit": max(1, min(limit, 500)),
         "query": f"%{(search_query or '').strip()}%",
         "has_query": bool((search_query or "").strip()),
+        "matter_status": matter_status,
     }
     with get_engine(database_url).connect() as connection:
         owner_row = connection.execute(
@@ -751,6 +754,10 @@ def list_ai_inbox(
                 WHERE matters.user_id = :user_id
                   AND matters.generation_id = :generation_id
                   AND matters.visible = TRUE
+                  AND (
+                    CAST(:matter_status AS TEXT) IS NULL
+                    OR matters.status = CAST(:matter_status AS TEXT)
+                  )
                   AND EXISTS (
                     SELECT 1
                     FROM matter_members AS visible_members
@@ -2554,8 +2561,19 @@ def count_generation_jobs(database_url: str, *, user_id: str, generation_id: str
     return int(value)
 
 
-def active_member_snapshot(database_url: str, *, user_id: str, matter_id: str) -> dict[str, Any] | None:
-    result = get_matter(database_url, user_id=user_id, matter_id=matter_id)
+def active_member_snapshot(
+    database_url: str,
+    *,
+    user_id: str,
+    matter_id: str,
+    generation_id: str | None = None,
+) -> dict[str, Any] | None:
+    result = get_matter(
+        database_url,
+        user_id=user_id,
+        matter_id=matter_id,
+        generation_id=generation_id,
+    )
     if result is None:
         return None
     matter, message_ids = result
@@ -2571,6 +2589,26 @@ def active_member_snapshot(database_url: str, *, user_id: str, matter_id: str) -
             {"user_id": user_id, "message_ids": message_ids},
         ).mappings().all()
     return {"matter": matter, "message_ids": message_ids, "thread_ids": list(dict.fromkeys(str(row["gmail_thread_id"]) for row in rows))}
+
+
+def hide_matter(database_url: str, *, user_id: str, matter_id: str) -> bool:
+    """Hide a matter after its complete Gmail group mutation succeeds."""
+    with user_mail_write_transaction(
+        get_engine(database_url),
+        user_id=user_id,
+        gmail_account_id=active_gmail_account_id(),
+    ) as connection:
+        result = connection.execute(
+            text(
+                """
+                UPDATE matters
+                SET visible = FALSE, revision = revision + 1, updated_at = now()
+                WHERE id = :matter_id AND user_id = :user_id AND visible = TRUE
+                """
+            ),
+            {"matter_id": matter_id, "user_id": user_id},
+        )
+    return bool(result.rowcount)
 
 
 def apply_user_decision(

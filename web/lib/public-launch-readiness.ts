@@ -1,6 +1,5 @@
 import { resolveBackendURL } from './backend-config';
 import { downloadAvailability, loadDownloadConfig } from './download-config';
-import { legalConfigIssues, loadLegalConfig } from './legal-config';
 
 export type PublicLaunchReadiness = {
   serving: boolean;
@@ -8,7 +7,6 @@ export type PublicLaunchReadiness = {
   checks: {
     backend: boolean;
     download: boolean;
-    legal: boolean;
   };
 };
 
@@ -31,14 +29,10 @@ export function evaluatePublicLaunchReadiness(
   const checks = {
     backend: backendReady,
     download: downloadState === 'available',
-    legal: legalConfigIssues(loadLegalConfig(environment)).length === 0,
   };
 
   return {
-    // Only an explicit operational pause may keep Product information, Usage, and Support
-    // online with a degraded health response. Unknown or broken download
-    // configuration is unsafe to present as an intentional pause.
-    serving: checks.backend && checks.legal && downloadState !== 'misconfigured',
+    serving: checks.backend && downloadState !== 'misconfigured',
     ready: Object.values(checks).every(Boolean),
     checks,
   };

@@ -109,6 +109,8 @@ public struct SignedInShellView: View {
     private let onDisconnectGoogle: () async throws -> Void
     private let onDeleteAccount: () async throws -> Void
     @State private var selection: SignedInDestination = .inbox
+    @ObservedObject private var notifications = MailNotificationController.shared
+    @State private var routingNotification = false
     @State private var supplementalDestination: ShellSupplementalDestination?
     @State private var navigationOpen = false
     @State private var mailboxSearchOpen = false
@@ -122,7 +124,7 @@ public struct SignedInShellView: View {
     @State private var pendingCommandThreadID: String?
     @State private var mailboxSearchText = ""
     @State private var confirmPermanentReaderDelete = false
-    @State private var confirmAIMatterTrash = false
+    @State private var pendingAIMatterTrash: AIMatterDetail?
     @State private var contactPhotoAuthorizationRunning = false
     @State private var aiReaderChromeState: AIReaderChromeState
     @AppStorage(ElectronicMailSettingsDestination.selectionStorageKey)
@@ -249,6 +251,10 @@ public struct SignedInShellView: View {
         }
         .task {
             await accountSettingsStore.load()
+            if notifications.pendingOpen != nil {
+                await openPendingNotification()
+                return
+            }
             if let accounts = accountSettingsStore.response {
                 await store.setMailboxViewScope(
                     accountSettingsStore.selectedScope,
@@ -257,10 +263,14 @@ public struct SignedInShellView: View {
             }
         }
         .onChange(of: accountSettingsStore.selectedScope) { _, scope in
+            guard !routingNotification, store.mailboxViewScope != scope else { return }
             guard let accounts = accountSettingsStore.response else { return }
             Task {
                 await store.setMailboxViewScope(scope, accounts: accounts)
             }
+        }
+        .onChange(of: notifications.pendingOpen) { _, target in
+            if target != nil { Task { await openPendingNotification() } }
         }
         .onChange(of: store.activeMailboxLabel) { _, label in
             guard supplementalDestination == nil else {
@@ -315,17 +325,35 @@ public struct SignedInShellView: View {
         } message: {
             Text("This cannot be undone.")
         }
-        .alert("Move this matter to Trash?", isPresented: $confirmAIMatterTrash) {
-            Button("Cancel", role: .cancel) {}
-            Button("Move to Trash", role: .destructive) {
-                guard let matter = activeAIMatter else { return }
-                Task { await performAIMatterAction(.moveTrash, matter: matter, confirmTrash: true) }
+        .alert(
+            "Move this entire group to Trash?",
+            isPresented: Binding(
+                get: { pendingAIMatterTrash != nil },
+                set: { isPresented in
+                    if !isPresented { pendingAIMatterTrash = nil }
+                }
+            ),
+            presenting: pendingAIMatterTrash
+        ) { matter in
+            Button("Cancel", role: .cancel) {
+                pendingAIMatterTrash = nil
+            }
+            Button("Move Entire Group to Trash", role: .destructive) {
+                pendingAIMatterTrash = nil
+                Task {
+                    await performAIMatterAction(
+                        .moveTrash,
+                        matter: matter,
+                        confirmTrash: true
+                    )
+                }
             }
         } message: {
-            if let matter = activeAIMatter {
-                let threadCount = Set(matter.messages.compactMap(\.threadID)).count
-                Text("This changes exactly \(matter.totalMessages) messages across \(threadCount) Gmail \(threadCount == 1 ? "thread" : "threads").")
-            }
+            let threadCount = Set($0.messages.compactMap(\.threadID)).count
+            Text(
+                "This moves all \($0.totalMessages) \($0.totalMessages == 1 ? "message" : "messages") "
+                    + "in this group across \(threadCount) Gmail \(threadCount == 1 ? "thread" : "threads")."
+            )
         }
         .confirmationDialog(
             "Resume your unsent message?",
@@ -406,6 +434,26 @@ public struct SignedInShellView: View {
     }
 
     @MainActor
+    private func openPendingNotification() async {
+        guard !routingNotification, let target = notifications.pendingOpen else { return }
+        routingNotification = true
+        defer { routingNotification = false }
+        if accountSettingsStore.response == nil { await accountSettingsStore.load() }
+        guard let accounts = accountSettingsStore.response else { return }
+        guard target.userID == store.notificationUserID else {
+            notifications.consume(target)
+            return
+        }
+        supplementalDestination = nil
+        selection = .inbox
+        navigationOpen = false
+        mailboxSearchOpen = false
+        if await store.openNotification(target, accounts: accounts) {
+            accountSettingsStore.selectedScope = .gmail(accountID: target.accountID)
+        }
+        notifications.consume(target)
+    }
+
     private func authorizeContactPhotos() async {
         contactPhotoAuthorizationRunning = true
         defer { contactPhotoAuthorizationRunning = false }
@@ -441,7 +489,8 @@ public struct SignedInShellView: View {
         )
         let showsReader = store.readerThreadID != nil || activeAIMatter != nil
         let showsMailboxControls = supplementalDestination == nil || supplementalDestination == .aiInbox
-        let fixedTrailingControlCount: CGFloat = showsMailboxControls ? 3 : 2
+        let showsTodoControls = supplementalDestination == .todos
+        let usesCompactTrailingControls = showsMailboxControls || showsTodoControls
         let readerTitleLeading = ElectronicMailControlMetrics.centeredContentLeading(
             containerWidth: width,
             maxContentWidth: ElectronicMailControlMetrics.readerMaxWidth,
@@ -455,12 +504,17 @@ public struct SignedInShellView: View {
                 )
                 + ElectronicMailControlMetrics.readerActionGap
         } else if showsMailboxControls {
-            ElectronicMailControlMetrics.headerControlSize * fixedTrailingControlCount
-                + ElectronicMailControlMetrics.mailboxHeaderControlGap * fixedTrailingControlCount
+            ElectronicMailControlMetrics.headerControlSize * 3
+                + ElectronicMailControlMetrics.mailboxHeaderControlGap * 3
+                + (mailboxSearchOpen ? searchWidth : ElectronicMailControlMetrics.headerControlSize)
+                + ElectronicMailControlMetrics.mailboxHeaderTrailingInset
+        } else if showsTodoControls {
+            ElectronicMailControlMetrics.headerControlSize
+                + ElectronicMailControlMetrics.mailboxHeaderControlGap
                 + (mailboxSearchOpen ? searchWidth : ElectronicMailControlMetrics.headerControlSize)
                 + ElectronicMailControlMetrics.mailboxHeaderTrailingInset
         } else {
-            ElectronicMailControlMetrics.headerControlSize * fixedTrailingControlCount
+            ElectronicMailControlMetrics.headerControlSize * 2
                 + ElectronicMailControlMetrics.headerControlGap
                 + ElectronicMailControlMetrics.trailingInset
         }
@@ -475,7 +529,7 @@ public struct SignedInShellView: View {
             )
             : ElectronicMailControlMetrics.headerHeight
 
-        return VStack(alignment: .leading, spacing: 0) {
+        return ZStack(alignment: .topLeading) {
             ElectronicMailShellHeader(
                 width: width,
                 height: resolvedHeaderHeight,
@@ -484,10 +538,10 @@ public struct SignedInShellView: View {
                     : ElectronicMailControlMetrics.headerTitleLeading,
                 titleTrailingReservation: trailingControlsWidth,
                 titleAlignment: showsReader ? .topLeading : .leading,
-                trailingSpacing: showsMailboxControls && !showsReader
+                trailingSpacing: usesCompactTrailingControls && !showsReader
                     ? ElectronicMailControlMetrics.mailboxHeaderControlGap
                     : ElectronicMailControlMetrics.headerControlGap,
-                trailingInset: showsMailboxControls && !showsReader
+                trailingInset: usesCompactTrailingControls && !showsReader
                     ? ElectronicMailControlMetrics.mailboxHeaderTrailingInset
                     : ElectronicMailControlMetrics.trailingInset,
                 leading: {
@@ -549,6 +603,33 @@ public struct SignedInShellView: View {
                                 .trailing,
                                 max(0, readerTitleLeading - ElectronicMailControlMetrics.trailingInset)
                             )
+                    } else if showsTodoControls {
+                        ShellInboxSettingsButton(
+                            colorScheme: colorScheme,
+                            accessibilityLabel: "To-do Settings",
+                            action: openTodoSettings
+                        )
+
+                        if mailboxSearchOpen {
+                            DebouncedMailboxToolbarSearchField(
+                                query: $mailboxSearchText,
+                                prompt: "Search To-do's",
+                                focusRequested: mailboxSearchFocusRequested,
+                                onCancel: closeMailboxSearch,
+                                onFocusLost: closeMailboxSearch
+                            )
+                            .padding(.horizontal, 11)
+                            .frame(width: searchWidth, height: ElectronicMailControlMetrics.headerSearchHeight)
+                            .electronicMailGlassPanel(shape: .capsule)
+                            .transition(searchFieldTransition)
+                        } else {
+                            ShellSearchButton(
+                                colorScheme: colorScheme,
+                                accessibilityLabel: "Search To-do's",
+                                action: openMailboxSearch
+                            )
+                            .transition(searchButtonTransition)
+                        }
                     } else {
                         ShellAccountSettingsButton(
                             colorScheme: colorScheme,
@@ -587,7 +668,21 @@ public struct SignedInShellView: View {
                     }
                 }
             )
+
+            if supplementalDestination == .todos, !showsReader {
+                TodoDateTimeRail(
+                    name: store.session?.user.firstName
+                        ?? store.session?.user.displayName
+                        ?? "there",
+                    width: TodoPageLayout.contentWidth(for: width)
+                )
+                    .position(
+                        x: width / 2,
+                        y: ElectronicMailControlMetrics.headerCenterY
+                    )
+            }
         }
+        .frame(width: width, height: resolvedHeaderHeight, alignment: .topLeading)
         .animation(
             searchAnimation,
             value: mailboxSearchOpen
@@ -703,9 +798,9 @@ public struct SignedInShellView: View {
 
                 ElectronicMailIconControl(
                     symbol: "trash.fill",
-                    accessibilityLabel: "Move Matter to Trash",
+                    accessibilityLabel: "Move Entire Group to Trash",
                     role: .destructive,
-                    action: { confirmAIMatterTrash = true }
+                    action: { pendingAIMatterTrash = matter }
                 )
             }
         }
@@ -763,8 +858,10 @@ public struct SignedInShellView: View {
         case .todos:
             TodoHomeView(
                 store: store,
-                onCompose: openComposeComposer,
-                onOpenSource: openTodoSource
+                aiInboxStore: aiInboxStore,
+                searchText: $mailboxSearchText,
+                onOpenSource: openTodoSource,
+                onOpenAIMatter: openTodoAIMatter
             )
         case nil:
             InboxView(
@@ -803,6 +900,11 @@ public struct SignedInShellView: View {
         selectedSettingsDestination = supplementalDestination == .aiInbox
             ? ElectronicMailSettingsDestination.aiInbox.rawValue
             : ElectronicMailSettingsDestination.general.rawValue
+        openSettings()
+    }
+
+    private func openTodoSettings() {
+        selectedSettingsDestination = ElectronicMailSettingsDestination.general.rawValue
         openSettings()
     }
 
@@ -971,9 +1073,6 @@ public struct SignedInShellView: View {
         store.closeReader()
         aiInboxStore.closeDetail()
         withAnimation(searchAnimation) {
-            if supplementalDestination == .todos {
-                supplementalDestination = nil
-            }
             navigationOpen = false
             commandPaletteOpen = false
             mailboxSearchOpen = true
@@ -1018,6 +1117,19 @@ public struct SignedInShellView: View {
                 return
             }
             applyPendingCommandThreadIfNeeded(for: .inbox)
+        }
+    }
+
+    private func openTodoAIMatter(_ matterID: String) {
+        mailboxSearchText = ""
+        withAnimation(reduceMotion ? nil : ShellNavigationMotion.screen) {
+            navigationOpen = false
+            mailboxSearchOpen = false
+            mailboxSearchFocusRequested = false
+            supplementalDestination = .aiInbox
+        }
+        Task {
+            await aiInboxStore.select(matterID)
         }
     }
 
@@ -1497,12 +1609,13 @@ private struct ShellInboxSettingsButton: View {
 
 private struct ShellSearchButton: View {
     let colorScheme: ColorScheme
+    var accessibilityLabel = "Search Mail"
     let action: () -> Void
 
     var body: some View {
         ElectronicMailIconControl(
             symbol: ElectronicMailSymbols.search,
-            accessibilityLabel: "Search Mail",
+            accessibilityLabel: accessibilityLabel,
             symbolOpacity: ElectronicMailControlMetrics.mailboxHeaderIconOpacity,
             symbolOffset: ElectronicMailControlMetrics.searchSymbolOpticalOffset,
             action: action
@@ -1631,18 +1744,21 @@ private struct DebouncedMailboxToolbarSearchField: View {
     @Binding private var query: String
     @State private var fieldText: String
     @FocusState private var isFocused: Bool
+    private let prompt: String
     private let focusRequested: Bool
     private let onCancel: () -> Void
     private let onFocusLost: () -> Void
 
     init(
         query: Binding<String>,
+        prompt: String = "Search Mail",
         focusRequested: Bool,
         onCancel: @escaping () -> Void,
         onFocusLost: @escaping () -> Void
     ) {
         self._query = query
         self._fieldText = State(initialValue: query.wrappedValue)
+        self.prompt = prompt
         self.focusRequested = focusRequested
         self.onCancel = onCancel
         self.onFocusLost = onFocusLost
@@ -1656,12 +1772,12 @@ private struct DebouncedMailboxToolbarSearchField: View {
                 .opacity(ElectronicMailControlMetrics.mailboxHeaderIconOpacity)
                 .accessibilityHidden(true)
 
-            TextField("Search Mail", text: $fieldText)
+            TextField(prompt, text: $fieldText)
                 .textFieldStyle(.plain)
                 .font(ElectronicMailType.body())
                 .focused($isFocused)
                 .onExitCommand(perform: onCancel)
-                .accessibilityLabel("Search Mail")
+                .accessibilityLabel(prompt)
 
             if !fieldText.isEmpty {
                 Button {

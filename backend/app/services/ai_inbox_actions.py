@@ -3,6 +3,7 @@ from __future__ import annotations
 """Exact-message Gmail mutations initiated from AI Inbox matters."""
 
 from app.core.config import Settings
+from app.db.ai_inbox import hide_matter
 from app.db.jobs import enqueue_job
 from app.services.integrations.google import (
     delete_gmail_message_forever,
@@ -58,6 +59,14 @@ def run_matter_action(
 ) -> None:
     for message_id in list(dict.fromkeys(message_ids)):
         _apply_message_action(settings, user_id=user_id, message_id=message_id, action=action)
+    if action in {"move_trash", "delete_forever"}:
+        # The toolbar action is matter-scoped: only hide the group after every
+        # snapshotted Gmail message has been mutated successfully.
+        hide_matter(
+            str(settings.database_path),
+            user_id=user_id,
+            matter_id=matter_id,
+        )
     enqueue_job(
         str(settings.database_path),
         kind="gmail_delta_sync",

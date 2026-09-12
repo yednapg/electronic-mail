@@ -1,23 +1,21 @@
 import XCTest
 @testable import ElectronicMailShared
 
-final class DashboardViewModelTests: XCTestCase {
+final class MobileTodoViewModelTests: XCTestCase {
     override func tearDown() {
         MobileAuthMockURLProtocol.responseData = nil
         MobileAuthMockURLProtocol.transientFailure = nil
         super.tearDown()
     }
 
-    func testDashboardFixtureBuildsSummarySectionsAndGmailAction() throws {
+    func testDashboardFixtureBuildsTodoSectionsAndGmailAction() throws {
         let dashboard = try JSONDecoder.backend.decode(
             DashboardResponse.self,
             from: contractFixtureData("dashboard.json")
         )
 
-        let summary = DashboardViewModelBuilder.summary(from: dashboard)
-        let sections = DashboardViewModelBuilder.sections(from: dashboard.feed)
+        let sections = MobileTodoViewModelBuilder.sections(from: dashboard.feed)
 
-        XCTAssertEqual(summary.headline, "Good morning.")
         XCTAssertEqual(sections.map(\.title), ["Now", "Today", "Worth Knowing"])
         XCTAssertEqual(sections[0].items.first?.title, "Groww confirmed your demat account has been closed and sent the client master report.")
         XCTAssertEqual(sections[0].items.first?.entityID, "entity-1")
@@ -31,7 +29,7 @@ final class DashboardViewModelTests: XCTestCase {
             from: contractFixtureData("dashboard.json")
         )
 
-        let sections = DashboardViewModelBuilder.sections(from: dashboard.feed, hiddenItemIDs: ["item-1"])
+        let sections = MobileTodoViewModelBuilder.sections(from: dashboard.feed, hiddenItemIDs: ["item-1"])
 
         XCTAssertTrue(sections[0].items.isEmpty)
         XCTAssertEqual(sections[2].items.map(\.id), ["item-2"])
@@ -100,7 +98,7 @@ final class DashboardViewModelTests: XCTestCase {
             )
         )
 
-        let agenda = DashboardViewModelBuilder.agenda(from: feed)
+        let agenda = MobileTodoViewModelBuilder.agenda(from: feed)
 
         XCTAssertEqual(agenda.map(\.id), ["cal-1", "cal-2"])
         XCTAssertEqual(agenda[0].title, "Standup")
@@ -151,8 +149,19 @@ final class DashboardViewModelTests: XCTestCase {
             "abc123"
         )
 
-        let handoffURL = try MobileAuthFlow.handoffCompletionRedirectURL(baseURL: baseURL, handoffID: "handoff-1")
-        XCTAssertEqual(handoffURL.absoluteString, "https://api.example.com/auth/mobile/complete?handoff_id=handoff-1")
+        let challenge = String(repeating: "c", count: 43)
+        let handoffURL = try MobileAuthFlow.handoffCompletionRedirectURL(
+            baseURL: baseURL,
+            handoffID: "handoff-1",
+            codeChallenge: challenge
+        )
+        XCTAssertEqual(
+            handoffURL.absoluteString,
+            "https://api.example.com/auth/mobile/complete?handoff_id=handoff-1&code_challenge=\(challenge)"
+        )
+        let pkce = MobileAuthFlow.makePKCEPair()
+        XCTAssertEqual(pkce.verifier.count, 43)
+        XCTAssertEqual(pkce.challenge.count, 43)
         XCTAssertEqual(
             MobileAuthFlow.handoffStatusURL(baseURL: baseURL, handoffID: "handoff-1").absoluteString,
             "https://api.example.com/v1/auth/mobile/handoff/handoff-1"

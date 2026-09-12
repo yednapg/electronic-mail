@@ -11,14 +11,6 @@ function productionEnvironment(
     ELECTRONIC_MAIL_BACKEND_URL: 'https://api.electronicmail.app',
     MACOS_DOWNLOAD_ENABLED: 'true',
     MACOS_DOWNLOAD_URL: 'https://downloads.electronicmail.app/ElectronicMail.dmg',
-    LEGAL_ENTITY_NAME: 'Electronic Mail Incorporated',
-    STATUS_PAGE_URL: 'https://status.electronicmail.app',
-    LEGAL_EFFECTIVE_DATE: '2026-07-24',
-    LEGAL_JURISDICTION: 'Karnataka, India',
-    LEGAL_HOSTING_PROVIDERS: 'Reviewed infrastructure providers',
-    LEGAL_DATA_REGIONS: 'Reviewed production data regions',
-    LEGAL_BACKUP_RETENTION_DAYS: '14',
-    LEGAL_REVIEW_STATUS: 'approved',
     ...overrides,
   };
 }
@@ -30,12 +22,11 @@ test('public launch readiness passes only complete approved production configura
     checks: {
       backend: true,
       download: true,
-      legal: true,
     },
   });
 });
 
-test('public launch readiness keeps legal/support online during an intentional download pause', () => {
+test('public launch readiness remains available during an intentional download pause', () => {
   const result = evaluatePublicLaunchReadiness(productionEnvironment({
     MACOS_DOWNLOAD_ENABLED: 'false',
     MACOS_DOWNLOAD_URL: undefined,
@@ -74,13 +65,10 @@ test('public launch readiness fails closed when enabled download URL is missing 
   }
 });
 
-test('public launch readiness fails serving health for backend or legal misconfiguration', () => {
-  for (const [label, override] of [
-    ['backend', { ELECTRONIC_MAIL_BACKEND_URL: 'http://localhost:3001' }],
-    ['legal', { LEGAL_REVIEW_STATUS: 'example-only' }],
-  ] as const) {
-    const result = evaluatePublicLaunchReadiness(productionEnvironment(override));
-    assert.equal(result.serving, false, label);
-    assert.equal(result.ready, false, label);
-  }
+test('public launch readiness fails serving health for backend misconfiguration', () => {
+  const result = evaluatePublicLaunchReadiness(productionEnvironment({
+    ELECTRONIC_MAIL_BACKEND_URL: 'http://localhost:3001',
+  }));
+  assert.equal(result.serving, false);
+  assert.equal(result.ready, false);
 });

@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 
+#if !ELECTRONIC_MAIL_SHARED_AI_DOMAIN
 public enum AIGroupingStyle: String, Codable, CaseIterable, Identifiable {
     case focused
     case broader
@@ -234,6 +235,84 @@ public struct AIInboxResponse: Codable, Equatable {
     }
 }
 
+public enum AITodoDisplayKind: String, Codable {
+    case todo
+    case worthKnowing = "worth_knowing"
+    case hidden
+}
+
+public enum AITodoStatus: String, Codable {
+    case open
+    case completed
+    case snoozed
+    case dismissed
+}
+
+public struct AITodoItem: Codable, Equatable, Identifiable {
+    var gmailAccountID: String? = nil
+    var sourceAccountEmail: String? = nil
+    public let id: String
+    let matterID: String
+    let sourceSubgoalID: String?
+    let displayKind: AITodoDisplayKind
+    let title: String?
+    let detail: String?
+    let actionType: String
+    let requirement: String
+    let dueAt: String?
+    let urgency: String
+    let confidence: Double
+    let evidenceMessageIDs: [String]
+    let evidenceText: String?
+    let status: AITodoStatus
+    let sourceLabel: String
+    let latestMessageAt: String?
+    let revision: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, detail, requirement, urgency, confidence, status, revision
+        case gmailAccountID = "gmail_account_id"
+        case matterID = "matter_id"
+        case sourceSubgoalID = "source_subgoal_id"
+        case displayKind = "display_kind"
+        case actionType = "action_type"
+        case dueAt = "due_at"
+        case evidenceMessageIDs = "evidence_message_ids"
+        case evidenceText = "evidence_text"
+        case sourceLabel = "source_label"
+        case latestMessageAt = "latest_message_at"
+    }
+}
+
+public struct AITodoResponse: Codable, Equatable {
+    var gmailAccountID: String? = nil
+    var items: [AITodoItem]
+    let organizingCount: Int
+    let generatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case items
+        case gmailAccountID = "gmail_account_id"
+        case organizingCount = "organizing_count"
+        case generatedAt = "generated_at"
+    }
+}
+
+public struct AITodoUpdateRequest: Codable, Equatable {
+    let status: AITodoStatus
+    let snoozedUntil: String?
+
+    init(status: AITodoStatus, snoozedUntil: String? = nil) {
+        self.status = status
+        self.snoozedUntil = snoozedUntil
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case snoozedUntil = "snoozed_until"
+    }
+}
+
 public struct AIMatterDetail: Codable, Equatable, Identifiable {
     var gmailAccountID: String? = nil
     public let id: String
@@ -384,6 +463,10 @@ public final class AIInboxStore: ObservableObject {
     @Published private(set) var pendingDecisionCount = 0
     @Published private(set) var groupingExplanations: [String: AIGroupingExplanation] = [:]
     @Published private(set) var explanationMessageIDsLoading: Set<String> = []
+    @Published private(set) var todoItems: [AITodoItem] = []
+    @Published private(set) var todoOrganizingCount = 0
+    @Published private(set) var todoLoading = false
+    @Published private(set) var todoRefreshFailed = false
 
     private let client: AppClient
     private let decisionQueue: MatterDecisionQueue
@@ -429,6 +512,40 @@ public final class AIInboxStore: ObservableObject {
         }
     }
 
+    func refreshTodos(limit: Int = 100) async {
+        todoLoading = todoItems.isEmpty
+        do {
+            let loaded = try await client.aiTodos(limit: limit)
+            todoItems = loaded.items
+            todoOrganizingCount = loaded.organizingCount
+            todoRefreshFailed = false
+            todoLoading = false
+        } catch is CancellationError {
+            return
+        } catch {
+            todoRefreshFailed = true
+            todoLoading = false
+        }
+    }
+
+    func completeTodo(_ item: AITodoItem) async -> Bool {
+        mutationInProgress = true
+        defer { mutationInProgress = false }
+        do {
+            _ = try await client.updateAITodo(
+                item.id,
+                gmailAccountID: item.gmailAccountID,
+                request: AITodoUpdateRequest(status: .completed)
+            )
+            todoItems.removeAll { $0.id == item.id }
+            detail = nil
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        return false
+    }
+
     func enable(style: AIGroupingStyle) async {
         mutationInProgress = true
         defer { mutationInProgress = false }
@@ -464,6 +581,22 @@ public final class AIInboxStore: ObservableObject {
             detailLoading = false
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Loads a matter for an inline list expansion without changing the active
+    /// reader selection. The same cached detail is reused if the user opens
+    /// the matter afterwards.
+    func detailForExpansion(_ matterID: String) async throws -> AIMatterDetail {
+        if let cached = detailCache[matterID] {
+            return cached
+        }
+        let loaded = try await client.aiMatter(matterID)
+        detailCache[matterID] = loaded
+        return loaded
+    }
+
+    func reportExpansionError(_ error: Error) {
+        errorMessage = error.localizedDescription
     }
 
     func closeDetail() {
@@ -632,8 +765,18 @@ public final class AIInboxStore: ObservableObject {
                     confirmMultiThreadTrash: confirmMultiThreadTrash
                 )
             )
+            let removesMatterFromInbox = action == .moveTrash || action == .deleteForever
+            if removesMatterFromInbox {
+                response?.matters.removeAll { $0.id == matter.id }
+                detailCache[matter.id] = nil
+            }
             detail = nil
-            await refresh(query: query)
+            // Gmail mutations are queued. Refreshing the AI Inbox immediately can
+            // race the worker and briefly restore the group that was just removed.
+            // The worker emits an AI Inbox event after the complete group succeeds.
+            if !removesMatterFromInbox {
+                await refresh(query: query)
+            }
             return true
         } catch APIError.httpStatus(let status) where status == 409 {
             errorMessage = "This matter changed on another device. Refresh it before applying the action."
@@ -658,6 +801,7 @@ public final class AIInboxStore: ObservableObject {
         pendingDecisionCount = decisionQueue.read().count
     }
 }
+#endif
 
 @MainActor
 public final class AIReaderChromeState: ObservableObject {
@@ -698,10 +842,13 @@ public struct AIInboxView: View {
     let isAttachmentDownloading: (ThreadAttachment, String) -> Bool
     let readerChromeState: AIReaderChromeState
 
-    @State private var setupStyle: AIGroupingStyle = .focused
     @State private var selectedMatterID: String?
     @State private var openingMatterID: String?
-    @FocusState private var isListFocused: Bool
+    @State private var navigationCursor = InboxKeyboardNavigationCursor()
+    @FocusState private var isKeyboardNavigationFocused: Bool
+    @State private var expandedMatterIDs: Set<String> = []
+    @State private var expandedMatterDetails: [String: AIMatterDetail] = [:]
+    @State private var expandingMatterIDs: Set<String> = []
 
     public init(
         store: AIInboxStore,
@@ -784,39 +931,45 @@ public struct AIInboxView: View {
     }
 
     private func consentView(_ profile: AIOrganizationProfile) -> some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 16) {
             Image(systemName: "sparkles.rectangle.stack.fill")
-                .font(.system(size: 38))
+                .font(.system(size: ElectronicMailType.mailboxHeaderSize, weight: .semibold))
                 .foregroundStyle(ElectronicMailDesign.appleBlue)
-            Text("Organize mail by what it is actually about")
-                .font(.title2.weight(.semibold))
-            Text("AI Inbox sends cleaned email text and bounded text from supported documents to OpenAI. Sensitive authentication codes, links, payment numbers, and account numbers are removed or tokenized first. OpenAI's standard API retention applies, and API data is not used to train models by default. Your normal Inbox is unchanged and always remains available.")
+            Text("Set up AI Inbox")
+                .font(ElectronicMailType.sectionTitle(weight: .semibold))
+            Text("Organize cleaned email into focused matters with OpenAI. Your normal Inbox stays unchanged.")
+                .font(ElectronicMailType.body())
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Picker("Grouping style", selection: $setupStyle) {
-                ForEach(AIGroupingStyle.allCases) { style in
-                    Text(style.title).tag(style)
+
+            DisclosureGroup("Privacy details") {
+                Text("Authentication codes, links, payment numbers, and account numbers are removed or tokenized first. Bounded text from supported documents may be included. OpenAI's API retention applies, and API data is not used to train models by default.")
+                    .font(ElectronicMailType.small())
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 6)
+            }
+            .font(ElectronicMailType.small(weight: .medium))
+
+            HStack(spacing: 12) {
+                Button("Enable AI Inbox") {
+                    Task { await store.enable(style: profile.groupingStyle) }
                 }
+                .buttonStyle(.borderedProminent)
+                .disabled(store.mutationInProgress || !profile.available)
+
+                Text("Focused matters")
+                    .font(ElectronicMailType.small())
+                    .foregroundStyle(.tertiary)
             }
-            .pickerStyle(.segmented)
-            Text(setupStyle == .focused
-                 ? "Recommended. Keeps each concrete request, case, purchase, or task separate."
-                 : "Combines related work into wider projects when the evidence supports it.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Button("Enable AI Inbox") {
-                Task { await store.enable(style: setupStyle) }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(store.mutationInProgress || !profile.available)
             if !profile.available {
                 Text("AI Inbox is currently disabled on this server. Inbox continues to work normally.")
-                    .font(.callout)
+                    .font(ElectronicMailType.small())
                     .foregroundStyle(.secondary)
             }
         }
-        .frame(maxWidth: 620, alignment: .leading)
-        .padding(44)
+        .frame(maxWidth: 460, alignment: .leading)
+        .padding(36)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
@@ -841,6 +994,10 @@ public struct AIInboxView: View {
                         showsIndicators: true
                     ) {
                         LazyVStack(alignment: .leading, spacing: 0) {
+                            Color.clear
+                                .frame(height: 0)
+                                .id("ai-inbox-list-top")
+
                             if sections.isEmpty {
                                 VStack(spacing: 12) {
                                     Text(searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -872,10 +1029,14 @@ public struct AIInboxView: View {
                                         AIInboxMatterListRow(
                                             matter: matter,
                                             isSelected: selectedMatterID == matter.id,
+                                            detail: expandedMatterDetails[matter.id],
+                                            isExpanded: expandedMatterIDs.contains(matter.id),
+                                            isExpanding: expandingMatterIDs.contains(matter.id),
                                             metrics: metrics,
                                             colorScheme: colorScheme,
                                             disabled: store.mutationInProgress,
-                                            onOpen: { open(matter) }
+                                            onOpen: { open(matter) },
+                                            onToggleExpansion: { toggleExpansion(for: matter) }
                                         )
                                         .id(matter.id)
                                     case .organizing(let row):
@@ -895,22 +1056,29 @@ public struct AIInboxView: View {
                     .refreshable { await store.refresh(query: searchText) }
                     .focusable()
                     .focusEffectDisabled()
-                    .focused($isListFocused)
-                    .defaultFocus($isListFocused, true)
-                    .background {
-                        InboxKeyboardNavigationCapture(
-                            onMove: { delta in
-                                moveSelection(in: matters, by: delta, scrollProxy: scrollProxy)
-                            },
-                            onOpenSelection: {
-                                openSelectedMatter(in: matters)
-                            }
-                        )
-                        .frame(width: 1, height: 1)
-                        .accessibilityHidden(true)
+                    .focused($isKeyboardNavigationFocused)
+                    .onMoveCommand { direction in
+                        switch direction {
+                        case .up:
+                            moveSelection(in: matters, by: -1, scrollProxy: scrollProxy)
+                        case .down:
+                            moveSelection(in: matters, by: 1, scrollProxy: scrollProxy)
+                        default:
+                            break
+                        }
+                    }
+                    .onKeyPress(.return, phases: .down) { _ in
+                        openSelectedMatter(in: matters)
+                        return .handled
                     }
                     .onAppear {
-                        restoreSelectedMatterPosition(in: matters, scrollProxy: scrollProxy)
+                        selectFirstMatter(in: matters, scrollProxy: scrollProxy)
+                        DispatchQueue.main.async {
+                            isKeyboardNavigationFocused = true
+                        }
+                    }
+                    .onChange(of: matters.map(\.id)) { _, _ in
+                        normalizeSelection(in: matters)
                     }
                     .transaction { transaction in
                         transaction.disablesAnimations = true
@@ -931,11 +1099,35 @@ public struct AIInboxView: View {
     private func open(_ matter: AIMatterRow) {
         guard !store.mutationInProgress, openingMatterID == nil else { return }
         selectedMatterID = matter.id
+        navigationCursor.selectedRowID = matter.id
         openingMatterID = matter.id
         Task {
             await store.select(matter.id)
             if openingMatterID == matter.id {
                 openingMatterID = nil
+            }
+        }
+    }
+
+    private func toggleExpansion(for matter: AIMatterRow) {
+        guard matter.messageCount > 1, !store.mutationInProgress else { return }
+        if expandedMatterIDs.contains(matter.id) {
+            expandedMatterIDs.remove(matter.id)
+            return
+        }
+        if expandedMatterDetails[matter.id] != nil {
+            expandedMatterIDs.insert(matter.id)
+            return
+        }
+
+        expandingMatterIDs.insert(matter.id)
+        Task {
+            defer { expandingMatterIDs.remove(matter.id) }
+            do {
+                expandedMatterDetails[matter.id] = try await store.detailForExpansion(matter.id)
+                expandedMatterIDs.insert(matter.id)
+            } catch {
+                store.reportExpansionError(error)
             }
         }
     }
@@ -946,12 +1138,14 @@ public struct AIInboxView: View {
         scrollProxy: ScrollViewProxy
     ) {
         guard !matters.isEmpty else { return }
-        let currentIndex = selectedMatterID.flatMap { selectedID in
+        let currentSelectionID = navigationCursor.selectedRowID ?? selectedMatterID
+        let currentIndex = currentSelectionID.flatMap { selectedID in
             matters.firstIndex(where: { $0.id == selectedID })
         }
         let fallbackIndex = delta > 0 ? -1 : matters.count
         let nextIndex = min(max((currentIndex ?? fallbackIndex) + delta, 0), matters.count - 1)
         let nextMatter = matters[nextIndex]
+        navigationCursor.selectedRowID = nextMatter.id
         selectedMatterID = nextMatter.id
         scrollProxy.scrollTo(nextMatter.id, anchor: .center)
     }
@@ -962,6 +1156,36 @@ public struct AIInboxView: View {
             return
         }
         open(matter)
+    }
+
+    private func normalizeSelection(in matters: [AIMatterRow]) {
+        guard let firstMatter = matters.first else {
+            navigationCursor.selectedRowID = nil
+            selectedMatterID = nil
+            return
+        }
+        if selectedMatterID == nil || !matters.contains(where: { $0.id == selectedMatterID }) {
+            navigationCursor.selectedRowID = firstMatter.id
+            selectedMatterID = firstMatter.id
+        } else {
+            navigationCursor.selectedRowID = selectedMatterID
+        }
+    }
+
+    private func selectFirstMatter(
+        in matters: [AIMatterRow],
+        scrollProxy: ScrollViewProxy
+    ) {
+        guard let firstMatter = matters.first else {
+            navigationCursor.selectedRowID = nil
+            selectedMatterID = nil
+            return
+        }
+        navigationCursor.selectedRowID = firstMatter.id
+        selectedMatterID = firstMatter.id
+        DispatchQueue.main.async {
+            scrollProxy.scrollTo("ai-inbox-list-top", anchor: .top)
+        }
     }
 
     private func restoreSelectedMatterPosition(
@@ -1505,29 +1729,7 @@ private struct AIMatterSummaryDisclosure: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .aiSummaryGlassSurface()
-    }
-}
-
-private extension View {
-    @ViewBuilder
-    func aiSummaryGlassSurface() -> some View {
-        if #available(macOS 26.0, *) {
-            background {
-                Color.clear
-                    .glassEffect(
-                        .clear,
-                        in: .rect(cornerRadius: 12)
-                    )
-                    .opacity(0.24)
-            }
-        } else {
-            background {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .opacity(0.24)
-            }
-        }
+        .electronicMailSummaryCardSurface()
     }
 }
 
@@ -1805,6 +2007,7 @@ private struct AIInboxListMetrics: Equatable {
     let windowWidth: CGFloat
     let disclosureIconSize: CGFloat = 22
     let disclosureHitWidth: CGFloat = 40
+    let childIndent: CGFloat = 22
     let senderSubjectGap: CGFloat = 24
     let subjectAttachmentGap: CGFloat = 16
     let attachmentWidth: CGFloat = 34
@@ -1904,12 +2107,40 @@ private struct AIInboxStatusIcon: View {
 private struct AIInboxMatterListRow: View {
     let matter: AIMatterRow
     let isSelected: Bool
+    let detail: AIMatterDetail?
+    let isExpanded: Bool
+    let isExpanding: Bool
     let metrics: AIInboxListMetrics
     let colorScheme: ColorScheme
     let disabled: Bool
     let onOpen: () -> Void
+    let onToggleExpansion: () -> Void
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            parentRow
+            if isExpanded, let detail {
+                VStack(spacing: 0) {
+                    ForEach(detail.messages) { message in
+                        AIInboxMatterMessageListRow(
+                            message: message,
+                            metrics: metrics,
+                            colorScheme: colorScheme,
+                            onOpen: onOpen
+                        )
+                    }
+                }
+                .background(expandedMessagesTint)
+            }
+        }
+        .frame(width: metrics.windowWidth, alignment: .topLeading)
+    }
+
+    private var expandedMessagesTint: Color {
+        ElectronicMailDesign.appleBlue.opacity(colorScheme == .dark ? 0.20 : 0.09)
+    }
+
+    private var parentRow: some View {
         ZStack(alignment: .leading) {
             Button(action: onOpen) {
                 HStack(spacing: 0) {
@@ -1961,8 +2192,8 @@ private struct AIInboxMatterListRow: View {
             .accessibilityAddTraits(isSelected ? .isSelected : [])
 
             if matter.messageCount > 1 {
-                Button(action: onOpen) {
-                    Image(systemName: "chevron.right")
+                Button(action: onToggleExpansion) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(isSelected ? selectedTextColor : ElectronicMailDesign.appleBlue)
                         .frame(width: metrics.disclosureIconSize, height: metrics.disclosureIconSize)
@@ -1970,9 +2201,10 @@ private struct AIInboxMatterListRow: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(disabled)
+                .disabled(disabled || isExpanding)
                 .offset(x: metrics.disclosureHitLeading)
-                .accessibilityLabel("Open \(matter.messageCount) messages")
+                .accessibilityLabel(isExpanded ? "Collapse \(matter.messageCount) messages" : "Expand \(matter.messageCount) messages")
+                .accessibilityHint("Shows or hides the emails in this matter")
             }
 
         }
@@ -2078,6 +2310,66 @@ private struct AIInboxMatterListRow: View {
         return matter.unread
             ? ElectronicMailDesign.unreadText(for: colorScheme).opacity(0.88)
             : ElectronicMailDesign.secondaryText(for: colorScheme)
+    }
+}
+
+private struct AIInboxMatterMessageListRow: View {
+    let message: ThreadMessage
+    let metrics: AIInboxListMetrics
+    let colorScheme: ColorScheme
+    let onOpen: () -> Void
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(spacing: 0) {
+                Color.clear.frame(width: metrics.senderLeading + metrics.childIndent)
+
+                rowText(sender)
+                    .frame(width: max(0, metrics.senderWidth - metrics.childIndent), alignment: .leading)
+                    .clipped()
+
+                Color.clear.frame(width: metrics.senderSubjectGap)
+
+                rowText(subject)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .clipped()
+
+                Color.clear.frame(width: metrics.subjectAttachmentGap)
+                Color.clear.frame(width: metrics.attachmentWidth)
+                Color.clear.frame(width: metrics.attachmentTimeGap)
+
+                rowText(AIInboxDateFormatting.mailboxLabel(for: message.receivedAt))
+                    .frame(width: metrics.timeWidth, alignment: .trailing)
+                    .clipped()
+
+                Color.clear.frame(width: metrics.trailingInset)
+            }
+            .frame(width: metrics.windowWidth, height: ElectronicMailMailboxType.rowHeight)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Email from \(sender), \(subject)")
+        .accessibilityHint("Opens the matter summary and chronological messages")
+    }
+
+    private var sender: String {
+        EmailAddressDisplayFormatter.displayName(from: message.fromAddress ?? "")
+    }
+
+    private var subject: String {
+        let generatedTitle = message.aiTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let value = generatedTitle.isEmpty
+            ? (message.subject?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+            : generatedTitle
+        return value.isEmpty ? "(No subject)" : value
+    }
+
+    private func rowText(_ value: String) -> some View {
+        Text(value)
+            .font(ElectronicMailMailboxType.metadata(unread: false))
+            .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+            .lineLimit(1)
+            .truncationMode(.tail)
     }
 }
 
@@ -2414,6 +2706,8 @@ private struct OrganizeMatterSheet: View {
     }
 }
 
+#if !ELECTRONIC_MAIL_SHARED_AI_DOMAIN
 public extension Notification.Name {
     static let electronicMailAIInboxChanged = Notification.Name("ElectronicMailAIInboxChanged")
 }
+#endif

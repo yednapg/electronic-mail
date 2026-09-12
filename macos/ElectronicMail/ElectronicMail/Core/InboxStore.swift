@@ -1,7 +1,10 @@
-import AppKit
-import CoreServices
 import CryptoKit
 import Foundation
+
+#if os(macOS)
+import AppKit
+import CoreServices
+#endif
 
 public struct AttachmentDownloadID: Hashable, Sendable {
     public let messageID: String
@@ -69,6 +72,7 @@ final class AttachmentOpenAuthorization: @unchecked Sendable {
     }
 }
 
+#if os(macOS)
 enum AttachmentFileQuarantine {
     static let typeKey = kLSQuarantineTypeKey as String
     static let emailAttachmentType = kLSQuarantineTypeEmailAttachment as String
@@ -99,6 +103,7 @@ enum AttachmentFileQuarantine {
         }
     }
 }
+#endif
 
 struct AttachmentFileOperations: Sendable {
     typealias SecurityScopeStarter = @Sendable (_ url: URL) -> Bool
@@ -182,6 +187,7 @@ struct AttachmentFileHandler {
         )
     }
 
+    #if os(macOS)
     static var live: AttachmentFileHandler {
         AttachmentFileHandler(
             chooseDestination: { suggestedFilename in
@@ -205,6 +211,7 @@ struct AttachmentFileHandler {
             openFile: { NSWorkspace.shared.open($0) }
         )
     }
+    #endif
 
     func saveAndOpen(
         _ attachment: DownloadedAttachment,
@@ -743,6 +750,28 @@ private actor LocalMailStoreWorker {
 
 @MainActor
 public final class InboxStore: ObservableObject {
+    private var notificationsConnected = false
+
+    public var notificationUserID: String? { session?.user.id }
+
+    public func connectNotifications() {
+        guard client.mode != .demo else { return }
+        notificationsConnected = true
+        MailNotificationController.shared.install()
+        MailNotificationController.shared.configure(baseURL: client.baseURL, sessionToken: client.sessionToken)
+    }
+
+    public func openNotification(_ target: MailNotificationTarget, accounts: GmailAccountsResponse) async -> Bool {
+        guard target.userID == session?.user.id,
+              accounts.accounts.contains(where: { $0.id == target.accountID && $0.state == .ready }) else { return false }
+        await setMailboxViewScope(.gmail(accountID: target.accountID), accounts: accounts)
+        guard target.userID == session?.user.id else { return false }
+        clearSearch()
+        await setMailboxLabel(.inbox)
+        guard target.userID == session?.user.id, mailboxViewScope.gmailAccountID == target.accountID else { return false }
+        await openReader(threadID: target.threadID, focusedMessageID: target.messageID).value
+        return true
+    }
     @Published public private(set) var phase: LoadPhase = .idle
     @Published private(set) var session: AppSessionResponse?
     @Published public private(set) var mailboxViewScope: MailboxViewScope = .combined
@@ -958,6 +987,9 @@ public final class InboxStore: ObservableObject {
     private func updateSessionToken(_ token: String?, preservingPendingThreadActions: Bool) {
         let previousToken = client.sessionToken
         client.sessionToken = token
+        if notificationsConnected {
+            MailNotificationController.shared.configure(baseURL: client.baseURL, sessionToken: token)
+        }
         let tokenChanged = previousToken != token
         if tokenChanged {
             let retiringWriteGeneration = accountOperationGeneration
@@ -1646,6 +1678,7 @@ public final class InboxStore: ObservableObject {
         bcc: [String] = [],
         subject: String,
         bodyText: String,
+        bodyHTML: String? = nil,
         attachments: [MailAttachmentUpload] = []
     ) async throws -> MailSendResponse {
         guard canSendMail else {
@@ -1660,7 +1693,7 @@ public final class InboxStore: ObservableObject {
                 bcc: bcc,
                 subject: subject,
                 bodyText: bodyText,
-                bodyHTML: nil,
+                bodyHTML: bodyHTML,
                 attachments: attachments,
                 createdAt: ISO8601DateFormatter.backendActionTimestamp.string(from: Date()),
                 gmailAccountID: gmailAccountID ?? mailboxViewScope.gmailAccountID
@@ -1680,6 +1713,7 @@ public final class InboxStore: ObservableObject {
         bcc: [String] = [],
         subject: String? = nil,
         bodyText: String,
+        bodyHTML: String? = nil,
         attachments: [MailAttachmentUpload] = [],
         includeOriginalAttachments: Bool = false
     ) async throws -> MailSendResponse {
@@ -1698,7 +1732,7 @@ public final class InboxStore: ObservableObject {
                 bcc: bcc,
                 subject: subject,
                 bodyText: bodyText,
-                bodyHTML: nil,
+                bodyHTML: bodyHTML,
                 attachments: attachments,
                 includeOriginalAttachments: includeOriginalAttachments,
                 createdAt: ISO8601DateFormatter.backendActionTimestamp.string(from: Date()),
@@ -3098,8 +3132,53 @@ public final class InboxStore: ObservableObject {
         _ = await performThreadAction(action, threadID: threadID, targetMessageID: targetMessageID)
     }
 
+    #if os(macOS)
     public func openAttachment(_ attachment: ThreadAttachment, messageID: String) async {
         await openAttachment(attachment, messageID: messageID, fileHandler: .live)
+    }
+    #endif
+
+    /// Downloads an attachment through the same account-generation fence used by
+    /// the desktop save/open flow. iOS writes the returned bytes to a protected
+    /// temporary file before presenting Quick Look.
+    public func downloadAttachmentForPreview(
+        _ attachment: ThreadAttachment,
+        messageID: String
+    ) async throws -> DownloadedAttachment {
+        let operationGeneration = accountOperationGeneration
+        let authorizationID = UUID()
+        let authorization = AttachmentOpenAuthorization()
+        attachmentOpenAuthorizations[authorizationID] = authorization
+        let downloadID = AttachmentDownloadID(
+            messageID: messageID,
+            attachmentID: attachment.attachmentID
+        )
+        guard downloadingAttachmentIDs.insert(downloadID).inserted else {
+            throw CancellationError()
+        }
+        defer {
+            downloadingAttachmentIDs.remove(downloadID)
+            attachmentOpenAuthorizations[authorizationID] = nil
+        }
+        attachmentErrorMessage = nil
+
+        do {
+            let downloaded = try await client.downloadAttachment(messageID: messageID, attachment: attachment)
+            try authorization.check()
+            guard operationGeneration == accountOperationGeneration else {
+                throw CancellationError()
+            }
+            return downloaded
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            guard operationGeneration == accountOperationGeneration,
+                  (try? authorization.check()) != nil else {
+                throw CancellationError()
+            }
+            attachmentErrorMessage = "The attachment could not be downloaded. \(error.localizedDescription)"
+            throw error
+        }
     }
 
     func openAttachment(

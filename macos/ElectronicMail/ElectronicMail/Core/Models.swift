@@ -1472,9 +1472,15 @@ public struct MailComposeRequest: Codable, Equatable {
 }
 
 public struct MailAttachmentUpload: Codable, Equatable {
-    let filename: String
-    let mimeType: String
-    let dataBase64: String
+    public let filename: String
+    public let mimeType: String
+    public let dataBase64: String
+
+    public init(filename: String, mimeType: String, dataBase64: String) {
+        self.filename = filename
+        self.mimeType = mimeType
+        self.dataBase64 = dataBase64
+    }
 
     enum CodingKeys: String, CodingKey {
         case filename
@@ -2572,6 +2578,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
     let cc: String?
     let bcc: String?
     let subject: String?
+    let aiTitle: String?
     let body: String
     let bodyComplete: Bool
     let htmlBody: String?
@@ -2593,6 +2600,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         case cc
         case bcc
         case subject
+        case aiTitle = "ai_title"
         case body
         case bodyComplete = "body_complete"
         case htmlBody = "html_body"
@@ -2623,6 +2631,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         cc = try container.decodeIfPresent(String.self, forKey: .cc)
         bcc = try container.decodeIfPresent(String.self, forKey: .bcc)
         subject = try container.decodeIfPresent(String.self, forKey: .subject)
+        aiTitle = try container.decodeIfPresent(String.self, forKey: .aiTitle)
         body = decodedBody
         bodyComplete = try container.decodeIfPresent(Bool.self, forKey: .bodyComplete)
             ?? Self.inferredBodyCompleteness(
@@ -2658,6 +2667,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         cc: String?,
         bcc: String?,
         subject: String?,
+        aiTitle: String? = nil,
         body: String,
         bodyComplete: Bool = true,
         htmlBody: String?,
@@ -2678,6 +2688,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         self.cc = cc
         self.bcc = bcc
         self.subject = subject
+        self.aiTitle = aiTitle
         self.body = body
         self.bodyComplete = bodyComplete
         self.htmlBody = htmlBody
@@ -2707,6 +2718,7 @@ public struct ThreadMessage: Codable, Equatable, Identifiable {
         cc = message.cc
         bcc = message.bcc
         subject = message.subject
+        aiTitle = message.aiTitle
         body = message.body
         bodyComplete = message.bodyComplete
         htmlBody = message.htmlBody

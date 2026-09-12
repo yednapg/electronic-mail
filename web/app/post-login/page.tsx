@@ -1,4 +1,3 @@
-import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import React from 'react';
 
@@ -48,9 +47,6 @@ export function OAuthCompletionView() {
             Return to Electronic Mail on your Mac. You can close this browser window.
           </p>
         </div>
-        <Link className="post-login-fallback-link" href="/support">
-          Need help?
-        </Link>
       </section>
     </main>
   );
@@ -67,14 +63,6 @@ export function OAuthCompletionUnavailableView() {
             We could not confirm the connection right now. Return to Electronic Mail on your Mac; the app can safely
             retry when the service is available. This page has not changed your Google account.
           </p>
-        </div>
-        <div className="post-login-fallback-actions">
-          <Link className="post-login-fallback-link" href="/post-login">
-            Try again
-          </Link>
-          <Link className="post-login-fallback-link" href="/support">
-            Get support
-          </Link>
         </div>
       </section>
     </main>
