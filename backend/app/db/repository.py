@@ -27,7 +27,7 @@ from app.db.models import (
 from app.db.account_scope import gmail_account_scope
 
 DEFAULT_USER_ID = os.getenv("APP_USER_ID", "local-user").strip() or "local-user"
-ALEMBIC_HEAD_REVISION = "20260830_0041"
+ALEMBIC_HEAD_REVISION = "20260908_0043"
 ALEMBIC_BASELINE_REVISION = ALEMBIC_HEAD_REVISION
 POSTGRES_URL_PREFIXES = ("postgres://", "postgresql://")
 ADVISORY_LOCK_POOL_SIZE = 10

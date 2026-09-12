@@ -1,28 +1,32 @@
+import Foundation
 import SwiftUI
 
 public struct TodoHomeView: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var store: InboxStore
+    @ObservedObject private var aiInboxStore: AIInboxStore
     @State private var hiddenEntityIDs: Set<String> = []
     @State private var completingEntityIDs: Set<String> = []
     @State private var completionError: String?
-    @State private var draftTitle = ""
-    @State private var draftNotes = ""
-    @State private var composerSectionID: String?
-    @State private var creatingTask = false
     @State private var expandedItemID: String?
+    @State private var collapsedSectionIDs: Set<String> = []
+    @Binding private var searchText: String
 
-    private let onCompose: () -> Void
     private let onOpenSource: (String) -> Void
+    private let onOpenAIMatter: (String) -> Void
 
     public init(
         store: InboxStore,
-        onCompose: @escaping () -> Void = {},
-        onOpenSource: @escaping (String) -> Void = { _ in }
+        aiInboxStore: AIInboxStore,
+        searchText: Binding<String> = .constant(""),
+        onOpenSource: @escaping (String) -> Void = { _ in },
+        onOpenAIMatter: @escaping (String) -> Void = { _ in }
     ) {
         self.store = store
-        self.onCompose = onCompose
+        self.aiInboxStore = aiInboxStore
+        self._searchText = searchText
         self.onOpenSource = onOpenSource
+        self.onOpenAIMatter = onOpenAIMatter
     }
 
     public var body: some View {
@@ -31,14 +35,18 @@ public struct TodoHomeView: View {
                 .ignoresSafeArea()
 
             if let session = store.session {
-                content(for: TodoHomeMapper.snapshot(
-                    from: session,
-                    inboxRows: store.flatRows,
-                    now: Date(),
-                    hiddenEntityIDs: hiddenEntityIDs
-                ))
+                TimelineView(.periodic(from: .now, by: 60)) { context in
+                    content(for: TodoHomeMapper.snapshot(
+                        from: session,
+                        inboxRows: store.flatRows,
+                        aiTodos: aiInboxStore.todoItems,
+                        todoOrganizingCount: aiInboxStore.todoOrganizingCount,
+                        now: context.date,
+                        hiddenEntityIDs: hiddenEntityIDs
+                    ))
+                }
 
-                if store.refreshFailed {
+                if store.refreshFailed && aiInboxStore.todoRefreshFailed {
                     ElectronicMailRefreshFailureToast(message: "To-do's could not refresh. Showing last saved state.")
                 }
             } else {
@@ -49,141 +57,156 @@ public struct TodoHomeView: View {
             if store.session == nil {
                 await store.load()
             }
+            await aiInboxStore.refreshTodos()
+
+            while aiInboxStore.todoOrganizingCount > 0 && !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: 4_000_000_000)
+                } catch {
+                    return
+                }
+                await aiInboxStore.refreshTodos()
+            }
         }
         .environment(\.font, .body)
     }
 
     private func content(for snapshot: TodoHomeSnapshot) -> some View {
         GeometryReader { proxy in
-            let contentWidth = min(
-                TodoTypography.maxContentWidth,
-                max(
-                    TodoTypography.minContentWidth,
-                    proxy.size.width * 0.5 - ElectronicMailShellMetrics.navLeading * 2
-                )
-            )
+            let contentWidth = TodoPageLayout.contentWidth(for: proxy.size.width)
             let metrics = TodoLayoutMetrics(contentWidth: contentWidth)
 
-            ScrollViewReader { scrollProxy in
-                ScrollView(.vertical, showsIndicators: true) {
-                    VStack(alignment: .leading, spacing: 48) {
-                        header(snapshot: snapshot)
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 48) {
+                    header(snapshot: snapshot)
 
-                        if let aiBuildStatus = snapshot.aiBuildStatus {
-                            aiBuildStatusPanel(aiBuildStatus)
-                        }
+                    if let aiBuildStatus = snapshot.aiBuildStatus {
+                        aiBuildStatusPanel(aiBuildStatus)
+                    }
 
-                        if let dashboardBuildStatus = snapshot.dashboardBuildStatus {
-                            aiBuildStatusPanel(dashboardBuildStatus)
-                        } else {
-                            agendaPanel(snapshot.agenda)
+                    if let dashboardBuildStatus = snapshot.dashboardBuildStatus {
+                        aiBuildStatusPanel(dashboardBuildStatus)
+                    } else {
+                        agendaPanel(snapshot.agenda)
 
-                            TodoSectionView(
-                                section: snapshot.now,
-                                metrics: metrics,
-                                colorScheme: colorScheme,
-                                completingEntityIDs: completingEntityIDs,
-                                expandedItemID: $expandedItemID,
-                                trailingButton: AnyView(addButton(for: snapshot.now, scrollProxy: scrollProxy)),
-                                footer: AnyView(composer(for: snapshot.now)),
-                                onComplete: complete,
-                                onOpenSource: onOpenSource
+                        VStack(alignment: .leading, spacing: 0) {
+                            todoSection(
+                                filtered(snapshot.now),
+                                isFirstSection: true,
+                                metrics: metrics
                             )
 
-                            TodoSectionView(
-                                section: snapshot.laterToday,
-                                metrics: metrics,
-                                colorScheme: colorScheme,
-                                completingEntityIDs: completingEntityIDs,
-                                expandedItemID: $expandedItemID,
-                                trailingButton: AnyView(addButton(for: snapshot.laterToday, scrollProxy: scrollProxy)),
-                                footer: AnyView(composer(for: snapshot.laterToday)),
-                                onComplete: complete,
-                                onOpenSource: onOpenSource
-                            )
+                            todoSection(filtered(snapshot.laterToday), metrics: metrics)
 
-                            TodoSectionView(
-                                section: snapshot.worthKnowing,
-                                metrics: metrics,
-                                colorScheme: colorScheme,
-                                completingEntityIDs: completingEntityIDs,
-                                expandedItemID: $expandedItemID,
-                                trailingButton: AnyView(addButton(for: snapshot.worthKnowing, scrollProxy: scrollProxy)),
-                                footer: AnyView(composer(for: snapshot.worthKnowing)),
-                                onComplete: complete,
-                                onOpenSource: onOpenSource
-                            )
+                            todoSection(filtered(snapshot.upcoming), metrics: metrics)
+
+                            todoSection(filtered(snapshot.worthKnowing), metrics: metrics)
                         }
                     }
-                    .frame(width: contentWidth, alignment: .leading)
-                    .padding(.top, TodoTypography.contentTop)
-                    .padding(.bottom, 70)
-                    .padding(.horizontal, ElectronicMailShellMetrics.navLeading)
-                    .frame(maxWidth: .infinity)
+                }
+                .frame(width: contentWidth, alignment: .leading)
+                .padding(.top, TodoTypography.contentTop)
+                .padding(.bottom, 70)
+                .padding(.horizontal, ElectronicMailShellMetrics.navLeading)
+                .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    private func todoSection(
+        _ section: TodoSectionModel,
+        isFirstSection: Bool = false,
+        metrics: TodoLayoutMetrics
+    ) -> some View {
+        TodoSectionView(
+            section: section,
+            isFirstSection: isFirstSection,
+            metrics: metrics,
+            colorScheme: colorScheme,
+            completingEntityIDs: completingEntityIDs,
+            expandedItemID: $expandedItemID,
+            collapsed: collapsedSectionIDs.contains(section.id),
+            onToggleCollapsed: { toggleCollapsed(section) },
+            onComplete: complete,
+            onOpenSource: onOpenSource,
+            onOpenAIMatter: onOpenAIMatter
+        )
+    }
+
+    private func filtered(_ section: TodoSectionModel) -> TodoSectionModel {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return section }
+
+        let rows = section.rows.filter { row in
+            [row.title, row.sender, row.detailText, row.actionLabel, row.sourceLabel]
+                .contains { $0.localizedCaseInsensitiveContains(query) }
+        }
+        return TodoSectionModel(id: section.id, title: section.title, rows: rows)
+    }
+
+    private func toggleCollapsed(_ section: TodoSectionModel) {
+        withAnimation(.easeInOut(duration: 0.18)) {
+            if collapsedSectionIDs.contains(section.id) {
+                collapsedSectionIDs.remove(section.id)
+            } else {
+                collapsedSectionIDs.insert(section.id)
+                if let expandedItemID,
+                   section.rows.contains(where: { $0.id == expandedItemID }) {
+                    self.expandedItemID = nil
                 }
             }
         }
     }
 
     private func header(snapshot: TodoHomeSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(snapshot.greeting)
-                    .font(TodoTypography.normal(weight: .regular))
-                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-
-                Spacer(minLength: 24)
-
-                Text(snapshot.headerContextLabel)
-                    .font(TodoTypography.normal(weight: .regular))
-                    .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-
-            }
-
-        }
+        summaryBlock(snapshot)
     }
 
-    private func summaryBlock(_ summary: TodoSummary) -> some View {
+    private func summaryBlock(_ snapshot: TodoHomeSnapshot) -> some View {
         InlineSummaryLayout(spacing: 0, lineSpacing: 6) {
-            ForEach(Array(summaryTokens(summary).enumerated()), id: \.offset) { _, token in
+            ForEach(Array(summaryTokens(snapshot).enumerated()), id: \.offset) { _, token in
                 SummaryTokenView(token: token, colorScheme: colorScheme)
             }
         }
-        .frame(maxWidth: 820, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func summaryTokens(_ summary: TodoSummary) -> [SummaryToken] {
+    private func summaryTokens(_ snapshot: TodoHomeSnapshot) -> [SummaryToken] {
+        let summary = snapshot.summary
         let parts = summary.parts.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        var tokens: [SummaryToken] = []
+
         guard !parts.isEmpty else {
-            return [.text(summary.fallbackBrief, style: .muted)]
+            tokens.append(.text(summary.fallbackBrief, style: .supporting))
+            return tokens
         }
 
-        var tokens: [SummaryToken] = [.text("You have ", style: .muted)]
+        tokens.append(.text("You have ", style: .supporting))
 
         for index in parts.indices {
             let separator = summarySeparator(index: index, count: parts.count)
             if !separator.isEmpty {
-                tokens.append(.text(separator, style: .muted))
+                tokens.append(.text(separator, style: .supporting))
             }
             tokens.append(contentsOf: summaryPartTokens(parts[index]))
         }
 
-        tokens.append(.text(".", style: .muted))
+        tokens.append(.text(".", style: .supporting))
 
         if let important = summary.important {
-            tokens.append(.text(" You also have ", style: .muted))
+            tokens.append(.text(" You also have ", style: .supporting))
             tokens.append(.symbol(summarySymbol(type: "important", fallbackEmoji: important.emoji)))
-            tokens.append(.text(" ", style: .muted))
-            tokens.append(.text(summaryCountPhrase(count: important.count, text: important.text), style: .emphasis))
-            tokens.append(.text(".", style: .muted))
+            tokens.append(.text(" ", style: .supporting))
+            tokens.append(.text(summaryCountPhrase(count: important.count, text: important.text), style: .statement))
+            tokens.append(.text(".", style: .supporting))
         }
 
         if let availability = summary.calendarAvailability {
-            tokens.append(.text(" You are ", style: .muted))
+            tokens.append(.text(" You are ", style: .supporting))
             tokens.append(.symbol(summarySymbol(type: "availability", fallbackEmoji: availability.emoji)))
-            tokens.append(.text(" ", style: .muted))
-            tokens.append(.text(availability.text, style: .emphasis))
-            tokens.append(.text(".", style: .muted))
+            tokens.append(.text(" ", style: .supporting))
+            tokens.append(.text(availability.text, style: .statement))
+            tokens.append(.text(".", style: .supporting))
         }
 
         return tokens
@@ -194,14 +217,14 @@ public struct TodoHomeView: View {
         if part.count == 0 {
             return [
                 .symbol(symbol),
-                .text(" no \(part.text)", style: .muted),
+                .text(" no \(part.text)", style: .supporting),
             ]
         }
 
         return [
             .symbol(symbol),
-            .text(" ", style: .muted),
-            .text(summaryCountPhrase(count: part.count, text: part.text), style: .emphasis),
+            .text(" ", style: .supporting),
+            .text(summaryCountPhrase(count: part.count, text: part.text), style: .metric),
         ]
     }
 
@@ -209,29 +232,29 @@ public struct TodoHomeView: View {
         let normalized = type?.lowercased() ?? ""
         switch normalized {
         case "meetings", "calendar":
-            return SummarySymbol(name: "calendar")
+            return SummarySymbol(name: "calendar", tone: .blue)
         case "tasks", "todo", "todos":
-            return SummarySymbol(name: "checkmark.square")
+            return SummarySymbol(name: "checkmark.square", tone: .green)
         case "emails", "mail":
-            return SummarySymbol(name: "envelope")
+            return SummarySymbol(name: "envelope", tone: .blue)
         case "important", "bill", "payment":
-            return SummarySymbol(name: "creditcard")
+            return SummarySymbol(name: "creditcard", tone: .green)
         case "availability":
-            return SummarySymbol(name: "sunset")
+            return SummarySymbol(name: "sunset", tone: .orange)
         default:
             if fallbackEmoji.contains("✅") {
-                return SummarySymbol(name: "checkmark.square")
+                return SummarySymbol(name: "checkmark.square", tone: .green)
             }
             if fallbackEmoji.contains("📨") || fallbackEmoji.contains("✉") {
-                return SummarySymbol(name: "envelope")
+                return SummarySymbol(name: "envelope", tone: .blue)
             }
             if fallbackEmoji.contains("💸") || fallbackEmoji.contains("💳") {
-                return SummarySymbol(name: "creditcard")
+                return SummarySymbol(name: "creditcard", tone: .green)
             }
             if fallbackEmoji.contains("🌄") || fallbackEmoji.contains("☀") {
-                return SummarySymbol(name: "sunset")
+                return SummarySymbol(name: "sunset", tone: .orange)
             }
-            return SummarySymbol(name: "calendar")
+            return SummarySymbol(name: "calendar", tone: .blue)
         }
     }
 
@@ -267,7 +290,7 @@ public struct TodoHomeView: View {
 
                     Text("You're free today!")
                         .font(TodoTypography.normal())
-                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                        .foregroundStyle(ElectronicMailDesign.readText(for: colorScheme))
                         .lineLimit(1)
                 }
                 .frame(height: TodoTypography.lineHeight)
@@ -278,27 +301,20 @@ public struct TodoHomeView: View {
                     Text(item.time)
                         .font(TodoTypography.normal())
                         .foregroundStyle(item.tone.color)
-                        .frame(width: 74, alignment: .leading)
+                        .frame(width: 82, alignment: .leading)
 
                     Text(item.title)
                         .font(TodoTypography.normal())
-                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                        .foregroundStyle(ElectronicMailDesign.readText(for: colorScheme))
                         .lineLimit(1)
                 }
                 .frame(height: TodoTypography.lineHeight)
             }
         }
-        .padding(.horizontal, 22)
-        .padding(.vertical, 16)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(ElectronicMailDesign.panelFill(for: colorScheme))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .stroke(ElectronicMailDesign.panelBorder(for: colorScheme), lineWidth: 1)
-        )
+        .electronicMailSummaryCardSurface()
     }
 
     private func aiBuildStatusPanel(_ text: String) -> some View {
@@ -325,110 +341,6 @@ public struct TodoHomeView: View {
         )
     }
 
-    private func addButton(for section: TodoSectionModel, scrollProxy: ScrollViewProxy) -> some View {
-        ElectronicMailIconControl(
-            symbol: "plus",
-            accessibilityLabel: "Add to-do"
-        ) {
-            let willOpen = composerSectionID != section.id
-            withAnimation(.easeInOut(duration: 0.16)) {
-                composerSectionID = composerSectionID == section.id ? nil : section.id
-            }
-            if willOpen {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        scrollProxy.scrollTo(composerID(for: section.id), anchor: .center)
-                    }
-                }
-            }
-        }
-    }
-
-    private func composerID(for sectionID: String) -> String {
-        "todo-composer-\(sectionID)"
-    }
-
-    private func composer(for section: TodoSectionModel) -> some View {
-        Group {
-            if composerSectionID == section.id {
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack(alignment: .center, spacing: 16) {
-                        Image(systemName: "circle")
-                            .font(TodoTypography.normal())
-                            .foregroundStyle(ElectronicMailDesign.tertiaryText(for: colorScheme))
-                            .frame(width: 26)
-
-                        TextField("New to-do", text: $draftTitle)
-                            .textFieldStyle(.plain)
-                            .font(TodoTypography.normal(weight: .semibold))
-                            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                            .onSubmit { createManualTask(in: section) }
-                    }
-
-                    TextField("Notes", text: $draftNotes, axis: .vertical)
-                        .textFieldStyle(.plain)
-                        .font(TodoTypography.small())
-                        .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
-                        .lineLimit(2...4)
-                        .padding(.leading, 42)
-
-                    if let completionError {
-                        Text(completionError)
-                            .font(TodoTypography.small())
-                            .foregroundStyle(Color.red.opacity(0.82))
-                            .padding(.leading, 42)
-                    }
-
-                    HStack(spacing: 10) {
-                        Spacer()
-                        Button {
-                            resetComposer()
-                        } label: {
-                            Text("Cancel")
-                                .padding(.horizontal, 13)
-                                .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
-                        }
-                        .buttonStyle(.bordered)
-                        .buttonBorderShape(.capsule)
-                        .font(TodoTypography.small(weight: .regular))
-
-                        Button {
-                            createManualTask(in: section)
-                        } label: {
-                            Group {
-                                if creatingTask {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                } else {
-                                    Text("Add")
-                                }
-                            }
-                            .padding(.horizontal, 16)
-                            .frame(minHeight: ElectronicMailControlMetrics.actionHeight)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .buttonBorderShape(.capsule)
-                        .font(TodoTypography.small(weight: .regular))
-                        .disabled(creatingTask || draftTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    }
-                }
-                .padding(.horizontal, 22)
-                .padding(.vertical, 20)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(ElectronicMailDesign.panelFill(for: colorScheme))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .stroke(ElectronicMailDesign.panelBorder(for: colorScheme), lineWidth: 1)
-                )
-                .id(composerID(for: section.id))
-                .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-    }
-
     private var loadingView: some View {
         VStack(spacing: 14) {
             ProgressView()
@@ -453,6 +365,18 @@ public struct TodoHomeView: View {
         }
 
         Task { @MainActor in
+            if let todoID = row.aiTodoID,
+               let todo = aiInboxStore.todoItems.first(where: { $0.id == todoID }) {
+                let completed = await aiInboxStore.completeTodo(todo)
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    completingEntityIDs.remove(row.entityID)
+                    if !completed {
+                        hiddenEntityIDs.remove(row.entityID)
+                        completionError = "Could not complete this item. It is still visible."
+                    }
+                }
+                return
+            }
             do {
                 _ = try await store.completeEntity(entityID: row.entityID)
                 completingEntityIDs.remove(row.entityID)
@@ -466,74 +390,115 @@ public struct TodoHomeView: View {
         }
     }
 
-    private func createManualTask(in section: TodoSectionModel) {
-        let title = draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty, !creatingTask else {
-            return
-        }
-        let notes = draftNotes.trimmingCharacters(in: .whitespacesAndNewlines)
-        creatingTask = true
-        completionError = nil
+}
 
-        Task { @MainActor in
-            do {
-                _ = try await store.createManualTask(
-                    title: title,
-                    notes: notes.isEmpty ? nil : notes,
-                    section: section.backendSection
-                )
-                resetComposer()
-            } catch {
-                creatingTask = false
-                completionError = "Could not add this to-do."
+private struct SummarySymbol {
+    enum Tone {
+        case blue
+        case green
+        case orange
+
+        var color: Color {
+            switch self {
+            case .blue:
+                return Color(nsColor: .systemBlue)
+            case .green:
+                return Color(nsColor: .systemGreen)
+            case .orange:
+                return Color(nsColor: .systemOrange)
             }
         }
     }
 
-    private func resetComposer() {
-        creatingTask = false
-        composerSectionID = nil
-        draftTitle = ""
-        draftNotes = ""
-        completionError = nil
-    }
-}
-
-private struct SummarySymbol {
     let name: String
+    let tone: Tone
 }
 
 private enum TodoTypography {
-    static let normalSize: CGFloat = 15
-    static let lineHeight: CGFloat = 34
+    // Bind directly to the shared SF Pro mailbox scale. To-do hierarchy must
+    // use the same roles as Inbox rather than parallel rounded approximations.
+    static let headerSize = ElectronicMailType.mailboxHeaderSize
+    static let briefSize = ElectronicMailType.mailboxHeaderSize
+    static let normalSize = ElectronicMailType.bodySize
+    static let detailSize = ElectronicMailType.detailSize
+    static let metadataSize = ElectronicMailType.smallSize
+    static let sectionSize = ElectronicMailType.sectionTitleSize
+    static let lineHeight = ElectronicMailMailboxType.rowHeight
     static let tracking: CGFloat = 0
-    static let sectionRowTopGap: CGFloat = 10
-    static let contentTop: CGFloat = ElectronicMailShellMetrics.navTop + 8
+    static let sectionLabelHeight: CGFloat = 38
+    static let contentTop: CGFloat = ElectronicMailShellMetrics.navTop + 24
     static let minContentWidth: CGFloat = 620
     static let maxContentWidth: CGFloat = 1000
+
+    static func header(weight: Font.Weight = .regular) -> Font {
+        .system(size: headerSize, weight: weight)
+    }
+
+    static func brief(weight: Font.Weight = .regular) -> Font {
+        .system(size: briefSize, weight: weight)
+    }
 
     static func normal(weight: Font.Weight = .regular) -> Font {
         .system(size: normalSize, weight: weight)
     }
 
     static func sectionTitle() -> Font {
-        ElectronicMailType.sectionTitle()
+        ElectronicMailMailboxType.section()
     }
 
-    static func rowTitle() -> Font {
-        ElectronicMailType.body(weight: .regular)
+    static func rowTitle(weight: Font.Weight = .regular) -> Font {
+        .system(size: ElectronicMailMailboxType.subjectSize, weight: weight)
     }
 
     static func small(weight: Font.Weight = .regular) -> Font {
-        ElectronicMailType.detail(weight: weight)
+        .system(size: detailSize, weight: weight)
     }
 
     static func extraSmall(weight: Font.Weight = .regular) -> Font {
-        ElectronicMailType.small(weight: weight)
+        .system(size: metadataSize, weight: weight)
     }
 
     static func checkbox() -> Font {
-        .system(size: 15, weight: .regular)
+        .system(size: 18, weight: .regular)
+    }
+}
+
+enum TodoPageLayout {
+    static func contentWidth(for containerWidth: CGFloat) -> CGFloat {
+        min(
+            TodoTypography.maxContentWidth,
+            max(
+                TodoTypography.minContentWidth,
+                containerWidth * 0.5 - ElectronicMailShellMetrics.navLeading * 2
+            )
+        )
+    }
+}
+
+struct TodoDateTimeRail: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let name: String
+    let width: CGFloat
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            HStack(alignment: .firstTextBaseline) {
+                greeting(for: context.date)
+                Spacer(minLength: 24)
+                Text(DateFormatter.todoHeaderTime.string(from: context.date))
+            }
+            .font(TodoTypography.header())
+            .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
+            .frame(width: width)
+        }
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func greeting(for date: Date) -> Text {
+        let hour = Calendar.current.component(.hour, from: date)
+        let period = hour < 12 ? "morning" : hour < 17 ? "afternoon" : "evening"
+        return Text("Good \(period), ") + Text(name).fontWeight(.semibold)
     }
 }
 
@@ -543,8 +508,19 @@ private enum SummaryToken {
 }
 
 private enum SummaryTextStyle {
-    case muted
-    case emphasis
+    case supporting
+    case name
+    case metric
+    case statement
+
+    var weight: Font.Weight {
+        switch self {
+        case .supporting: .regular
+        case .name: .semibold
+        case .metric: .semibold
+        case .statement: .semibold
+        }
+    }
 }
 
 private struct SummaryTokenView: View {
@@ -555,25 +531,20 @@ private struct SummaryTokenView: View {
         switch token {
         case let .text(value, style):
             Text(value)
-                .font(TodoTypography.small(weight: .regular))
+                .font(TodoTypography.brief(weight: style.weight))
                 .foregroundStyle(textColor(for: style))
                 .fixedSize(horizontal: true, vertical: false)
         case let .symbol(symbol):
             Image(systemName: symbol.name)
-                .symbolRenderingMode(.multicolor)
-                .foregroundStyle(ElectronicMailDesign.primaryText(for: colorScheme))
-                .font(TodoTypography.small(weight: .regular))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(symbol.tone.color)
+                .font(TodoTypography.brief(weight: .medium))
                 .fixedSize(horizontal: true, vertical: false)
         }
     }
 
-    private func textColor(for style: SummaryTextStyle) -> Color {
-        switch style {
-        case .muted:
-            return ElectronicMailDesign.secondaryText(for: colorScheme)
-        case .emphasis:
-            return ElectronicMailDesign.primaryText(for: colorScheme)
-        }
+    private func textColor(for _: SummaryTextStyle) -> Color {
+        ElectronicMailDesign.primaryText(for: colorScheme)
     }
 }
 
@@ -638,54 +609,55 @@ private struct InlineSummaryLayout: Layout {
 
 private struct TodoSectionView: View {
     let section: TodoSectionModel
+    let isFirstSection: Bool
     let metrics: TodoLayoutMetrics
     let colorScheme: ColorScheme
     let completingEntityIDs: Set<String>
     @Binding var expandedItemID: String?
-    var trailingButton: AnyView?
-    var footer: AnyView?
+    let collapsed: Bool
+    let onToggleCollapsed: () -> Void
     let onComplete: (TodoRowViewModel) -> Void
     let onOpenSource: (String) -> Void
+    let onOpenAIMatter: (String) -> Void
 
     init(
         section: TodoSectionModel,
+        isFirstSection: Bool = false,
         metrics: TodoLayoutMetrics,
         colorScheme: ColorScheme,
         completingEntityIDs: Set<String>,
         expandedItemID: Binding<String?>,
-        trailingButton: AnyView? = nil,
-        footer: AnyView? = nil,
+        collapsed: Bool,
+        onToggleCollapsed: @escaping () -> Void,
         onComplete: @escaping (TodoRowViewModel) -> Void,
-        onOpenSource: @escaping (String) -> Void
+        onOpenSource: @escaping (String) -> Void,
+        onOpenAIMatter: @escaping (String) -> Void
     ) {
         self.section = section
+        self.isFirstSection = isFirstSection
         self.metrics = metrics
         self.colorScheme = colorScheme
         self.completingEntityIDs = completingEntityIDs
         self._expandedItemID = expandedItemID
-        self.trailingButton = trailingButton
-        self.footer = footer
+        self.collapsed = collapsed
+        self.onToggleCollapsed = onToggleCollapsed
         self.onComplete = onComplete
         self.onOpenSource = onOpenSource
+        self.onOpenAIMatter = onOpenAIMatter
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             TodoSectionHeader(
                 title: section.title,
+                isFirstSection: isFirstSection,
                 metrics: metrics,
                 colorScheme: colorScheme,
-                trailingButton: trailingButton
+                collapsed: collapsed,
+                onToggleCollapsed: onToggleCollapsed
             )
 
-            Spacer()
-                .frame(height: TodoTypography.sectionRowTopGap)
-
-            footer
-
-            if section.rows.isEmpty {
-                TodoEmptyRow(metrics: metrics, colorScheme: colorScheme)
-            } else {
+            if !collapsed {
                 ForEach(section.rows) { row in
                     TodoItemRow(
                         row: row,
@@ -696,8 +668,11 @@ private struct TodoSectionView: View {
                         onToggleExpanded: { toggleExpanded(row.id) },
                         onComplete: { onComplete(row) },
                         onOpenSource: {
-                            guard let threadID = row.gmailThreadID else { return }
-                            onOpenSource(threadID)
+                            if let matterID = row.aiMatterID {
+                                onOpenAIMatter(matterID)
+                            } else if let threadID = row.gmailThreadID {
+                                onOpenSource(threadID)
+                            }
                         }
                     )
                 }
@@ -724,45 +699,53 @@ private enum TodoExpansionMotion {
 
 private struct TodoSectionHeader: View {
     let title: String
+    let isFirstSection: Bool
     let metrics: TodoLayoutMetrics
     let colorScheme: ColorScheme
-    let trailingButton: AnyView?
+    let collapsed: Bool
+    let onToggleCollapsed: () -> Void
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            Text(title)
-                .font(TodoTypography.sectionTitle())
-                .tracking(TodoTypography.tracking)
-                .foregroundStyle(ElectronicMailDesign.sectionText(for: colorScheme))
-                .lineLimit(1)
-                .frame(height: TodoTypography.lineHeight)
+        let topSpacing = isFirstSection
+            ? ElectronicMailControlMetrics.mailboxFirstSectionTopSpacing
+            : ElectronicMailControlMetrics.mailboxSectionTopSpacing
 
-            if let trailingButton {
-                trailingButton
-                    .offset(x: metrics.contentWidth - 30)
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: onToggleCollapsed) {
+                HStack(spacing: 7) {
+                    Text(title)
+                        .font(TodoTypography.sectionTitle())
+                        .lineLimit(1)
+
+                    Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .accessibilityHidden(true)
+                }
+                .foregroundStyle(
+                    ElectronicMailDesign.sectionText(for: colorScheme)
+                        .opacity(ElectronicMailMailboxType.sectionOpacity)
+                )
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .help(collapsed ? "Expand \(title)" : "Collapse \(title)")
+            .accessibilityLabel(title)
+            .accessibilityValue(collapsed ? "Collapsed" : "Expanded")
+            .accessibilityAddTraits(.isHeader)
+            .frame(
+                width: metrics.contentWidth,
+                height: TodoTypography.sectionLabelHeight,
+                alignment: .leading
+            )
 
-            Rectangle()
-                .fill(ElectronicMailDesign.divider(for: colorScheme))
-                .frame(width: metrics.contentWidth, height: 1)
-                .offset(y: TodoTypography.lineHeight)
+            Divider()
         }
-        .frame(width: metrics.contentWidth, height: TodoTypography.lineHeight + 3, alignment: .topLeading)
-    }
-}
-
-private struct TodoEmptyRow: View {
-    let metrics: TodoLayoutMetrics
-    let colorScheme: ColorScheme
-
-    var body: some View {
-        Text("Nothing here.")
-            .font(TodoTypography.normal())
-            .tracking(TodoTypography.tracking)
-            .foregroundStyle(ElectronicMailDesign.readText(for: colorScheme))
-            .frame(width: metrics.subjectWidth, height: TodoTypography.lineHeight, alignment: .leading)
-            .offset(x: metrics.subjectLeading)
-            .frame(width: metrics.contentWidth, height: TodoTypography.lineHeight, alignment: .topLeading)
+        .padding(.top, topSpacing)
+        .frame(
+            width: metrics.contentWidth,
+            height: topSpacing + TodoTypography.sectionLabelHeight + 1,
+            alignment: .topLeading
+        )
     }
 }
 
@@ -859,13 +842,30 @@ private struct TodoItemRow: View {
     private var actionRow: some View {
         ZStack(alignment: .leading) {
             HStack(spacing: 14) {
-                Text(row.actionLabel)
-                    .font(TodoTypography.small(weight: .semibold))
+                if row.gmailThreadID != nil || row.aiMatterID != nil {
+                    Button(action: onOpenSource) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 9, weight: .semibold))
+
+                            Text(row.actionLabel)
+                                .font(TodoTypography.small(weight: .semibold))
+                        }
+                    }
+                    .buttonStyle(.plain)
                     .foregroundStyle(ElectronicMailDesign.green)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
+                    .accessibilityLabel("Start task: \(row.title)")
+                } else {
+                    Text(row.actionLabel)
+                        .font(TodoTypography.small(weight: .semibold))
+                        .foregroundStyle(ElectronicMailDesign.green)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
 
-                if row.gmailThreadID != nil {
+                if row.gmailThreadID != nil || row.aiMatterID != nil {
                     Rectangle()
                         .fill(ElectronicMailDesign.secondaryText(for: colorScheme).opacity(0.65))
                         .frame(width: 1, height: 18)
@@ -895,7 +895,10 @@ private struct TodoItemRow: View {
     }
 
     private var sourceIconName: String {
-        row.gmailThreadID == nil ? "square.and.pencil" : "tray.full"
+        if row.aiMatterID != nil {
+            return "sparkles"
+        }
+        return row.gmailThreadID == nil ? "square.and.pencil" : "tray.full"
     }
 
     private var sourceAccessibilityLabel: String {
@@ -903,6 +906,9 @@ private struct TodoItemRow: View {
     }
 
     private var sourceDisplayLabel: String {
+        if row.aiMatterID != nil {
+            return "AI Inbox"
+        }
         if row.gmailThreadID != nil {
             return "Gmail"
         }
@@ -924,16 +930,25 @@ private struct TodoItemRow: View {
         containerWidth: CGFloat
     ) -> some View {
         ZStack(alignment: .topLeading) {
-            Button(action: onComplete) {
-                completionIcon
+            if row.allowsCompletion {
+                Button(action: onComplete) {
+                    completionIcon
+                }
+                .buttonStyle(.plain)
+                .help("Complete")
+                .frame(width: 26, height: TodoTypography.lineHeight)
+                .offset(x: checkboxX)
+            } else {
+                Image(systemName: "info.circle")
+                    .font(TodoTypography.small(weight: .medium))
+                    .foregroundStyle(ElectronicMailDesign.secondaryText(for: colorScheme))
+                    .frame(width: 26, height: TodoTypography.lineHeight)
+                    .offset(x: checkboxX)
+                    .accessibilityLabel("Worth knowing")
             }
-            .buttonStyle(.plain)
-            .help("Complete")
-            .frame(width: 26, height: TodoTypography.lineHeight)
-            .offset(x: checkboxX)
 
             Button(action: onToggleExpanded) {
-                rowText(row.title, color: ElectronicMailDesign.primaryText(for: colorScheme))
+                rowText(row.title, color: ElectronicMailDesign.readText(for: colorScheme))
                     .frame(width: subjectWidth, height: TodoTypography.lineHeight, alignment: .leading)
             }
             .buttonStyle(.plain)
@@ -967,12 +982,73 @@ private struct TodoItemRow: View {
     }
 
     private func rowText(_ value: String, color: Color, alignment: TextAlignment = .leading) -> some View {
-        Text(value)
-            .font(TodoTypography.rowTitle())
-            .foregroundStyle(color)
+        styledTitle(value, baseColor: color)
             .lineLimit(1)
             .truncationMode(.tail)
             .multilineTextAlignment(alignment)
+    }
+
+    private func styledTitle(_ value: String, baseColor: Color) -> Text {
+        guard let actionRange = actionRange(in: value) else {
+            return Text(value)
+                .font(TodoTypography.rowTitle())
+                .foregroundColor(baseColor)
+        }
+
+        return Text(String(value[..<actionRange.lowerBound]))
+            .font(TodoTypography.rowTitle())
+            .foregroundColor(baseColor)
+            + Text(String(value[actionRange]))
+                .font(TodoTypography.rowTitle())
+                .foregroundColor(actionAccent)
+            + Text(String(value[actionRange.upperBound...]))
+                .font(TodoTypography.rowTitle())
+                .foregroundColor(baseColor)
+    }
+
+    private func actionRange(in value: String) -> Range<String.Index>? {
+        let candidates: [String]
+        switch row.primaryAction.lowercased() {
+        case "reply":
+            candidates = ["Reply", "Respond"]
+        case "confirm":
+            candidates = ["RSVP", "Confirm"]
+        case "pay":
+            candidates = ["Pay"]
+        case "track":
+            candidates = ["Track"]
+        case "review":
+            candidates = ["Review"]
+        case "join":
+            candidates = ["Join"]
+        case "send":
+            candidates = ["Send"]
+        case "approve":
+            candidates = ["Approve"]
+        case "register":
+            candidates = ["Register"]
+        case "open":
+            candidates = ["Read Notice", "Review", "Open", "Read"]
+        default:
+            candidates = []
+        }
+
+        for candidate in candidates {
+            let pattern = "\\b\(NSRegularExpression.escapedPattern(for: candidate))\\b"
+            if let range = value.range(of: pattern, options: [.regularExpression, .caseInsensitive]) {
+                return range
+            }
+        }
+        return nil
+    }
+
+    private var actionAccent: Color {
+        switch row.primaryAction.lowercased() {
+        case "open", "pay", "track", "review":
+            return ElectronicMailDesign.successAccent(for: colorScheme)
+        default:
+            return Color(nsColor: .systemBlue)
+        }
     }
 
 }
@@ -987,12 +1063,11 @@ private struct TodoRevealedContentHeightKey: PreferenceKey {
 
 struct TodoHomeSnapshot: Equatable {
     let greeting: String
-    let timeLabel: String
-    let headerContextLabel: String
     let summary: TodoSummary
     let agenda: [TodoAgendaItem]
     let now: TodoSectionModel
     let laterToday: TodoSectionModel
+    let upcoming: TodoSectionModel
     let worthKnowing: TodoSectionModel
     let refreshWarning: String?
     let aiBuildStatus: String?
@@ -1035,17 +1110,6 @@ struct TodoSectionModel: Equatable, Identifiable {
     let id: String
     let title: String
     let rows: [TodoRowViewModel]
-
-    var backendSection: String {
-        switch id {
-        case "now":
-            return "now"
-        case "worth-knowing":
-            return "later"
-        default:
-            return "today"
-        }
-    }
 }
 
 struct TodoRowViewModel: Equatable, Identifiable {
@@ -1055,9 +1119,13 @@ struct TodoRowViewModel: Equatable, Identifiable {
     let title: String
     let timeLabel: String
     let detailText: String
+    let primaryAction: String
     let actionLabel: String
     let sourceLabel: String
     let gmailThreadID: String?
+    let aiMatterID: String?
+    let aiTodoID: String?
+    let allowsCompletion: Bool
 }
 
 struct TodoLayoutMetrics: Equatable {
@@ -1128,36 +1196,59 @@ enum TodoHomeMapper {
     static func snapshot(
         from session: AppSessionResponse,
         inboxRows: [InboxRowViewModel] = [],
+        aiTodos: [AITodoItem] = [],
+        todoOrganizingCount: Int = 0,
         now: Date = Date(),
         hiddenEntityIDs: Set<String> = [],
         refreshWarning: String? = nil
     ) -> TodoHomeSnapshot {
         let feed = session.dashboard.feed
         let inboxRowsByThreadID = Dictionary(uniqueKeysWithValues: inboxRows.map { ($0.threadID, $0) })
+        let visibleTodos = aiTodos.filter { $0.status == .open }
+        let actionTodos = visibleTodos.filter { $0.displayKind == .todo }
+        let nowTodos = actionTodos.filter { $0.urgency == "now" }
+        let laterTodos = actionTodos.filter { $0.urgency == "today" }
+        let upcomingTodos = actionTodos.filter { !["now", "today"].contains($0.urgency) }
+        let worthKnowingTodos = visibleTodos.filter { $0.displayKind == .worthKnowing }
         return TodoHomeSnapshot(
             greeting: greeting(from: session, now: now),
-            timeLabel: DateFormatter.todoHeaderTime.string(from: now),
-            headerContextLabel: "35°C",
-            summary: summary(from: session.dashboard),
+            summary: summary(from: session.dashboard, feed: feed, aiTodos: actionTodos),
             agenda: agenda(from: feed),
             now: TodoSectionModel(
                 id: "now",
                 title: "Now",
-                rows: todoRows(from: feed.now, inboxRowsByThreadID: inboxRowsByThreadID, hiddenEntityIDs: hiddenEntityIDs)
+                rows: todoRows(
+                    from: feed.now.filter { $0.source != .gmail },
+                    inboxRowsByThreadID: inboxRowsByThreadID,
+                    hiddenEntityIDs: hiddenEntityIDs
+                ) + todoRows(from: nowTodos, hiddenEntityIDs: hiddenEntityIDs)
             ),
             laterToday: TodoSectionModel(
                 id: "later-today",
                 title: "Later Today",
-                rows: todoRows(from: feed.today, inboxRowsByThreadID: inboxRowsByThreadID, hiddenEntityIDs: hiddenEntityIDs)
+                rows: todoRows(
+                    from: feed.today.filter { $0.source != .gmail },
+                    inboxRowsByThreadID: inboxRowsByThreadID,
+                    hiddenEntityIDs: hiddenEntityIDs
+                ) + todoRows(from: laterTodos, hiddenEntityIDs: hiddenEntityIDs)
+            ),
+            upcoming: TodoSectionModel(
+                id: "upcoming",
+                title: "Upcoming",
+                rows: todoRows(from: upcomingTodos, hiddenEntityIDs: hiddenEntityIDs)
             ),
             worthKnowing: TodoSectionModel(
                 id: "worth-knowing",
                 title: "Worth Knowing",
-                rows: todoRows(from: feed.worthKnowing, inboxRowsByThreadID: inboxRowsByThreadID, hiddenEntityIDs: hiddenEntityIDs)
+                rows: todoRows(
+                    from: feed.worthKnowing.filter { $0.source != .gmail },
+                    inboxRowsByThreadID: inboxRowsByThreadID,
+                    hiddenEntityIDs: hiddenEntityIDs
+                ) + todoRows(from: worthKnowingTodos, hiddenEntityIDs: hiddenEntityIDs)
             ),
             refreshWarning: refreshWarning,
-            aiBuildStatus: aiBuildStatus(from: session),
-            dashboardBuildStatus: dashboardBuildStatus(from: session)
+            aiBuildStatus: todoOrganizingCount > 0 && visibleTodos.isEmpty ? "Finding clear next actions" : nil,
+            dashboardBuildStatus: dashboardBuildStatus(from: session, actionableMatterCount: actionTodos.count)
         )
     }
 
@@ -1182,7 +1273,11 @@ enum TodoHomeMapper {
         return withoutTerminal.contains(",") ? "\(withoutTerminal)!" : "\(withoutTerminal)."
     }
 
-    private static func summary(from dashboard: DashboardResponse) -> TodoSummary {
+    private static func summary(
+        from dashboard: DashboardResponse,
+        feed: FeedResponse,
+        aiTodos: [AITodoItem]
+    ) -> TodoSummary {
         guard let briefing = dashboard.briefing else {
             return TodoSummary(
                 fallbackBrief: "Connect Google to generate a personalized briefing.",
@@ -1192,9 +1287,20 @@ enum TodoHomeMapper {
             )
         }
 
+        let manualTaskCount = (feed.now + feed.today + feed.worthKnowing).filter { $0.source == .manual }.count
+        let replyCount = aiTodos.filter { $0.actionType == "reply" }.count
+        let actionableTaskCount = manualTaskCount + aiTodos.count - replyCount
+        let originalParts = briefing.parts ?? []
+        var parts = originalParts.filter { part in
+            let type = part.type.lowercased()
+            return !["tasks", "todo", "todos", "emails", "mail"].contains(type)
+        }
+        parts.append(DashboardBriefingPart(type: "tasks", emoji: "", count: actionableTaskCount, text: "tasks"))
+        parts.append(DashboardBriefingPart(type: "emails", emoji: "", count: replyCount, text: "emails to reply"))
+
         return TodoSummary(
             fallbackBrief: briefing.brief,
-            parts: briefing.parts ?? [],
+            parts: parts,
             important: briefing.important,
             calendarAvailability: briefing.calendarAvailability
         )
@@ -1204,7 +1310,10 @@ enum TodoHomeMapper {
         nil
     }
 
-    private static func dashboardBuildStatus(from session: AppSessionResponse) -> String? {
+    private static func dashboardBuildStatus(from session: AppSessionResponse, actionableMatterCount: Int) -> String? {
+        guard actionableMatterCount == 0 else {
+            return nil
+        }
         let feed = session.dashboard.feed
         let feedCount = feed.now.count + feed.today.count + feed.worthKnowing.count
         guard feedCount == 0 else {
@@ -1261,13 +1370,51 @@ enum TodoHomeMapper {
             id: item.id,
             entityID: item.entityID,
             sender: sender(for: item, inboxRow: inboxRow),
-            title: inboxRow?.title ?? item.title,
+            title: item.title,
             timeLabel: inboxRow?.timeLabel ?? dueTimeLabel(for: item.dueAt),
             detailText: detailText(for: item),
+            primaryAction: item.primaryAction,
             actionLabel: actionLabel(for: item),
             sourceLabel: sourceLabel(for: item),
-            gmailThreadID: item.gmailThreadID?.isEmpty == false ? item.gmailThreadID : nil
+            gmailThreadID: item.gmailThreadID?.isEmpty == false ? item.gmailThreadID : nil,
+            aiMatterID: nil,
+            aiTodoID: nil,
+            allowsCompletion: true
         )
+    }
+
+    private static func todoRows(
+        from items: [AITodoItem],
+        hiddenEntityIDs: Set<String>
+    ) -> [TodoRowViewModel] {
+        items.compactMap { item in
+            let entityID = "ai-todo:\(item.id)"
+            guard !hiddenEntityIDs.contains(entityID) else {
+                return nil
+            }
+            return TodoRowViewModel(
+                id: entityID,
+                entityID: entityID,
+                sender: item.sourceLabel,
+                title: item.title ?? "Open this update",
+                timeLabel: item.dueAt.flatMap(todoMatterTimeLabel) ?? "",
+                detailText: item.detail ?? item.evidenceText ?? "Open the source for details.",
+                primaryAction: item.actionType,
+                actionLabel: item.displayKind == .todo ? "Start task" : "Open source",
+                sourceLabel: item.sourceAccountEmail ?? "AI Inbox",
+                gmailThreadID: nil,
+                aiMatterID: item.matterID,
+                aiTodoID: item.id,
+                allowsCompletion: item.displayKind == .todo
+            )
+        }
+    }
+
+    private static func todoMatterTimeLabel(_ value: String) -> String {
+        guard let date = ISO8601DateFormatter.todo.date(from: value) else {
+            return ""
+        }
+        return DateFormatter.todoTime.string(from: date)
     }
 
     private static func sender(for item: AttentionItem, inboxRow: InboxRowViewModel?) -> String {
@@ -1401,7 +1548,11 @@ private extension DateFormatter {
 
 #if DEBUG
 #Preview {
-    TodoHomeView(store: InboxStore(client: DemoAppClient()))
+    let client = DemoAppClient()
+    TodoHomeView(
+        store: InboxStore(client: client),
+        aiInboxStore: AIInboxStore(client: client)
+    )
         .frame(width: 1100, height: 760)
 }
 #endif

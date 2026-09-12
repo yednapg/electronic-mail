@@ -652,6 +652,14 @@ def reconcile_generation(
                     "review": review.model_dump(),
                 },
             ):
+                from app.services.ai_todos import enqueue_todo_extraction
+
+                enqueue_todo_extraction(
+                    settings,
+                    user_id=user_id,
+                    generation_id=generation_id,
+                    matter_id=target_id,
+                )
                 merges += 1
                 merged_this_round = True
                 break
@@ -891,6 +899,16 @@ def organize_message(
             membership_source=membership_source,
             embedding=embedding,
             review_model=settings.ai_inbox_review_model if review is not None else None,
+        )
+        # Matter organization and task eligibility are independent. Keep the
+        # narrower task decision off the message-organizing critical path.
+        from app.services.ai_todos import enqueue_todo_extraction
+
+        enqueue_todo_extraction(
+            settings,
+            user_id=user_id,
+            generation_id=generation_id,
+            matter_id=matter_id,
         )
         emit_mailbox_event(
             settings,
@@ -1340,8 +1358,12 @@ def _classify(
             "employee, or delivery relay, and never include the mailbox owner. Use only supplied entity tokens. Titles "
             "must state the latest supported development factually, including any important unresolved subgoal, and "
             "should not begin with the primary counterpart when the adjacent sender column already supplies that "
-            "identity. Never claim completion, failure, or partial completion without direct evidence. Summarize the "
-            "request, developments, current state, and next action. Evidence and predecessor IDs must be supplied IDs."
+            "identity. Write titles and summaries in plain, natural English. Prefer active voice and one main idea per "
+            "sentence. Do not use semicolons or bureaucratic phrases such as remains pending, has been made available, "
+            "or requires action when a simpler human phrase is accurate. Keep secondary developments in the summary "
+            "rather than compressing multiple clauses into the title. Never claim completion, failure, or partial "
+            "completion without direct evidence. Summarize the request, developments, current state, and next action. "
+            "Evidence and predecessor IDs must be supplied IDs."
         ),
         payload=payload,
         output_type=MatterClassification,

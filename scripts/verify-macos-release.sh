@@ -270,7 +270,7 @@ expected_entitlements = {
     "com.apple.security.network.client": True,
     "com.apple.security.files.user-selected.read-write": True,
 }
-require(entitlements == expected_entitlements, f"source entitlements differ from the approved minimal set: {entitlements}")
+require(entitlements == expected_entitlements | {"com.apple.developer.aps-environment": "$(ELECTRONIC_MAIL_APNS_ENVIRONMENT)"}, f"source entitlements differ from the approved push-enabled set: {entitlements}")
 beta_entitlements = load(source_beta_entitlements_path)
 expected_beta_entitlements = expected_entitlements | {
     "com.apple.security.cs.disable-library-validation": True,
@@ -503,12 +503,14 @@ if explicit_groups is not None:
     require(isinstance(explicit_groups, list) and expected_app_id in explicit_groups, "explicit Keychain groups do not include the app's private access group")
 
 allowed_keys = set(required) | {
+    "com.apple.developer.aps-environment",
     "com.apple.application-identifier",
     "com.apple.developer.team-identifier",
     "keychain-access-groups",
 }
 unexpected_keys = set(entitlements) - allowed_keys
 require(not unexpected_keys, f"signed app contains unapproved entitlements: {sorted(unexpected_keys)}")
+require(entitlements.get("com.apple.developer.aps-environment") == "production", "signed Release app must use the production APNs environment")
 PY
 
   if [ "$REQUIRE_NOTARIZATION" = "1" ]; then

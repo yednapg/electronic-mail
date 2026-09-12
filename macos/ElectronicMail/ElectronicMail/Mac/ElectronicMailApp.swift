@@ -104,6 +104,7 @@ struct ElectronicMailApp: App {
                 .electronicMailSymbolAppearance()
                 .background(ElectronicMailTrafficLightOverlayInstaller())
                 .preferredColorScheme(preferredColorScheme)
+                .task { if !visualQAMode { store.connectNotifications() } }
         }
         .defaultSize(
             width: ElectronicMailControlMetrics.onboardingWindowWidth,
@@ -473,6 +474,22 @@ private extension View {
 
 @MainActor
 private final class ElectronicMailApplicationDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        MailNotificationController.shared.install()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Task { await MailNotificationController.shared.refresh() }
+    }
+
+    func application(_ application: NSApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        MailNotificationController.shared.didRegister(deviceToken: deviceToken)
+    }
+
+    func application(_ application: NSApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        MailNotificationController.shared.registrationFailed()
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard ElectronicMailComposerShutdownCoordinator.shared.hasActiveComposer else {
             return .terminateNow

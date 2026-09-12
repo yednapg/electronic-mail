@@ -11,14 +11,6 @@ function productionEnvironment(
     ELECTRONIC_MAIL_BACKEND_URL: 'https://api.electronicmail.app',
     MACOS_DOWNLOAD_ENABLED: 'true',
     MACOS_DOWNLOAD_URL: 'https://downloads.electronicmail.app/ElectronicMail.dmg',
-    LEGAL_ENTITY_NAME: 'Electronic Mail Incorporated',
-    STATUS_PAGE_URL: 'https://status.electronicmail.app',
-    LEGAL_EFFECTIVE_DATE: '2026-07-24',
-    LEGAL_JURISDICTION: 'Karnataka, India',
-    LEGAL_HOSTING_PROVIDERS: 'Reviewed infrastructure providers',
-    LEGAL_DATA_REGIONS: 'Reviewed production data regions',
-    LEGAL_BACKUP_RETENTION_DAYS: '14',
-    LEGAL_REVIEW_STATUS: 'approved',
     ...overrides,
   };
 }
@@ -33,7 +25,6 @@ test('/healthz returns ready only for complete public launch configuration', asy
     checks: {
       backend: true,
       download: true,
-      legal: true,
     },
   });
 });
@@ -50,7 +41,6 @@ test('/healthz returns degraded for an explicit download pause', async () => {
     checks: {
       backend: true,
       download: false,
-      legal: true,
     },
   });
 });
@@ -70,7 +60,6 @@ test('/healthz returns not ready for absent, unknown, or broken download configu
       checks: {
         backend: true,
         download: false,
-        legal: true,
       },
     }, label);
   }

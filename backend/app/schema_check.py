@@ -21,6 +21,8 @@ ALEMBIC_REVISION_PROBE = (
 )
 VECTOR_EXTENSION_PROBE = "SELECT COUNT(*) FROM pg_extension WHERE extname = 'vector'"
 REQUIRED_SCHEMA_PROBES = (
+    "SELECT session_id, token_encrypted, enabled FROM push_devices LIMIT 1",
+    "SELECT gmail_account_id, device_id, message_id, status FROM push_deliveries LIMIT 1",
     (
         "SELECT body_fetch_status, body_fetch_updated_at, render_doc_bytes, "
         "content_revision, attachment_descriptors_json, attachment_descriptors_ready "

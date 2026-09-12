@@ -410,7 +410,8 @@ private struct InboxMailboxList: View, Equatable {
     let onOpenSelection: () -> Void
     let onMoveToTrash: () -> Void
     let onPermanentDelete: () -> Void
-    @FocusState private var isFocused: Bool
+    @State private var navigationCursor = InboxKeyboardNavigationCursor()
+    @FocusState private var isKeyboardNavigationFocused: Bool
 
     static func == (lhs: InboxMailboxList, rhs: InboxMailboxList) -> Bool {
         lhs.snapshot == rhs.snapshot
@@ -450,7 +451,7 @@ private struct InboxMailboxList: View, Equatable {
                             ForEach(section.rows) { row in
                                 InboxRowView(
                                     row: row,
-                                    isSelected: snapshot.selectedRowID == row.id,
+                                    isSelected: (navigationCursor.selectedRowID ?? snapshot.selectedRowID) == row.id,
                                     metrics: metrics,
                                     colorScheme: colorScheme,
                                     actionHint: snapshot.mailboxLabel == .drafts ? "Open draft" : "Open email",
@@ -480,8 +481,21 @@ private struct InboxMailboxList: View, Equatable {
                 .scrollIndicators(.automatic)
                 .focusable()
                 .focusEffectDisabled()
-                .focused($isFocused)
-                .defaultFocus($isFocused, true)
+                .focused($isKeyboardNavigationFocused)
+                .onMoveCommand { direction in
+                    switch direction {
+                    case .up:
+                        moveSelection(by: -1, scrollProxy: scrollProxy)
+                    case .down:
+                        moveSelection(by: 1, scrollProxy: scrollProxy)
+                    default:
+                        break
+                    }
+                }
+                .onKeyPress(.return, phases: .down) { _ in
+                    onOpenSelection()
+                    return .handled
+                }
                 .onKeyPress(.delete, phases: .down) { keyPress in
                     guard keyPress.modifiers.contains(.command) else {
                         return .ignored
@@ -490,18 +504,15 @@ private struct InboxMailboxList: View, Equatable {
                     return .handled
                 }
                 .onDeleteCommand(perform: onMoveToTrash)
-                .background {
-                    InboxKeyboardNavigationCapture(
-                        onMove: { delta in
-                            moveSelection(by: delta, scrollProxy: scrollProxy)
-                        },
-                        onOpenSelection: onOpenSelection
-                    )
-                    .frame(width: 1, height: 1)
-                    .accessibilityHidden(true)
-                }
                 .onAppear {
+                    navigationCursor.selectedRowID = snapshot.selectedRowID
                     restoreSelectedRowPosition(scrollProxy: scrollProxy)
+                    DispatchQueue.main.async {
+                        isKeyboardNavigationFocused = true
+                    }
+                }
+                .onChange(of: snapshot.selectedRowID) { _, selectedRowID in
+                    navigationCursor.selectedRowID = selectedRowID
                 }
                 .transaction { transaction in
                     transaction.disablesAnimations = true
@@ -515,7 +526,8 @@ private struct InboxMailboxList: View, Equatable {
         guard !snapshot.flatRows.isEmpty else {
             return
         }
-        let currentIndex = snapshot.selectedRowID.flatMap { selectedID in
+        let currentSelectionID = navigationCursor.selectedRowID ?? snapshot.selectedRowID
+        let currentIndex = currentSelectionID.flatMap { selectedID in
             snapshot.flatRows.firstIndex(where: { $0.id == selectedID })
         }
         let fallbackIndex = delta > 0 ? -1 : snapshot.flatRows.count
@@ -524,6 +536,7 @@ private struct InboxMailboxList: View, Equatable {
             snapshot.flatRows.count - 1
         )
         let nextRow = snapshot.flatRows[nextIndex]
+        navigationCursor.selectedRowID = nextRow.id
         onSelect(nextRow)
         scrollProxy.scrollTo(nextRow.id, anchor: .center)
     }
@@ -542,6 +555,10 @@ private struct InboxMailboxList: View, Equatable {
 enum InboxKeyboardNavigationAction: Equatable {
     case move(Int)
     case openSelection
+}
+
+final class InboxKeyboardNavigationCursor {
+    var selectedRowID: String?
 }
 
 enum InboxKeyboardNavigationPolicy {
@@ -582,93 +599,6 @@ enum InboxKeyboardNavigationPolicy {
             isTextEditing: isTextEditing
         ) else { return nil }
         return delta
-    }
-}
-
-struct InboxKeyboardNavigationCapture: NSViewRepresentable {
-    let onMove: (Int) -> Void
-    let onOpenSelection: () -> Void
-
-    func makeNSView(context: Context) -> NavigationView {
-        let view = NavigationView()
-        view.onMove = onMove
-        view.onOpenSelection = onOpenSelection
-        view.installMonitorIfNeeded()
-        return view
-    }
-
-    func updateNSView(_ nsView: NavigationView, context: Context) {
-        nsView.onMove = onMove
-        nsView.onOpenSelection = onOpenSelection
-        nsView.installMonitorIfNeeded()
-    }
-
-    static func dismantleNSView(_ nsView: NavigationView, coordinator: ()) {
-        nsView.removeMonitor()
-    }
-
-    final class NavigationView: NSView {
-        var onMove: ((Int) -> Void)?
-        var onOpenSelection: (() -> Void)?
-        private var monitor: Any?
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            if window == nil {
-                removeMonitor()
-            } else {
-                installMonitorIfNeeded()
-            }
-        }
-
-        deinit {
-            removeMonitor()
-        }
-
-        func installMonitorIfNeeded() {
-            guard monitor == nil else {
-                return
-            }
-
-            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                self?.handle(event) ?? event
-            }
-        }
-
-        func removeMonitor() {
-            if let monitor {
-                NSEvent.removeMonitor(monitor)
-                self.monitor = nil
-            }
-        }
-
-        private func handle(_ event: NSEvent) -> NSEvent? {
-            guard
-                let window,
-                event.windowNumber == window.windowNumber,
-                window.isKeyWindow
-            else {
-                return event
-            }
-
-            let responder = window.firstResponder
-            let isTextEditing = responder is NSTextView || responder is NSTextField
-            guard let action = InboxKeyboardNavigationPolicy.action(
-                keyCode: event.keyCode,
-                modifiers: event.modifierFlags,
-                isTextEditing: isTextEditing
-            ) else {
-                return event
-            }
-
-            switch action {
-            case .move(let delta):
-                onMove?(delta)
-            case .openSelection:
-                onOpenSelection?()
-            }
-            return nil
-        }
     }
 }
 

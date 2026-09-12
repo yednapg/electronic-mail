@@ -47,10 +47,10 @@ public enum AppRunMode: String, Equatable {
 }
 
 public struct DownloadedAttachment: Equatable {
-    let filename: String
-    let mimeType: String?
-    let data: Data
-    let etag: String?
+    public let filename: String
+    public let mimeType: String?
+    public let data: Data
+    public let etag: String?
 
     public init(filename: String, mimeType: String?, data: Data, etag: String? = nil) {
         self.filename = filename
@@ -173,6 +173,8 @@ public protocol AppClient: AnyObject {
     func updateTask(_ taskID: String, request: TaskUpdateRequest) async throws -> TaskResponse
     func completeEntity(_ entityID: String, request: EntityOutcomeRequest) async throws -> EntityOutcomeResponse
     func aiInbox(query: String?) async throws -> AIInboxResponse
+    func aiTodos(limit: Int) async throws -> AITodoResponse
+    func updateAITodo(_ todoID: String, gmailAccountID: String?, request: AITodoUpdateRequest) async throws -> AITodoItem
     func aiOrganizationProfile() async throws -> AIOrganizationProfile
     func updateAIOrganizationProfile(_ patch: AIOrganizationProfilePatch) async throws -> AIOrganizationProfile
     func aiMatter(_ matterID: String) async throws -> AIMatterDetail
@@ -290,6 +292,18 @@ public extension AppClient {
     }
 
     func aiInbox(query: String? = nil) async throws -> AIInboxResponse {
+        throw APIError.httpStatus(501)
+    }
+
+    func aiTodos(limit: Int = 100) async throws -> AITodoResponse {
+        throw APIError.httpStatus(501)
+    }
+
+    func updateAITodo(
+        _ todoID: String,
+        gmailAccountID: String? = nil,
+        request: AITodoUpdateRequest
+    ) async throws -> AITodoItem {
         throw APIError.httpStatus(501)
     }
 
@@ -862,14 +876,19 @@ public final class LiveBackendAppClient: AppClient {
             guard let first = loaded.first else {
                 throw APIError.httpStatus(503)
             }
+            guard let primary = loaded.first(where: {
+                $0.gmailAccountID == configuredGmailAccounts?.primaryGmailAccountID
+            }) else {
+                // A secondary account's disabled profile must never masquerade
+                // as the global AI Inbox state when the primary request fails.
+                throw APIError.httpStatus(503)
+            }
             var matters = loaded.flatMap(\.matters)
             matters.sort { $0.latestMessageAt > $1.latestMessageAt }
             var organizing = loaded.flatMap(\.organizing)
             organizing.sort { $0.latestMessageAt > $1.latestMessageAt }
             return AIInboxResponse(
-                profile: loaded.first(where: {
-                    $0.gmailAccountID == configuredGmailAccounts?.primaryGmailAccountID
-                })?.profile ?? first.profile,
+                profile: primary.profile,
                 generationID: nil,
                 revision: loaded.map(\.revision).joined(separator: ":"),
                 stale: loaded.contains(where: { $0.stale }) || !failures.isEmpty,
@@ -886,6 +905,67 @@ public final class LiveBackendAppClient: AppClient {
             )
         }
         return try await request(path: "/v1/ai-inbox")
+    }
+
+    public func aiTodos(limit: Int = 100) async throws -> AITodoResponse {
+        let boundedLimit = max(1, min(limit, 200))
+        if let accountID = activeMailboxScope.gmailAccountID {
+            return try await accountAITodos(accountID: accountID, limit: boundedLimit)
+        }
+        if let accounts = configuredGmailAccounts?.accounts.filter({ $0.state == .ready }),
+           !accounts.isEmpty {
+            var loaded: [AITodoResponse] = []
+            for account in accounts {
+                do {
+                    var response = try await accountAITodos(accountID: account.id, limit: boundedLimit)
+                    response.items = response.items.map { item in
+                        var item = item
+                        item.sourceAccountEmail = account.email
+                        return item
+                    }
+                    loaded.append(response)
+                } catch {
+                    continue
+                }
+            }
+            guard !loaded.isEmpty else {
+                throw APIError.httpStatus(503)
+            }
+            return AITodoResponse(
+                items: Array(
+                    loaded.flatMap(\.items)
+                        .sorted(by: Self.aiTodoComesFirst)
+                        .prefix(boundedLimit)
+                ),
+                organizingCount: loaded.reduce(0) { $0 + $1.organizingCount },
+                generatedAt: loaded.map(\.generatedAt).max() ?? ""
+            )
+        }
+        return try await request(
+            path: "/v1/ai-todos",
+            queryItems: [URLQueryItem(name: "limit", value: String(boundedLimit))]
+        )
+    }
+
+    public func updateAITodo(
+        _ todoID: String,
+        gmailAccountID: String? = nil,
+        request update: AITodoUpdateRequest
+    ) async throws -> AITodoItem {
+        let body = try JSONEncoder.backend.encode(update)
+        let accountID = gmailAccountID ?? activeMailboxScope.gmailAccountID
+        if let accountID {
+            return try await request(
+                path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/ai-todos/\(todoID.urlPathEncoded)",
+                method: "PATCH",
+                body: body
+            )
+        }
+        return try await request(
+            path: "/v1/ai-todos/\(todoID.urlPathEncoded)",
+            method: "PATCH",
+            body: body
+        )
     }
 
     public func aiOrganizationProfile() async throws -> AIOrganizationProfile {
@@ -961,7 +1041,10 @@ public final class LiveBackendAppClient: AppClient {
         try await emptyRequest(path: "/v1/ai-organization/data", method: "DELETE")
     }
 
-    private func accountAIInbox(accountID: String, query: String?) async throws -> AIInboxResponse {
+    private func accountAIInbox(
+        accountID: String,
+        query: String?
+    ) async throws -> AIInboxResponse {
         let path: String
         var queryItems: [URLQueryItem] = []
         if let query, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -984,6 +1067,36 @@ public final class LiveBackendAppClient: AppClient {
             response.organizing[index].sourceAccountEmail = accountEmail
         }
         return response
+    }
+
+    private func accountAITodos(accountID: String, limit: Int) async throws -> AITodoResponse {
+        var response: AITodoResponse = try await request(
+            path: "/v1/gmail-accounts/\(accountID.urlPathEncoded)/ai-todos",
+            queryItems: [URLQueryItem(name: "limit", value: String(limit))]
+        )
+        response.gmailAccountID = accountID
+        response.items = response.items.map { item in
+            var item = item
+            item.gmailAccountID = accountID
+            return item
+        }
+        return response
+    }
+
+    private static func aiTodoComesFirst(_ lhs: AITodoItem, _ rhs: AITodoItem) -> Bool {
+        let kindRank: (AITodoItem) -> Int = { $0.displayKind == .todo ? 0 : 1 }
+        let urgencyRank: (AITodoItem) -> Int = {
+            switch $0.urgency {
+            case "now": 0
+            case "today": 1
+            case "upcoming": 2
+            default: 3
+            }
+        }
+        if kindRank(lhs) != kindRank(rhs) { return kindRank(lhs) < kindRank(rhs) }
+        if urgencyRank(lhs) != urgencyRank(rhs) { return urgencyRank(lhs) < urgencyRank(rhs) }
+        if lhs.dueAt != rhs.dueAt { return (lhs.dueAt ?? "9999") < (rhs.dueAt ?? "9999") }
+        return lhs.confidence > rhs.confidence
     }
 
     private func request<Response: Decodable>(

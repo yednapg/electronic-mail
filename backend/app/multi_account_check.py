@@ -40,6 +40,8 @@ MAILBOX_TABLES = (
     "matter_decisions",
     "ai_usage_events",
     "matter_subgoals",
+    "ai_todo_items",
+    "push_deliveries",
 )
 
 

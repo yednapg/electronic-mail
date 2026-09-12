@@ -15,6 +15,8 @@ from app.schemas.ai_inbox import (
     AIOrganizationProfilePatch, AIOrganizationProfileResponse,
     AIOrganizationProgressResponse, MatterDecisionRequest,
     MatterDecisionResponse, MatterEntityActionRequest, MatterEntityActionResponse,
+    MatterStatus,
+    AITodoItem, AITodoResponse, AITodoUpdateRequest,
 )
 from app.schemas.domain import MailReplyRequest
 from app.services.auth import require_current_user
@@ -100,9 +102,29 @@ def progress(request: Request, gmail_account_id: str) -> AIOrganizationProgressR
 @router.get("/v1/gmail-accounts/{gmail_account_id}/ai-inbox",
             response_model=AIInboxResponse)
 def inbox(request: Request, gmail_account_id: str,
-          limit: int = Query(default=200, ge=1, le=500)) -> AIInboxResponse:
+          limit: int = Query(default=200, ge=1, le=500),
+          matter_status: MatterStatus | None = Query(default=None, alias="status")) -> AIInboxResponse:
     with _scope(request, gmail_account_id):
-        result = legacy.ai_inbox(request, limit)
+        result = legacy.ai_inbox(request, limit, matter_status)
+    return result.model_copy(update={"gmail_account_id": gmail_account_id})
+
+
+@router.get("/v1/gmail-accounts/{gmail_account_id}/ai-todos",
+            response_model=AITodoResponse)
+def todos(request: Request, gmail_account_id: str,
+          limit: int = Query(default=100, ge=1, le=200)) -> AITodoResponse:
+    with _scope(request, gmail_account_id):
+        result = legacy.ai_todos(request, limit)
+    items = [item.model_copy(update={"gmail_account_id": gmail_account_id}) for item in result.items]
+    return result.model_copy(update={"gmail_account_id": gmail_account_id, "items": items})
+
+
+@router.patch("/v1/gmail-accounts/{gmail_account_id}/ai-todos/{todo_id}",
+              response_model=AITodoItem)
+def patch_todo(request: Request, gmail_account_id: str, todo_id: str,
+               payload: AITodoUpdateRequest) -> AITodoItem:
+    with _scope(request, gmail_account_id):
+        result = legacy.patch_ai_todo(request, todo_id, payload)
     return result.model_copy(update={"gmail_account_id": gmail_account_id})
 
 

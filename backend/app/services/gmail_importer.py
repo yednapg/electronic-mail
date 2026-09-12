@@ -212,6 +212,10 @@ def run_gmail_delta_sync(
                 user_id=user_id,
                 target_history_id=latest_history_id,
             )
+        from app.db.push_notifications import queue_new_mail
+        added_ids = set(delta.get("added_message_ids", []))
+        queue_new_mail(settings, user_id=user_id,
+                       messages=[message for message in messages if message.message_id in added_ids])
         mark_history_delta_completed(
             database_url,
             user_id=user_id,
@@ -2836,6 +2840,7 @@ def _list_history_delta(
     seen_page_tokens: set[str] = set()
     message_ids: list[str] = []
     deleted_message_ids: list[str] = []
+    added_message_ids: list[str] = []
     latest_history_id: str | None = None
     page_count = 0
     while True:
@@ -2856,6 +2861,7 @@ def _list_history_delta(
             latest_history_id = _max_history_id(latest_history_id, history_item.get("id"))
             message_ids.extend(_history_messages(history_item, keys=["messages", "messagesAdded", "labelsAdded", "labelsRemoved"]))
             deleted_message_ids.extend(_history_messages(history_item, keys=["messagesDeleted"]))
+            added_message_ids.extend(_history_messages(history_item, keys=["messagesAdded"]))
         next_page_token = response.get("nextPageToken") if isinstance(response.get("nextPageToken"), str) else None
         if not next_page_token:
             break
@@ -2873,6 +2879,7 @@ def _list_history_delta(
     return {
         "message_ids": [message_id for message_id in list(dict.fromkeys(message_ids)) if message_id not in deleted_set],
         "deleted_message_ids": list(dict.fromkeys(deleted_message_ids)),
+        "added_message_ids": [message_id for message_id in dict.fromkeys(added_message_ids) if message_id not in deleted_set],
         "latest_history_id": latest_history_id,
     }
 

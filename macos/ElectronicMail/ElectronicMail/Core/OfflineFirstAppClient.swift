@@ -625,6 +625,24 @@ public final class OfflineFirstAppClient: AppClient {
         try await accountScopedResponse { try await self.backend.aiInbox(query: query) }
     }
 
+    public func aiTodos(limit: Int = 100) async throws -> AITodoResponse {
+        try await accountScopedResponse { try await self.backend.aiTodos(limit: limit) }
+    }
+
+    public func updateAITodo(
+        _ todoID: String,
+        gmailAccountID: String? = nil,
+        request: AITodoUpdateRequest
+    ) async throws -> AITodoItem {
+        try await accountScopedResponse {
+            try await self.backend.updateAITodo(
+                todoID,
+                gmailAccountID: gmailAccountID,
+                request: request
+            )
+        }
+    }
+
     public func aiOrganizationProfile() async throws -> AIOrganizationProfile {
         try await accountScopedResponse { try await self.backend.aiOrganizationProfile() }
     }

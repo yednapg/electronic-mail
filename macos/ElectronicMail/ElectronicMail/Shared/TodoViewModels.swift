@@ -1,12 +1,11 @@
 import Foundation
 
-public struct DashboardSnapshot: Equatable {
+public struct MobileTodoSnapshot: Equatable {
     public let userDisplayName: String?
     public let dateLabel: String
     public let timeLabel: String
-    public let summary: DashboardSummaryViewModel
-    public let agenda: [DashboardAgendaItemViewModel]
-    public let sections: [DashboardSectionViewModel]
+    public let agenda: [MobileTodoAgendaItem]
+    public let sections: [MobileTodoSection]
     public let fullImportRunning: Bool
     public let refreshWarning: String?
 
@@ -15,28 +14,7 @@ public struct DashboardSnapshot: Equatable {
     }
 }
 
-public struct DashboardSummaryViewModel: Equatable {
-    public let headline: String
-    public let brief: String
-    public let parts: [DashboardSummaryPartViewModel]
-    public let important: DashboardSummaryCalloutViewModel?
-    public let calendarAvailability: DashboardSummaryCalloutViewModel?
-}
-
-public struct DashboardSummaryPartViewModel: Equatable, Identifiable {
-    public let id: String
-    public let emoji: String
-    public let count: Int
-    public let text: String
-}
-
-public struct DashboardSummaryCalloutViewModel: Equatable {
-    public let emoji: String
-    public let text: String
-    public let count: Int?
-}
-
-public struct DashboardAgendaItemViewModel: Equatable, Identifiable {
+public struct MobileTodoAgendaItem: Equatable, Identifiable {
     public enum Tone: String, Equatable {
         case blue
         case green
@@ -51,25 +29,26 @@ public struct DashboardAgendaItemViewModel: Equatable, Identifiable {
     public let tone: Tone
 }
 
-public struct DashboardSectionViewModel: Equatable, Identifiable {
+public struct MobileTodoSection: Equatable, Identifiable {
     public let id: String
     public let title: String
-    public let items: [DashboardSectionItemViewModel]
+    public let items: [MobileTodoItem]
     public let maxVisible: Int?
 }
 
-public struct DashboardSectionItemViewModel: Equatable, Identifiable {
+public struct MobileTodoItem: Equatable, Identifiable {
     public let id: String
     public let entityID: String
     public let title: String
     public let primaryAction: String
     public let needType: String
     public let source: String?
-    public let detail: DashboardItemDetailViewModel?
-    public let action: DashboardItemActionViewModel?
+    public let gmailThreadID: String?
+    public let detail: MobileTodoItemDetail?
+    public let action: MobileTodoItemAction?
 }
 
-public struct DashboardItemDetailViewModel: Equatable {
+public struct MobileTodoItemDetail: Equatable {
     public let body: [String]
     public let actionLabel: String
     public let confirmLabel: String
@@ -77,10 +56,10 @@ public struct DashboardItemDetailViewModel: Equatable {
     public let sourceLabel: String
 }
 
-public struct DashboardItemActionViewModel: Equatable {
+public struct MobileTodoItemAction: Equatable {
     public let label: String
-    public let tone: DashboardActionTone
-    public let operation: DashboardActionOperation?
+    public let tone: MobileTodoActionTone
+    public let operation: MobileTodoActionOperation?
     public let gmailThreadID: String?
 
     public var canRunOnBackend: Bool {
@@ -88,29 +67,28 @@ public struct DashboardItemActionViewModel: Equatable {
     }
 }
 
-public enum DashboardActionTone: Equatable {
+public enum MobileTodoActionTone: Equatable {
     case blue
     case green
 }
 
-public enum DashboardActionOperation: Equatable {
+public enum MobileTodoActionOperation: Equatable {
     case archive
     case unarchive
     case markRead
 }
 
-public enum DashboardViewModelBuilder {
+public enum MobileTodoViewModelBuilder {
     public static func snapshot(
         from session: AppSessionResponse,
         now: Date = Date(),
         hiddenItemIDs: Set<String> = [],
         refreshWarning: String? = nil
-    ) -> DashboardSnapshot {
-        DashboardSnapshot(
+    ) -> MobileTodoSnapshot {
+        MobileTodoSnapshot(
             userDisplayName: session.user.displayName ?? session.user.firstName,
             dateLabel: DateFormatter.dashboardDate.string(from: now),
             timeLabel: DateFormatter.dashboardTime.string(from: now),
-            summary: summary(from: session.dashboard),
             agenda: agenda(from: session.dashboard.feed),
             sections: sections(from: session.dashboard.feed, hiddenItemIDs: hiddenItemIDs),
             fullImportRunning: session.mailbox.fullImportRunning ?? session.sync.fullImportRunning,
@@ -118,46 +96,7 @@ public enum DashboardViewModelBuilder {
         )
     }
 
-    public static func summary(from dashboard: DashboardResponse) -> DashboardSummaryViewModel {
-        guard let briefing = dashboard.briefing else {
-            return DashboardSummaryViewModel(
-                headline: "Dashboard",
-                brief: "Connect Google to generate a personalized briefing.",
-                parts: [],
-                important: nil,
-                calendarAvailability: nil
-            )
-        }
-
-        return DashboardSummaryViewModel(
-            headline: briefing.headline,
-            brief: briefing.brief,
-            parts: briefing.parts?.map { part in
-                DashboardSummaryPartViewModel(
-                    id: part.type,
-                    emoji: part.emoji,
-                    count: part.count,
-                    text: part.text
-                )
-            } ?? [],
-            important: briefing.important.map { important in
-                DashboardSummaryCalloutViewModel(
-                    emoji: important.emoji,
-                    text: important.text,
-                    count: important.count
-                )
-            },
-            calendarAvailability: briefing.calendarAvailability.map { availability in
-                DashboardSummaryCalloutViewModel(
-                    emoji: availability.emoji,
-                    text: availability.text,
-                    count: nil
-                )
-            }
-        )
-    }
-
-    public static func agenda(from feed: FeedResponse) -> [DashboardAgendaItemViewModel] {
+    public static func agenda(from feed: FeedResponse) -> [MobileTodoAgendaItem] {
         let visibleItems = feed.now + feed.today + feed.worthKnowing
         return visibleItems
             .compactMap(toAgendaItem)
@@ -172,7 +111,7 @@ public enum DashboardViewModelBuilder {
             }
             .enumerated()
             .map { index, item in
-                DashboardAgendaItemViewModel(
+                MobileTodoAgendaItem(
                     id: item.id,
                     time: item.time,
                     title: item.title,
@@ -182,21 +121,21 @@ public enum DashboardViewModelBuilder {
             }
     }
 
-    public static func sections(from feed: FeedResponse, hiddenItemIDs: Set<String> = []) -> [DashboardSectionViewModel] {
+    public static func sections(from feed: FeedResponse, hiddenItemIDs: Set<String> = []) -> [MobileTodoSection] {
         [
-            DashboardSectionViewModel(
+            MobileTodoSection(
                 id: "now",
                 title: "Now",
                 items: sectionItems(from: feed.now, hiddenItemIDs: hiddenItemIDs),
                 maxVisible: 6
             ),
-            DashboardSectionViewModel(
+            MobileTodoSection(
                 id: "today",
                 title: "Today",
                 items: sectionItems(from: feed.today, hiddenItemIDs: hiddenItemIDs),
                 maxVisible: 5
             ),
-            DashboardSectionViewModel(
+            MobileTodoSection(
                 id: "worth-knowing",
                 title: "Worth Knowing",
                 items: sectionItems(from: feed.worthKnowing, hiddenItemIDs: hiddenItemIDs),
@@ -205,33 +144,34 @@ public enum DashboardViewModelBuilder {
         ]
     }
 
-    private static func sectionItems(from items: [AttentionItem], hiddenItemIDs: Set<String>) -> [DashboardSectionItemViewModel] {
+    private static func sectionItems(from items: [AttentionItem], hiddenItemIDs: Set<String>) -> [MobileTodoItem] {
         sortSectionFeedItems(items)
             .filter { $0.source != .calendar }
             .filter { !hiddenItemIDs.contains($0.id) }
             .map(toSectionItem)
     }
 
-    private static func toSectionItem(_ item: AttentionItem) -> DashboardSectionItemViewModel {
-        DashboardSectionItemViewModel(
+    private static func toSectionItem(_ item: AttentionItem) -> MobileTodoItem {
+        MobileTodoItem(
             id: item.id,
             entityID: item.entityID,
             title: item.needType == .awareness && item.source == .calendar && !item.whyThisIsHere.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? item.whyThisIsHere : item.title,
             primaryAction: item.primaryAction,
             needType: item.needType.rawValue,
             source: item.source?.rawValue,
+            gmailThreadID: item.gmailThreadID,
             detail: detail(from: item),
             action: action(from: item)
         )
     }
 
-    private static func detail(from item: AttentionItem) -> DashboardItemDetailViewModel? {
+    private static func detail(from item: AttentionItem) -> MobileTodoItemDetail? {
         guard item.source == .gmail else {
             return nil
         }
 
         if let detail = item.detail {
-            return DashboardItemDetailViewModel(
+            return MobileTodoItemDetail(
                 body: detail.body.isEmpty ? [detailDescription(from: item)] : detail.body,
                 actionLabel: detail.actionLabel,
                 confirmLabel: primaryActionDoneLabel(item.primaryAction),
@@ -240,7 +180,7 @@ public enum DashboardViewModelBuilder {
             )
         }
 
-        return DashboardItemDetailViewModel(
+        return MobileTodoItemDetail(
             body: [detailDescription(from: item)],
             actionLabel: nextMoveLabel(for: item),
             confirmLabel: primaryActionDoneLabel(item.primaryAction),
@@ -249,31 +189,31 @@ public enum DashboardViewModelBuilder {
         )
     }
 
-    private static func action(from item: AttentionItem) -> DashboardItemActionViewModel? {
+    private static func action(from item: AttentionItem) -> MobileTodoItemAction? {
         if let gmailAction = item.gmailThreadAction, let threadID = item.gmailThreadID, !threadID.isEmpty {
             switch gmailAction {
             case .archive:
-                return DashboardItemActionViewModel(label: "Archive", tone: .green, operation: .archive, gmailThreadID: threadID)
+                return MobileTodoItemAction(label: "Archive", tone: .green, operation: .archive, gmailThreadID: threadID)
             case .unarchive:
-                return DashboardItemActionViewModel(label: "Unarchive", tone: .blue, operation: .unarchive, gmailThreadID: threadID)
+                return MobileTodoItemAction(label: "Unarchive", tone: .blue, operation: .unarchive, gmailThreadID: threadID)
             case .markRead:
-                return DashboardItemActionViewModel(label: "Mark Read", tone: .green, operation: .markRead, gmailThreadID: threadID)
+                return MobileTodoItemAction(label: "Mark Read", tone: .green, operation: .markRead, gmailThreadID: threadID)
             case .markUnread, .moveTrash, .restoreTrash, .markSpam, .notSpam, .star, .unstar, .deleteForever:
                 return nil
             }
         }
 
         if item.primaryAction == "confirm" && item.title.range(of: #"^within\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
-            return DashboardItemActionViewModel(label: "RSVP", tone: .blue, operation: nil, gmailThreadID: nil)
+            return MobileTodoItemAction(label: "RSVP", tone: .blue, operation: nil, gmailThreadID: nil)
         }
 
         if item.primaryAction == "register" {
-            return DashboardItemActionViewModel(label: "Register", tone: .blue, operation: nil, gmailThreadID: nil)
+            return MobileTodoItemAction(label: "Register", tone: .blue, operation: nil, gmailThreadID: nil)
         }
 
         let lowerTitle = item.title.lowercased()
         if lowerTitle.contains("read notice") || lowerTitle.contains("ofs in ipo") {
-            return DashboardItemActionViewModel(label: "Read Notice", tone: .green, operation: nil, gmailThreadID: nil)
+            return MobileTodoItemAction(label: "Read Notice", tone: .green, operation: nil, gmailThreadID: nil)
         }
 
         return nil
@@ -358,7 +298,7 @@ public enum DashboardViewModelBuilder {
         value.contains("T")
     }
 
-    private static func tone(for timingBand: TimingBand, index: Int) -> DashboardAgendaItemViewModel.Tone {
+    private static func tone(for timingBand: TimingBand, index: Int) -> MobileTodoAgendaItem.Tone {
         switch timingBand {
         case .now:
             return .blue

@@ -1,304 +1,310 @@
 import ElectronicMailShared
 import SwiftUI
 
-private enum RootStage {
+private enum IOSRootStage: Equatable {
     case restoring
     case signedOut
-    case importing
-    case dashboard
+    case preparing
+    case signedIn
+    case recovery(String)
 }
 
 struct ElectronicMailiOSRootView: View {
-    @ObservedObject var store: DashboardStore
+    @ObservedObject var inboxStore: InboxStore
+    @ObservedObject var aiStore: AIInboxStore
+    @ObservedObject var accountStore: GmailAccountSettingsStore
     let tokenStore: KeychainSessionTokenStore
     let authService: IOSGoogleOAuthService
+    let demoMode: Bool
 
     @Environment(\.scenePhase) private var scenePhase
-    @State private var stage: RootStage = .restoring
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var stage = IOSRootStage.restoring
     @State private var signingIn = false
     @State private var signInError: String?
-    @State private var importStartedAt = Date()
+    @State private var signOutError: String?
 
     var body: some View {
         Group {
             switch stage {
             case .restoring:
-                ProgressView("Opening dashboard")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .task {
-                        await restoreSession()
-                    }
+                IOSLaunchView(title: "Opening Electronic Mail", detail: "Restoring your encrypted mailbox", progress: nil)
+                    .task { await restoreSession() }
             case .signedOut:
-                SignInView(
+                IOSSignInView(
                     signingIn: signingIn,
-                    errorMessage: signInError,
-                    onSignIn: {
-                        Task { await signIn() }
-                    }
+                    errorMessage: signInError ?? ElectronicMailiOSConfiguration.backendWarning,
+                    onSignIn: { Task { await signIn() } }
                 )
-            case .importing:
-                ImportProgressView(startedAt: importStartedAt)
-            case .dashboard:
-                DashboardScreen(
-                    store: store,
+            case .preparing:
+                IOSLaunchView(
+                    title: preparationTitle,
+                    detail: preparationDetail,
+                    progress: inboxStore.setupProgress.progressFraction
+                )
+            case .signedIn:
+                IOSAppShell(
+                    inboxStore: inboxStore,
+                    aiStore: aiStore,
+                    accountStore: accountStore,
                     authService: authService,
-                    onSignOut: {
-                        Task { await signOut() }
-                    }
+                    onSignOut: { await signOut() },
+                    onSessionInvalidated: { clearLocalSessionForSignIn() }
+                )
+                .alert("Sign out unavailable", isPresented: Binding(
+                    get: { signOutError != nil },
+                    set: { if !$0 { signOutError = nil } }
+                )) {
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text(signOutError ?? "Try again when your queued mail changes can sync.")
+                }
+            case .recovery(let message):
+                IOSRecoveryView(
+                    message: message,
+                    retry: { Task { await retrySavedSession() } },
+                    signInAgain: { clearLocalSessionForSignIn() }
                 )
             }
         }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: stage)
         .onChange(of: scenePhase) { _, nextPhase in
-            guard nextPhase == .active, stage == .dashboard else {
-                return
+            guard nextPhase == .active, stage == .signedIn else { return }
+            Task {
+                if !demoMode { await MailNotificationController.shared.refresh() }
+                async let inbox: Void = inboxStore.refresh()
+                async let accounts: Void = accountStore.load()
+                _ = await (inbox, accounts)
             }
-            Task { await store.refresh() }
         }
+    }
+
+    private var preparationTitle: String {
+        inboxStore.setupProgress.initialTargetReady ? "Almost ready" : "Preparing your mailbox"
+    }
+
+    private var preparationDetail: String {
+        let progress = inboxStore.setupProgress
+        if progress.initialTargetCount > 0 {
+            return "\(progress.initialBodyReadyCount) of \(progress.initialBodyTargetCount) recent conversations ready"
+        }
+        return progress.phase.replacingOccurrences(of: "_", with: " ").capitalized
     }
 
     @MainActor
     private func restoreSession() async {
+        if demoMode {
+            inboxStore.setSessionToken("demo-session-token")
+            stage = .preparing
+            await inboxStore.load()
+            finishPreparation()
+            return
+        }
+
         guard let token = tokenStore.load(), !token.isEmpty else {
             stage = .signedOut
             return
         }
 
-        store.setSessionToken(token)
-        await store.load()
-
-        if case .failed(let message) = store.phase {
-            tokenStore.clear()
-            store.setSessionToken(nil)
-            signInError = message
-            stage = .signedOut
+        inboxStore.setSessionToken(token)
+        if await inboxStore.restoreLocalCache() {
+            stage = .signedIn
+            Task { await inboxStore.load() }
             return
         }
 
-        stage = .dashboard
+        stage = .preparing
+        await inboxStore.load()
+        finishPreparation()
+    }
+
+    @MainActor
+    private func retrySavedSession() async {
+        stage = .preparing
+        await inboxStore.load()
+        finishPreparation()
+    }
+
+    @MainActor
+    private func finishPreparation() {
+        switch inboxStore.phase {
+        case .loaded:
+            stage = .signedIn
+        case .failed(let message):
+            // Keep the Keychain token and encrypted cache. Only explicit sign
+            // out or a new completed sign-in may replace this saved session.
+            stage = .recovery(message)
+        case .idle, .loading:
+            if inboxStore.canEnterWithBuildingDashboard {
+                stage = .signedIn
+            } else {
+                stage = .recovery("Mailbox setup is still in progress. Try again in a moment.")
+            }
+        }
     }
 
     @MainActor
     private func signIn() async {
-        guard !signingIn else {
-            return
-        }
-
+        guard !signingIn else { return }
         signingIn = true
         signInError = nil
         AppHaptics.lightImpact()
+        defer { signingIn = false }
 
         do {
-            let loginCode = try await authService.startGoogleAuthentication(baseURL: store.backendURL)
-            let session = try await store.exchangeMobileSession(loginCode: loginCode)
+            let grant = try await authService.startGoogleAuthentication(baseURL: inboxStore.backendURL)
+            let session = try await inboxStore.exchangeMobileSession(grant: grant)
             try tokenStore.save(session.sessionToken)
-            importStartedAt = Date()
-            withAnimation(.easeInOut(duration: 0.35)) {
-                stage = .importing
-            }
-            let minimumImportDisplay = Task {
-                try? await Task.sleep(nanoseconds: 5_200_000_000)
-            }
-            await store.load()
-            await minimumImportDisplay.value
-
-            if case .failed(let message) = store.phase {
-                withAnimation(.easeInOut(duration: 0.25)) {
-                    stage = .signedOut
-                }
-                throw RuntimeError(message)
-            }
-
-            AppHaptics.success()
-            withAnimation(.easeInOut(duration: 0.45)) {
-                stage = .dashboard
-            }
+            stage = .preparing
+            await inboxStore.load()
+            finishPreparation()
+            if stage == .signedIn { AppHaptics.success() }
         } catch {
-            tokenStore.clear()
-            store.setSessionToken(nil)
+            // A cancelled or failed browser session must not erase a previously
+            // valid Keychain token. No token has been replaced until exchange succeeds.
             signInError = error.localizedDescription
-            withAnimation(.easeInOut(duration: 0.25)) {
-                stage = .signedOut
-            }
+            stage = .signedOut
             AppHaptics.error()
         }
-
-        signingIn = false
     }
 
     @MainActor
     private func signOut() async {
-        AppHaptics.warning()
-        await store.logout()
+        do {
+            try await inboxStore.logoutRemoteSession()
+            tokenStore.clear()
+            inboxStore.setSessionToken(nil)
+            aiStore.resetForAccountChange()
+            stage = .signedOut
+            AppHaptics.success()
+        } catch {
+            signOutError = error.localizedDescription
+            AppHaptics.error()
+        }
+    }
+
+    @MainActor
+    private func clearLocalSessionForSignIn() {
         tokenStore.clear()
+        inboxStore.setSessionToken(nil)
+        aiStore.resetForAccountChange()
+        signInError = nil
         stage = .signedOut
     }
 }
 
-private struct RuntimeError: LocalizedError {
-    let message: String
-
-    init(_ message: String) {
-        self.message = message
-    }
-
-    var errorDescription: String? {
-        message
-    }
-}
-
-private struct SignInView: View {
+private struct IOSSignInView: View {
     @Environment(\.colorScheme) private var colorScheme
-
     let signingIn: Bool
     let errorMessage: String?
     let onSignIn: () -> Void
 
     var body: some View {
-        VStack(spacing: 42) {
-            Spacer()
-
-            VStack(spacing: 28) {
-                HStack(spacing: 18) {
-                    Text("📥")
-                    Image(systemName: "arrow.right")
-                        .font(.system(size: 42, weight: .heavy, design: .rounded))
-                    Text("✅")
+        ScrollView {
+            VStack(spacing: 32) {
+                Spacer(minLength: 70)
+                Image(systemName: "envelope.badge")
+                    .font(.system(size: 70, weight: .medium))
+                    .foregroundStyle(IOSMailDesign.accent)
+                    .accessibilityHidden(true)
+                VStack(spacing: 12) {
+                    Text("Electronic Mail")
+                        .font(.system(.largeTitle, design: .rounded, weight: .bold))
+                    Text("Turn email into a clear inbox, organized matters, and to-do's — without changing how Gmail works.")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
                 }
-                .font(.system(size: 64))
-                .accessibilityHidden(true)
+                .padding(.horizontal, 12)
 
-                Text("Turn your emails into to-do's!")
-                    .font(.system(size: 31, weight: .bold, design: .rounded))
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(IOSMailSurface.primaryText(for: colorScheme))
-                    .minimumScaleFactor(0.72)
-                    .lineLimit(2)
-            }
+                VStack(alignment: .leading, spacing: 14) {
+                    benefit("tray.full", "Every Gmail folder and action")
+                    benefit("sparkles.rectangle.stack", "AI organization you control")
+                    benefit("lock.shield", "Encrypted, account-isolated offline mail")
+                }
+                .padding(20)
+                .mailCard()
 
-            Button(action: onSignIn) {
-                HStack(spacing: 12) {
-                    if signingIn {
-                        ProgressView()
-                    } else {
-                        GoogleMark()
+                Button(action: onSignIn) {
+                    HStack(spacing: 12) {
+                        if signingIn { ProgressView() }
+                        else { Image(systemName: "person.crop.circle.badge.checkmark") }
+                        Text(signingIn ? "Opening Google…" : "Continue with Google")
+                            .font(.system(.headline, design: .rounded))
                     }
-
-                    Text(signingIn ? "Opening Google" : "Sign up with Google")
-                        .font(.system(size: 20, weight: .regular, design: .rounded))
+                    .frame(maxWidth: .infinity)
+                    .frame(minHeight: 52)
                 }
-                .foregroundStyle(IOSMailSurface.primaryText(for: colorScheme))
-                .frame(width: 260)
-                .frame(height: 54)
-                .background(IOSMailSurface.controlFill(for: colorScheme), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(IOSMailSurface.controlBorder(for: colorScheme), lineWidth: 1)
-                )
-            }
-            .buttonStyle(.plain)
-            .disabled(signingIn)
+                .buttonStyle(.borderedProminent)
+                .disabled(signingIn)
 
-            VStack(spacing: 10) {
                 if let errorMessage {
-                    Text(errorMessage)
+                    Label(errorMessage, systemImage: "exclamationmark.triangle")
                         .font(.footnote)
                         .foregroundStyle(.red)
                         .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
+                Text("Google sign-in opens in a secure system browser. Electronic Mail never receives your Google password.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
             }
-
-            Spacer()
+            .padding(24)
         }
-        .padding(24)
+        .background(IOSMailDesign.canvas(colorScheme).ignoresSafeArea())
+    }
+
+    private func benefit(_ symbol: String, _ text: String) -> some View {
+        Label(text, systemImage: symbol)
+            .font(.system(.body, design: .rounded, weight: .medium))
+            .symbolRenderingMode(.hierarchical)
+    }
+}
+
+private struct IOSLaunchView: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let title: String
+    let detail: String
+    let progress: Double?
+
+    var body: some View {
+        VStack(spacing: 22) {
+            Image(systemName: "envelope.badge")
+                .font(.system(size: 56, weight: .medium))
+                .foregroundStyle(IOSMailDesign.accent)
+                .symbolEffect(.pulse, options: .repeating)
+            VStack(spacing: 8) {
+                Text(title).font(.system(.title2, design: .rounded, weight: .bold))
+                Text(detail).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            }
+            if let progress {
+                ProgressView(value: progress)
+                    .frame(maxWidth: 280)
+                    .accessibilityLabel("Mailbox preparation")
+                    .accessibilityValue("\(Int(progress * 100)) percent")
+            } else {
+                ProgressView()
+            }
+        }
+        .padding(28)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(IOSMailSurface.background(for: colorScheme))
+        .background(IOSMailDesign.canvas(colorScheme).ignoresSafeArea())
     }
 }
 
-private struct GoogleMark: View {
-    var body: some View {
-        Text("G")
-            .font(.system(size: 28, weight: .bold, design: .rounded))
-            .foregroundStyle(.blue)
-            .frame(width: 34, height: 34)
-            .accessibilityLabel("Google")
-    }
-}
-
-private struct ImportProgressView: View {
-    @Environment(\.colorScheme) private var colorScheme
-
-    let startedAt: Date
-
-    private let steps = [
-        "Importing emails ...",
-        "Grouping related emails ...",
-        "Finding to-do items ...",
-        "Building dashboard ...",
-        "Almost ready!",
-    ]
+private struct IOSRecoveryView: View {
+    let message: String
+    let retry: () -> Void
+    let signInAgain: () -> Void
 
     var body: some View {
-        ZStack {
-            IOSMailSurface.background(for: colorScheme)
-                .ignoresSafeArea()
-
-            TimelineView(.periodic(from: startedAt, by: 0.25)) { timeline in
-                let elapsed = max(0, timeline.date.timeIntervalSince(startedAt))
-                let step = min(Int(elapsed / 1.05), steps.count - 1)
-
-                WavyStatusText(text: steps[step])
-                    .id(step)
-                    .transition(.opacity.combined(with: .scale(scale: 0.985)))
-                    .animation(.easeInOut(duration: 0.35), value: step)
-            }
-            .padding(.horizontal, 26)
+        ContentUnavailableView {
+            Label("Mailbox unavailable", systemImage: "wifi.exclamationmark")
+        } description: {
+            Text("\(message)\n\nYour saved session and encrypted mailbox have not been deleted.")
+        } actions: {
+            Button("Try Again", action: retry).buttonStyle(.borderedProminent)
+            Button("Use Another Sign-in", role: .destructive, action: signInAgain)
         }
-    }
-}
-
-private struct WavyStatusText: View {
-    @Environment(\.colorScheme) private var colorScheme
-    let text: String
-
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timeline in
-            let elapsed = timeline.date.timeIntervalSinceReferenceDate
-
-            HStack(spacing: 0) {
-                ForEach(Array(text.enumerated()), id: \.offset) { index, character in
-                    let phase = elapsed * 4.0 - Double(index) * 0.52
-                    let crest = (sin(phase) + 1.0) / 2.0
-                    let opacity = 0.34 + (crest * crest * 0.66)
-
-                    Text(String(character))
-                        .font(.system(size: 34, weight: .bold, design: .rounded))
-                        .foregroundStyle(IOSMailSurface.primaryText(for: colorScheme).opacity(opacity))
-                        .minimumScaleFactor(0.58)
-                }
-            }
-            .lineLimit(1)
-            .minimumScaleFactor(0.58)
-            .accessibilityLabel(text)
-        }
-    }
-}
-
-private enum IOSMailSurface {
-    static func background(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? .black : .white
-    }
-
-    static func primaryText(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? .white : .black
-    }
-
-    static func controlFill(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.03)
-    }
-
-    static func controlBorder(for colorScheme: ColorScheme) -> Color {
-        colorScheme == .dark ? Color.white.opacity(0.24) : Color.black.opacity(0.22)
     }
 }

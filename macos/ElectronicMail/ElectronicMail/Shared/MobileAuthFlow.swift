@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public enum MobileAuthFlowError: LocalizedError, Equatable {
@@ -63,17 +64,30 @@ public enum MobileAuthFlow {
         throw MobileAuthFlowError.missingLoginCode
     }
 
-    public static func handoffCompletionRedirectURL(baseURL: URL, handoffID: String) throws -> URL {
+    public static func handoffCompletionRedirectURL(
+        baseURL: URL,
+        handoffID: String,
+        codeChallenge: String
+    ) throws -> URL {
         guard var components = URLComponents(url: baseURL.appendingPathComponent("auth/mobile/complete"), resolvingAgainstBaseURL: false) else {
             throw MobileAuthFlowError.invalidURL
         }
         components.queryItems = [
-            URLQueryItem(name: "handoff_id", value: handoffID)
+            URLQueryItem(name: "handoff_id", value: handoffID),
+            URLQueryItem(name: "code_challenge", value: codeChallenge),
         ]
         guard let url = components.url else {
             throw MobileAuthFlowError.invalidURL
         }
         return url
+    }
+
+    public static func makePKCEPair() -> (verifier: String, challenge: String) {
+        var generator = SystemRandomNumberGenerator()
+        let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max, using: &generator) }
+        let verifier = base64URLEncoded(Data(bytes))
+        let digest = SHA256.hash(data: Data(verifier.utf8))
+        return (verifier, base64URLEncoded(Data(digest)))
     }
 
     public static func handoffStatusURL(baseURL: URL, handoffID: String) -> URL {
@@ -137,6 +151,13 @@ public enum MobileAuthFlow {
 
     private static func isTransientURLFailure(_ error: URLError) -> Bool {
         error.code != .cancelled && error.code != .badURL && error.code != .unsupportedURL
+    }
+
+    private static func base64URLEncoded(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 }
 

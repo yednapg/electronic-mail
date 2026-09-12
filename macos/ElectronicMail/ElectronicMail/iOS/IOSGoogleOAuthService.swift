@@ -1,5 +1,6 @@
 import AuthenticationServices
 import ElectronicMailShared
+import Network
 import UIKit
 
 enum IOSGoogleOAuthError: LocalizedError {
@@ -23,18 +24,50 @@ enum IOSGoogleOAuthError: LocalizedError {
 final class IOSGoogleOAuthService: NSObject, ASWebAuthenticationPresentationContextProviding {
     private var webSession: ASWebAuthenticationSession?
 
-    func startGoogleAuthentication(baseURL: URL) async throws -> String {
+    func startGoogleAuthentication(baseURL: URL) async throws -> MobileAuthenticationGrant {
+        let loopbackRelay = try await IOSLoopbackOAuthRelay.startIfNeeded(for: baseURL)
+        defer { loopbackRelay?.stop() }
+
+        let handoffID = UUID().uuidString
+        let pkce = MobileAuthFlow.makePKCEPair()
+        let redirectURL = try MobileAuthFlow.handoffCompletionRedirectURL(
+            baseURL: IOSLoopbackOAuthRelay.redirectBaseURL(for: baseURL),
+            handoffID: handoffID,
+            codeChallenge: pkce.challenge
+        )
+        let authorizationURL = try MobileAuthFlow.authenticationURL(
+            baseURL: baseURL,
+            redirectURL: redirectURL
+        )
+
+        let loginCode: String
         do {
-            return try await authenticateWithCallback(baseURL: baseURL)
+            loginCode = try await authenticateWithCallback(authorizationURL: authorizationURL)
         } catch IOSGoogleOAuthError.cancelled {
             throw IOSGoogleOAuthError.cancelled
         } catch {
-            return try await authenticateWithHandoffFallback(baseURL: baseURL)
+            loginCode = try await authenticateWithHandoffFallback(
+                authorizationURL: authorizationURL,
+                baseURL: baseURL,
+                handoffID: handoffID
+            )
         }
+
+        return MobileAuthenticationGrant(
+            loginCode: loginCode,
+            handoffID: handoffID,
+            codeVerifier: pkce.verifier
+        )
     }
 
-    func startGoogleAccountLink(authorizationURL: URL) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
+    func startGoogleAccountLink(
+        authorizationURL: URL,
+        backendBaseURL: URL
+    ) async throws -> String {
+        let loopbackRelay = try await IOSLoopbackOAuthRelay.startIfNeeded(for: backendBaseURL)
+        defer { loopbackRelay?.stop() }
+
+        return try await withCheckedThrowingContinuation { continuation in
             let session = ASWebAuthenticationSession(
                 url: authorizationURL,
                 callbackURLScheme: MobileAuthFlow.callbackScheme
@@ -72,13 +105,10 @@ final class IOSGoogleOAuthService: NSObject, ASWebAuthenticationPresentationCont
         }
     }
 
-    private func authenticateWithCallback(baseURL: URL) async throws -> String {
-        let redirectURL = URL(string: MobileAuthFlow.callbackRedirectURI)!
-        let url = try MobileAuthFlow.authenticationURL(baseURL: baseURL, redirectURL: redirectURL)
-
+    private func authenticateWithCallback(authorizationURL: URL) async throws -> String {
         return try await withCheckedThrowingContinuation { continuation in
             let session = ASWebAuthenticationSession(
-                url: url,
+                url: authorizationURL,
                 callbackURLScheme: MobileAuthFlow.callbackScheme
             ) { callbackURL, error in
                 self.webSession = nil
@@ -113,12 +143,12 @@ final class IOSGoogleOAuthService: NSObject, ASWebAuthenticationPresentationCont
         }
     }
 
-    private func authenticateWithHandoffFallback(baseURL: URL) async throws -> String {
-        let handoffID = UUID().uuidString
-        let redirectURL = try MobileAuthFlow.handoffCompletionRedirectURL(baseURL: baseURL, handoffID: handoffID)
-        let url = try MobileAuthFlow.authenticationURL(baseURL: baseURL, redirectURL: redirectURL)
-
-        let opened = await open(url)
+    private func authenticateWithHandoffFallback(
+        authorizationURL: URL,
+        baseURL: URL,
+        handoffID: String
+    ) async throws -> String {
+        let opened = await open(authorizationURL)
         guard opened else {
             throw IOSGoogleOAuthError.browserOpenFailed
         }
@@ -139,5 +169,166 @@ final class IOSGoogleOAuthService: NSObject, ASWebAuthenticationPresentationCont
             .compactMap { $0 as? UIWindowScene }
             .flatMap(\.windows)
             .first { $0.isKeyWindow } ?? ASPresentationAnchor()
+    }
+}
+
+/// Bridges the OAuth redirect registered for local development back to the
+/// Mac-hosted API. It is only active for physical-device builds that use an
+/// HTTP LAN address; Simulator localhost and production HTTPS never start it.
+final class IOSLoopbackOAuthRelay: @unchecked Sendable {
+    private static let callbackPort: UInt16 = 3001
+    private static let callbackPath = "/auth/google/callback"
+
+    private let backendBaseURL: URL
+    private let queue = DispatchQueue(label: "app.electronicmail.ios.oauth-loopback")
+    private var listener: NWListener?
+
+    private init(backendBaseURL: URL) {
+        self.backendBaseURL = backendBaseURL
+    }
+
+    static func startIfNeeded(for backendBaseURL: URL) async throws -> IOSLoopbackOAuthRelay? {
+        guard requiresRelay(for: backendBaseURL) else { return nil }
+        let relay = IOSLoopbackOAuthRelay(backendBaseURL: backendBaseURL)
+        try await relay.start()
+        return relay
+    }
+
+    static func requiresRelay(for backendBaseURL: URL) -> Bool {
+        guard backendBaseURL.scheme?.lowercased() == "http",
+              let host = backendBaseURL.host?.lowercased() else {
+            return false
+        }
+        return host != "localhost" && host != "127.0.0.1" && host != "::1"
+    }
+
+    static func redirectBaseURL(for backendBaseURL: URL) -> URL {
+        guard requiresRelay(for: backendBaseURL) else { return backendBaseURL }
+        return URL(string: "http://localhost:\(callbackPort)")!
+    }
+
+    private func start() async throws {
+        guard let port = NWEndpoint.Port(rawValue: Self.callbackPort) else {
+            throw IOSGoogleOAuthError.browserStartFailed
+        }
+
+        let listener = try NWListener(using: .tcp, on: port)
+        self.listener = listener
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.accept(connection)
+        }
+
+        try await withCheckedThrowingContinuation { continuation in
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    listener.stateUpdateHandler = nil
+                    continuation.resume()
+                case .failed(let error):
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(throwing: error)
+                case .cancelled:
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(throwing: CancellationError())
+                default:
+                    break
+                }
+            }
+            listener.start(queue: queue)
+        }
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+    }
+
+    private func accept(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        receiveRequest(from: connection, accumulated: Data())
+    }
+
+    private func receiveRequest(from connection: NWConnection, accumulated: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [weak self] data, _, isComplete, error in
+            guard let self else {
+                connection.cancel()
+                return
+            }
+
+            var request = accumulated
+            if let data {
+                request.append(data)
+            }
+
+            if request.count > 65_536 {
+                self.respond(status: "413 Payload Too Large", redirectURL: nil, on: connection)
+                return
+            }
+
+            if request.range(of: Data("\r\n\r\n".utf8)) != nil || isComplete {
+                self.handle(request, on: connection)
+                return
+            }
+
+            if error != nil {
+                connection.cancel()
+                return
+            }
+
+            self.receiveRequest(from: connection, accumulated: request)
+        }
+    }
+
+    private func handle(_ request: Data, on connection: NWConnection) {
+        guard let text = String(data: request, encoding: .utf8),
+              let requestLine = text.components(separatedBy: "\r\n").first,
+              requestLine.hasPrefix("GET "),
+              let target = requestLine.split(separator: " ", maxSplits: 2).dropFirst().first,
+              let incomingURL = URL(string: String(target), relativeTo: URL(string: "http://localhost:\(Self.callbackPort)"))?.absoluteURL,
+              let incomingURL = URL(string: String(target), relativeTo: URL(string: "http://localhost:\(Self.callbackPort)"))?.absoluteURL,
+              let destinationURL = forwardedDestination(for: incomingURL),
+              var destination = URLComponents(url: destinationURL, resolvingAgainstBaseURL: false) else {
+            respond(status: "400 Bad Request", redirectURL: nil, on: connection)
+            return
+        }
+
+        destination.percentEncodedQuery = URLComponents(
+            url: incomingURL,
+            resolvingAgainstBaseURL: false
+        )?.percentEncodedQuery
+        respond(status: "302 Found", redirectURL: destination.url, on: connection)
+    }
+
+    private func forwardedDestination(for incomingURL: URL) -> URL? {
+        switch incomingURL.path {
+        case Self.callbackPath:
+            return backendBaseURL
+                .appendingPathComponent("auth")
+                .appendingPathComponent("google")
+                .appendingPathComponent("callback")
+        case "/auth/mobile/complete":
+            return backendBaseURL
+                .appendingPathComponent("auth")
+                .appendingPathComponent("mobile")
+                .appendingPathComponent("complete")
+        default:
+            return nil
+        }
+    }
+
+    private func respond(status: String, redirectURL: URL?, on connection: NWConnection) {
+        var headers = [
+            "HTTP/1.1 \(status)",
+            "Cache-Control: no-store",
+            "Content-Length: 0",
+            "Connection: close",
+        ]
+        if let redirectURL {
+            headers.insert("Location: \(redirectURL.absoluteString)", at: 1)
+        }
+        let response = Data((headers.joined(separator: "\r\n") + "\r\n\r\n").utf8)
+        connection.send(content: response, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
     }
 }

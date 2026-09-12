@@ -162,6 +162,8 @@ class Settings:
     def readiness_errors(self) -> list[str]:
         """Return blocking config issues for production-like deployments."""
         errors: list[str] = []
+        from app.services.push_notifications import PushConfiguration
+        errors.extend(PushConfiguration.load().readiness_errors())
 
         if self.app_env not in {"local", "staging", "production"}:
             errors.append("APP_ENV must be one of local, staging, or production")

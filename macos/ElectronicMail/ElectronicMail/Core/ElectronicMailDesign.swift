@@ -552,6 +552,29 @@ extension View {
     func electronicMailFloatingAction(role: ElectronicMailFloatingActionRole) -> some View {
         electronicMailGlassButton(role: role, shape: .capsule)
     }
+
+    /// The quiet rectangular surface used by AI-generated summary content.
+    /// Keep non-interactive briefing cards on this shared treatment so Inbox
+    /// and To-do never drift into different material, radius, or opacity.
+    @ViewBuilder
+    func electronicMailSummaryCardSurface() -> some View {
+        if #available(macOS 26.0, *) {
+            background {
+                Color.clear
+                    .glassEffect(
+                        .clear,
+                        in: .rect(cornerRadius: 12)
+                    )
+                    .opacity(0.24)
+            }
+        } else {
+            background {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .opacity(0.24)
+            }
+        }
+    }
 }
 
 private struct ElectronicMailGlassControlSurfaceModifier: ViewModifier {

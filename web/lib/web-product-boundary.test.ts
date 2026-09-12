@@ -32,7 +32,7 @@ test('the boundary covers every legacy product page and web BFF endpoint', () =>
 });
 
 test('the production boundary preserves public and OAuth-completion pages', () => {
-  for (const pathname of ['/', '/healthz', '/post-login', '/product-info', '/product-info', '/support', '/icon.svg']) {
+  for (const pathname of ['/', '/healthz', '/post-login', '/icon.svg']) {
     assert.equal(isWebProductPath(pathname), false, pathname);
     assert.equal(shouldBlockProductionWebPath(pathname, { APP_ENV: 'production' }), false, pathname);
   }

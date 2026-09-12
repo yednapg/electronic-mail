@@ -157,6 +157,82 @@ public final class DemoAppClient: AppClient {
     public func aiInbox(query: String? = nil) async throws -> AIInboxResponse {
         let rows = [
             AIMatterRow(
+                id: "demo-action-review",
+                title: "Confirm your macOS review appointment",
+                summary: "Apple Developer needs your confirmation before the review slot expires.",
+                status: .needsYou,
+                confidenceState: .confirmed,
+                confidence: 0.98,
+                latestMessageAt: "2026-09-03T11:30:00+00:00",
+                messageCount: 2,
+                unread: true,
+                starred: true,
+                participants: ["Apple Developer", "You"],
+                counterpartEntities: ["Apple Developer"],
+                evidenceMessageIDs: ["demo-message"],
+                revision: 4,
+                openSubgoalCount: 1,
+                reviewCount: 0,
+                matchingMessageIDs: []
+            ),
+            AIMatterRow(
+                id: "demo-action-reply",
+                title: "Reply to Priya about Friday's proposal",
+                summary: "Priya asked whether the revised proposal can be approved before Friday afternoon.",
+                status: .needsYou,
+                confidenceState: .confirmed,
+                confidence: 0.96,
+                latestMessageAt: "2026-09-03T10:45:00+00:00",
+                messageCount: 3,
+                unread: true,
+                starred: false,
+                participants: ["Priya", "You"],
+                counterpartEntities: ["Priya"],
+                evidenceMessageIDs: ["demo-message"],
+                revision: 2,
+                openSubgoalCount: 1,
+                reviewCount: 0,
+                matchingMessageIDs: []
+            ),
+            AIMatterRow(
+                id: "demo-action-pay",
+                title: "Pay your card bill by September 5",
+                summary: "Your credit-card statement is due in two days and still needs payment.",
+                status: .needsYou,
+                confidenceState: .confirmed,
+                confidence: 0.94,
+                latestMessageAt: "2026-09-03T09:15:00+00:00",
+                messageCount: 1,
+                unread: false,
+                starred: false,
+                participants: ["Card Services", "You"],
+                counterpartEntities: ["Northstar"],
+                evidenceMessageIDs: ["demo-message"],
+                revision: 1,
+                openSubgoalCount: 1,
+                reviewCount: 0,
+                matchingMessageIDs: []
+            ),
+            AIMatterRow(
+                id: "demo-action-register",
+                title: "Register for the developer conference",
+                summary: "Your complimentary registration link expires tomorrow.",
+                status: .needsYou,
+                confidenceState: .confirmed,
+                confidence: 0.91,
+                latestMessageAt: "2026-09-03T08:00:00+00:00",
+                messageCount: 1,
+                unread: false,
+                starred: false,
+                participants: ["Conference Team", "You"],
+                counterpartEntities: ["PyCon"],
+                evidenceMessageIDs: ["demo-message"],
+                revision: 1,
+                openSubgoalCount: 1,
+                reviewCount: 0,
+                matchingMessageIDs: []
+            ),
+            AIMatterRow(
                 id: "demo-matter",
                 title: "Your account request has been processed",
                 summary: "You asked the bank to move your customer relationship to a different branch. The bank confirmed that the request was processed; no next action is currently required.",
@@ -223,6 +299,84 @@ public final class DemoAppClient: AppClient {
             ],
             generatedAt: "2026-08-24T11:00:00+00:00"
         )
+    }
+
+    public func aiTodos(limit: Int = 100) async throws -> AITodoResponse {
+        let items = [
+            AITodoItem(
+                id: "demo-todo-confirm",
+                matterID: "demo-action-review",
+                sourceSubgoalID: "demo-subgoal-confirm",
+                displayKind: .todo,
+                title: "Confirm your macOS review appointment",
+                detail: "Apple Developer asked you to confirm the review slot.",
+                actionType: "confirm",
+                requirement: "required",
+                dueAt: "2026-09-03T14:00:00+00:00",
+                urgency: "now",
+                confidence: 0.98,
+                evidenceMessageIDs: ["demo-message"],
+                evidenceText: "Please confirm your review appointment.",
+                status: .open,
+                sourceLabel: "Apple Developer",
+                latestMessageAt: "2026-09-03T11:30:00+00:00",
+                revision: 1
+            ),
+            AITodoItem(
+                id: "demo-todo-reply",
+                matterID: "demo-action-reply",
+                sourceSubgoalID: "demo-subgoal-reply",
+                displayKind: .todo,
+                title: "Reply to Priya about the proposal",
+                detail: "Priya asked for your decision before Friday afternoon.",
+                actionType: "reply",
+                requirement: "required",
+                dueAt: nil,
+                urgency: "unscheduled",
+                confidence: 0.96,
+                evidenceMessageIDs: ["demo-message"],
+                evidenceText: "Can you approve the revised proposal?",
+                status: .open,
+                sourceLabel: "Priya",
+                latestMessageAt: "2026-09-03T10:45:00+00:00",
+                revision: 1
+            ),
+            AITodoItem(
+                id: "demo-worth-knowing",
+                matterID: "demo-action-register",
+                sourceSubgoalID: "demo-subgoal-register",
+                displayKind: .worthKnowing,
+                title: "Complimentary conference registration closes tomorrow",
+                detail: "Registration is optional.",
+                actionType: "open",
+                requirement: "optional",
+                dueAt: nil,
+                urgency: "unscheduled",
+                confidence: 0.91,
+                evidenceMessageIDs: ["demo-message"],
+                evidenceText: "Your complimentary registration link expires tomorrow.",
+                status: .open,
+                sourceLabel: "PyCon",
+                latestMessageAt: "2026-09-03T08:00:00+00:00",
+                revision: 1
+            ),
+        ]
+        return AITodoResponse(
+            items: Array(items.prefix(max(1, limit))),
+            organizingCount: 0,
+            generatedAt: "2026-09-03T12:00:00+00:00"
+        )
+    }
+
+    public func updateAITodo(
+        _ todoID: String,
+        gmailAccountID: String? = nil,
+        request: AITodoUpdateRequest
+    ) async throws -> AITodoItem {
+        guard let item = try await aiTodos().items.first(where: { $0.id == todoID }) else {
+            throw APIError.httpStatus(404)
+        }
+        return item
     }
 
     public func aiMatter(_ matterID: String) async throws -> AIMatterDetail {
