@@ -26,6 +26,7 @@ from app.db.ai_inbox import (
     start_shadow_generation,
     update_profile,
 )
+from app.db.ai_todos import list_ai_todos, update_ai_todo_status
 from app.db.mail_groups import list_messages_by_ids
 from app.schemas.ai_inbox import (
     AIGroupingExplanation,
@@ -44,6 +45,10 @@ from app.schemas.ai_inbox import (
     MatterDecisionResponse,
     MatterEntityActionRequest,
     MatterEntityActionResponse,
+    MatterStatus,
+    AITodoItem,
+    AITodoResponse,
+    AITodoUpdateRequest,
 )
 from app.schemas.domain import MailReplyRequest
 from app.services.ai_inbox import (
@@ -53,6 +58,7 @@ from app.services.ai_inbox import (
     enqueue_message_organization,
     shadow_promotion_gate_failures,
 )
+from app.services.ai_todos import ensure_todo_extractions
 from app.services.ai_inbox_actions import enqueue_matter_action
 from app.services.auth import require_current_user
 from app.services.mailbox_events import AI_INBOX_CHANGED, AI_PROFILE_CHANGED, emit_mailbox_event
@@ -163,6 +169,7 @@ def _inbox_response(
     query: str | None,
     limit: int,
     generation_id: str | None = None,
+    matter_status: str | None = None,
 ) -> AIInboxResponse:
     projection = list_ai_inbox(
         str(settings.database_path),
@@ -170,6 +177,7 @@ def _inbox_response(
         search_query=query,
         limit=limit,
         generation_id_override=generation_id,
+        matter_status=matter_status,
     )
     return AIInboxResponse(
         profile=_profile_response(projection["profile"]),
@@ -182,14 +190,68 @@ def _inbox_response(
 
 
 @router.get("/v1/ai-inbox", response_model=AIInboxResponse)
-def ai_inbox(request: Request, limit: int = Query(default=200, ge=1, le=500)) -> AIInboxResponse:
+def ai_inbox(
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    matter_status: MatterStatus | None = Query(default=None, alias="status"),
+) -> AIInboxResponse:
     user = require_current_user(settings, request)
     return _inbox_response(
         user_id=user.id,
         query=None,
         limit=limit,
         generation_id=_local_shadow_generation_id(user.id),
+        matter_status=matter_status,
     )
+
+
+@router.get("/v1/ai-todos", response_model=AITodoResponse)
+def ai_todos(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=200),
+) -> AITodoResponse:
+    user = require_current_user(settings, request)
+    organizing_count = ensure_todo_extractions(
+        settings, user_id=user.id, limit=min(limit, 50)
+    )
+    projection = list_ai_todos(
+        str(settings.database_path), user_id=user.id, limit=limit
+    )
+    return AITodoResponse(
+        items=[AITodoItem(**item) for item in projection["items"]],
+        organizing_count=organizing_count,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+@router.patch("/v1/ai-todos/{todo_id}", response_model=AITodoItem)
+def patch_ai_todo(
+    request: Request,
+    todo_id: str,
+    payload: AITodoUpdateRequest,
+) -> AITodoItem:
+    user = require_current_user(settings, request)
+    if payload.status == "snoozed" and not payload.snoozed_until:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="snoozed_until is required when snoozing a to-do",
+        )
+    item = update_ai_todo_status(
+        str(settings.database_path),
+        user_id=user.id,
+        todo_id=todo_id,
+        status=payload.status,
+        snoozed_until=payload.snoozed_until,
+    )
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="To-do not found")
+    emit_mailbox_event(
+        settings,
+        user_id=user.id,
+        event_type=AI_INBOX_CHANGED,
+        payload={"source": "ai_todo_status", "todo_id": todo_id, "status": payload.status},
+    )
+    return AITodoItem(**item)
 
 
 @router.get("/v1/ai-inbox/search", response_model=AIInboxResponse)
@@ -475,6 +537,18 @@ def matter_decision(request: Request, payload: MatterDecisionRequest) -> MatterD
 def matter_entity_action(request: Request, payload: MatterEntityActionRequest) -> MatterEntityActionResponse:
     user = require_current_user(settings, request)
     snapshot = active_member_snapshot(str(settings.database_path), user_id=user.id, matter_id=payload.matter_id)
+    if snapshot is None:
+        # Local preview can render a shadow generation before it is promoted.
+        # Resolve actions against that same generation so a visible group is
+        # never undeletable merely because it is being previewed.
+        preview_generation_id = _local_shadow_generation_id(user.id)
+        if preview_generation_id:
+            snapshot = active_member_snapshot(
+                str(settings.database_path),
+                user_id=user.id,
+                matter_id=payload.matter_id,
+                generation_id=preview_generation_id,
+            )
     if snapshot is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Matter not found")
     revision = int(snapshot["matter"]["revision"])

@@ -20,6 +20,7 @@ from app.api.routes.system import router as system_router
 from app.api.routes.mailbox import router as mailbox_router
 from app.api.routes.tasks import router as tasks_router
 from app.api.routes.ai_inbox import router as ai_inbox_router
+from app.api.routes.push_notifications import router as push_notifications_router
 from app.core.config import Settings, load_settings
 from app.core.observability import RequestObservabilityMiddleware, configure_observability
 from app.core.rate_limit import RateLimitMiddleware
@@ -61,6 +62,7 @@ def create_app(runtime_settings: Settings) -> FastAPI:
     application.include_router(ai_inbox_router)
     application.include_router(gmail_accounts_router)
     application.include_router(gmail_account_ai_router)
+    application.include_router(push_notifications_router)
 
     if not production_like:
         application.include_router(first_run_router)

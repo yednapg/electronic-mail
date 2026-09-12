@@ -7,11 +7,35 @@ WORKSPACE="macos/ElectronicMail/ElectronicMail.xcworkspace"
 SCHEME="ElectronicMailiOS"
 DERIVED_DATA="/tmp/ElectronicMailIOSDerivedData"
 APP_PATH="$DERIVED_DATA/Build/Products/Debug-iphoneos/ElectronicMailiOS.app"
-BUNDLE_ID="com.rameshpandey.ElectronicMail.iOS"
+BUNDLE_ID="app.electronicmail.ios"
+
+if [[ -z "${ELECTRONIC_MAIL_IOS_BACKEND_URL:-}" ]]; then
+  bash scripts/ios-lan-backend.sh start
+  ELECTRONIC_MAIL_IOS_BACKEND_URL="$(bash scripts/ios-lan-backend.sh url)"
+fi
+
+if [[ ! "$ELECTRONIC_MAIL_IOS_BACKEND_URL" =~ ^https?://[^/]+ ]]; then
+  echo "ELECTRONIC_MAIL_IOS_BACKEND_URL must be an absolute http(s) URL." >&2
+  exit 1
+fi
+
+if ! curl --noproxy '*' --fail --silent --max-time 5 "$ELECTRONIC_MAIL_IOS_BACKEND_URL/health" >/dev/null; then
+  echo "The iPhone cannot use an unhealthy backend: $ELECTRONIC_MAIL_IOS_BACKEND_URL" >&2
+  exit 1
+fi
 
 if [[ -z "$DEVICE_ID" ]]; then
-  echo "Set IOS_DEVICE_ID to the iPhone UDID from: npm run ios:devices"
-  exit 1
+  DEVICE_IDS="$(
+    bash scripts/xcode.sh -showdestinations -workspace "$WORKSPACE" -scheme "$SCHEME" 2>&1 \
+      | sed -nE 's/.*platform:iOS, arch:[^,]+, id:([^,]+), name:.*/\1/p'
+  )"
+  DEVICE_COUNT="$(printf '%s\n' "$DEVICE_IDS" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [[ "$DEVICE_COUNT" != "1" ]]; then
+    echo "Set IOS_DEVICE_ID because $DEVICE_COUNT physical iOS devices were discovered." >&2
+    printf '%s\n' "$DEVICE_IDS" >&2
+    exit 1
+  fi
+  DEVICE_ID="$DEVICE_IDS"
 fi
 
 build_settings=(
@@ -22,9 +46,7 @@ if [[ -n "${IOS_DEVELOPMENT_TEAM:-}" ]]; then
   build_settings+=("DEVELOPMENT_TEAM=$IOS_DEVELOPMENT_TEAM")
 fi
 
-if [[ -n "${ELECTRONIC_MAIL_IOS_BACKEND_URL:-}" ]]; then
-  build_settings+=("ELECTRONIC_MAIL_IOS_BACKEND_URL=$ELECTRONIC_MAIL_IOS_BACKEND_URL")
-fi
+build_settings+=("ELECTRONIC_MAIL_IOS_BACKEND_URL=$ELECTRONIC_MAIL_IOS_BACKEND_URL")
 
 xcodebuild_common=(
   -workspace "$WORKSPACE"
@@ -41,15 +63,15 @@ xcodebuild_common=(
 
 case "$ACTION" in
   build)
-    xcodebuild build "${xcodebuild_common[@]}"
-    xcrun devicectl device install app --device "$DEVICE_ID" "$APP_PATH"
+    bash scripts/xcode.sh build "${xcodebuild_common[@]}"
+    bash scripts/xcrun.sh devicectl device install app --device "$DEVICE_ID" "$APP_PATH"
     ;;
   run)
     "$0" build
-    xcrun devicectl device process launch --device "$DEVICE_ID" --terminate-existing "$BUNDLE_ID"
+    bash scripts/xcrun.sh devicectl device process launch --device "$DEVICE_ID" --terminate-existing "$BUNDLE_ID"
     ;;
   test)
-    xcodebuild test "${xcodebuild_common[@]}"
+    bash scripts/xcode.sh test "${xcodebuild_common[@]}"
     ;;
   *)
     echo "Usage: IOS_DEVICE_ID=<iphone-udid> $0 [build|run|test]"

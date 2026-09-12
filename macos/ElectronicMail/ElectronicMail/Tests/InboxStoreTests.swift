@@ -3,7 +3,122 @@ import XCTest
 @testable import ElectronicMailCore
 
 @MainActor
+final class MailNotificationControllerTests: XCTestCase {
+    func testOfflineDisableIsReconciledAfterRelaunch() async throws {
+        let defaults = UserDefaults.ephemeral()
+        let installationID = UUID().uuidString
+        defaults.set(false, forKey: "ElectronicMail.Notifications.Enabled")
+        defaults.set(installationID, forKey: "ElectronicMail.Notifications.Installation")
+        let baseURL = try XCTUnwrap(URL(string: "https://mail.example.test"))
+        var offlineRequests: [URLRequest] = []
+        let offline = MailNotificationController(defaults: defaults, authorizationStatus: { .authorized }) { request in
+            offlineRequests.append(request)
+            throw URLError(.notConnectedToInternet)
+        }
+        offline.configure(baseURL: baseURL, sessionToken: "test-session")
+        await offline.refresh()
+        XCTAssertFalse(offline.enabled)
+        XCTAssertFalse(offlineRequests.isEmpty)
+        XCTAssertTrue(offline.status.contains("Will retry"))
+
+        // A new controller has no in-memory retry state from the previous run.
+        var onlineRequests: [URLRequest] = []
+        let relaunched = MailNotificationController(defaults: defaults, authorizationStatus: { .authorized }) { request in
+            onlineRequests.append(request)
+            let response = try XCTUnwrap(HTTPURLResponse(url: baseURL, statusCode: 204, httpVersion: nil, headerFields: nil))
+            return (Data(), response)
+        }
+        relaunched.configure(baseURL: baseURL, sessionToken: "test-session")
+        await relaunched.refresh()
+        XCTAssertFalse(onlineRequests.isEmpty)
+        for request in offlineRequests + onlineRequests {
+            XCTAssertEqual(request.httpMethod, "DELETE")
+            XCTAssertEqual(request.url?.path, "/v1/push/devices/\(installationID)")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-session")
+        }
+        XCTAssertFalse(relaunched.enabled)
+        XCTAssertEqual(relaunched.status, "Notifications are off.")
+    }
+
+    func testRevokedSystemPermissionRemovesServerRegistration() async throws {
+        let defaults = UserDefaults.ephemeral()
+        defaults.set(true, forKey: "ElectronicMail.Notifications.Enabled")
+        let baseURL = try XCTUnwrap(URL(string: "https://mail.example.test"))
+        var requests: [URLRequest] = []
+        let controller = MailNotificationController(defaults: defaults, authorizationStatus: { .denied }) { request in
+            requests.append(request)
+            let response = try XCTUnwrap(HTTPURLResponse(url: baseURL, statusCode: 204, httpVersion: nil, headerFields: nil))
+            return (Data(), response)
+        }
+        controller.configure(baseURL: baseURL, sessionToken: "test-session")
+        await controller.refresh()
+        XCTAssertFalse(requests.isEmpty)
+        XCTAssertTrue(requests.allSatisfy { $0.httpMethod == "DELETE" })
+        XCTAssertEqual(controller.status, "Allow notifications in System Settings.")
+    }
+
+    func testSignedOutRefreshDoesNotRegisterOrRemoveDevices() async throws {
+        var requests: [URLRequest] = []
+        let controller = MailNotificationController(defaults: .ephemeral(), authorizationStatus: { .authorized }) { request in
+            requests.append(request)
+            throw URLError(.userAuthenticationRequired)
+        }
+        controller.configure(baseURL: try XCTUnwrap(URL(string: "https://mail.example.test")), sessionToken: nil)
+        await controller.refresh()
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertEqual(controller.status, "Sign in to receive notifications.")
+    }
+}
+
+@MainActor
 final class InboxStoreTests: XCTestCase {
+    func testNotificationTargetRequiresEveryRoutingIdentifier() {
+        let payload: [AnyHashable: Any] = ["user_id": "user", "gmail_account_id": "account", "thread_id": "thread", "message_id": "message"]
+        XCTAssertNotNil(MailNotificationTarget(userInfo: payload))
+        for key in payload.keys {
+            var incomplete = payload
+            incomplete.removeValue(forKey: key)
+            XCTAssertNil(MailNotificationTarget(userInfo: incomplete))
+        }
+        var invalid = payload
+        invalid["thread_id"] = ""
+        XCTAssertNil(MailNotificationTarget(userInfo: invalid))
+        invalid["thread_id"] = String(repeating: "x", count: 257)
+        XCTAssertNil(MailNotificationTarget(userInfo: invalid))
+    }
+
+    func testNotificationOpensItsAccountThreadAndMessage() async throws {
+        let client = DemoAppClient()
+        let store = InboxStore(client: client, automaticallyPrefetchThreads: false)
+        await store.load()
+        let accounts = try await client.gmailAccounts()
+        let row = try XCTUnwrap(store.activeMailbox?.sections.first?.rows.first)
+        let target = try XCTUnwrap(MailNotificationTarget(userInfo: [
+            "user_id": DemoAppFixtures.userID, "gmail_account_id": DemoAppFixtures.userID,
+            "thread_id": row.threadID, "message_id": row.latestSourceRecordID,
+        ]))
+        let opened = await store.openNotification(target, accounts: accounts)
+        XCTAssertTrue(opened)
+        XCTAssertEqual(store.mailboxViewScope.gmailAccountID, target.accountID)
+        XCTAssertEqual(store.readerThreadID, target.threadID)
+        XCTAssertEqual(store.readerFocusedMessageID, target.messageID)
+    }
+
+    func testNotificationCannotOpenAnotherUsersMailOrDisconnectedAccount() async throws {
+        let client = DemoAppClient()
+        let store = InboxStore(client: client, automaticallyPrefetchThreads: false)
+        await store.load()
+        let accounts = try await client.gmailAccounts()
+        for (userID, accountID) in [("another-user", DemoAppFixtures.userID), (DemoAppFixtures.userID, "removed-account")] {
+            let target = try XCTUnwrap(MailNotificationTarget(userInfo: [
+                "user_id": userID, "gmail_account_id": accountID, "thread_id": "thread", "message_id": "message",
+            ]))
+            let opened = await store.openNotification(target, accounts: accounts)
+            XCTAssertFalse(opened)
+            XCTAssertNil(store.readerThreadID)
+        }
+    }
+
     func testDemoAppSessionRoundTripsThroughBackendDecoder() throws {
         let data = try JSONEncoder.backend.encode(DemoAppFixtures.appSession)
         let decoded = try JSONDecoder.backend.decode(AppSessionResponse.self, from: data)
@@ -3172,11 +3287,22 @@ final class InboxStoreTests: XCTestCase {
     }
 
     func testTodoMapperSplitsDashboardFeedSections() throws {
-        let snapshot = TodoHomeMapper.snapshot(from: DemoAppFixtures.appSession, now: Date(timeIntervalSince1970: 0))
+        let todos = [
+            makeTodoAIItem(id: "now", title: "Confirm your review slot", urgency: "now"),
+            makeTodoAIItem(id: "today", title: "Reply to the conference organizer", actionType: "reply", urgency: "today"),
+            makeTodoAIItem(id: "upcoming", title: "Pay your card bill", urgency: "upcoming"),
+            makeTodoAIItem(id: "optional", title: "Conference registration closes tomorrow", displayKind: .worthKnowing, actionType: "open"),
+        ]
+        let snapshot = TodoHomeMapper.snapshot(
+            from: DemoAppFixtures.appSession,
+            aiTodos: todos,
+            now: Date(timeIntervalSince1970: 0)
+        )
 
-        XCTAssertEqual(snapshot.now.rows.map(\.entityID), ["demo-apple-today"])
-        XCTAssertEqual(snapshot.laterToday.rows.map(\.entityID), ["demo-github-today", "manual-task:demo-manual-seed"])
-        XCTAssertEqual(snapshot.worthKnowing.rows.map(\.entityID), ["demo-rbi-today"])
+        XCTAssertEqual(snapshot.now.rows.map(\.entityID), ["ai-todo:now"])
+        XCTAssertEqual(snapshot.laterToday.rows.map(\.entityID), ["manual-task:demo-manual-seed", "ai-todo:today"])
+        XCTAssertEqual(snapshot.upcoming.rows.map(\.entityID), ["ai-todo:upcoming"])
+        XCTAssertEqual(snapshot.worthKnowing.rows.map(\.entityID), ["ai-todo:optional"])
         XCTAssertEqual(snapshot.now.title, "Now")
         XCTAssertEqual(snapshot.laterToday.title, "Later Today")
         XCTAssertEqual(snapshot.worthKnowing.title, "Worth Knowing")
@@ -3212,21 +3338,32 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertEqual(snapshot.agenda.map(\.time), expectedAgendaTimes)
     }
 
-    func testTodoRowsUseInboxDerivedMetadata() async {
-        let store = InboxStore(client: DemoAppClient(), sessionCache: AppSessionCache(defaults: .ephemeral()), threadCache: ThreadCache(defaults: .ephemeral()))
+    func testTodoRowsUseIndependentAIActionMetadata() {
+        let todo = makeTodoAIItem(
+            id: "apple-review",
+            title: "RSVP within 72 hrs to confirm your macOS review slot",
+            detail: "Apple Developer needs one more screenshot before review can continue.",
+            sourceLabel: "Apple Developer",
+            actionType: "confirm",
+            urgency: "now",
+            revision: 7
+        )
+        let snapshot = TodoHomeMapper.snapshot(
+            from: DemoAppFixtures.appSession,
+            aiTodos: [todo],
+            now: Date(timeIntervalSince1970: 0)
+        )
 
-        await store.load()
-        let snapshot = TodoHomeMapper.snapshot(from: DemoAppFixtures.appSession, inboxRows: store.flatRows, now: Date(timeIntervalSince1970: 0))
-
-        let sourceInboxRow = store.flatRows.first { $0.threadID == "demo-apple-today" }
         let nowRow = snapshot.now.rows.first
-        XCTAssertNotNil(sourceInboxRow)
         XCTAssertEqual(nowRow?.sender, "Apple Developer")
-        XCTAssertEqual(nowRow?.title, "App Review needs one more screenshot for macOS")
-        XCTAssertEqual(nowRow?.timeLabel, sourceInboxRow?.timeLabel)
-        XCTAssertEqual(nowRow?.detailText, "Apple Developer needs one more screenshot before review can continue. Confirm the slot or move it out of today's work.")
-        XCTAssertEqual(nowRow?.actionLabel, "Open source")
-        XCTAssertEqual(nowRow?.gmailThreadID, "demo-apple-today")
+        XCTAssertEqual(nowRow?.title, "RSVP within 72 hrs to confirm your macOS review slot")
+        XCTAssertEqual(nowRow?.detailText, "Apple Developer needs one more screenshot before review can continue.")
+        XCTAssertEqual(nowRow?.actionLabel, "Start task")
+        XCTAssertEqual(nowRow?.primaryAction, "confirm")
+        XCTAssertEqual(nowRow?.aiMatterID, "apple-review")
+        XCTAssertEqual(nowRow?.aiTodoID, "apple-review")
+        XCTAssertTrue(nowRow?.allowsCompletion == true)
+        XCTAssertNil(nowRow?.gmailThreadID)
 
         let manualRow = snapshot.laterToday.rows.first { $0.entityID == "manual-task:demo-manual-seed" }
         XCTAssertEqual(manualRow?.sender, "Manual")
@@ -3235,17 +3372,20 @@ final class InboxStoreTests: XCTestCase {
         XCTAssertNil(manualRow?.gmailThreadID)
     }
 
-    func testTodoRowsFallbackWhenInboxRowIsMissing() {
-        let snapshot = TodoHomeMapper.snapshot(from: DemoAppFixtures.appSession, inboxRows: [], now: Date(timeIntervalSince1970: 0))
+    func testTodoRowsExcludeLegacyGmailAndCompletedAIItems() {
+        let completed = makeTodoAIItem(id: "completed", title: "Request completed", status: .completed)
+        let snapshot = TodoHomeMapper.snapshot(
+            from: DemoAppFixtures.appSession,
+            aiTodos: [completed],
+            now: Date(timeIntervalSince1970: 0)
+        )
 
-        let nowRow = snapshot.now.rows.first
-        XCTAssertEqual(nowRow?.sender, "3 emails from Apple Developer")
-        XCTAssertEqual(nowRow?.title, "RSVP within 72 hrs to confirm your macOS review slot")
-        XCTAssertEqual(nowRow?.timeLabel, "")
-        XCTAssertEqual(nowRow?.sourceLabel, "3 emails from Apple Developer")
+        XCTAssertTrue(snapshot.now.rows.isEmpty)
+        XCTAssertEqual(snapshot.laterToday.rows.map(\.entityID), ["manual-task:demo-manual-seed"])
+        XCTAssertTrue(snapshot.worthKnowing.rows.isEmpty)
     }
 
-    func testTodoSnapshotKeepsThreeSectionsWhenFeedIsEmpty() {
+    func testTodoSnapshotKeepsSemanticSectionsWhenFeedIsEmpty() {
         let current = DemoAppFixtures.appSession
         let emptySession = AppSessionResponse(
             user: current.user,
@@ -3257,9 +3397,10 @@ final class InboxStoreTests: XCTestCase {
 
         let snapshot = TodoHomeMapper.snapshot(from: emptySession, now: Date(timeIntervalSince1970: 0))
 
-        XCTAssertEqual([snapshot.now.title, snapshot.laterToday.title, snapshot.worthKnowing.title], ["Now", "Later Today", "Worth Knowing"])
+        XCTAssertEqual([snapshot.now.title, snapshot.laterToday.title, snapshot.upcoming.title, snapshot.worthKnowing.title], ["Now", "Later Today", "Upcoming", "Worth Knowing"])
         XCTAssertTrue(snapshot.now.rows.isEmpty)
         XCTAssertTrue(snapshot.laterToday.rows.isEmpty)
+        XCTAssertTrue(snapshot.upcoming.rows.isEmpty)
         XCTAssertTrue(snapshot.worthKnowing.rows.isEmpty)
         XCTAssertTrue(snapshot.agenda.isEmpty)
         XCTAssertNil(snapshot.dashboardBuildStatus)
@@ -7353,6 +7494,38 @@ private func makeThreadAttachment(filename: String, index: Int = 1) -> ThreadAtt
         attachmentID: "gmail-attachment-\(index)",
         partID: "part-\(index)",
         downloadURL: nil
+    )
+}
+
+private func makeTodoAIItem(
+    id: String,
+    title: String,
+    detail: String = "This email needs your action.",
+    sourceLabel: String = "Example",
+    displayKind: AITodoDisplayKind = .todo,
+    actionType: String = "confirm",
+    urgency: String = "unscheduled",
+    status: AITodoStatus = .open,
+    revision: Int = 1
+) -> AITodoItem {
+    AITodoItem(
+        id: id,
+        matterID: id,
+        sourceSubgoalID: "subgoal-\(id)",
+        displayKind: displayKind,
+        title: title,
+        detail: detail,
+        actionType: actionType,
+        requirement: displayKind == .todo ? "required" : "optional",
+        dueAt: nil,
+        urgency: urgency,
+        confidence: 0.95,
+        evidenceMessageIDs: ["message-\(id)"],
+        evidenceText: "Direct evidence",
+        status: status,
+        sourceLabel: sourceLabel,
+        latestMessageAt: "2026-09-03T12:00:00+00:00",
+        revision: revision
     )
 }
 

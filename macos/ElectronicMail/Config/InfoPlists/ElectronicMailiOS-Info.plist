@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
+	<key>APNSEnvironment</key>
+	<string>$(ELECTRONIC_MAIL_APNS_ENVIRONMENT)</string>
 	<key>BackendBaseURL</key><string>$(ELECTRONIC_MAIL_IOS_BACKEND_URL)</string>
 	<key>CFBundleDevelopmentRegion</key><string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key><string>Electronic Mail</string>
@@ -15,6 +17,10 @@
 		<key>CFBundleURLSchemes</key><array><string>electronicmail</string></array>
 	</dict></array>
 	<key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>NSAppTransportSecurity</key><dict>
+		<key>NSAllowsLocalNetworking</key><true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key><string>Electronic Mail connects to your explicitly configured development backend on the local network.</string>
 	<key>UILaunchScreen</key><dict/>
 	<key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
 </dict></plist>

@@ -54,6 +54,44 @@ macOS app -> FastAPI on localhost:3001 -> dev Postgres
 
 Demo fixtures are still available for tests and previews, but the shipped app does not fall back to demo data.
 
+## iPhone development
+
+`ElectronicMailiOS` is the portrait iPhone client (iOS 17+). Debug Simulator builds use `http://localhost:3001`; the deterministic visual-QA mode uses the in-process demo client and never needs a backend.
+
+Boot an iPhone Simulator in Xcode, then run:
+
+```bash
+npm run ios:simulator:build
+npm run ios:simulator:run
+npm run ios:test
+npm run ios:ui:test
+```
+
+The run command launches with `-ElectronicMailDemo`. For a signed physical-device build, keep the local backend running and use:
+
+```bash
+npm run ios:device:run
+```
+
+When exactly one iPhone is connected, the script selects it automatically. It also starts a zero-cost LAN relay from this Mac to the local backend and embeds that address in the build. The iPhone app temporarily receives the Google OAuth localhost callback and forwards it to the LAN backend, so local device sign-in does not require a public tunnel or a second Google OAuth configuration.
+
+You can inspect or stop the relay explicitly:
+
+```bash
+npm run ios:lan:status
+npm run ios:lan:stop
+```
+
+To use a hosted backend instead, provide its canonical HTTPS origin:
+
+```bash
+IOS_DEVICE_ID=<udid> \
+ELECTRONIC_MAIL_IOS_BACKEND_URL=https://mail-api.example.com \
+npm run ios:device:run
+```
+
+All iOS build scripts honor `DEVELOPER_DIR` and otherwise select an installed full Xcode, including Xcode beta, without changing global `xcode-select`.
+
 ## OAuth
 
 The macOS auth redirect URL is:

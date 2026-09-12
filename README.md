@@ -27,6 +27,8 @@ npm run dev:macos
 
 See `macos/ElectronicMail/README.md` for native build details. Never use production Google, database, signing, or notarization credentials in local `.env` files.
 
+New-email push notifications for Mac and iPhone are opt-in under Settings → Notifications. See [push notification setup](docs/PUSH_NOTIFICATIONS.md) for Apple signing, backend configuration, and device verification.
+
 ### Local AI Inbox testing with Codex
 
 Local manual testing can run AI Inbox classification and review through the signed-in Codex app instead of the usage-billed API. Install the local-only adapter and configure `backend/.env`:

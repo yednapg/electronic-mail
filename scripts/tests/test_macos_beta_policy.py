@@ -73,7 +73,9 @@ class MacOSBetaPolicyTests(unittest.TestCase):
             "com.apple.security.files.user-selected.read-write": True,
             "com.apple.security.network.client": True,
         }
-        self.assertEqual(production, expected_production)
+        self.assertEqual(production, expected_production | {
+            "com.apple.developer.aps-environment": "$(ELECTRONIC_MAIL_APNS_ENVIRONMENT)"
+        })
         self.assertEqual(
             beta,
             expected_production | {"com.apple.security.cs.disable-library-validation": True},

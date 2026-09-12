@@ -46,6 +46,7 @@ public enum ElectronicMailStartupScreen: String, CaseIterable, Identifiable {
 }
 
 enum ElectronicMailSettingsDestination: String, CaseIterable, Identifiable {
+    case notifications
     case general
     case composing
     case accounts
@@ -59,6 +60,7 @@ enum ElectronicMailSettingsDestination: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .notifications: return "Notifications"
         case .general: return "General"
         case .composing: return "Composing"
         case .accounts: return "Accounts"
@@ -70,6 +72,7 @@ enum ElectronicMailSettingsDestination: String, CaseIterable, Identifiable {
 
     var systemImage: String {
         switch self {
+        case .notifications: return "bell"
         case .general: return "gearshape"
         case .composing: return "square.and.pencil"
         case .accounts: return "person.crop.circle"
@@ -81,6 +84,7 @@ enum ElectronicMailSettingsDestination: String, CaseIterable, Identifiable {
 
     var searchKeywords: String {
         switch self {
+        case .notifications: return "notifications push alerts sound previews new mail"
         case .general:
             return "appearance theme system light dark startup launch inbox to-do todos"
         case .composing:
@@ -194,6 +198,8 @@ public struct ElectronicMailSettingsView: View {
     @ViewBuilder
     private var settingsDetail: some View {
         switch ElectronicMailSettingsDestination(rawValue: selectedDestinationRawValue) ?? .accounts {
+        case .notifications:
+            MailNotificationSettingsView()
         case .general:
             ElectronicMailGeneralSettingsView()
                 .navigationTitle("General")

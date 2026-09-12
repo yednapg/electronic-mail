@@ -22,6 +22,13 @@ MatterStatus = Literal[
 MatterConfidenceState = Literal["automatic", "provisional", "confirmed"]
 GroupingStyle = Literal["focused", "broader"]
 RolloutMode = Literal["disabled", "shadow", "preview", "live"]
+AITodoDisplayKind = Literal["todo", "worth_knowing", "hidden"]
+AITodoStatus = Literal["open", "completed", "snoozed", "dismissed"]
+AITodoActionType = Literal[
+    "reply", "upload", "pay", "confirm", "review", "track",
+    "register", "schedule", "send", "sign", "submit", "call",
+    "attend", "renew", "cancel", "open", "other", "none",
+]
 
 
 class AIOrganizationProfileResponse(BaseModel):
@@ -123,6 +130,41 @@ class AIInboxResponse(BaseModel):
     generated_at: str
 
 
+class AITodoItem(BaseModel):
+    gmail_account_id: str | None = None
+    id: str
+    matter_id: str
+    source_subgoal_id: str | None = None
+    display_kind: AITodoDisplayKind
+    title: str | None = None
+    detail: str | None = None
+    action_type: AITodoActionType
+    requirement: Literal[
+        "required", "committed", "necessary", "optional", "informational", "waiting"
+    ]
+    due_at: str | None = None
+    urgency: Literal["now", "today", "upcoming", "unscheduled"]
+    confidence: float = Field(ge=0, le=1)
+    evidence_message_ids: list[str] = Field(default_factory=list)
+    evidence_text: str | None = None
+    status: AITodoStatus
+    source_label: str = "AI Inbox"
+    latest_message_at: str | None = None
+    revision: int
+
+
+class AITodoResponse(BaseModel):
+    gmail_account_id: str | None = None
+    items: list[AITodoItem] = Field(default_factory=list)
+    organizing_count: int = 0
+    generated_at: str
+
+
+class AITodoUpdateRequest(BaseModel):
+    status: AITodoStatus
+    snoozed_until: str | None = None
+
+
 class AIGroupingExplanation(BaseModel):
     message_id: str
     event_role: str
@@ -216,6 +258,9 @@ class AIMatterReplyResponse(MailSendResponse):
 
 __all__ = [
     "AIInboxResponse",
+    "AITodoItem",
+    "AITodoResponse",
+    "AITodoUpdateRequest",
     "AIMatterDetailResponse",
     "AIGroupingExplanation",
     "AIReviewProposal",

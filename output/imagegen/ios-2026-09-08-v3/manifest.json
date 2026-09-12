@@ -1,0 +1,66 @@
+{
+  "revision": 3,
+  "generator": "built-in image_gen",
+  "reference_viewport_points": [
+    390,
+    844
+  ],
+  "all_exports_same_dimensions": true,
+  "actual_export_pixels": [
+    853,
+    1844
+  ],
+  "default_view": "AI Inbox",
+  "summary_layout": "Sender line, subject line, exactly two reserved summary lines",
+  "screens": [
+    {
+      "key": "01-ai-inbox",
+      "source": "/Users/gauravpandey/.codex/generated_images/01a07fcb-1502-7201-b07f-f2ae8ffe765c/exec-8c1322fa-072a-47da-8150-6273ca36c5c6.png",
+      "destination": "/Users/gauravpandey/dev/electronic-mail/output/imagegen/ios-2026-09-08-v3/01-ai-inbox.png",
+      "width": 853,
+      "height": 1844,
+      "bytes": 926444
+    },
+    {
+      "key": "02-mailboxes",
+      "source": "/Users/gauravpandey/.codex/generated_images/01a07fcb-1502-7201-b07f-f2ae8ffe765c/exec-92ae5482-60a6-4d22-86ef-be1bd2306b76.png",
+      "destination": "/Users/gauravpandey/dev/electronic-mail/output/imagegen/ios-2026-09-08-v3/02-mailboxes.png",
+      "width": 853,
+      "height": 1844,
+      "bytes": 423387
+    },
+    {
+      "key": "03-message-reader",
+      "source": "/Users/gauravpandey/.codex/generated_images/01a07fcb-1502-7201-b07f-f2ae8ffe765c/exec-6663f8d8-78b3-47d5-b329-bd660ab96481.png",
+      "destination": "/Users/gauravpandey/dev/electronic-mail/output/imagegen/ios-2026-09-08-v3/03-message-reader.png",
+      "width": 853,
+      "height": 1844,
+      "bytes": 1040258
+    },
+    {
+      "key": "04-new-mail",
+      "source": "/Users/gauravpandey/.codex/generated_images/01a07fcb-1502-7201-b07f-f2ae8ffe765c/exec-1abb8bde-8694-4ae5-af27-5da6d5cf9d75.png",
+      "destination": "/Users/gauravpandey/dev/electronic-mail/output/imagegen/ios-2026-09-08-v3/04-new-mail.png",
+      "width": 853,
+      "height": 1844,
+      "bytes": 868690
+    },
+    {
+      "key": "05-reply",
+      "source": "/Users/gauravpandey/.codex/generated_images/01a07fcb-1502-7201-b07f-f2ae8ffe765c/exec-d2f16ae0-20fe-400b-8a76-2c184f22ab4f.png",
+      "destination": "/Users/gauravpandey/dev/electronic-mail/output/imagegen/ios-2026-09-08-v3/05-reply.png",
+      "width": 853,
+      "height": 1844,
+      "bytes": 652995
+    },
+    {
+      "key": "06-compose-keyboard",
+      "source": "/Users/gauravpandey/.codex/generated_images/01a07fcb-1502-7201-b07f-f2ae8ffe765c/exec-6b24664e-997b-42d4-9bff-599df10e9a17.png",
+      "destination": "/Users/gauravpandey/dev/electronic-mail/output/imagegen/ios-2026-09-08-v3/06-compose-keyboard.png",
+      "width": 853,
+      "height": 1844,
+      "bytes": 811484
+    }
+  ],
+  "validation": "Visual placement review and PNG copy integrity; native app behavior is not implemented by these images."
+}

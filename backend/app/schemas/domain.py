@@ -736,6 +736,7 @@ class ThreadMessage(BaseModel):
     cc: str | None = None
     bcc: str | None = None
     subject: str | None = None
+    ai_title: str | None = None
     body: str
     body_complete: bool = True
     html_body: str | None = None

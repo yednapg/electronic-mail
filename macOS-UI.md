@@ -25,8 +25,8 @@ The app is one product. Inbox, To-do's, Calendar, and future screens must feel c
 
 ### Font
 
-- Font family: SF Pro Rounded.
-- Use system rounded font APIs.
+- Font family: the native SF Pro system face used by the mailbox UI.
+- Use the shared system-font helpers; do not add page-local font designs.
 - Do not introduce custom fonts.
 
 ### Symbols
@@ -47,33 +47,31 @@ Use these semantic tokens everywhere:
 - `primaryText`: 90% opacity.
 - `secondaryText`: 75% opacity.
 - `mutedText`: 50% opacity.
-- `sectionText`: 25% opacity.
+- `sectionText`: 50% opacity.
 - `dividerText`: 10% opacity.
 
 Use focus through opacity first, then weight only when necessary.
 
 ### Typography Tokens
 
-Use these sizes across the macOS client:
+Use the shared `ElectronicMailType` sizes across the macOS client:
 
-- `large`: 22pt.
-- `medium`: 20pt.
-- `small`: 18pt.
-- `extraSmall`: 16pt.
+- `mailboxHeader`: 20pt.
+- `sectionTitle`: 17pt.
+- `body`: 15pt.
+- `detail`, `small`, and `status`: 13pt.
 
 Default line-height/rhythm:
 
-- `large`: 40pt line height.
-- `medium`: 40pt line height.
-- `small`: 28-32pt line height.
-- `extraSmall`: 24pt line height.
+- Header content: 28pt line rhythm.
+- Section and body content: 20-24pt text rhythm inside the shared 35pt row height.
+- Detail and metadata content: 18-20pt text rhythm.
 
 Default weights:
 
-- Section titles: `large`, semibold.
-- Main row/item text: `medium`, regular.
-- Supporting summary text: `small`, regular.
-- Metadata/source text: `extraSmall`, regular or semibold only when needed.
+- Section titles: `sectionTitle`, regular.
+- Main row/item text: `body`, regular.
+- Supporting summary and metadata/source text: `detail` or `small`, regular or semibold only when needed.
 
 Do not create page-specific font sizes without updating this contract.
 
@@ -147,9 +145,15 @@ Layout:
 
 Header:
 
-- Top-left: greeting or date, depending on the active product decision.
-- Top-right: current contextual label such as weather or time, depending on the active product decision.
-- If this contract conflicts with code, stop and ask before changing the header meaning.
+- The greeting/time rail shares the fixed app-header row with the menu, page title, Settings, and Search controls; it is not a second row inside the scrolling page.
+- To-do's shows only Settings and Search in the trailing header rail. It does not show account, compose, or create controls.
+- Settings and Search use the same 16pt `mailboxHeaderControlGap` used by Inbox and AI Inbox. Do not allow To-do's to fall back to the looser generic 32pt header gap.
+- Within the centered To-do content column, `Good morning`, `Good afternoon`, or `Good evening` followed by the user's name sits at the left, and the current local time sits at the right.
+- The greeting period and time update from the local system clock without requiring a refresh.
+- The scrolling content begins directly with `You have…`; it must not repeat the greeting or user's name.
+- Briefing concepts such as meetings, tasks, email, payments, and availability use SF Symbols rather than emoji.
+- Use the shared `mailboxHeader` (20pt) SF Pro title scale for the briefing. The user's name, counts/action metrics, and status conclusions are semibold; connective copy is regular.
+- Every text run in the briefing uses the same `primaryText` color. Hierarchy comes from weight only; semantic SF Symbols retain their semantic colors.
 
 Calendar card:
 
@@ -165,24 +169,43 @@ TIME  Event title
 - If there are no events, show that the user is free today.
 - Keep this card compact.
 - Do not turn it into a large calendar view.
+- Use the exact shared AI-summary rectangular surface: 12pt corner radius, clear Liquid Glass at 24% opacity on macOS 26+, and the matching material fallback on earlier systems.
+- Event text and the empty-state message use the shared read-text color; do not mute the card until it becomes illegible.
 
 Sections:
 
-- Always render exactly these three sections:
+- Always render exactly these four sections:
   - Now
   - Later Today
+  - Upcoming
   - Worth Knowing
-- Section title: `large`, semibold, `sectionText`.
-- Section divider: `dividerText`.
-- Gap between section title/divider and rows must match the Inbox row rhythm.
+- Section headers must use the exact Inbox section component role: 17pt regular SF Pro, 50% label opacity, a 38pt label row, and the system `Divider` beneath it.
+- Each section header is a disclosure control. The title and chevron toggle that section between expanded and collapsed states without affecting the other sections.
+- The first section has no extra top gap. Every later section begins 24pt after the preceding section's content, exactly like Inbox.
+- There is no page-specific spacer between the divider and the first row; row placement follows the shared 35pt mailbox rhythm.
+- An expanded empty section renders only its header and divider. Never show `Nothing here`, an empty-state row, or reserved row height.
+- The page has no per-section plus button or inline create composer.
+
+Data source and priority:
+
+- AI Inbox matters are evidence sources, not To-do rows. Never copy every Gmail, Inbox, or `needs_you` row into To-do's.
+- A separate AI projection may emit a To-do only when it identifies one concrete, unresolved action owned by the user, expressed as a verb and object, supported by cited message evidence, and classified as required, previously committed, or necessary to a declared goal.
+- Optional opportunities, surveys, giveaways, marketing, vague suggestions, work owned by someone else, completed work, and low-confidence candidates are neither To-do's nor `Worth Knowing`. Reserve `Worth Knowing` for recent, materially useful status changes or work genuinely waiting on someone else; it has no completion checkbox.
+- Before prioritizing, remove lifecycle-invalid actions: a later sent response resolves the request, a passed deadline expires it, and an undated request older than 14 days is stale. A future explicit deadline may keep an older request active. These are deterministic gates and must not depend on the model's claimed urgency.
+- Never infer a due date. A passed deadline is expired, not overdue. Use `Now` only for an imminent or genuinely critical action supported by evidence from the last 24 hours; use `Later Today` only for an explicit today deadline; use `Upcoming` for a future explicit deadline or a still-fresh unscheduled action.
+- Within each semantic section, sort explicit due dates first and then confidence and recency. Do not use arbitrary top-three/next-five buckets, starred state, or unread state as task eligibility.
+- Manual tasks and calendar-derived tasks remain valid To-do sources and are merged with the independent AI To-do projection.
+- Completing an AI-derived To-do changes only that To-do's status. It must not archive, mark read, or otherwise mutate the source Gmail thread. Opening its source navigates to the supporting AI Inbox matter.
+- While unprojected candidates are being checked, retain already projected rows, show a short `Finding clear next actions` status, and refresh until classification finishes.
 
 Rows:
 
-- Rows are derived from Inbox items.
-- Row title text must match the Inbox-derived title exactly.
+- Email-backed rows are derived from the independent AI To-do projection and keep an evidence link to their source matter.
+- Row title text uses the AI-derived action sentence rather than repeating the Inbox subject.
+- When the action verb is present in the sentence, emphasize only that verb or phrase with the semantic blue or green accent.
 - Do not show Inbox sender/date columns in To-do rows.
-- Row/item text: `medium`, regular, `primaryText`.
-- Row/body line height: 40pt.
+- Row/item text uses the exact read-email subject role: 15pt regular SF Pro with `readText` color. The semantic action phrase may change color, but it must not change size or weight.
+- Row container height follows the shared 35pt mailbox row rhythm.
 - Each row has a circle checkbox on the left.
 - Checkbox uses SF Symbol `circle`.
 - Completed/loading visual may use `checkmark.circle.fill`.
@@ -224,15 +247,23 @@ ________________________________________________________________________
 
 Expanded row typography:
 
-- Title: `medium`, regular, `primaryText`.
-- Summary: `small`, regular, `secondaryText`.
-- Action item: `small` or `medium` depending on available space, semibold, green.
-- Secondary action: `small`, semibold, `secondaryText`.
-- Source: `extraSmall`, regular, `mutedText`.
+- Title: `body`, regular, `primaryText`.
+- Summary: `detail`, regular, `secondaryText`.
+- Action item: `detail` or `body` depending on available space, semibold, green.
+- Secondary action: `detail`, semibold, `secondaryText`.
+- Source: `small`, regular, `mutedText`.
+
+Start control:
+
+- The primary expanded-row control uses SF Symbol `play.fill` followed by the contextual action label.
+- It means `Start this task`, not complete it.
+- For `Reply`, open the source matter/thread with the reply workflow available. For `Review`, `Open`, and `Track`, open the relevant source. For trusted external flows such as `Pay`, `Register`, and `Confirm`, opening the supporting source is the safe fallback until a validated destination is available; never submit automatically.
+- The adjacent `Open source` control always opens the supporting AI Inbox matter or Gmail thread without changing task state.
+- Manual rows reveal their notes/editing state and do not show an inert play control.
 
 Expanded row spacing:
 
-- Title row follows the same 40pt row rhythm as collapsed rows.
+- Title row follows the same shared 35pt row rhythm as collapsed rows.
 - Gap from title row to summary: 12-16pt.
 - Gap from summary to actions/source row: 12-16pt.
 - These two gaps must be visually equal.
@@ -252,37 +283,37 @@ Expanded row card:
 These are known visual failures from the screenshot and recording review.
 Treat each one as a regression even when the app builds successfully.
 
-#### 1. Header hierarchy is too heavy
+#### 1. Daily briefing hierarchy drifts from the title scale
 
 Failure:
 
-- The greeting and morning/afternoon brief can become too bold, too large, or too similar in weight.
-- The brief can visually compete with the section rows.
-- The header can contain too much text for the amount of space it occupies.
+- The briefing can become too small or faint and stop functioning as the page's primary summary.
+- The entire sentence can become uniformly bold, erasing the scan hierarchy between connective copy and facts.
+- Wrapping can create awkward short lines or crowd the calendar card.
 
 How to test:
 
 - Open the To-do page in a normal desktop window and in a wide/full-screen window.
 - Compare the greeting, the brief, the calendar card, section headers, and row titles in one screenshot.
-- The greeting should be readable but calm.
-- The brief should feel secondary to the actionable rows.
-- The brief must not look like the loudest text on the page.
+- The briefing must use the same 20pt scale as the mailbox page title and greeting rail.
+- The user's name, counts, and status conclusion are semibold; connective copy is regular, with all text sharing the same primary color.
+- The weight changes must remain visible even though the whole sentence shares one title-scale size.
 - If the brief wraps, it must still feel intentional and must not crowd the calendar card or first section.
 
-#### 2. Header placement is too low and too centered
+#### 2. Greeting/time rail placement is too low and too centered
 
 Failure:
 
-- The greeting can appear too far down from the app chrome.
-- The To-do header can feel disconnected from the hamburger/navigation anchor.
+- The greeting/time rail can appear too far down from the app chrome or become a second body header.
+- The To-do greeting/time rail can feel disconnected from the hamburger/navigation anchor.
 - The top content can drift into the middle of the page instead of starting from a stable top grid.
 
 How to test:
 
 - Open the To-do page after a cold launch.
-- Draw an imaginary horizontal guide from the hamburger row into the content area.
-- The greeting should sit on the same intentional top grid, not far below it.
-- The time/weather/refresh control must align with the same header row.
+- Draw an imaginary horizontal guide from the hamburger row into the centered content column.
+- The greeting and time must sit on that same fixed app-header grid.
+- The briefing below the rail must begin directly with `You have…` and must not repeat the greeting.
 - The header must keep the same top metrics after refresh, sidebar open/close, and page navigation.
 
 #### 3. To-do content column is too wide
@@ -298,22 +329,22 @@ How to test:
 - Test at full-screen width, a 1440px-ish desktop width, and a narrower window.
 - The To-do content column should occupy the centered working area, roughly the middle half of the usable window on large screens.
 - There should be meaningful empty space on both sides.
-- The plus buttons, section dividers, calendar card, rows, and expanded cards must all align to the same column width.
+- The section disclosures, dividers, calendar card, rows, and expanded cards must all align to the same column width.
 
 #### 4. Calendar card background and rhythm are inconsistent
 
 Failure:
 
-- The calendar card can look visually different from the expanded To-do card or new To-do composer.
-- The card can feel like a separate style instead of part of the same panel system.
+- The calendar card can drift away from the existing AI-summary rectangle.
+- A solid custom fill or border can make it feel like a separate style.
 - The card text can be too strong relative to the page.
 
 How to test:
 
 - Open To-do with no events and with calendar events if possible.
-- Open a To-do row and also open the new To-do composer.
-- Compare fill color, border, corner radius, height, text size, and text weight.
-- The calendar card, expanded row card, and new To-do composer must feel like the same component family.
+- Open AI Inbox and compare its summary disclosure with the To-do calendar card.
+- Compare glass/material behavior, 12pt corner radius, opacity, padding, and text contrast.
+- The two summary rectangles must use the same shared surface implementation.
 
 #### 5. Section title to row gap is too tight
 
@@ -325,10 +356,10 @@ Failure:
 
 How to test:
 
-- Open the To-do page with rows in all three sections.
+- Open the To-do page with rows in all four sections.
 - Compare the gap from section title/divider to the first checkbox/title row for each section.
-- The gap must be clearly visible and consistent across `Now`, `Later Today`, and `Worth Knowing`.
-- The divider should not visually collide with the first row checkbox or title.
+- The divider-to-row relationship must exactly match Inbox; do not add a To-do-only spacer.
+- The first section has no extra top spacing, and each later section adds exactly the Inbox 24pt section spacing.
 
 #### 6. Row typography is inconsistent
 
@@ -341,7 +372,7 @@ Failure:
 How to test:
 
 - Compare collapsed To-do rows, an expanded To-do title, and Inbox row text.
-- Row titles should use the shared `medium`, regular style.
+- Row titles should use the exact read-email subject style: 15pt regular SF Pro and read-text color.
 - Supporting summary text should stay smaller and secondary.
 - Section labels should be readable but quiet.
 - No row title should look like a page heading.
@@ -409,19 +440,19 @@ How to test:
 - These gaps should feel visually equal, roughly 12-16pt.
 - The action row must have a stable bottom inset.
 
-#### 11. New To-do composer does not match expanded row background
+#### 11. Empty and collapsed sections leave phantom content
 
 Failure:
 
-- The new To-do composer can use a different panel fill or border than expanded rows.
-- Opening the composer below an expanded row can make the page look like two unrelated card systems.
+- An empty section displays `Nothing here` or reserves the height of a row.
+- Collapsing a section hides its header or leaves its rows interactive.
 
 How to test:
 
-- Expand a To-do row.
-- Click the plus button for `Now`, `Later Today`, and `Worth Knowing`.
-- Compare the composer background, border, corner radius, checkbox lane, text sizes, and button placement against the expanded row card.
-- The composer must use the same panel language as expanded rows.
+- Check an expanded empty section; only its title and divider should remain.
+- Toggle every section through its title/chevron.
+- Confirm each section collapses independently and all of its rows disappear.
+- Confirm the page has no plus or inline create control.
 
 #### 12. Refresh failure message is inconsistent between Inbox and To-do
 
@@ -602,7 +633,8 @@ Minimum To-do screenshots to inspect:
 - Collapsed To-do page.
 - To-do with first `Now` row expanded.
 - To-do with one `Later Today` row expanded.
-- To-do with new item composer open.
+- To-do with one whole section collapsed and another expanded.
+- To-do with empty sections showing no placeholder rows.
 - To-do refresh failure toast.
 - At least three animation frames from an open/close recording.
 

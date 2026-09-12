@@ -122,6 +122,69 @@ final class APIClientTests: XCTestCase {
         try await client.deleteAccount()
     }
 
+    func testMainMatterTrashSubmitsConfirmedAccountScopedGroupRequest() async throws {
+        let client = makeClient { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(
+                request.url?.path(percentEncoded: true),
+                "/v1/gmail-accounts/gmail-account-1/mailbox/entity-actions"
+            )
+            let payload = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: self.requestBodyData(request))
+                    as? [String: Any]
+            )
+            XCTAssertEqual(payload["matter_id"] as? String, "matter-1")
+            XCTAssertEqual(payload["action"] as? String, "move_trash")
+            XCTAssertEqual(payload["expected_revision"] as? Int, 7)
+            XCTAssertEqual(payload["confirm_multi_thread_trash"] as? Bool, true)
+            XCTAssertNotNil(payload["client_action_id"] as? String)
+
+            let data = Data(
+                #"{"gmail_account_id":"gmail-account-1","client_action_id":"client-action-1","matter_id":"matter-1","action":"move_trash","target_message_ids":["message-1","message-2"],"affected_thread_count":2,"state":"queued"}"#.utf8
+            )
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!,
+                data
+            )
+        }
+        let accounts = GmailAccountsResponse(
+            multiAccountEnabled: false,
+            migrationVerified: true,
+            maxAccounts: 1,
+            primaryGmailAccountID: "gmail-account-1",
+            accounts: [
+                GmailAccount(
+                    id: "gmail-account-1",
+                    email: "owner@example.com",
+                    displayName: "Owner",
+                    state: .ready,
+                    isPrimary: true,
+                    initialReadyAt: "2026-09-04T00:00:00Z"
+                )
+            ]
+        )
+        client.configureMailboxScope(.combined, accounts: accounts)
+
+        let response = try await client.applyMatterAction(
+            MatterEntityActionRequest(
+                clientActionID: "client-action-1",
+                matterID: "matter-1",
+                action: .moveTrash,
+                expectedRevision: 7,
+                confirmMultiThreadTrash: true
+            )
+        )
+
+        XCTAssertEqual(response.targetMessageIDs, ["message-1", "message-2"])
+        XCTAssertEqual(response.affectedThreadCount, 2)
+        XCTAssertEqual(response.state, "queued")
+    }
+
     func testBearerSessionTokenIsSentToBackend() async throws {
         let client = makeClient { request in
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer live-session-token")

@@ -3141,6 +3141,7 @@ def _thread_message_from_gmail(
         cc=message.recipients.get("cc") if isinstance(message.recipients.get("cc"), str) else None,
         bcc=message.recipients.get("bcc") if isinstance(message.recipients.get("bcc"), str) else None,
         subject=message.subject,
+        ai_title=message.ai_title,
         body=message.text_body or message.snippet or "",
         body_complete=not _needs_body_fetch(message),
         html_body=html_body,

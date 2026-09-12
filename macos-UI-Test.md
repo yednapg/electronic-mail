@@ -58,6 +58,9 @@ Test:
 - Confirm To-do is still centered/narrow.
 - Confirm Inbox still has sender/title/date columns.
 - Confirm To-do still shows only task titles, not Inbox sender/date columns.
+- Confirm a sent reply after the request removes the generated To-do.
+- Confirm passed deadlines and undated requests older than 14 days do not appear in any active section.
+- Confirm surveys, giveaways, promotions, and optional opportunities do not appear in Worth Knowing.
 
 Pass:
 
@@ -76,7 +79,7 @@ Test:
 - Check To-do at the normal desktop window size.
 - Check collapsed rows, expanded rows, and calendar card together.
 - Confirm the To-do content remains centered.
-- Confirm the section divider, plus button, row text, and expanded card feel like one column system.
+- Confirm the section divider, disclosure label, row text, and expanded card feel like one column system.
 - Confirm expanded card does not start far left of the row content.
 
 Pass:
@@ -90,7 +93,7 @@ Failure:
 
 - To-do and Inbox used different font weights, sizes, or colors in a way that made them feel like separate apps.
 - To-do section title was forgotten when listing or changing typography.
-- Brief/greeting text became too bold, too large, or visually louder than the work list.
+- Brief/greeting text became smaller or lighter than the shared page-title scale, or lost its internal weight hierarchy.
 - Login/onboarding typography drifted into unrelated custom sizes.
 
 Test:
@@ -102,24 +105,27 @@ Test:
   - summary/body text
   - action text
   - source/metadata text
-- Confirm app-wide font family is SF Pro Rounded.
+- Confirm the To-do page uses the same native SF Pro system face as Inbox; no page-local rounded design or custom font is applied.
 - Confirm icons are SF Symbols, not emoji.
-- Confirm text hierarchy mostly uses opacity, not many unrelated weights/colors.
+- Confirm every briefing text run uses the same primary color; hierarchy comes from regular versus semibold weight, not mixed opacity.
+- Confirm the fixed To-do rail shows the local time-of-day greeting plus the user's name on the left and the time on the right.
+- Confirm the scrolling briefing begins with `You have…` and does not repeat the greeting or name.
 
 Expected tokens:
 
-- Section title: 22pt, semibold, sectionText.
-- Row/item text: 20pt, regular, primaryText.
-- Expanded title: 20pt, regular, primaryText.
-- Expanded summary: 18pt, regular, secondaryText.
-- Expanded action: 18pt or 20pt depending on space, semibold, green.
-- Expanded source: 16pt, mutedText.
+- Daily briefing: 20pt, regular connective copy with semibold name/metrics/conclusions, matching the mailbox-header scale.
+- Section title: exactly the Inbox section role — 17pt regular at 50% label opacity in a 38pt label row.
+- Row/item text: exactly the read-email subject role — 15pt regular, readText, in the shared 35pt row.
+- Expanded title: 15pt, regular, primaryText.
+- Expanded summary: 13pt, regular, secondaryText.
+- Expanded action: 13pt or 15pt depending on space, semibold, green.
+- Expanded source: 13pt, mutedText.
 
 Pass:
 
 - To-do rows are not oversized.
-- Inbox rows and To-do rows share the same 20pt item rhythm.
-- Section titles are visually quiet but readable.
+- Inbox rows and To-do rows share the same 15pt body type and 35pt row rhythm.
+- Section titles match Inbox exactly and remain visually quiet but readable.
 - No element feels accidentally bold because it inherited the wrong font weight.
 
 ### 4. Opacity And Color Drift
@@ -138,7 +144,7 @@ Test:
   - primaryText: 90%
   - secondaryText: 75%
   - mutedText: 50%
-  - sectionText: 25%
+  - sectionText: 50%
   - dividerText: 10%
 - Check the brief, calendar card, section titles, rows, expanded summary, actions, and source.
 
@@ -163,6 +169,7 @@ Test:
   - expanded row
   - collapsed row below expanded row
   - rows in Later Today
+  - rows in Upcoming
   - rows in Worth Knowing
 - Draw an imaginary vertical line through all circles.
 - Confirm collapsed and expanded circles share one lane.
@@ -182,7 +189,7 @@ Failure:
 - Gap between section title/divider and first To-do row was too small compared with Inbox.
 - Expanded card created uneven gaps above and below.
 - Section spacing became inconsistent after expansion.
-- Worth Knowing looked disconnected from Now and Later Today.
+- Worth Knowing looked disconnected from Now, Later Today, and Upcoming.
 
 Test:
 
@@ -191,6 +198,9 @@ Test:
 - Check row-to-row spacing within a section.
 - Check spacing before and after an expanded row.
 - Check the gap between sections when rows are collapsed and when one row is expanded.
+- Confirm the first section adds no extra top gap and later sections add exactly 24pt before their 38pt label row.
+- Confirm every section title/chevron toggles that section independently.
+- Confirm an empty expanded section shows no placeholder text and reserves no row height.
 
 Pass:
 
@@ -278,7 +288,7 @@ Test:
 4. Confirm it collapses immediately.
 5. Click row A, then row B.
 6. Confirm row A collapses and row B expands.
-7. Repeat across Now, Later Today, and Worth Knowing.
+7. Repeat across Now, Later Today, Upcoming, and Worth Knowing.
 8. Click title text, whitespace inside the row, and the checkbox lane separately.
 9. Watch the animation frame-by-frame enough to confirm it opens vertically in place.
 10. Confirm the card edges and text columns do not slide left or right during expansion.
@@ -325,25 +335,29 @@ Pass:
 - Rows and sections beneath the active item stay visible throughout and are pushed only by the active row's animated height.
 - The whole page feels like one accordion reflow: the selected row opens downward, and everything beneath it moves together without overlap.
 - The motion reads like the reference app: the row itself gains expanded state instead of the page rearranging around it.
-- Now, Later Today, and Worth Knowing rows share the same motion behavior.
+- Now, Later Today, Upcoming, and Worth Knowing rows share the same motion behavior.
 
-### 9. Add Button Placement
+### 9. Section Disclosure And Page Actions
 
 Failure:
 
-- Plus button appeared only once or felt unrelated to sections.
-- Plus button alignment drifted from section edge.
-- Plus button was too visually loud or too far from the section it controls.
+- A section cannot be collapsed, or collapsing one section changes another.
+- An empty section shows `Nothing here`.
+- A plus, compose, account, or other create control appears on the To-do page.
+- Settings and Search use a different gap from Inbox and AI Inbox.
 
 Test:
 
-- Confirm every To-do section has its own plus affordance.
-- Confirm plus aligns consistently with the section width.
-- Confirm plus does not overlap section title/divider/rows.
+- Expand and collapse each of the four sections through its title/chevron.
+- Confirm collapsed rows are hidden and not interactive while the header remains visible.
+- Confirm empty sections contain only the title and divider.
+- Confirm the trailing To-do actions are only Settings and Search.
+- Confirm their frame gap is the shared 16pt `mailboxHeaderControlGap`.
+- Open Search, type part of a To-do title, and verify matching rows remain without navigating away from To-do's.
 
 Pass:
 
-- Plus appears as a section action, not a floating unrelated button.
+- Section disclosure is independent, empty states are blank, and only consistently spaced Settings/Search actions remain.
 
 ### 10. Calendar Card
 
@@ -726,14 +740,14 @@ Pass:
 Failure:
 
 - macOS app UI introduces title/body sizes above the agreed maximum.
-- Email reader title or page title uses 26pt after the max was set to 22pt.
+- A normal app page invents a font size outside `ElectronicMailType`.
 - Checkbox size drifts from the agreed 18pt.
 - App UI font-size changes are made while trying to fix sender HTML font rendering.
 
 Test:
 
 - Inspect macOS UI tokens and visible UI.
-- Confirm maximum normal app UI size is 22pt.
+- Confirm normal app UI resolves through the shared `ElectronicMailType` roles.
 - Confirm:
   - sectionTitleSize: 22
   - bodySize: 20
@@ -758,20 +772,23 @@ Run this full flow after any To-do or shared typography change:
 1. Build the app.
 2. Relaunch the app.
 3. Open To-do.
-4. Check header, calendar card, Now, Later Today, and Worth Knowing.
-5. Expand and collapse at least three rows:
+4. Check header, calendar card, Now, Later Today, Upcoming, and Worth Knowing.
+5. Expand and collapse all four section disclosures and confirm they operate independently.
+6. Check an empty section and confirm it has no `Nothing here` row.
+7. Open To-do Search and confirm it filters To-do rows without navigating to Inbox.
+8. Expand and collapse at least three rows:
    - first row
    - middle row
    - row near the bottom of a visible section
-6. Verify one-click expansion/collapse.
-7. Verify only one row remains expanded.
-8. Check checkbox lane alignment.
-9. Check title, summary, action, and source alignment.
-10. Open Inbox.
-11. Check full-width layout, columns, section titles, row text, and selected row.
-12. Hard-scroll Inbox.
-13. Open sidebar and navigate back to To-do.
-14. If a refresh warning is visible, confirm Inbox and To-do use the same bottom capsule toast style.
+9. Verify one-click row expansion/collapse.
+10. Verify only one row remains expanded.
+11. Check checkbox lane alignment.
+12. Check title, summary, action, and source alignment.
+13. Open Inbox.
+14. Check full-width layout, columns, section titles, row text, selected row, and the Settings/Search control gap.
+15. Hard-scroll Inbox.
+16. Open sidebar and navigate back to To-do.
+17. If a refresh warning is visible, confirm Inbox and To-do use the same bottom capsule toast style.
 
 Do not skip Inbox after a shared token change.
 
@@ -820,7 +837,7 @@ When reviewing a screenshot, inspect these exact edges and lines:
 - summary left edge
 - action row left edge
 - source right inset
-- plus button right alignment
+- section disclosure chevron alignment
 - refresh warning toast position and style
 - row baseline alignment
 - hamburger icon visual bounds
@@ -863,16 +880,24 @@ A To-do UI change passes only when:
 
 - To-do remains centered/narrow.
 - Inbox remains full-width.
-- To-do row text is 20pt regular.
-- Inbox row text is 20pt regular.
-- Section titles are 22pt semibold at 25% opacity.
-- Row/body rhythm is 40pt.
+- To-do row text is 15pt regular.
+- Inbox row text is 15pt regular.
+- Section titles are 17pt regular at 50% opacity.
+- Row/body rhythm is 35pt.
 - Circles align in one lane and do not dominate.
 - Expanded row opens in place.
 - Expanded card content aligns internally.
 - Source has proper trailing inset.
+- The SF Symbol play control opens the source workflow and never marks the task complete.
 - One click expands/collapses.
 - One expanded row at a time.
+- Every section expands and collapses independently.
+- Empty sections show no placeholder text or phantom row height.
+- To-do's has only Settings and Search in its trailing action rail, separated by the shared 16pt mailbox gap.
 - Calendar card is unchanged unless explicitly requested.
 - Inbox does not freeze during fast scrolling.
 - Refresh warnings use the same bottom capsule toast treatment on Inbox and To-do.
+- Every email-backed To-do is a concrete user-owned action with cited source evidence.
+- Optional or informational mail appears only in Worth Knowing and has no completion checkbox.
+- Completing an AI To-do does not archive or mutate its Gmail source.
+- Now, Later Today, and Upcoming are semantic urgency buckets, never arbitrary rank slices.

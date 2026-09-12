@@ -1,0 +1,58 @@
+{
+  "generator": "built-in image_gen",
+  "design_viewport_points": [
+    390,
+    844
+  ],
+  "note": "Raster dimensions are generated approximations; images are static mockups.",
+  "screens": [
+    {
+      "key": "01-inbox",
+      "source": "/Users/gauravpandey/.codex/generated_images/01a07fcb-1502-7201-b07f-f2ae8ffe765c/exec-27eae2af-b357-47e5-9298-fd64b1c77bf2.png",
+      "destination": "/Users/gauravpandey/dev/electronic-mail/output/imagegen/ios-2026-09-08/01-inbox.png",
+      "width": 875,
+      "height": 1798,
+      "bytes": 967632
+    },
+    {
+      "key": "02-ai-inbox",
+      "source": "/Users/gauravpandey/.codex/generated_images/01a07fcb-1502-7201-b07f-f2ae8ffe765c/exec-7b0a6826-9df4-4ad3-a05e-407cd3a82ce1.png",
+      "destination": "/Users/gauravpandey/dev/electronic-mail/output/imagegen/ios-2026-09-08/02-ai-inbox.png",
+      "width": 875,
+      "height": 1798,
+      "bytes": 994479
+    },
+    {
+      "key": "03-mailboxes",
+      "source": "/Users/gauravpandey/.codex/generated_images/01a07fcb-1502-7201-b07f-f2ae8ffe765c/exec-96cda00a-1289-4271-8fba-e92c00c6e823.png",
+      "destination": "/Users/gauravpandey/dev/electronic-mail/output/imagegen/ios-2026-09-08/03-mailboxes.png",
+      "width": 875,
+      "height": 1798,
+      "bytes": 632779
+    },
+    {
+      "key": "04-message-reader",
+      "source": "/Users/gauravpandey/.codex/generated_images/01a07fcb-1502-7201-b07f-f2ae8ffe765c/exec-cf50b73e-8b44-4617-83b2-b3e9c9672b62.png",
+      "destination": "/Users/gauravpandey/dev/electronic-mail/output/imagegen/ios-2026-09-08/04-message-reader.png",
+      "width": 853,
+      "height": 1844,
+      "bytes": 1028791
+    },
+    {
+      "key": "05-compose",
+      "source": "/Users/gauravpandey/.codex/generated_images/01a07fcb-1502-7201-b07f-f2ae8ffe765c/exec-be446673-4dd0-4351-9081-ac04375fdc23.png",
+      "destination": "/Users/gauravpandey/dev/electronic-mail/output/imagegen/ios-2026-09-08/05-compose.png",
+      "width": 877,
+      "height": 1793,
+      "bytes": 457241
+    },
+    {
+      "key": "06-compose-keyboard",
+      "source": "/Users/gauravpandey/.codex/generated_images/01a07fcb-1502-7201-b07f-f2ae8ffe765c/exec-4fd87f55-f6b8-4017-8bfe-989d65d38d91.png",
+      "destination": "/Users/gauravpandey/dev/electronic-mail/output/imagegen/ios-2026-09-08/06-compose-keyboard.png",
+      "width": 851,
+      "height": 1848,
+      "bytes": 783820
+    }
+  ]
+}

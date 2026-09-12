@@ -26,6 +26,7 @@ from app.db.user_mail_guard import (
 # Child tables precede their parents. Authentication/account tables are deliberately
 # absent: deleting Gmail-derived data must not sign the user out or delete the account.
 USER_MAIL_DATA_DELETE_ORDER = (
+    "push_deliveries",
     "google_contact_avatar_cache",
     "ai_usage_events",
     "matter_decisions",
