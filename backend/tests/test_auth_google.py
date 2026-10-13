@@ -761,13 +761,15 @@ class GoogleAuthRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Connected. Returning to Electronic Mail", response.text)
-        self.assertIn("electronicmail://auth/callback?login_code=login-1", response.text)
+        self.assertIn("electronicmail://auth/callback?status=ready", response.text)
+        self.assertNotIn("login_code=", response.text)
         self.assertIn(f"handoff_id={HANDOFF_ID}", response.text)
         mock_read.assert_called_once_with(HANDOFF_ID)
         self.assert_no_store(response)
 
+    @patch("app.api.routes.auth_google.note_mobile_oauth_handoff_delivery", return_value=1)
     @patch("app.api.routes.auth_google._read_handoff", return_value=("ready", "login-1", None))
-    def test_mobile_poll_reads_durable_handoff(self, mock_read: Mock) -> None:
+    def test_mobile_poll_reads_durable_handoff(self, mock_read: Mock, _mock_note: Mock) -> None:
         response = self.client.get(f"/v1/auth/mobile/handoff/{HANDOFF_ID}")
 
         self.assertEqual(response.status_code, 200)
@@ -786,8 +788,9 @@ class GoogleAuthRouteTests(unittest.TestCase):
         self.assertEqual(response.json(), {"status": "pending"})
         self.assert_no_store(response)
 
+    @patch("app.api.routes.auth_google.note_mobile_oauth_handoff_delivery", return_value=1)
     @patch("app.api.routes.auth_google._read_handoff", return_value=("ready", "login-1", None))
-    def test_browser_completion_does_not_consume_handoff_before_native_poll(self, mock_read: Mock) -> None:
+    def test_browser_completion_does_not_consume_handoff_before_native_poll(self, mock_read: Mock, _mock_note: Mock) -> None:
         browser = self.client.get(
             "/auth/mobile/complete",
             params={"handoff_id": HANDOFF_ID},
@@ -796,7 +799,8 @@ class GoogleAuthRouteTests(unittest.TestCase):
         poll = self.client.get(f"/v1/auth/mobile/handoff/{HANDOFF_ID}")
 
         self.assertEqual(browser.status_code, 200)
-        self.assertIn("login_code=login-1", browser.text)
+        self.assertNotIn("login_code=", browser.text)
+        self.assertIn("status=ready", browser.text)
         self.assertEqual(poll.status_code, 200)
         self.assertEqual(
             poll.json(),
@@ -804,8 +808,9 @@ class GoogleAuthRouteTests(unittest.TestCase):
         )
         self.assertEqual(mock_read.call_count, 2)
 
+    @patch("app.api.routes.auth_google.note_mobile_oauth_handoff_delivery", return_value=1)
     @patch("app.api.routes.auth_google._read_handoff", return_value=("ready", "login-1", None))
-    def test_native_may_poll_ready_handoff_repeatedly_until_login_code_exchange(self, mock_read: Mock) -> None:
+    def test_native_may_poll_ready_handoff_repeatedly_until_login_code_exchange(self, mock_read: Mock, _mock_note: Mock) -> None:
         first = self.client.get(f"/v1/auth/mobile/handoff/{HANDOFF_ID}")
         second = self.client.get(f"/v1/auth/mobile/handoff/{HANDOFF_ID}")
 

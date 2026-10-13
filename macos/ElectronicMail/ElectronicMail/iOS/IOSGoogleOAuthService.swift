@@ -43,6 +43,11 @@ final class IOSGoogleOAuthService: NSObject, ASWebAuthenticationPresentationCont
         let loginCode: String
         do {
             loginCode = try await authenticateWithCallback(authorizationURL: authorizationURL)
+        } catch MobileAuthFlowError.missingLoginCode {
+            // The browser callback confirms sign-in without carrying the login
+            // code. Read it from the poll, which is bound to this device's PKCE
+            // verifier, instead of opening the browser a second time.
+            loginCode = try await MobileAuthFlow.pollForLoginCode(baseURL: baseURL, handoffID: handoffID)
         } catch IOSGoogleOAuthError.cancelled {
             throw IOSGoogleOAuthError.cancelled
         } catch {

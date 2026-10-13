@@ -21,6 +21,7 @@ from app import schema_check
 from app.api.routes import jobs as jobs_routes
 from app.core import config as config_module
 from app.core.config import load_settings
+from app.main import enforce_production_readiness
 from app.core.observability import JSONLogFormatter
 from app.core.rate_limit import RateLimitMiddleware
 from app.main import app
@@ -166,6 +167,31 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertTrue(any("APP_SESSION_SECRET" in error for error in errors))
         self.assertTrue(any("APP_ENCRYPTION_KEY" in error for error in errors))
         self.assertTrue(any("OPENAI_API_KEY" in error for error in errors))
+
+    def test_production_rejects_low_entropy_key_material(self) -> None:
+        with patch.dict(
+            os.environ,
+            production_environment(
+                APP_SESSION_SECRET="a" * 40,
+                APP_ENCRYPTION_KEY="b" * 40,
+            ),
+            clear=True,
+        ):
+            errors = load_settings().readiness_errors()
+
+        self.assertTrue(any("APP_SESSION_SECRET" in error and "mixed characters" in error for error in errors))
+        self.assertTrue(any("APP_ENCRYPTION_KEY" in error and "mixed characters" in error for error in errors))
+
+    def test_unready_production_configuration_refuses_to_start(self) -> None:
+        with patch.dict(
+            os.environ,
+            production_environment(APP_ENCRYPTION_KEY="b" * 40),
+            clear=True,
+        ):
+            settings = load_settings()
+
+        with self.assertRaises(RuntimeError):
+            enforce_production_readiness(settings)
 
     def test_production_requires_explicit_canonical_no_ai_configuration(self) -> None:
         cases = (

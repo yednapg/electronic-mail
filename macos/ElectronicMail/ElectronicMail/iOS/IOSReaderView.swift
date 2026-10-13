@@ -254,7 +254,7 @@ private struct IOSReaderMessageCard: View {
                     }
 
                     if let html = message.html, !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        IOSMailWebView(html: html)
+                        IOSMailBodyView(html: html, fallbackText: message.body)
                     } else {
                         Text(message.body)
                             .font(.body)
@@ -328,8 +328,30 @@ private struct IOSReaderMessageCard: View {
     }
 }
 
+/// Renders sender HTML only once WebKit has the reader content rules; if they
+/// cannot be compiled the message body is shown as plain text instead.
+struct IOSMailBodyView: View {
+    let html: String
+    let fallbackText: String
+    @State private var networkIsolationUnavailable = false
+
+    var body: some View {
+        if networkIsolationUnavailable {
+            Text(fallbackText)
+                .font(.body)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            IOSMailWebView(html: html) {
+                networkIsolationUnavailable = true
+            }
+        }
+    }
+}
+
 struct IOSMailWebView: UIViewRepresentable {
     let html: String
+    let onNetworkIsolationFailure: () -> Void
     @State private var measuredHeight: CGFloat = 80
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -349,22 +371,27 @@ struct IOSMailWebView: UIViewRepresentable {
         webView.backgroundColor = .white
         webView.scrollView.backgroundColor = .white
         context.coordinator.onHeight = { height in measuredHeight = max(80, height) }
+        context.coordinator.onNetworkIsolationFailure = onNetworkIsolationFailure
+        context.coordinator.beginNetworkIsolation(for: webView)
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
+        context.coordinator.onNetworkIsolationFailure = onNetworkIsolationFailure
         guard context.coordinator.lastHTML != html else { return }
         context.coordinator.lastHTML = html
-        webView.loadHTMLString(document, baseURL: nil)
+        context.coordinator.load(document, in: webView)
     }
 
     private var document: String {
-        if html.localizedCaseInsensitiveContains("<html") { return html }
-        return """
+        if html.localizedCaseInsensitiveContains("<html") {
+            return EmailRemoteImagePolicy.renderDocument(from: html)
+        }
+        return EmailRemoteImagePolicy.renderDocument(from: """
         <!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
         <style>html,body{margin:0;padding:0;background:#fff;color:#17191f;font:-apple-system-body;line-height:1.45}img{max-width:100%;height:auto}pre{white-space:pre-wrap}a{color:#246bfd}</style>
         </head><body>\(html)</body></html>
-        """
+        """)
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, uiView: WKWebView, context: Context) -> CGSize? {
@@ -372,8 +399,48 @@ struct IOSMailWebView: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
+        private enum NetworkIsolationState {
+            case pending
+            case ready
+            case failed
+        }
+
         var lastHTML: String?
         var onHeight: ((CGFloat) -> Void)?
+        var onNetworkIsolationFailure: (() -> Void)?
+        private var networkIsolationState: NetworkIsolationState = .pending
+        private var pendingDocument: String?
+
+        func beginNetworkIsolation(for webView: WKWebView) {
+            Task { @MainActor [weak self, weak webView] in
+                do {
+                    let rules = try await EmailReaderNetworkIsolation.shared.ruleList()
+                    guard let self, let webView else { return }
+                    webView.configuration.userContentController.add(rules)
+                    networkIsolationState = .ready
+                    if let document = pendingDocument {
+                        pendingDocument = nil
+                        webView.loadHTMLString(document, baseURL: nil)
+                    }
+                } catch {
+                    guard let self else { return }
+                    networkIsolationState = .failed
+                    pendingDocument = nil
+                    onNetworkIsolationFailure?()
+                }
+            }
+        }
+
+        func load(_ document: String, in webView: WKWebView) {
+            switch networkIsolationState {
+            case .ready:
+                webView.loadHTMLString(document, baseURL: nil)
+            case .pending:
+                pendingDocument = document
+            case .failed:
+                onNetworkIsolationFailure?()
+            }
+        }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation?) {
             webView.evaluateJavaScript("Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)") { [weak self] value, _ in
@@ -387,15 +454,19 @@ struct IOSMailWebView: UIViewRepresentable {
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
-            guard navigationAction.navigationType == .linkActivated,
-                  let url = navigationAction.request.url else {
-                decisionHandler(.allow)
+            if navigationAction.navigationType == .linkActivated, let url = navigationAction.request.url {
+                if ["https", "http", "mailto"].contains(url.scheme?.lowercased() ?? "") {
+                    UIApplication.shared.open(url)
+                }
+                decisionHandler(.cancel)
                 return
             }
-            if ["https", "http", "mailto"].contains(url.scheme?.lowercased() ?? "") {
-                UIApplication.shared.open(url)
+            guard navigationAction.targetFrame?.isMainFrame == true,
+                  EmailReaderNavigationPolicy.allowsDocumentLoad(navigationAction.request.url) else {
+                decisionHandler(.cancel)
+                return
             }
-            decisionHandler(.cancel)
+            decisionHandler(.allow)
         }
     }
 }

@@ -481,6 +481,51 @@ class EmailExtractionTests(unittest.TestCase):
         self.assertNotIn("onload", cleaned)
         self.assertNotIn("javascript:", cleaned)
 
+    def test_render_sanitizer_closes_remote_load_bypasses_and_is_stable(self) -> None:
+        from app.core.config import load_settings
+        from app.services.remote_images import rewrite_external_image_sources, scrub_unproxied_subresources
+
+        settings = load_settings()
+        cases = {
+            "plain http img": '<img src="http://tracker.example/p.gif">',
+            "unquoted https src": "<img src=https://tracker.example/p.gif>",
+            "entity-encoded scheme": '<img src="&#104;ttps://tracker.example/p.gif">',
+            "link stylesheet": '<link rel="stylesheet" href="https://tracker.example/a.css">',
+            "video poster": '<video poster="https://tracker.example/p.png"></video>',
+            "svg image href": '<svg><image href="https://tracker.example/p.png"/></svg>',
+            "css import string": '<style>@import "https://tracker.example/a.css";</style>',
+            "css url": '<div style="background:url(https://tracker.example/p.png)">x</div>',
+            "unquoted onload": "<body onload=alert(1)>Hi</body>",
+            "protocol-relative": '<img src="//tracker.example/p.gif">',
+            "javascript href": '<a href="javascript:alert(1)">bad</a>',
+        }
+        for name, html in cases.items():
+            with self.subTest(name=name):
+                cleaned = sanitize_email_render_document(html)
+                self.assertEqual(sanitize_email_render_document(cleaned), cleaned)
+                rewritten = rewrite_external_image_sources(
+                    settings,
+                    user_id="user-1",
+                    message_id="message-1",
+                    document=cleaned,
+                )
+                isolated = scrub_unproxied_subresources(rewritten)
+                rendered = isolated or ""
+                self.assertNotIn("https://tracker.example", rendered)
+                self.assertNotIn("http://tracker.example", rendered)
+                self.assertNotIn("//tracker.example", rendered)
+                self.assertNotIn("javascript:", rendered)
+                self.assertNotIn("onload", rendered)
+                self.assertNotIn("<link", rendered)
+                self.assertNotIn("<svg", rendered)
+                self.assertNotIn("<video", rendered)
+
+        kept = sanitize_email_render_document(
+            '<a href="https://links.example/otp">Open</a><img src="cid:logo">'
+        )
+        self.assertIn('href="https://links.example/otp"', kept)
+        self.assertIn('src="cid:logo"', kept)
+
     def test_renderable_body_check_rejects_snippet_only_metadata(self) -> None:
         self.assertFalse(
             has_persisted_renderable_body(

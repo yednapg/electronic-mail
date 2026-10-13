@@ -518,7 +518,7 @@ function GmailThreadMessageCard({ message }: { message: ThreadMessage }) {
             className="thread-message-html-frame"
             title={subject}
             sandbox=""
-            srcDoc={htmlBody}
+            srcDoc={readerSrcDoc(htmlBody)}
           />
         ) : (
           <p className="thread-message-body">{body.length > 0 ? body : 'No persisted body text.'}</p>
@@ -526,6 +526,15 @@ function GmailThreadMessageCard({ message }: { message: ThreadMessage }) {
       </article>
     </li>
   );
+}
+
+function readerSrcDoc(html: string): string {
+  const policy = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; frame-src 'none'; script-src 'none'";
+  const meta = `<meta http-equiv="Content-Security-Policy" content="${policy}">`;
+  if (/<head[\s>]/i.test(html)) {
+    return html.replace(/<head([^>]*)>/i, `<head$1>${meta}`);
+  }
+  return `<!doctype html><html><head>${meta}</head><body>${html}</body></html>`;
 }
 
 function buildPreviewThread(row: GmailThreadRow): ThreadReaderResponse {

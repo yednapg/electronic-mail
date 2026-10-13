@@ -408,6 +408,146 @@ public final class EmailRemoteImageSchemeHandler: NSObject, WKURLSchemeHandler {
     }
 }
 
+// MARK: - Reader network isolation
+
+/// Content rules that forbid every network load from a reader web view except
+/// the authenticated privacy-image scheme and inline `data:` payloads.
+///
+/// The backend rewrites remote sources to `electronicmail-image://` tokens and
+/// the reader document carries a meta CSP, but both depend on interpreting the
+/// sender's markup the same way WebKit does. Content rules are evaluated by
+/// WebKit itself for every resource load regardless of how it was expressed,
+/// so they are the layer that must be in place before any sender HTML loads.
+public enum EmailReaderNetworkRules {
+    /// Bump whenever `encodedRules` changes; the rule store caches by identifier.
+    public static let identifier = "electronicmail-reader-network-isolation-v1"
+
+    public static let encodedRules = """
+    [
+      {"trigger":{"url-filter":".*"},"action":{"type":"block"}},
+      {"trigger":{"url-filter":"^about:blank$"},"action":{"type":"ignore-previous-rules"}},
+      {"trigger":{"url-filter":"^electronicmail-image://"},"action":{"type":"ignore-previous-rules"}},
+      {"trigger":{"url-filter":"^data:"},"action":{"type":"ignore-previous-rules"}}
+    ]
+    """
+}
+
+/// Compiles the reader rules once per process and hands the same list to every
+/// reader web view. Callers must not load sender HTML until this succeeds; a
+/// compilation failure is reported so the reader can fall back to plain text.
+@MainActor
+public final class EmailReaderNetworkIsolation {
+    public static let shared = EmailReaderNetworkIsolation()
+
+    public enum Failure: Error, Equatable {
+        case storeUnavailable
+        case compilationProducedNoRules
+    }
+
+    private let identifier: String
+    private let encodedRules: String
+    private let store: WKContentRuleListStore?
+    private var compiled: WKContentRuleList?
+    private var compiling = false
+    private var waiters: [CheckedContinuation<WKContentRuleList, Error>] = []
+
+    public init(
+        identifier: String = EmailReaderNetworkRules.identifier,
+        encodedRules: String = EmailReaderNetworkRules.encodedRules,
+        store: WKContentRuleListStore? = WKContentRuleListStore.default()
+    ) {
+        self.identifier = identifier
+        self.encodedRules = encodedRules
+        self.store = store
+    }
+
+    /// Starts compilation early so the first opened message does not wait.
+    public func warmUp() {
+        Task { @MainActor in
+            _ = try? await ruleList()
+        }
+    }
+
+    public func ruleList() async throws -> WKContentRuleList {
+        if let compiled {
+            return compiled
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            waiters.append(continuation)
+            guard !compiling else {
+                return
+            }
+            compiling = true
+            guard let store else {
+                finishCompilation(.failure(Failure.storeUnavailable))
+                return
+            }
+            // Always recompile instead of looking up a cached list: a cached
+            // entry compiled by an older build could silently carry stale rules
+            // under the same identifier if a bump were ever forgotten.
+            store.compileContentRuleList(
+                forIdentifier: identifier,
+                encodedContentRuleList: encodedRules
+            ) { [weak self] ruleList, error in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let self else {
+                            return
+                        }
+                        if let error {
+                            self.finishCompilation(.failure(error))
+                        } else if let ruleList {
+                            self.finishCompilation(.success(ruleList))
+                        } else {
+                            self.finishCompilation(.failure(Failure.compilationProducedNoRules))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func finishCompilation(_ result: Result<WKContentRuleList, Error>) {
+        compiling = false
+        if case .success(let ruleList) = result {
+            compiled = ruleList
+        }
+        let pending = waiters
+        waiters = []
+        for waiter in pending {
+            waiter.resume(with: result)
+        }
+    }
+}
+
+/// Main-frame navigations a reader web view may perform on its own. Sender
+/// HTML is always loaded with `loadHTMLString(_:baseURL: nil)`, which WebKit
+/// reports as `about:blank`; anything else (a meta refresh that survived
+/// sanitization, a form, a stray frame) is cancelled.
+public enum EmailReaderNavigationPolicy {
+    public static func allowsDocumentLoad(_ url: URL?) -> Bool {
+        guard let url else {
+            return true
+        }
+        return url.scheme?.lowercased() == "about"
+    }
+}
+
+/// Document-level CSP applied before sender HTML reaches WebKit. This is a
+/// second, independent statement of the same policy the content rules enforce.
+public enum EmailRemoteImagePolicy {
+    public static func renderDocument(from html: String) -> String {
+        let policy = "default-src 'none'; img-src electronicmail-image: data: cid:; style-src 'unsafe-inline'; font-src data:; media-src data:; frame-src 'none'; script-src 'none'"
+        let meta = #"<meta http-equiv="Content-Security-Policy" content="\#(policy)">"#
+        if let headRange = html.range(of: #"(?i)<head(?:\s[^>]*)?>"#, options: .regularExpression) {
+            var result = html
+            result.insert(contentsOf: meta, at: headRange.upperBound)
+            return result
+        }
+        return "<html><head>\(meta)</head><body>\(html)</body></html>"
+    }
+}
+
 private extension String {
     var urlPathComponentEncoded: String {
         var allowed = CharacterSet.urlPathAllowed

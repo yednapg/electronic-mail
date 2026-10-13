@@ -45,6 +45,7 @@ struct ElectronicMailiOSApp: App {
                 demoMode: ElectronicMailiOSConfiguration.isDemoMode
             )
             .task {
+                EmailReaderNetworkIsolation.shared.warmUp()
                 if !ElectronicMailiOSConfiguration.isDemoMode { inboxStore.connectNotifications() }
             }
         }

@@ -36,7 +36,7 @@ struct IOSComposerView: View {
         self.store = store
         self.accountStore = accountStore
         self.context = context
-        let recovered = IOSComposerRecovery.load(id: context.id)
+        let recovered = IOSComposerRecovery.load(userID: store.signedInUserID ?? "signed-out", id: context.id)
         _toText = State(initialValue: recovered?.to ?? context.to.joined(separator: ", "))
         _ccText = State(initialValue: recovered?.cc ?? context.cc.joined(separator: ", "))
         _bccText = State(initialValue: recovered?.bcc ?? context.bcc.joined(separator: ", "))
@@ -353,7 +353,7 @@ struct IOSComposerView: View {
                     attachments: uploads
                 )
             }
-            IOSComposerRecovery.clear(id: context.id)
+            IOSComposerRecovery.clear(userID: store.signedInUserID ?? "signed-out", id: context.id)
             AppHaptics.success()
             dismiss()
         } catch {
@@ -429,7 +429,7 @@ struct IOSComposerView: View {
         sending = true
         do {
             try await store.deleteMobileDraft(gmailDraftID: gmailDraftID)
-            IOSComposerRecovery.clear(id: context.id)
+            IOSComposerRecovery.clear(userID: store.signedInUserID ?? "signed-out", id: context.id)
             dismiss()
         } catch {
             sendError = error.localizedDescription
@@ -441,6 +441,7 @@ struct IOSComposerView: View {
     private func saveRecovery() {
         IOSComposerRecovery.save(
             .init(to: toText, cc: ccText, bcc: bccText, subject: subject, body: messageBody.string),
+            userID: store.signedInUserID ?? "signed-out",
             id: context.id
         )
     }
@@ -489,17 +490,31 @@ private struct IOSComposerRecovery: Codable {
     let subject: String
     let body: String
 
-    static func load(id: String) -> Self? {
-        guard let data = UserDefaults.standard.data(forKey: key(id)) else { return nil }
-        return try? JSONDecoder().decode(Self.self, from: data)
+    static func load(userID: String, id: String) -> Self? {
+        if let payload = EncryptedComposerRecoveryStore.read(userID: userID, draftID: id),
+           let value = try? JSONDecoder().decode(Self.self, from: payload) {
+            return value
+        }
+        guard let legacy = UserDefaults.standard.data(forKey: key(id)),
+              let value = try? JSONDecoder().decode(Self.self, from: legacy) else {
+            return nil
+        }
+        try? EncryptedComposerRecoveryStore.write(userID: userID, draftID: id, payload: legacy)
+        UserDefaults.standard.removeObject(forKey: key(id))
+        return value
     }
 
-    static func save(_ value: Self, id: String) {
+    static func save(_ value: Self, userID: String, id: String) {
         guard let data = try? JSONEncoder().encode(value) else { return }
-        UserDefaults.standard.set(data, forKey: key(id))
+        try? EncryptedComposerRecoveryStore.write(userID: userID, draftID: id, payload: data)
+        UserDefaults.standard.removeObject(forKey: key(id))
     }
 
-    static func clear(id: String) { UserDefaults.standard.removeObject(forKey: key(id)) }
+    static func clear(userID: String, id: String) {
+        EncryptedComposerRecoveryStore.remove(userID: userID, draftID: id)
+        UserDefaults.standard.removeObject(forKey: key(id))
+    }
+
     private static func key(_ id: String) -> String { "ElectronicMail.iOS.composer.\(id)" }
 }
 

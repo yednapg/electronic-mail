@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import logging
 import os
 from threading import Lock
+import time
 from typing import Any, Iterable, Iterator
 from uuid import uuid4
 
@@ -27,7 +28,7 @@ from app.db.models import (
 from app.db.account_scope import gmail_account_scope
 
 DEFAULT_USER_ID = os.getenv("APP_USER_ID", "local-user").strip() or "local-user"
-ALEMBIC_HEAD_REVISION = "20260908_0043"
+ALEMBIC_HEAD_REVISION = "20261013_0045"
 ALEMBIC_BASELINE_REVISION = ALEMBIC_HEAD_REVISION
 POSTGRES_URL_PREFIXES = ("postgres://", "postgresql://")
 ADVISORY_LOCK_POOL_SIZE = 10
@@ -1049,6 +1050,54 @@ def consume_bound_mobile_login_code(
             ),
         ).fetchone()
     return _to_mobile_login_code(row) if row is not None else None
+
+
+def consume_rate_limit_bucket(
+    database_url: str,
+    *,
+    rule: str,
+    identity: str,
+    maximum: int,
+    window_seconds: int,
+) -> tuple[bool, int]:
+    """Count one request in a shared fixed window. The count includes rejects."""
+    now = int(time.time())
+    window_start = now - (now % window_seconds)
+    retry_after = max(1, window_seconds - (now % window_seconds))
+    with connect(database_url) as connection:
+        row = connection.execute(
+            """
+            INSERT INTO rate_limit_buckets (rule, identity_hash, window_start, request_count)
+            VALUES (?, ?, to_timestamp(?), 1)
+            ON CONFLICT (rule, identity_hash, window_start)
+            DO UPDATE SET request_count = rate_limit_buckets.request_count + 1
+            RETURNING request_count
+            """,
+            (rule, identity, window_start),
+        ).fetchone()
+    count = int(row["request_count"]) if row is not None else maximum + 1
+    if count > maximum:
+        return False, retry_after
+    return True, 0
+
+
+def note_mobile_oauth_handoff_delivery(database_path: str, *, handoff_id: str) -> int | None:
+    """Count a code-bearing poll. Delivery stays repeatable; the count is for anomaly logs."""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            """
+            UPDATE mobile_oauth_handoffs
+            SET delivered_count = delivered_count + 1
+            WHERE handoff_id = ?
+              AND status = 'ready'
+              AND consumed_at IS NULL
+            RETURNING delivered_count
+            """,
+            (handoff_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return int(row["delivered_count"])
 
 
 def get_mobile_oauth_handoff(

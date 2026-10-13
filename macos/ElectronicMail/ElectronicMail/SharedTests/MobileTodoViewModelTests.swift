@@ -148,6 +148,13 @@ final class MobileTodoViewModelTests: XCTestCase {
             try MobileAuthFlow.loginCode(from: URL(string: "electronicmail://auth/callback?login_code=abc123")!),
             "abc123"
         )
+        XCTAssertThrowsError(
+            try MobileAuthFlow.loginCode(
+                from: URL(string: "electronicmail://auth/callback?status=ready&handoff_id=11111111-1111-4111-8111-111111111111")!
+            )
+        ) { error in
+            XCTAssertEqual(error as? MobileAuthFlowError, .missingLoginCode)
+        }
 
         let challenge = String(repeating: "c", count: 43)
         let handoffURL = try MobileAuthFlow.handoffCompletionRedirectURL(

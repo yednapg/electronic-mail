@@ -478,6 +478,10 @@ private final class ElectronicMailApplicationDelegate: NSObject, NSApplicationDe
         MailNotificationController.shared.install()
     }
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        EmailReaderNetworkIsolation.shared.warmUp()
+    }
+
     func applicationDidBecomeActive(_ notification: Notification) {
         Task { await MailNotificationController.shared.refresh() }
     }

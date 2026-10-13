@@ -1,4 +1,6 @@
 import AppKit
+import CryptoKit
+import Network
 import SwiftUI
 import WebKit
 import XCTest
@@ -1737,6 +1739,111 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertFalse(configuration.defaultWebpagePreferences.allowsContentJavaScript)
     }
 
+    @MainActor
+    func testReaderNetworkRulesCompileAndAreSharedAcrossCallers() async throws {
+        let isolation = EmailReaderNetworkIsolation(store: try makeTemporaryContentRuleListStore())
+
+        async let first = isolation.ruleList()
+        async let second = isolation.ruleList()
+        let (firstList, secondList) = try await (first, second)
+
+        XCTAssertTrue(firstList === secondList)
+        XCTAssertEqual(firstList.identifier, EmailReaderNetworkRules.identifier)
+    }
+
+    @MainActor
+    func testReaderNetworkIsolationFailsClosedWhenRulesCannotCompile() async throws {
+        let isolation = EmailReaderNetworkIsolation(
+            identifier: "electronicmail-tests-broken-rules",
+            encodedRules: "{not valid content rules}",
+            store: try makeTemporaryContentRuleListStore()
+        )
+
+        do {
+            _ = try await isolation.ruleList()
+            XCTFail("Invalid rules must not produce a rule list")
+        } catch {
+            // Expected: the reader falls back to plain text instead of loading HTML.
+        }
+    }
+
+    func testReaderNavigationPolicyOnlyAllowsBlankDocumentLoads() {
+        XCTAssertTrue(EmailReaderNavigationPolicy.allowsDocumentLoad(nil))
+        XCTAssertTrue(EmailReaderNavigationPolicy.allowsDocumentLoad(URL(string: "about:blank")))
+        XCTAssertFalse(EmailReaderNavigationPolicy.allowsDocumentLoad(URL(string: "https://tracker.example/landing")))
+        XCTAssertFalse(EmailReaderNavigationPolicy.allowsDocumentLoad(URL(string: "http://127.0.0.1:1/")))
+        XCTAssertFalse(EmailReaderNavigationPolicy.allowsDocumentLoad(URL(string: "data:text/html,<p>x</p>")))
+        XCTAssertFalse(EmailReaderNavigationPolicy.allowsDocumentLoad(URL(string: "file:///etc/hosts")))
+        XCTAssertFalse(EmailReaderNavigationPolicy.allowsDocumentLoad(URL(string: "javascript:alert(1)")))
+    }
+
+    @MainActor
+    func testReaderWebViewNeverContactsRemoteHostsOnceIsolated() async throws {
+        let counter = try LoopbackConnectionCounter()
+        defer { counter.stop() }
+        let origin = "http://127.0.0.1:\(counter.port)"
+        // Every vector here survived the server-side regex rewriter in review.
+        let html = """
+        <html><head></head><body>
+        <img src="\(origin)/img.gif">
+        <img src=\(origin)/unquoted.gif>
+        <link rel="stylesheet" href="\(origin)/a.css">
+        <style>@import url("\(origin)/b.css"); @import "\(origin)/c.css"; body{background:url(\(origin)/bg.png)}</style>
+        <video poster="\(origin)/poster.png"></video>
+        <svg><image href="\(origin)/svg.png"/></svg>
+        <table background="\(origin)/table.png"><tr><td>Hello</td></tr></table>
+        </body></html>
+        """
+
+        // Control: the same document in an unisolated reader web view must
+        // reach the listener, otherwise this harness cannot observe loads
+        // (for example when transport security blocks loopback HTTP) and the
+        // protected run below would pass for the wrong reason.
+        let controlConnections = try await loadInReaderWebView(html, ruleList: nil, counter: counter)
+        try XCTSkipIf(controlConnections == 0, "Loopback loads are not observable in this environment")
+
+        counter.reset()
+        let isolation = EmailReaderNetworkIsolation(store: try makeTemporaryContentRuleListStore())
+        let rules = try await isolation.ruleList()
+        let isolatedConnections = try await loadInReaderWebView(html, ruleList: rules, counter: counter)
+
+        XCTAssertEqual(isolatedConnections, 0, "Reader web view contacted a remote host despite content rules")
+    }
+
+    @MainActor
+    private func loadInReaderWebView(
+        _ html: String,
+        ruleList: WKContentRuleList?,
+        counter: LoopbackConnectionCounter
+    ) async throws -> Int {
+        let configuration = WKWebViewConfiguration()
+        EmailHTMLWebViewPolicy.configure(configuration)
+        if let ruleList {
+            configuration.userContentController.add(ruleList)
+        }
+        let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 400, height: 400), configuration: configuration)
+        let delegate = ReaderTestNavigationDelegate()
+        webView.navigationDelegate = delegate
+        let finished = expectation(description: "reader document finished loading")
+        delegate.onFinish = { finished.fulfill() }
+        webView.loadHTMLString(html, baseURL: nil)
+        await fulfillment(of: [finished], timeout: 15)
+        // Subresource loads continue after didFinish; give them time to land.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        withExtendedLifetime((webView, delegate)) {}
+        return counter.connectionCount
+    }
+
+    private func makeTemporaryContentRuleListStore() throws -> WKContentRuleListStore {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("electronic-mail-content-rules-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        return try XCTUnwrap(WKContentRuleListStore(url: directory))
+    }
+
     func testEmailHTMLDocumentMarksTheCurrentAppearanceForTrustedDarkModeAdaptation() {
         let html = #"<html><head></head><body><table><tr><td style="background:#fff;color:#111">Hello</td></tr></table></body></html>"#
 
@@ -3149,6 +3256,38 @@ final class ModelDecodingTests: XCTestCase {
 
         XCTAssertEqual(try GoogleOAuthService.loginCode(from: url), "abc123")
         XCTAssertEqual(GoogleOAuthService.handoffID(from: url), "handoff-1")
+    }
+
+    func testGoogleOAuthServiceTreatsCodeLessReadyCallbackAsStillWaiting() {
+        let url = URL(string: "electronicmail://auth/callback?status=ready&handoff_id=11111111-1111-4111-8111-111111111111")!
+
+        XCTAssertThrowsError(try GoogleOAuthService.loginCode(from: url)) { error in
+            XCTAssertEqual(error as? OAuthError, .missingLoginCode)
+        }
+    }
+
+    func testComposerRecoveryFileDoesNotContainTheDraftBody() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("composer-recovery-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            EncryptedComposerRecoveryStore.storageDirectoryOverride = nil
+            EncryptedComposerRecoveryStore.testingKey = nil
+            try? FileManager.default.removeItem(at: directory)
+        }
+        EncryptedComposerRecoveryStore.storageDirectoryOverride = directory
+        EncryptedComposerRecoveryStore.testingKey = SymmetricKey(size: .bits256)
+        let marker = "secret-draft-body-\(UUID().uuidString)"
+        let payload = Data(marker.utf8)
+
+        try EncryptedComposerRecoveryStore.write(userID: "user-1", draftID: "draft-1", payload: payload)
+        let stored = try Data(contentsOf: try XCTUnwrap(
+            EncryptedComposerRecoveryStore.fileURL(userID: "user-1", draftID: "draft-1")
+        ))
+
+        XCTAssertNil(stored.range(of: payload))
+        XCTAssertEqual(EncryptedComposerRecoveryStore.read(userID: "user-1", draftID: "draft-1"), payload)
+        XCTAssertNil(EncryptedComposerRecoveryStore.read(userID: "user-2", draftID: "draft-1"))
     }
 
     func testGoogleOAuthServiceParsesLinkedGmailAccountWithoutLoginCode() throws {
@@ -4657,5 +4796,112 @@ private extension UserDefaults {
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         return defaults
+    }
+}
+
+private final class ReaderTestNavigationDelegate: NSObject, WKNavigationDelegate {
+    var onFinish: (() -> Void)?
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        onFinish?()
+        onFinish = nil
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        onFinish?()
+        onFinish = nil
+    }
+}
+
+/// Accepts loopback TCP connections and counts them. Any connection at all
+/// means a reader web view reached the network for a sender-controlled URL.
+/// Plain BSD sockets keep this independent of Network.framework listener
+/// behaviour inside the hostless xctest runner.
+private final class LoopbackConnectionCounter: @unchecked Sendable {
+    let port: UInt16
+    private let listeningSocket: Int32
+    private let lock = NSLock()
+    private var count = 0
+    private var stopped = false
+
+    init() throws {
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else {
+            throw XCTSkip("Loopback listener could not create a socket")
+        }
+        var reuse: Int32 = 1
+        setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                bind(descriptor, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0, listen(descriptor, 16) == 0 else {
+            close(descriptor)
+            throw XCTSkip("Loopback listener could not bind")
+        }
+        var boundAddress = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &boundAddress) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                getsockname(descriptor, sockaddrPointer, &length)
+            }
+        }
+        guard named == 0 else {
+            close(descriptor)
+            throw XCTSkip("Loopback listener port is unknown")
+        }
+        listeningSocket = descriptor
+        port = UInt16(bigEndian: boundAddress.sin_port)
+        Thread.detachNewThread { [weak self] in
+            self?.acceptLoop()
+        }
+    }
+
+    var connectionCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    func reset() {
+        lock.lock()
+        count = 0
+        lock.unlock()
+    }
+
+    func stop() {
+        lock.lock()
+        stopped = true
+        lock.unlock()
+        shutdown(listeningSocket, SHUT_RDWR)
+        close(listeningSocket)
+    }
+
+    private func acceptLoop() {
+        while true {
+            let client = accept(listeningSocket, nil, nil)
+            guard client >= 0 else {
+                return
+            }
+            lock.lock()
+            let shouldServe = !stopped
+            if shouldServe {
+                count += 1
+            }
+            lock.unlock()
+            if shouldServe {
+                let response = Array("HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".utf8)
+                _ = response.withUnsafeBufferPointer { buffer in
+                    send(client, buffer.baseAddress, buffer.count, 0)
+                }
+            }
+            close(client)
+        }
     }
 }

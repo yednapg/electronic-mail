@@ -31,6 +31,7 @@ from app.db.mail_groups import (
 from app.db.repository import get_user_by_email
 from app.db.user_mail_guard import UserMailWorkBlocked
 from app.schemas.domain import MailComposeRequest, MailDraftResponse, MailDraftSaveRequest, MailDraftSendRequest, MailReplyRequest, MailSendResponse, MailboxRealtimeStateResponse, MailboxResponse, MailboxSyncStateResponse, MailboxSyncTriggerResponse, QueuedThreadActionRequest, QueuedThreadActionResponse, ThreadReaderResponse
+from app.services.attachment_media import attachment_response_media_type
 from app.services.auth import require_current_user
 from app.services.gmail_importer import run_gmail_delta_sync
 from app.services.gmail_watch import ensure_gmail_watch
@@ -318,7 +319,8 @@ def mailbox_attachment(request: Request, message_id: str, attachment_id: str) ->
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=cache_headers)
     return Response(
         content=content,
-        media_type=attachment.mime_type or "application/octet-stream",
+        # The sender chose attachment.mime_type; serve only verified inert types.
+        media_type=attachment_response_media_type(attachment.mime_type, content),
         headers={
             **cache_headers,
             "Content-Disposition": _attachment_content_disposition(filename),

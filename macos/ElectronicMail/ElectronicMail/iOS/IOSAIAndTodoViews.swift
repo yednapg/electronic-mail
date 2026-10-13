@@ -236,7 +236,7 @@ struct IOSAIMatterView: View {
                                     }
                                     Text(message.subject).font(.subheadline.weight(.semibold))
                                     if let html = message.html, !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                        IOSMailWebView(html: html)
+                                        IOSMailBodyView(html: html, fallbackText: message.body)
                                     } else {
                                         Text(message.body).textSelection(.enabled)
                                     }

@@ -35,7 +35,7 @@
     "web:test": "npm run test -w @electronic-mail/web",
     "web:typecheck": "npm run typecheck -w @electronic-mail/types && npm run typecheck -w @electronic-mail/web",
     "macos:generate": "cd macos/ElectronicMail && tuist generate",
-    "macos:icons": "node scripts/generate-app-icons.mjs",
+    "macos:dock-icons": "uv run --with pillow python scripts/render_dock_icons.py",
     "macos:typecheck": "bash scripts/xcode.sh build-for-testing -project macos/ElectronicMail/ElectronicMail.xcodeproj -scheme ElectronicMail -destination 'platform=macOS' COMPILER_INDEX_STORE_ENABLE=NO -jobs 2 -derivedDataPath /tmp/ElectronicMailDerivedData CODE_SIGNING_ALLOWED=NO",
     "macos:build": "bash scripts/xcode.sh build -project macos/ElectronicMail/ElectronicMail.xcodeproj -scheme ElectronicMail -destination 'platform=macOS' COMPILER_INDEX_STORE_ENABLE=NO -jobs 2 -derivedDataPath /tmp/ElectronicMailDerivedData CODE_SIGNING_ALLOWED=NO",
     "macos:test": "bash scripts/xcode.sh test -project macos/ElectronicMail/ElectronicMail.xcodeproj -scheme ElectronicMail -destination 'platform=macOS' COMPILER_INDEX_STORE_ENABLE=NO -jobs 2 -derivedDataPath /tmp/ElectronicMailDerivedData CODE_SIGNING_ALLOWED=NO",
@@ -82,10 +82,11 @@
   },
   "overrides": {
     "postcss": "8.5.23",
-    "sharp": "0.35.3"
+    "sharp": "0.35.5",
+    "source-map-js": "1.2.2"
   },
   "devDependencies": {
-    "sharp": "0.35.3",
+    "sharp": "0.35.5",
     "typescript": "5.9.3"
   }
 }

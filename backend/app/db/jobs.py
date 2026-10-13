@@ -568,6 +568,7 @@ def cleanup_old_jobs(database_url: str, *, succeeded_days: int = 30, dead_days: 
         expired_runtime_rows = 0
         for statement in (
             "DELETE FROM oauth_login_sessions WHERE expires_at < now()",
+            "DELETE FROM rate_limit_buckets WHERE window_start < now() - interval '2 hours'",
             "DELETE FROM mobile_login_codes WHERE expires_at < now()",
             "DELETE FROM mobile_oauth_handoffs WHERE expires_at < now()",
             """

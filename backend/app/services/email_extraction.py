@@ -9,17 +9,13 @@ import html
 import re
 from typing import Any, Callable
 
+from app.services.html_sanitizer import sanitize_email_markup
+
 SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style|iframe|object|embed|form|input|button|textarea|select)[^>]*>.*?</\1>")
-UNSAFE_TAG_RE = re.compile(r"(?is)</?(script|style|iframe|object|embed|form|input|button|textarea|select)[^>]*>")
 HTML_COMMENT_RE = re.compile(r"(?is)<!--.*?-->")
 HIDDEN_HTML_BLOCK_RE = re.compile(
     r"(?is)<([a-z0-9]+)\b(?=[^>]*\bstyle\s*=\s*['\"][^'\"]*(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0|color\s*:\s*transparent|font-size\s*:\s*0))[^>]*>.*?</\s*\1\s*>"
 )
-RENDER_UNSAFE_BLOCK_RE = re.compile(r"(?is)<(script|iframe|object|embed|form|input|button|textarea|select)[^>]*>.*?</\1>")
-RENDER_UNSAFE_TAG_RE = re.compile(r"(?is)</?(script|iframe|object|embed|form|input|button|textarea|select)[^>]*>")
-META_REFRESH_RE = re.compile(r"(?is)<meta\b(?=[^>]*http-equiv\s*=\s*(['\"]?)refresh\1)[^>]*>")
-EVENT_ATTR_RE = re.compile(r"\s+on[a-zA-Z]+\s*=\s*(['\"]).*?\1", re.DOTALL)
-JS_HREF_RE = re.compile(r"(?i)(href|src)\s*=\s*(['\"])\s*javascript:[^'\"]*\2")
 CID_SRC_RE = re.compile(r"(?i)\b(src|background)\s*=\s*(['\"])\s*cid:([^'\"]+)\2")
 TAG_RE = re.compile(r"(?is)<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
@@ -132,20 +128,13 @@ def parse_gmail_message(
 
 
 def sanitize_email_html(value: str) -> str:
-    cleaned = SCRIPT_STYLE_RE.sub("", value)
-    cleaned = UNSAFE_TAG_RE.sub("", cleaned)
-    cleaned = EVENT_ATTR_RE.sub("", cleaned)
-    cleaned = JS_HREF_RE.sub(r"\1=\2#\2", cleaned)
-    return cleaned.strip()
+    """Return reader HTML with layout CSS removed."""
+    return sanitize_email_markup(value, keep_style=False)
 
 
 def sanitize_email_render_document(value: str) -> str:
-    cleaned = RENDER_UNSAFE_BLOCK_RE.sub("", value)
-    cleaned = RENDER_UNSAFE_TAG_RE.sub("", cleaned)
-    cleaned = META_REFRESH_RE.sub("", cleaned)
-    cleaned = EVENT_ATTR_RE.sub("", cleaned)
-    cleaned = JS_HREF_RE.sub(r"\1=\2#\2", cleaned)
-    return cleaned.strip()
+    """Return reader HTML that keeps layout CSS and drops active content."""
+    return sanitize_email_markup(value, keep_style=True)
 
 
 def html_to_text(value: str) -> str:

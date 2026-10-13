@@ -2100,19 +2100,6 @@ private struct EmailHTMLPreparedDocument: @unchecked Sendable {
     let remoteImagesDocument: String
 }
 
-enum EmailRemoteImagePolicy {
-    static func renderDocument(from html: String) -> String {
-        let policy = "default-src 'none'; img-src electronicmail-image: data: cid:; style-src 'unsafe-inline'; font-src data:; media-src data:; frame-src 'none'; script-src 'none'"
-        let meta = #"<meta http-equiv="Content-Security-Policy" content="\#(policy)">"#
-        if let headRange = html.range(of: #"(?i)<head(?:\s[^>]*)?>"#, options: .regularExpression) {
-            var result = html
-            result.insert(contentsOf: meta, at: headRange.upperBound)
-            return result
-        }
-        return "<html><head>\(meta)</head><body>\(html)</body></html>"
-    }
-}
-
 enum EmailHTMLDarkModePolicy {
     static var userScript: WKUserScript {
         WKUserScript(
@@ -2229,6 +2216,7 @@ private struct EmailHTMLWebView: NSViewRepresentable {
         updateAppearance(of: webView)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
+        context.coordinator.beginNetworkIsolation(for: webView)
         return webView
     }
 
@@ -2240,7 +2228,7 @@ private struct EmailHTMLWebView: NSViewRepresentable {
             return
         }
         context.coordinator.currentHTML = html
-        webView.loadHTMLString(html, baseURL: nil)
+        context.coordinator.load(html, in: webView)
     }
 
     private func updateAppearance(of webView: WKWebView) {
@@ -2280,13 +2268,59 @@ private struct EmailHTMLWebView: NSViewRepresentable {
             )
         }
 
+        private enum NetworkIsolationState {
+            case pending
+            case ready
+            case failed
+        }
+
         var currentHTML: String?
         var onRenderResult: (EmailHTMLRenderResult) -> Void
         private var contentHeight: Binding<CGFloat>
+        private var networkIsolationState: NetworkIsolationState = .pending
+        private var pendingHTML: String?
 
         init(contentHeight: Binding<CGFloat>, onRenderResult: @escaping (EmailHTMLRenderResult) -> Void) {
             self.contentHeight = contentHeight
             self.onRenderResult = onRenderResult
+        }
+
+        /// Sender HTML is held until WebKit has the reader content rules. If
+        /// they cannot be compiled the message is shown as plain text instead
+        /// of rendering markup that could reach the network unrestricted.
+        func beginNetworkIsolation(for webView: WKWebView) {
+            Task { @MainActor [weak self, weak webView] in
+                do {
+                    let rules = try await EmailReaderNetworkIsolation.shared.ruleList()
+                    guard let self, let webView else {
+                        return
+                    }
+                    webView.configuration.userContentController.add(rules)
+                    networkIsolationState = .ready
+                    if let html = pendingHTML {
+                        pendingHTML = nil
+                        webView.loadHTMLString(html, baseURL: nil)
+                    }
+                } catch {
+                    guard let self else {
+                        return
+                    }
+                    networkIsolationState = .failed
+                    pendingHTML = nil
+                    onRenderResult(.networkIsolationUnavailable)
+                }
+            }
+        }
+
+        func load(_ html: String, in webView: WKWebView) {
+            switch networkIsolationState {
+            case .ready:
+                webView.loadHTMLString(html, baseURL: nil)
+            case .pending:
+                pendingHTML = html
+            case .failed:
+                onRenderResult(.networkIsolationUnavailable)
+            }
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -2313,6 +2347,11 @@ private struct EmailHTMLWebView: NSViewRepresentable {
                 if EmailExternalLinkPolicy.canOpen(url) {
                     NSWorkspace.shared.open(url)
                 }
+                decisionHandler(.cancel)
+                return
+            }
+            guard navigationAction.targetFrame?.isMainFrame == true,
+                  EmailReaderNavigationPolicy.allowsDocumentLoad(navigationAction.request.url) else {
                 decisionHandler(.cancel)
                 return
             }
@@ -2436,12 +2475,17 @@ enum EmailExternalLinkPolicy {
 }
 
 private struct EmailHTMLRenderResult {
+    static let networkIsolationUnavailable = EmailHTMLRenderResult(
+        forcedFallbackReason: "network-isolation-unavailable"
+    )
+
     let visibleTextLength: Int
     let imageCount: Int
     let brokenImageCount: Int
     let emptyImageCount: Int
     let tableCount: Int
     let height: CGFloat?
+    private let forcedFallbackReason: String?
 
     init(values: [String: Any]) {
         visibleTextLength = Self.intValue(values["visibleTextLength"])
@@ -2450,9 +2494,23 @@ private struct EmailHTMLRenderResult {
         emptyImageCount = Self.intValue(values["emptyImageCount"])
         tableCount = Self.intValue(values["tableCount"])
         height = Self.cgFloatValue(values["height"])
+        forcedFallbackReason = nil
+    }
+
+    private init(forcedFallbackReason: String) {
+        visibleTextLength = 0
+        imageCount = 0
+        brokenImageCount = 0
+        emptyImageCount = 0
+        tableCount = 0
+        height = nil
+        self.forcedFallbackReason = forcedFallbackReason
     }
 
     var fallbackReason: String? {
+        if let forcedFallbackReason {
+            return forcedFallbackReason
+        }
         if visibleTextLength < 12, imageCount == 0 {
             return "runtime-blank-html"
         }

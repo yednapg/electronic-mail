@@ -41,6 +41,7 @@ from app.db.repository import (
     delete_user_account_with_google_subject_tombstone,
     get_mobile_oauth_handoff,
     get_oauth_login_session,
+    note_mobile_oauth_handoff_delivery,
     get_gmail_account_by_google_subject,
     link_gmail_account,
     multi_account_migration_verified,
@@ -78,7 +79,7 @@ settings = load_settings()
 logger = logging.getLogger(__name__)
 _MOBILE_HANDOFF_TTL_SECONDS = 5 * 60
 _NO_STORE_HEADERS = {"Cache-Control": "no-store, private", "Pragma": "no-cache"}
-_HANDOFF_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_HANDOFF_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 _CODE_CHALLENGE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
@@ -388,7 +389,11 @@ def auth_mobile_complete(handoff_id: str) -> HTMLResponse:
         )
 
     if handoff[0] == "ready" and handoff[1]:
-        callback_params = {"login_code": handoff[1], "handoff_id": handoff_id}
+        # The login code stays on the authenticated poll. Putting it in this
+        # custom-scheme URL would copy it into browser history and OS logs.
+        # The native app already treats a code-less ready callback as "keep
+        # waiting" and reads the code from /v1/auth/mobile/handoff.
+        callback_params = {"status": "ready", "handoff_id": handoff_id}
         heading = "Connected. Returning to Electronic Mail..."
         detail = "If the app does not open, return to Electronic Mail and it will finish signing in."
     else:
@@ -432,6 +437,20 @@ def auth_mobile_handoff(handoff_id: str) -> JSONResponse:
         return JSONResponse({"status": "pending"}, status_code=202, headers=_NO_STORE_HEADERS)
     handoff_status, login_code, error = handoff
     if handoff_status == "ready" and login_code:
+        deliveries = note_mobile_oauth_handoff_delivery(
+            str(settings.database_path),
+            handoff_id=handoff_id,
+        )
+        if deliveries is not None and deliveries > 10:
+            logger.warning(
+                "mobile.handoff_reread",
+                extra={
+                    "event_fields": {
+                        "event": "mobile.handoff_reread",
+                        "delivery_count": deliveries,
+                    }
+                },
+            )
         return JSONResponse(
             {"status": "ready", "login_code": login_code, "handoff_id": handoff_id},
             headers=_NO_STORE_HEADERS,

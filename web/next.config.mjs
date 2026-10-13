@@ -32,6 +32,10 @@ const nextConfig = {
   devIndicators: false,
   output: 'standalone',
   poweredByHeader: false,
+  // The site never uses next/image. Disabling the optimizer removes the
+  // /_next/image fetch-and-decode surface (SSRF and image-codec advisories)
+  // instead of relying on remotePatterns to keep it closed.
+  images: { unoptimized: true },
   async headers() {
     const headers = process.env.NODE_ENV === 'production'
       ? [...baselineSecurityHeaders, ...productionSecurityHeaders]

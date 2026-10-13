@@ -51,6 +51,9 @@ def create_app(runtime_settings: Settings) -> FastAPI:
         RateLimitMiddleware,
         enabled=runtime_settings.rate_limit_enabled,
         trust_proxy_headers=production_like,
+        trusted_proxy_hops=runtime_settings.trusted_proxy_hops,
+        behind_cloudflare=runtime_settings.behind_cloudflare,
+        database_url=str(runtime_settings.database_path) if production_like else None,
     )
     application.add_middleware(RequestObservabilityMiddleware, production=production_like)
 
@@ -76,4 +79,14 @@ def create_app(runtime_settings: Settings) -> FastAPI:
     return application
 
 
+def enforce_production_readiness(runtime_settings: Settings) -> None:
+    """Stop a production process whose configuration would weaken auth or storage."""
+    if not runtime_settings.is_production_like:
+        return
+    errors = runtime_settings.readiness_errors()
+    if errors:
+        raise RuntimeError("Refusing to start with an unsafe configuration: " + "; ".join(errors))
+
+
 app = create_app(settings)
+enforce_production_readiness(settings)

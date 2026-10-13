@@ -91,6 +91,8 @@ from app.services.email_extraction import (
     html_body_for_reader,
     html_render_document_for_reader,
     parse_gmail_message,
+    sanitize_email_html,
+    sanitize_email_render_document,
     sender_domain,
 )
 from app.services.grouping_projection import build_inbox_projection
@@ -110,7 +112,7 @@ from app.services.integrations.google import (
 )
 from app.services.contact_avatars import normalize_contact_email, resolve_contact_avatar_asset_ids
 from app.services.mailbox_events import GMAIL_PUBSUB_RECEIVED, latest_event
-from app.services.remote_images import rewrite_external_image_sources
+from app.services.remote_images import rewrite_external_image_sources, scrub_unproxied_subresources
 
 FIRST_BATCH_SIZE = 25
 BACKFILL_BATCH_SIZE = 30
@@ -3102,33 +3104,54 @@ def _gmail_part_headers(part: dict[str, Any]) -> dict[str, str]:
     return headers
 
 
+def _reader_markup(
+    document: str | None,
+    *,
+    keep_style: bool,
+    settings: Settings | None,
+    user_id: str,
+    message_id: str,
+) -> str | None:
+    """Re-sanitize stored HTML, then proxy or strip every remote subresource."""
+    if not document:
+        return document
+    sanitized = (
+        sanitize_email_render_document(document)
+        if keep_style
+        else sanitize_email_html(document)
+    )
+    if not sanitized:
+        return None
+    if settings is not None and getattr(settings, "app_encryption_key", None):
+        rewritten = rewrite_external_image_sources(
+            settings,
+            user_id=user_id,
+            message_id=message_id,
+            document=sanitized,
+        )
+        sanitized = rewritten if rewritten is not None else sanitized
+    return scrub_unproxied_subresources(sanitized)
+
+
 def _thread_message_from_gmail(
     message: GmailMessageRecord,
     *,
     settings: Settings | None = None,
     sender_avatar_asset_id: str | None = None,
 ) -> ThreadMessage:
-    reader_html_body = html_body_for_reader(message.html_body_sanitized)
-    reader_html_render_document = html_render_document_for_reader(message.html_render_document)
-    html_body = (
-        rewrite_external_image_sources(
-            settings,
-            user_id=message.user_id,
-            message_id=message.message_id,
-            document=reader_html_body,
-        )
-        if settings is not None and getattr(settings, "app_encryption_key", None)
-        else reader_html_body
+    html_body = _reader_markup(
+        html_body_for_reader(message.html_body_sanitized),
+        keep_style=False,
+        settings=settings,
+        user_id=message.user_id,
+        message_id=message.message_id,
     )
-    html_render_document = (
-        rewrite_external_image_sources(
-            settings,
-            user_id=message.user_id,
-            message_id=message.message_id,
-            document=reader_html_render_document,
-        )
-        if settings is not None and getattr(settings, "app_encryption_key", None)
-        else reader_html_render_document
+    html_render_document = _reader_markup(
+        html_render_document_for_reader(message.html_render_document),
+        keep_style=True,
+        settings=settings,
+        user_id=message.user_id,
+        message_id=message.message_id,
     )
     return ThreadMessage(
         id=message.message_id,

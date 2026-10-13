@@ -774,6 +774,10 @@ public final class InboxStore: ObservableObject {
     }
     @Published public private(set) var phase: LoadPhase = .idle
     @Published private(set) var session: AppSessionResponse?
+
+    public var signedInUserID: String? {
+        session?.user.id
+    }
     @Published public private(set) var mailboxViewScope: MailboxViewScope = .combined
     @Published private(set) var activeMailboxLabel: MailboxLabel = .inbox {
         didSet {

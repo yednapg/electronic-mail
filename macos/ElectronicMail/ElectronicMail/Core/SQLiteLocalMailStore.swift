@@ -234,6 +234,13 @@ public final class SQLiteLocalMailStore: LocalMailStore {
     init?(databaseURL: URL, contentKeyStore: AccountContentKeyStore) {
         self.databaseURL = databaseURL
         self.contentKeyStore = contentKeyStore
+        #if os(iOS)
+        // New sqlite sidecars inherit the directory's protection class.
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: databaseURL.deletingLastPathComponent().path
+        )
+        #endif
         guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK else {
             return nil
         }
@@ -1586,5 +1593,86 @@ private extension NSLock {
         lock()
         defer { unlock() }
         return body()
+    }
+}
+
+/// Encrypted stand-in for draft text that used to live in UserDefaults.
+/// The account content key never leaves the Keychain; tests can supply a key
+/// and directory so the ciphertext can be inspected without a login prompt.
+public enum EncryptedComposerRecoveryStore {
+    public static var storageDirectoryOverride: URL?
+    public static var testingKey: SymmetricKey?
+
+    public static func read(userID: String, draftID: String) -> Data? {
+        guard let url = fileURL(userID: userID, draftID: draftID),
+              let combined = try? Data(contentsOf: url),
+              let key = try? encryptionKey(userID: userID),
+              let box = try? AES.GCM.SealedBox(combined: combined) else {
+            return nil
+        }
+        return try? AES.GCM.open(box, using: key, authenticating: context(userID: userID, draftID: draftID))
+    }
+
+    public static func write(userID: String, draftID: String, payload: Data) throws {
+        let key = try encryptionKey(userID: userID)
+        let sealed = try AES.GCM.seal(payload, using: key, authenticating: context(userID: userID, draftID: draftID))
+        guard let combined = sealed.combined, let url = fileURL(userID: userID, draftID: draftID) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        #if os(iOS)
+        try combined.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        #else
+        try combined.write(to: url, options: [.atomic])
+        #endif
+    }
+
+    public static func remove(userID: String, draftID: String) {
+        guard let url = fileURL(userID: userID, draftID: draftID) else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    public static func fileURL(userID: String, draftID: String) -> URL? {
+        let root = storageDirectoryOverride ?? defaultDirectory()
+        guard let root else { return nil }
+        let safeUser = sanitizedPathComponent(userID)
+        let safeDraft = sanitizedPathComponent(draftID)
+        return root
+            .appendingPathComponent(safeUser, isDirectory: true)
+            .appendingPathComponent("\(safeDraft).bin")
+    }
+
+    private static func encryptionKey(userID: String) throws -> SymmetricKey {
+        if let testingKey {
+            return testingKey
+        }
+        return try AccountContentKeyStore.shared.loadOrCreateKey(userID: userID)
+    }
+
+    private static func context(userID: String, draftID: String) -> Data {
+        Data("electronic-mail:composer-recovery:v1:\(userID):\(draftID)".utf8)
+    }
+
+    private static func defaultDirectory() -> URL? {
+        guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        return support
+            .appendingPathComponent("ElectronicMail", isDirectory: true)
+            .appendingPathComponent("ComposerRecovery", isDirectory: true)
+    }
+
+    private static func sanitizedPathComponent(_ value: String) -> String {
+        let cleaned = value.map { character -> Character in
+            if character.isLetter || character.isNumber || character == "-" || character == "_" {
+                return character
+            }
+            return "_"
+        }
+        let text = String(cleaned)
+        return text.isEmpty ? "draft" : String(text.prefix(80))
     }
 }

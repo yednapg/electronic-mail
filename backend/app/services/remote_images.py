@@ -54,6 +54,12 @@ _TRACKING_PATH_RE = re.compile(
     r"(?:open(?:[-_.]?pixel)?|track(?:er|ing)?|beacon|pixel|webbug)"
     r"(?:[-_.][^/]*)?(?:/|$)"
 )
+_LEFTOVER_SUBRESOURCE_ATTR_RE = re.compile(
+    r"""(?is)(\b(?:src|background|poster)\s*=\s*)(['"])\s*(?:https?://|//)[^'"]*\2"""
+)
+_LEFTOVER_CSS_URL_RE = re.compile(
+    r"""(?is)url\(\s*(['"]?)\s*(?:https?://|//)[^)'"]+\1\s*\)"""
+)
 _TRACKING_QUERY_KEYS: Final = frozenset(
     {
         "beacon",
@@ -90,6 +96,21 @@ class RemoteImagePayload:
     content: bytes
     mime_type: str
     etag: str
+
+
+def scrub_unproxied_subresources(document: str | None) -> str | None:
+    """Blank subresource URLs that the privacy rewriter did not replace.
+
+    Clickable ``href`` values stay. Rewritten ``electronicmail-image://`` tokens
+    stay too, because they do not begin with ``http://``, ``https://``, or ``//``.
+    """
+    if not document:
+        return document
+    cleaned = _LEFTOVER_SUBRESOURCE_ATTR_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}about:blank{match.group(2)}",
+        document,
+    )
+    return _LEFTOVER_CSS_URL_RE.sub("none", cleaned)
 
 
 def rewrite_external_image_sources(

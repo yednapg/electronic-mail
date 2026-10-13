@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 import ipaddress
+from math import log2
 from pathlib import Path
 import re
 from typing import Literal
@@ -113,6 +114,8 @@ class Settings:
     log_level: str
     release_sha: str
     rate_limit_enabled: bool
+    trusted_proxy_hops: int
+    behind_cloudflare: bool
     explicit_runtime_configuration_errors: tuple[str, ...]
 
     @property
@@ -281,10 +284,14 @@ class Settings:
                 errors.append(
                     "SESSION_COOKIE_SAMESITE=lax is required for hosted auth so OAuth redirects work without exposing app sessions to cross-site requests"
                 )
-            if len(self.app_session_secret) < 32 or _looks_like_placeholder(self.app_session_secret):
-                errors.append("APP_SESSION_SECRET must be a unique secret of at least 32 characters")
-            if len(self.app_encryption_key) < 32 or _looks_like_placeholder(self.app_encryption_key):
-                errors.append("APP_ENCRYPTION_KEY must be unique key material of at least 32 characters")
+            if _key_material_is_weak(self.app_session_secret):
+                errors.append(
+                    "APP_SESSION_SECRET must be a unique secret of at least 32 characters with mixed characters"
+                )
+            if _key_material_is_weak(self.app_encryption_key):
+                errors.append(
+                    "APP_ENCRYPTION_KEY must be unique key material of at least 32 characters with mixed characters"
+                )
             if self.app_session_secret == self.app_encryption_key:
                 errors.append("APP_SESSION_SECRET and APP_ENCRYPTION_KEY must use different key material")
             if _looks_like_placeholder(self.database_url):
@@ -431,6 +438,8 @@ def load_settings() -> Settings:
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         release_sha=release_sha,
         rate_limit_enabled=_resolve_boolean("RATE_LIMIT_ENABLED", default=app_env in {"staging", "production"}),
+        trusted_proxy_hops=_resolve_trusted_proxy_hops(),
+        behind_cloudflare=_resolve_boolean("BEHIND_CLOUDFLARE", default=False),
         explicit_runtime_configuration_errors=_explicit_runtime_configuration_errors(
             app_env=app_env,
             environment=os.environ,
@@ -560,6 +569,29 @@ def _explicit_runtime_configuration_errors(
         )
 
     return tuple(errors)
+
+
+def _resolve_trusted_proxy_hops() -> int:
+    raw_value = os.getenv("TRUSTED_PROXY_HOPS", "1").strip().strip("\"'")
+    try:
+        hops = int(raw_value)
+    except ValueError:
+        return 1
+    return min(max(hops, 0), 5)
+
+
+def _key_material_is_weak(value: str) -> bool:
+    """Reject short, placeholder, or low-entropy secrets before they protect tokens."""
+    if len(value) < 32 or _looks_like_placeholder(value):
+        return True
+    if len(set(value)) < 16:
+        return True
+    length = len(value)
+    counts: dict[str, int] = {}
+    for character in value:
+        counts[character] = counts.get(character, 0) + 1
+    entropy = -sum((count / length) * log2(count / length) for count in counts.values())
+    return entropy < 3.5
 
 
 def _looks_like_placeholder(value: str) -> bool:
